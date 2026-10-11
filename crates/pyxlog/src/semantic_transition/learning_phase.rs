@@ -36,7 +36,9 @@ mod private_execution;
 #[cfg(feature = "semantic-policy")]
 use private_execution::PrivateExecutionGroup;
 #[cfg(feature = "semantic-policy")]
-pub(crate) use private_execution::{PrivateReplayChildCustody, PySemanticPrivateReplayChild};
+pub(crate) use private_execution::{
+    PrivateReplayChildCustody, PySemanticPrivateExecutionContinuation, PySemanticPrivateReplayChild,
+};
 #[cfg(feature = "semantic-policy")]
 mod private_checkpoint;
 #[cfg(feature = "semantic-policy")]
@@ -584,12 +586,7 @@ fn verify_phase_native(
     let session = task.session.borrow(py);
     let mut owner = session.owner()?;
     task.require_current(&owner)?;
-    parent.require_task(py, task)?;
-    if !matches!(task.state()?.phase, TaskUsePhase::ArenaPreparing(_)) {
-        return Err(invalid(
-            "learning-phase owner escaped its retained preparation",
-        ));
-    }
+    require_phase_native_scope(py, task, parent)?;
     let lease = parent.lease()?;
     let actual = if recompute {
         owner.current_recompute_state_material(&lease)
@@ -599,6 +596,20 @@ fn verify_phase_native(
     .map_err(xlog_err)?;
     if actual != expected {
         return Err(invalid("retained learning-phase native state changed"));
+    }
+    Ok(())
+}
+
+fn require_phase_native_scope(
+    py: Python<'_>,
+    task: &PySemanticTransitionTaskUse,
+    parent: &PySemanticPublishedParent,
+) -> PyResult<()> {
+    parent.require_task(py, task)?;
+    if !matches!(task.state()?.phase, TaskUsePhase::ArenaPreparing(_)) {
+        return Err(invalid(
+            "learning-phase owner escaped its retained preparation",
+        ));
     }
     Ok(())
 }
@@ -616,7 +627,11 @@ fn verify_phase_checkpoint(
     task.require_current(&owner)?;
     let phase = checkpoint_task_phase(&*task.state()?)?;
     let binding = TaskCheckpointBinding::from_owner(&owner)?;
-    if task.checkpoint.encode(saved_snapshot, &phase, &binding)? != manifest.task {
+    if task
+        .checkpoint
+        .encode(&owner, saved_snapshot, &phase, &binding)?
+        != manifest.task
+    {
         return Err(invalid(
             "phase checkpoint differs from its original live task capsule",
         ));
@@ -985,6 +1000,7 @@ impl PySemanticLearningPhaseTransition {
                         inputs.cold_model_work_capacity,
                         0,
                         admission,
+                        xlog_cuda::SemanticColdModelWorkPurpose::PrivateCheckpoint,
                     )
                     .map_err(xlog_err)?;
                 let work = Py::new(
@@ -1072,7 +1088,12 @@ impl PySemanticLearningPhaseTransition {
                 // submission. Native dispatches from the original report's
                 // actual state without re-entering the model callback.
                 owner
-                    .finish_cold_model_work(&lease, &work.inner, &streams)
+                    .finish_cold_model_work(
+                        &lease,
+                        &work.inner,
+                        &streams,
+                        xlog_cuda::SemanticColdModelWorkDisposition::Complete,
+                    )
                     .map_err(xlog_err)?
             };
             // Retain the actual components before refusal. Other source S
@@ -2104,9 +2125,14 @@ impl PySemanticLearningPhaseTransition {
         let custody = retained
             .as_ref()
             .ok_or_else(|| invalid("known Source refusal lost its original checkpoint issuer"))?;
-        if custody.closure.phase_id != phase_id
-            || custody.closure.completion_digest != digest
-            || custody.origin != <[u8; 32]>::from(Sha256::digest(&self.source_checkpoint))
+        let (closure, checkpoint_origin) = custody
+            .closure
+            .as_ref()
+            .zip(custody.origin.as_ref())
+            .ok_or_else(|| invalid("known Source refusal lost its original checkpoint custody"))?;
+        if closure.phase_id != phase_id
+            || closure.completion_digest != digest
+            || *checkpoint_origin != <[u8; 32]>::from(Sha256::digest(&self.source_checkpoint))
         {
             return Err(invalid(
                 "Source refusal issuer differs from this original known terminal origin",
@@ -2115,7 +2141,7 @@ impl PySemanticLearningPhaseTransition {
         let origin = (
             PyBytes::new(py, &phase_id),
             PyBytes::new(py, &digest),
-            PyBytes::new(py, &custody.origin),
+            PyBytes::new(py, checkpoint_origin),
         )
             .into_pyobject(py)?;
         Ok(Some(

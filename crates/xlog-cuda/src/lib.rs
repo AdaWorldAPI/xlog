@@ -58,21 +58,22 @@ pub use semantic_hypergraph::{
     SemanticHypergraphCapacities, SemanticHypergraphError, SemanticHypergraphExecutionStats,
     SemanticInsertOutcome, SemanticInsertedSupport, SemanticPolarity, SemanticPredicateRecord,
     SemanticRecordRole, SemanticRootDigest, SemanticRootHandle, SemanticRootSnapshot,
-    SemanticStatementHandle, SemanticStatementIdentity, SemanticStatementKey, SemanticStatementRef,
-    SemanticSupportEvent, SemanticSupportHandle, SemanticSupportIdentity, SemanticSupportRecord,
-    SemanticSupportRef, SemanticTruth, SemanticTypedRecord, SemanticVersionHandle,
-    SemanticVersionIdentity, SemanticVersionRef, SemanticView,
+    SemanticRootSupport, SemanticStatementHandle, SemanticStatementIdentity, SemanticStatementKey,
+    SemanticStatementRef, SemanticSupportEvent, SemanticSupportHandle, SemanticSupportIdentity,
+    SemanticSupportRecord, SemanticSupportRef, SemanticTruth, SemanticTypedRecord,
+    SemanticVersionHandle, SemanticVersionIdentity, SemanticVersionRef, SemanticView,
 };
 pub use semantic_program::{SemanticProgramAdmission, SemanticProgramFact, SemanticProgramRule};
 pub use semantic_training_view::{
     validate_training_view_layout, SemanticSelectedTrainingView, SemanticTrainingCanary,
     SemanticTrainingCanaryKind, SemanticTrainingCanaryRecord, SemanticTrainingCanaryRefusalReason,
-    SemanticTrainingCanaryRefusalRecord, SemanticTrainingDomain, SemanticTrainingManifest,
-    SemanticTrainingObjective, SemanticTrainingObjectiveGroup, SemanticTrainingObjectiveGroupKind,
-    SemanticTrainingObjectiveGroupRecord, SemanticTrainingObjectiveRecord,
-    SemanticTrainingRosterRow, SemanticTrainingViewBasis, SemanticTrainingViewLayout,
-    SemanticTrainingViewOrigin, SemanticTrainingViewOriginRecord, SemanticTrainingViewPort,
-    SemanticTrainingViewRow, SemanticTrainingViewSelection, SEMANTIC_TRAINING_CANARY_EVALUATOR_ABI,
+    SemanticTrainingCanaryRefusalRecord, SemanticTrainingCanarySource, SemanticTrainingDomain,
+    SemanticTrainingManifest, SemanticTrainingObjective, SemanticTrainingObjectiveGroup,
+    SemanticTrainingObjectiveGroupKind, SemanticTrainingObjectiveGroupRecord,
+    SemanticTrainingObjectiveRecord, SemanticTrainingRosterRow, SemanticTrainingViewBasis,
+    SemanticTrainingViewLayout, SemanticTrainingViewOrigin, SemanticTrainingViewOriginRecord,
+    SemanticTrainingViewPort, SemanticTrainingViewRow, SemanticTrainingViewSelection,
+    SEMANTIC_TRAINING_CANARY_EVALUATOR_ABI,
 };
 pub use semantic_transition::{
     initial_source_layout, output_intents_from_publication_material,
@@ -86,45 +87,54 @@ pub use semantic_transition::{
     SemanticLearningCopyReset, SemanticLearningPhase, SemanticLearningPhaseRecord,
     SemanticLearningPhaseTransition, SemanticModelContext, SemanticModelContractLayout,
     SemanticModelForwardWitness, SemanticModelMemory, SemanticModelStorage, SemanticModelView,
-    SemanticObservedSource, SemanticOutputIntent, SemanticParentBinding, SemanticPolicyFieldLayout,
-    SemanticPolicyLayout, SemanticPreparedSegmentNonSubmission, SemanticPreparedSegmentTransfers,
-    SemanticPreparedStep, SemanticPreparedStepOutcome, SemanticPublicationInputProjection,
-    SemanticPublicationTensorProjection, SemanticPublishedIdentity, SemanticPublishedLease,
-    SemanticReplayMaterial, SemanticReplayModelBackings, SemanticResidentModelMemory,
-    SemanticRngBinding, SemanticSegmentColdCapacity, SemanticSegmentTerminalWait,
-    SemanticSourceMapping, SemanticStateRecord, SemanticStateRole,
+    SemanticNonterminalIntentBinding, SemanticObservedSource, SemanticOutputIntent,
+    SemanticParentBinding, SemanticPolicyFieldLayout, SemanticPolicyLayout,
+    SemanticPreparedSegmentCapture, SemanticPreparedSegmentContinuation,
+    SemanticPreparedSegmentNonSubmission, SemanticPreparedSegmentTransfers, SemanticPreparedStep,
+    SemanticPreparedStepOutcome, SemanticPublicationInputProjection,
+    SemanticPublicationTensorProjection, SemanticPublishedAcquisition, SemanticPublishedIdentity,
+    SemanticPublishedLease, SemanticPublishedStateObservation, SemanticReplayAppendBinding,
+    SemanticReplayMaterial, SemanticReplayModelBackings, SemanticReplayPublicationVerification,
+    SemanticResidentModelMemory, SemanticRngBinding, SemanticSegmentColdCapacity,
+    SemanticSegmentTerminalWait, SemanticSourceMapping, SemanticStateRecord, SemanticStateRole,
     SemanticStructuralCostDescriptor, SemanticTaskContentIdentity, SemanticTaskEvaluation,
-    SemanticTaskEvaluationSpec, SemanticTaskFacts, SemanticTaskGoalWitness,
-    SemanticTaskObjectiveLaw, SemanticTaskObservation, SemanticTaskObservationRoots,
-    SemanticTaskPriorityGoal, SemanticTaskPriorityLevel, SemanticTaskProgram, SemanticTaskRefusal,
-    SemanticTaskScoring, SemanticTensorContentWitness, SemanticTensorInput, SemanticTensorLayout,
-    SemanticTextRow, SemanticTextSlot, SemanticTokenProvenance, SemanticTransitionError,
-    SemanticTransitionHostIoStats, SemanticTransitionKind, SemanticTransitionLane,
-    SemanticTransitionObservation, SemanticTransitionOutcome, SemanticTransitionReceipt,
-    SemanticTransitionRefusal, SemanticTransitionSession, SemanticTransitionWork,
-    SEMANTIC_FEEDBACK_SUPPORT_FIELDS, SEMANTIC_TRANSITION_COMPONENT_COUNT,
+    SemanticTaskEvaluationSpec, SemanticTaskFacts, SemanticTaskGoalWitness, SemanticTaskGround,
+    SemanticTaskMeasurementBinding, SemanticTaskObjectiveLaw, SemanticTaskObservation,
+    SemanticTaskObservationRoots, SemanticTaskPriorityGoal, SemanticTaskPriorityLevel,
+    SemanticTaskProgram, SemanticTaskReceiptFamily, SemanticTaskRefusal, SemanticTaskScoring,
+    SemanticTaskVerificationBinding, SemanticTensorContentWitness, SemanticTensorInput,
+    SemanticTensorLayout, SemanticTextRow, SemanticTextSlot, SemanticTokenProvenance,
+    SemanticTransitionError, SemanticTransitionHostIoStats, SemanticTransitionKind,
+    SemanticTransitionLane, SemanticTransitionObservation, SemanticTransitionOutcome,
+    SemanticTransitionReceipt, SemanticTransitionRefusal, SemanticTransitionSession,
+    SemanticTransitionWork, SEMANTIC_FEEDBACK_SUPPORT_FIELDS, SEMANTIC_TRANSITION_COMPONENT_COUNT,
     SEMANTIC_TRANSITION_GENERATION,
 };
 #[cfg(feature = "semantic-policy")]
 pub use semantic_transition::{
-    SemanticCancelledModelEvaluation, SemanticCompletedModelEvaluation, SemanticEvaluationCohort,
-    SemanticModelEvaluation, SemanticModelEvaluationResult,
-};
-#[cfg(feature = "semantic-policy")]
-pub use semantic_transition::{
-    SemanticColdModelWork, SemanticColdModelWorkRegion, SemanticColdModelWorkResult,
-    SemanticColdNativeWork,
-};
-#[cfg(feature = "semantic-policy")]
-pub use semantic_transition::{
-    SemanticCompletedActionComponentMaterial, SemanticCompletedActionLaneMaterial,
-    SemanticCompletedActionProjectionMaterial, SemanticCompletedEditSolutionMaterial,
-    SemanticCompletedExecutionObservation, SemanticCompletedLaneOutcomeMaterial,
-    SemanticCompletedMaterialCapacity, SemanticCompletedModelCarrierMaterial,
-    SemanticCompletedReplayMaterials, SemanticCompletedStepWitnessMaterial,
-    SemanticCompletedTaskGroundMaterial, SemanticCompletedTheoryDeltaMaterial,
-    SemanticPolicyGradients, SemanticSelectedPolicyGradients, SemanticUpdateCanaryMeasurement,
+    SemanticActorRefreshInitializerRefusal, SemanticCompletedActionComponentMaterial,
+    SemanticCompletedActionLaneMaterial, SemanticCompletedActionProjectionMaterial,
+    SemanticCompletedEditSolutionMaterial, SemanticCompletedExecutionObservation,
+    SemanticCompletedLaneOutcomeMaterial, SemanticCompletedMaterialCapacity,
+    SemanticCompletedModelCarrierMaterial, SemanticCompletedReplayMaterials,
+    SemanticCompletedStepWitnessMaterial, SemanticCompletedTaskGroundMaterial,
+    SemanticCompletedTheoryDeltaMaterial, SemanticPolicyGradients,
+    SemanticPolicyNumericalDomainLayout, SemanticPreparedActorRefresh,
+    SemanticSegmentInstructionAdmission, SemanticSelectedPolicyGradients,
+    SemanticTransitionSessionConstruction, SemanticUpdateCanaryMeasurement,
     SemanticUpdateForwardReceipt, SemanticUpdateForwardReceiptMaterial, SemanticUpdateMeasurements,
+};
+#[cfg(feature = "semantic-policy")]
+pub use semantic_transition::{
+    SemanticCancelledModelEvaluation, SemanticColdEvaluationContent,
+    SemanticCompletedModelEvaluation, SemanticEvaluationCohort, SemanticModelEvaluation,
+    SemanticModelEvaluationResult,
+};
+#[cfg(feature = "semantic-policy")]
+pub use semantic_transition::{
+    SemanticColdModelWork, SemanticColdModelWorkDisposition, SemanticColdModelWorkOperation,
+    SemanticColdModelWorkPurpose, SemanticColdModelWorkRegion, SemanticColdModelWorkResult,
+    SemanticColdNativeWork,
 };
 pub use semantic_work::ModelWorkKind;
 

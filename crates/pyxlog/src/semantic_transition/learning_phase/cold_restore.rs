@@ -652,9 +652,12 @@ fn require_private_expense(
     let expense = private_seed.proposal_expense()?;
     if source.session != private.session
         || source_seed.training_domain != private_seed.training_domain
+        || source_seed.replay_capacity != private_seed.replay_capacity
         || source_seed.training_objective != private_seed.training_objective
+        || source_seed.original_training_roster()? != private_seed.original_training_roster()?
         || source_seed.checkpoint_source_limits()? != private_seed.checkpoint_source_limits()?
         || source_seed.proposal_expense()?.capacity != expense.capacity
+        || source_seed.proposal_expense()?.original_admission != expense.original_admission
         || source_seed.proposal_expense()?.spent > expense.spent
     {
         return Err(invalid(
@@ -1322,9 +1325,13 @@ impl VerifiedClosure {
         let (source_seed, _, _, _) = TaskCheckpointSeed::decode(&source_manifest.task)?;
         let (final_seed, final_snapshot, _, _) = TaskCheckpointSeed::decode(&final_manifest.task)?;
         if source_seed.training_domain != final_seed.training_domain
+            || source_seed.replay_capacity != final_seed.replay_capacity
             || source_seed.training_objective != final_seed.training_objective
+            || source_seed.original_training_roster()? != final_seed.original_training_roster()?
             || source_seed.checkpoint_source_limits()? != final_seed.checkpoint_source_limits()?
             || source_seed.proposal_expense()?.capacity != final_seed.proposal_expense()?.capacity
+            || source_seed.proposal_expense()?.original_admission
+                != final_seed.proposal_expense()?.original_admission
             || source_seed.proposal_expense()?.spent > final_seed.proposal_expense()?.spent
         {
             return Err(invalid(
@@ -1489,6 +1496,60 @@ impl VerifiedClosure {
     }
 }
 
+/// Reuse the canonical restore trust boundary without allocating a native Session.
+/// An absent closure still requires the Session signature, not phase completion.
+pub(in crate::semantic_transition) fn read_checkpoint_restore_closure(
+    checkpoint: &[u8],
+    snapshot: Option<&Bound<'_, PyAny>>,
+    issuer: Option<&Bound<'_, PyAny>>,
+    records: Option<&Bound<'_, PyAny>>,
+    limits: Option<&Bound<'_, PyAny>>,
+    fence: Option<&Bound<'_, PyAny>>,
+    checkpoint_issuer: Option<&Bound<'_, PyAny>>,
+) -> PyResult<Option<Arc<VerifiedClosure>>> {
+    let closure = match (issuer, records, limits, fence) {
+        (None, None, None, None) => {
+            let manifest = SemanticCheckpointManifest::decode(checkpoint)?;
+            let checkpoint_issuer = checkpoint_issuer.ok_or_else(|| {
+                invalid("checkpoint restoration requires its independently pinned Session issuer")
+            })?;
+            if verify_checkpoint_signature(&manifest, checkpoint_issuer)?
+                || !SemanticTransitionSession::checkpoint_learning_phase_history(&manifest.native)
+                    .map_err(xlog_err)?
+                    .is_empty()
+            {
+                return Err(invalid(
+                    "phase-marked checkpoint requires its original complete signed lifecycle",
+                ));
+            }
+            None
+        }
+        (Some(issuer), Some(records), Some(limits), Some(fence)) => {
+            let verified = VerifiedClosure::read(
+                checkpoint,
+                issuer,
+                records,
+                limits,
+                fence,
+                checkpoint_issuer,
+            )?;
+            let snapshot = snapshot.ok_or_else(|| {
+                invalid("cold phase restoration requires its current authority snapshot")
+            })?;
+            let current =
+                AuthoritySnapshot::parse(&ColdValue::read(snapshot, &mut (16 * 1024 * 1024), 0)?)?;
+            current.newer_than(&verified.snapshot)?;
+            Some(Arc::new(verified))
+        }
+        _ => {
+            return Err(invalid(
+                "cold phase restoration requires all original proof fields together",
+            ))
+        }
+    };
+    Ok(closure)
+}
+
 fn json_cold(value: &Value) -> PyResult<ColdValue> {
     Ok(match value {
         Value::Null => ColdValue::None,
@@ -1506,26 +1567,34 @@ fn json_cold(value: &Value) -> PyResult<ColdValue> {
     })
 }
 
-const SEAL_DOMAIN: &[u8] = b"xlog.learning-phase.checkpoint.v1\0";
-const SEAL_BYTES: usize = SEAL_DOMAIN.len() + 5 * 32 + 64;
+const SEAL_DOMAIN: &[u8] = b"xlog.semantic.checkpoint.v2\0";
+
+struct CheckpointPhaseSeal {
+    phase_id: [u8; 32],
+    completion_digest: [u8; 32],
+}
+
+struct CheckpointSeal {
+    issuer: [u8; 32],
+    root: [u8; 32],
+    phase: Option<CheckpointPhaseSeal>,
+    signature: ed25519_dalek::Signature,
+}
 
 /// This key belongs to the actual known Session, never to Python or a saved Q.
 /// The trusted consumer pins its public key independently before subsequent
 /// requests. A fresh known recovery gets one new issuer, not the old secret.
 pub(in crate::semantic_transition) struct CheckpointCustody {
-    pub(in crate::semantic_transition) closure: Arc<VerifiedClosure>,
-    pub(in crate::semantic_transition) origin: [u8; 32],
+    pub(in crate::semantic_transition) closure: Option<Arc<VerifiedClosure>>,
+    pub(in crate::semantic_transition) origin: Option<[u8; 32]>,
     key: SigningKey,
 }
 
 impl CheckpointCustody {
-    pub(in crate::semantic_transition) fn issue(
-        closure: Arc<VerifiedClosure>,
-        origin: [u8; 32],
-    ) -> Self {
+    pub(in crate::semantic_transition) fn issue() -> Self {
         Self {
-            closure,
-            origin,
+            closure: None,
+            origin: None,
             key: SigningKey::generate(&mut OsRng),
         }
     }
@@ -1538,37 +1607,47 @@ impl CheckpointCustody {
         &self,
         manifest: &SemanticCheckpointManifest,
     ) -> PyResult<Vec<u8>> {
-        let phases = SemanticTransitionSession::checkpoint_learning_phase_history(&manifest.native)
-            .map_err(xlog_err)?;
-        let valid = if let Some(refusal) = &self.closure.refusal {
-            let original = SemanticTransitionSession::checkpoint_learning_phase_history(
-                &refusal.source_native,
-            )
-            .map_err(xlog_err)?;
-            let (seed, _, _, _) = TaskCheckpointSeed::decode(&manifest.task)?;
-            let expense = seed.proposal_expense()?;
-            phases == original
-                && expense.capacity == refusal.expense.capacity
-                && expense.spent >= refusal.expense.spent
-        } else {
-            phases
-                .last()
-                .is_some_and(|phase| phase.admission.as_slice() == self.closure.admission.as_ref())
-        };
-        if !valid {
-            return Err(invalid(
-                "checkpoint signing lost this Session's known native lineage or cumulative expense",
-            ));
-        }
         let mut bytes = SEAL_DOMAIN.to_vec();
-        for field in [
-            self.closure.phase_id,
-            self.closure.completion_digest,
-            self.origin,
-            self.issuer(),
-            manifest.unsigned_phase_root(),
-        ] {
+        for field in [self.issuer(), manifest.unsigned_phase_root()] {
             bytes.extend_from_slice(&field);
+        }
+        if let Some(closure) = &self.closure {
+            let phases =
+                SemanticTransitionSession::checkpoint_learning_phase_history(&manifest.native)
+                    .map_err(xlog_err)?;
+            let valid = if let Some(refusal) = &closure.refusal {
+                let original = SemanticTransitionSession::checkpoint_learning_phase_history(
+                    &refusal.source_native,
+                )
+                .map_err(xlog_err)?;
+                let (seed, _, _, _) = TaskCheckpointSeed::decode(&manifest.task)?;
+                let expense = seed.proposal_expense()?;
+                phases == original
+                    && expense.capacity == refusal.expense.capacity
+                    && expense.original_admission == refusal.expense.original_admission
+                    && expense.spent >= refusal.expense.spent
+            } else {
+                phases
+                    .last()
+                    .is_some_and(|phase| phase.admission.as_slice() == closure.admission.as_ref())
+            };
+            if !valid {
+                return Err(invalid(
+                    "checkpoint signing lost this Session's known native lineage or cumulative expense",
+                ));
+            }
+            bytes.extend_from_slice(&1u64.to_le_bytes());
+            for field in [
+                closure.phase_id,
+                closure.completion_digest,
+                self.origin
+                    .ok_or_else(|| invalid("known checkpoint phase lost its original source"))?,
+            ] {
+                bytes.extend_from_slice(&field);
+            }
+        } else {
+            // A Session signature does not claim that a private phase completed.
+            bytes.extend_from_slice(&0u64.to_le_bytes());
         }
         bytes.extend_from_slice(&self.key.sign(&bytes).to_bytes());
         Ok(bytes)
@@ -1583,18 +1662,72 @@ pub(in crate::semantic_transition) fn checkpoint_issuer_selector(
     if manifest.phase_seal.is_empty() {
         return Ok(None);
     }
-    let mut reader = seal_reader(&manifest.phase_seal)?;
-    reader.take(3 * 32)?;
-    Ok(Some(reader.take(32)?.try_into().unwrap()))
+    Ok(Some(checkpoint_seal(&manifest.phase_seal)?.issuer))
 }
 
-fn seal_reader(bytes: &[u8]) -> PyResult<RecordReader<'_>> {
-    if bytes.len() != SEAL_BYTES || !bytes.starts_with(SEAL_DOMAIN) {
+fn checkpoint_seal(bytes: &[u8]) -> PyResult<CheckpointSeal> {
+    if !bytes.starts_with(SEAL_DOMAIN) {
+        return Err(invalid("checkpoint seal has another domain or version"));
+    }
+    let mut reader = RecordReader(&bytes[SEAL_DOMAIN.len()..]);
+    let issuer = reader.take(32)?.try_into().unwrap();
+    let root = reader.take(32)?.try_into().unwrap();
+    let phase = match reader.word()? {
+        0 => None,
+        1 => {
+            let phase_id = reader.take(32)?.try_into().unwrap();
+            let completion_digest = reader.take(32)?.try_into().unwrap();
+            // The signature covers the origin; the retained restore owner
+            // authenticates the exact source material when it is consumed.
+            reader.take(32)?;
+            Some(CheckpointPhaseSeal {
+                phase_id,
+                completion_digest,
+            })
+        }
+        _ => return Err(invalid("checkpoint seal has another ancestry tag")),
+    };
+    let signature = ed25519_dalek::Signature::from_slice(reader.take(64)?)
+        .map_err(|_| invalid("checkpoint has an invalid signature encoding"))?;
+    reader.finish()?;
+    Ok(CheckpointSeal {
+        issuer,
+        root,
+        phase,
+        signature,
+    })
+}
+
+fn authenticated_checkpoint_seal(
+    manifest: &SemanticCheckpointManifest,
+    checkpoint_issuer: &Bound<'_, PyAny>,
+) -> PyResult<CheckpointSeal> {
+    let issuer: [u8; 32] = original_bytes(checkpoint_issuer, 32)?.try_into().unwrap();
+    let seal = checkpoint_seal(&manifest.phase_seal)?;
+    if seal.issuer != issuer || seal.root != manifest.unsigned_phase_root() {
         return Err(invalid(
-            "phase checkpoint seal has another domain or extent",
+            "checkpoint changed its independently pinned issuer or complete state",
         ));
     }
-    Ok(RecordReader(&bytes[SEAL_DOMAIN.len()..]))
+    VerifyingKey::from_bytes(&issuer)
+        .map_err(|_| invalid("independent checkpoint issuer has an invalid encoding"))?
+        .verify_strict(
+            &manifest.phase_seal[..manifest.phase_seal.len() - 64],
+            &seal.signature,
+        )
+        .map_err(|_| invalid("checkpoint failed its independent native issuer"))?;
+    Ok(seal)
+}
+
+/// Verify the one canonical Session signature against an independently supplied pin.
+/// The returned phase tag is metadata, not proof of lifecycle completion.
+pub(in crate::semantic_transition) fn verify_checkpoint_signature(
+    manifest: &SemanticCheckpointManifest,
+    checkpoint_issuer: &Bound<'_, PyAny>,
+) -> PyResult<bool> {
+    Ok(authenticated_checkpoint_seal(manifest, checkpoint_issuer)?
+        .phase
+        .is_some())
 }
 
 impl VerifiedClosure {
@@ -1604,41 +1737,25 @@ impl VerifiedClosure {
         delivered_checkpoint: &[u8],
         checkpoint_issuer: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
+        let manifest = SemanticCheckpointManifest::decode(checkpoint)?;
+        let seal = authenticated_checkpoint_seal(
+            &manifest,
+            checkpoint_issuer.ok_or_else(|| {
+                invalid("checkpoint requires its independently pinned native issuer")
+            })?,
+        )?;
         if checkpoint == delivered_checkpoint {
-            if let Some(issuer) = checkpoint_issuer {
-                original_bytes(issuer, 32)?;
-            }
             return Ok(());
         }
-        let manifest = SemanticCheckpointManifest::decode(checkpoint)?;
         let original = SemanticCheckpointManifest::decode(delivered_checkpoint)?;
-        let issuer: [u8; 32] = original_bytes(
-            checkpoint_issuer.ok_or_else(|| {
-                invalid("descendant checkpoint requires its independently pinned native issuer")
-            })?,
-            32,
-        )?
-        .try_into()
-        .unwrap();
-        let mut reader = seal_reader(&manifest.phase_seal)?;
-        if reader.take(32)? != self.phase_id || reader.take(32)? != self.completion_digest {
+        let phase = seal.phase.ok_or_else(|| {
+            invalid("descendant checkpoint lacks its original known phase completion")
+        })?;
+        if phase.phase_id != self.phase_id || phase.completion_digest != self.completion_digest {
             return Err(invalid(
                 "descendant checkpoint belongs to another known phase completion",
             ));
         }
-        let _original_known_checkpoint = reader.take(32)?;
-        if reader.take(32)? != issuer || reader.take(32)? != manifest.unsigned_phase_root() {
-            return Err(invalid(
-                "descendant checkpoint changed its independently pinned issuer or complete state",
-            ));
-        }
-        let signature = ed25519_dalek::Signature::from_slice(reader.take(64)?)
-            .map_err(|_| invalid("descendant checkpoint has an invalid signature encoding"))?;
-        reader.finish()?;
-        VerifyingKey::from_bytes(&issuer)
-            .map_err(|_| invalid("independent checkpoint issuer has an invalid encoding"))?
-            .verify_strict(&manifest.phase_seal[..SEAL_BYTES - 64], &signature)
-            .map_err(|_| invalid("descendant checkpoint failed its independent native issuer"))?;
         let original_phases =
             SemanticTransitionSession::checkpoint_learning_phase_history(&original.native)
                 .map_err(xlog_err)?;
@@ -1654,12 +1771,15 @@ impl VerifiedClosure {
         let current_expense = current.proposal_expense()?;
         if original_phases != actual_phases
             || saved.training_domain != current.training_domain
+            || saved.replay_capacity != current.replay_capacity
             || saved.checkpoint_source_limits()? != current.checkpoint_source_limits()?
             || saved.proposal_expense()?.capacity != current_expense.capacity
+            || saved.proposal_expense()?.original_admission != current_expense.original_admission
             || saved.proposal_expense()?.spent > current_expense.spent
             || saved_parent.model_generation > current_parent.model_generation
             || self.refusal.as_ref().is_some_and(|refusal| {
                 current_expense.capacity != refusal.expense.capacity
+                    || current_expense.original_admission != refusal.expense.original_admission
                     || current_expense.spent < refusal.expense.spent
             })
         {
@@ -1724,7 +1844,9 @@ impl VerifiedClosure {
         let manifest = SemanticCheckpointManifest::decode(checkpoint)?;
         let (seed, _, _, _) = TaskCheckpointSeed::decode(&manifest.task)?;
         let mut expense = seed.proposal_expense()?;
-        if expense.capacity != refusal.expense.capacity {
+        if expense.capacity != refusal.expense.capacity
+            || expense.original_admission != refusal.expense.original_admission
+        {
             return Err(invalid(
                 "terminal Source restore changed its original Proposal capacity",
             ));

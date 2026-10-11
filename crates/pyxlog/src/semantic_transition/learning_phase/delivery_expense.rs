@@ -218,6 +218,30 @@ impl PySemanticLearningPhaseTransition {
                 .source_verified[0] = true;
         }
         self.handoff_terminal_report(py)?;
+        let (work, retired) = {
+            let retained = self.delivery_expense()?;
+            let current = retained.as_ref().expect("original delivery");
+            (
+                current.work.clone().expect("original work"),
+                current.refusal.as_ref().expect("original refusal").retired,
+            )
+        };
+        if !retired {
+            // The known refusal authorizes only original callbacks that never
+            // entered to be skipped. Keep Source serialization before private
+            // retirement, in the order of the one frozen full report.
+            self.source
+                .borrow(py)
+                .owner()?
+                .cancel_unentered_cold_model_work_regions(&work, 6)
+                .map_err(xlog_err)?;
+            self.require_terminal_source(py, true)?;
+            self.source
+                .borrow(py)
+                .owner()?
+                .cancel_unentered_cold_model_work_regions(&work, 8)
+                .map_err(xlog_err)?;
+        }
         self.retire_terminal_candidate(py)?;
         let verified = self
             .delivery_expense()?
@@ -385,17 +409,19 @@ impl PySemanticLearningPhaseTransition {
         let origin: [u8; 32] = Sha256::digest(&self.source_checkpoint).into();
         let source = self.source.borrow(py);
         let mut custody = source.checkpoint_custody()?;
-        if custody.as_ref().is_some_and(|current| {
-            current.closure.phase_id == closure.phase_id
-                && current.closure.completion_digest == closure.completion_digest
-                && current.origin == origin
+        let current = custody
+            .as_mut()
+            .ok_or_else(|| invalid("source Session lost its original checkpoint signing owner"))?;
+        if current.closure.as_ref().is_some_and(|previous| {
+            previous.phase_id == closure.phase_id
+                && previous.completion_digest == closure.completion_digest
+                && current.origin == Some(origin)
         }) {
             return Ok(());
         }
-        // A distinct terminal origin gets exactly one distinct issuer. Existing
-        // immutable public pins and signed records remain with the consumer.
-        // The Source is still held; no public pin is visible until resumption.
-        *custody = Some(cold_restore::CheckpointCustody::issue(closure, origin));
+        // The actual Source closure changes; its original Session key does not.
+        current.closure = Some(closure);
+        current.origin = Some(origin);
         Ok(())
     }
 
@@ -850,8 +876,8 @@ impl PySemanticLearningPhaseTransition {
         ))
     }
 
-    /// Known signed Delivery alone authorizes a checkpoint signer. This cold
-    /// CPU custody does not repeat model work, change Q or enter another region.
+    /// Known signed Delivery binds completed-phase ancestry to the original
+    /// Session signer without repeating model work or entering another region.
     pub(super) fn install_delivered_checkpoint_custody(&self, py: Python<'_>) -> PyResult<()> {
         let (phase_id, delivery_digest, admission) = self.records()?.delivered_identity()?;
         let payload = self
@@ -1031,6 +1057,7 @@ impl PySemanticLearningPhaseTransition {
                     self.preparation_inputs.cold_model_work_capacity,
                     ordinal,
                     self.records()?.confirmed_admission()?,
+                    xlog_cuda::SemanticColdModelWorkPurpose::Delivery,
                 )
                 .map_err(xlog_err)?;
             self.delivery_expense()?
@@ -1440,6 +1467,11 @@ impl PySemanticLearningPhaseTransition {
         {
             return Err(invalid("terminal accounting precedes known private release and unchanged source verification"));
         }
+        let disposition = if refusing {
+            xlog_cuda::SemanticColdModelWorkDisposition::KnownRefusal
+        } else {
+            xlog_cuda::SemanticColdModelWorkDisposition::Complete
+        };
         let (work, reader, closed, verified, cached_report) = {
             let retained = self.delivery_expense()?;
             let current = retained.as_ref().expect("original delivery");
@@ -1492,7 +1524,7 @@ impl PySemanticLearningPhaseTransition {
                 .session
                 .borrow(py)
                 .owner()?
-                .finish_cold_model_work(&*parent.lease()?, &work, &streams)
+                .finish_cold_model_work(&*parent.lease()?, &work, &streams, disposition)
                 .map_err(xlog_err)?;
             self.delivery_expense()?
                 .as_mut()
