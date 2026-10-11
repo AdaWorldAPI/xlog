@@ -2,6 +2,8 @@
 
 use super::*;
 
+type EvaluationPortLayout = (DeviceAllocationProvenance, Vec<i64>, Vec<i64>, (u8, u8));
+
 /// Lexical recording of this invocation, never an executable application plan.
 pub struct SemanticModelEvaluationCapture {
     invocation: Arc<()>,
@@ -1010,6 +1012,72 @@ impl SemanticTransitionSession {
             .consumer_streams
             .insert(stream);
         self.export_owned_view(view, shape, strides, dtype, guard, stream, None)
+    }
+
+    /// Project every original cohort allocation before preparation resumes.
+    /// This retains geometry only, without a content read or capsule export.
+    pub fn evaluation_training_view_layouts(
+        &self,
+        lease: &SemanticPublishedLease,
+        handle: &SemanticModelEvaluation,
+        stream: u64,
+    ) -> Result<Vec<EvaluationPortLayout>, SemanticTransitionError> {
+        let evaluation = self.evaluation_layout_metadata(lease, handle, stream)?;
+        SemanticTrainingViewPort::ALL
+            .into_iter()
+            .map(|port| {
+                let (view, shape, strides, dtype) = evaluation.cohort.selected.port(port)?;
+                let allocation = view
+                    .allocation_provenance()
+                    .ok_or(SemanticTransitionError::ObservationMismatch)?;
+                Ok((allocation, shape, strides, dtype))
+            })
+            .collect()
+    }
+
+    /// The actual numerical scratch allocation, separate from cold-report work.
+    pub fn evaluation_model_work_buffer_layout(
+        &self,
+        lease: &SemanticPublishedLease,
+        handle: &SemanticModelEvaluation,
+        stream: u64,
+    ) -> Result<EvaluationPortLayout, SemanticTransitionError> {
+        let evaluation = self.evaluation_layout_metadata(lease, handle, stream)?;
+        if stream != evaluation.stream {
+            return Err(publication_input_error(
+                "evaluation numerical work layout requires its original execution stream",
+            ));
+        }
+        let words = evaluation.work.actual.len();
+        if words == 0 || words % 3 != 0 {
+            return Err(SemanticTransitionError::ObservationMismatch);
+        }
+        let capacity =
+            i64::try_from(words / 3).map_err(|_| SemanticTransitionError::GenerationExhausted)?;
+        let allocation = evaluation
+            .work
+            .actual
+            .view()
+            .allocation_provenance()
+            .ok_or(SemanticTransitionError::ObservationMismatch)?;
+        Ok((allocation, vec![capacity, 3], vec![3, 1], (1, 64)))
+    }
+
+    fn evaluation_layout_metadata(
+        &self,
+        lease: &SemanticPublishedLease,
+        handle: &SemanticModelEvaluation,
+        stream: u64,
+    ) -> Result<&EvaluationStorage, SemanticTransitionError> {
+        self.checked_evaluation_parent(lease, handle)?;
+        dlpack_consumer_stream(stream)?;
+        let evaluation = self.evaluation(handle)?;
+        if evaluation.execution != EvaluationExecution::Prepared {
+            return Err(publication_input_error(
+                "evaluation layouts require their prepared original invocation",
+            ));
+        }
+        Ok(evaluation)
     }
 
     fn checked_evaluation_parent(

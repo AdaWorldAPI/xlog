@@ -433,6 +433,76 @@ impl PySemanticModelEvaluation {
         owner.evaluation_stream(&self.inner).map_err(xlog_err)
     }
 
+    /// Allocation-backed cohort geometry without resuming preparation.
+    #[pyo3(signature = (*, consumer_stream))]
+    fn training_view_layouts(
+        &self,
+        py: Python<'_>,
+        consumer_stream: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyTuple>> {
+        let stream = parse_witness_consumer_stream(consumer_stream, &mut 128)?;
+        let parent = self.parent.borrow(py);
+        let session = parent.session.borrow(py);
+        session.require_creator()?;
+        let owner = session.owner()?;
+        self.check(py, &owner)?;
+        let original = owner
+            .evaluation_training_view_layouts(&*parent.lease()?, &self.inner, stream)
+            .map_err(xlog_err)?;
+        let mut rows = Vec::with_capacity(original.len());
+        for (provenance, shape, strides, dtype) in original {
+            rows.push(
+                (
+                    Py::new(
+                        py,
+                        PyNativeTensorAllocation {
+                            provenance,
+                            policy_layout: None,
+                        },
+                    )?,
+                    PyTuple::new(py, shape)?,
+                    PyTuple::new(py, strides)?,
+                    dtype,
+                )
+                    .into_pyobject(py)?
+                    .unbind(),
+            );
+        }
+        Ok(PyTuple::new(py, rows)?.unbind())
+    }
+
+    /// Original numerical scratch geometry, not the cold-report scratch.
+    #[pyo3(signature = (*, consumer_stream))]
+    fn model_work_buffer_layout(
+        &self,
+        py: Python<'_>,
+        consumer_stream: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyTuple>> {
+        let stream = parse_witness_consumer_stream(consumer_stream, &mut 128)?;
+        let parent = self.parent.borrow(py);
+        let session = parent.session.borrow(py);
+        session.require_creator()?;
+        let owner = session.owner()?;
+        self.check(py, &owner)?;
+        let (provenance, shape, strides, dtype) = owner
+            .evaluation_model_work_buffer_layout(&*parent.lease()?, &self.inner, stream)
+            .map_err(xlog_err)?;
+        Ok((
+            Py::new(
+                py,
+                PyNativeTensorAllocation {
+                    provenance,
+                    policy_layout: None,
+                },
+            )?,
+            PyTuple::new(py, shape)?,
+            PyTuple::new(py, strides)?,
+            dtype,
+        )
+            .into_pyobject(py)?
+            .unbind())
+    }
+
     /// All seventeen original ports, unchanged for source and final models.
     #[pyo3(signature = (*, consumer_stream))]
     fn training_view(

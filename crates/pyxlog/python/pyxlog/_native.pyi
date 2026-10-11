@@ -434,6 +434,12 @@ class SemanticModelEvaluation:
     def cohort(self) -> SemanticEvaluationCohort: ...
     @property
     def consumer_stream(self) -> int: ...
+    def training_view_layouts(self, *, consumer_stream: int) -> tuple[_TrainingViewLayout, ...]:
+        """All seventeen original allocation-backed ports without preparation or export."""
+        ...
+    def model_work_buffer_layout(self, *, consumer_stream: int) -> _NativeWorkBufferLayout:
+        """Actual numerical U64 scratch geometry, separate from cold-report scratch."""
+        ...
     def training_view(self, *, consumer_stream: int) -> tuple[Any, ...]: ...
     def model_work_buffer(self, *, consumer_stream: int) -> Any: ...
     def capture(
@@ -506,6 +512,9 @@ class NativeTensorAllocation:
 _NativeWorkBufferLayout = tuple[
     NativeTensorAllocation, tuple[int, int], tuple[int, int],
     tuple[Literal[1], Literal[64]],
+]
+_TrainingViewLayout = tuple[
+    NativeTensorAllocation, tuple[int, ...], tuple[int, ...], tuple[int, int],
 ]
 _PolicyNumericalDomainLayout = tuple[
     NativeTensorAllocation, tuple[int, ...], tuple[int, ...],

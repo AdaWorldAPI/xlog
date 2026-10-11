@@ -4655,6 +4655,23 @@ Do not repeat tensor producer callbacks, replace the evaluation or cancel its
 unresolved entered prefix. This original-owner continuation does not clear Session
 quarantine or grant new numerical submissions after a fatal CUDA failure.
 
+Before the cold report is admitted, use
+`evaluation.training_view_layouts(consumer_stream=...)` and
+`evaluation.model_work_buffer_layout(consumer_stream=...)`. Training metadata
+accepts the same consumer stream as the original training-view export; numerical
+work metadata requires that evaluation's own `consumer_stream`.
+The former returns all seventeen original cohort rows;
+the latter returns its actual numerical U64 `[capacity,3]` scratch row with
+strides `[3,1]`. Each row contains
+`(NativeTensorAllocation, shape, element_strides, dlpack_dtype)` and retains the
+real original allocation. These getters neither resume preparation nor export
+capsules, order streams, initialize storage or enqueue work. They authenticate
+the same prepared invocation, live parent, cohort and valid consumer stream, and grant
+no numerical content rights. Numerical scratch is a separate allocation from
+the cold report's work buffer; its stream is not inferred from that report.
+Keep the rows to bind the compiler's future ports and verify the genuine later
+exports against the same native allocation provenance.
+
 The returned evaluation owns one recording. Export its
 `training_view(consumer_stream=...)` and `model_work_buffer(consumer_stream=...)`
 while the invocation is still prepared. Bind the output tensors and their native
