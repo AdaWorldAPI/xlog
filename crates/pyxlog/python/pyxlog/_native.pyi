@@ -161,6 +161,20 @@ class SemanticPreparedStep:
     def prepare_actor_refresh(self, member_ordinal: int, *, refresh_snapshot: Any) -> SemanticPreparedActorRefresh: ...
     """Session-issued original step; construction is not public."""
 
+    def register_gradient_delivery(
+        self, bank: int, phase: _SemanticTensorInput,
+        accumulation: _SemanticTensorInput,
+        leaves: Sequence[tuple[
+            Optional[Any], _SemanticTensorInput, Optional[_SemanticTensorInput],
+            _SemanticTensorInput, _SemanticTensorInput,
+        ]], *, consumer_stream: int,
+        group_member: Optional[SemanticRetainedReplayMember] = None,
+        actor_refresh: Optional[SemanticPreparedActorRefresh] = None,
+        edit_only: bool = False,
+    ) -> SemanticGradientDelivery:
+        """Freeze one bank's original physical gradient delivery and contribution."""
+        ...
+
     @property
     def requested_transition(self) -> Literal["proposal", "recompute", "update"]: ...
 
@@ -202,6 +216,26 @@ _SemanticTensorLayout = tuple[
     int, int, int, int, int, int, tuple[int, ...], tuple[int, ...]
 ]
 _SemanticTensorInput = tuple[_SemanticTensorLayout, int, int, Any, Optional[Any]]
+
+class SemanticGradientDelivery:
+    """Native-issued delivery retained through the bank's sole backward."""
+
+    def activate(self) -> None: ...
+    def record_reset(self) -> None: ...
+    def finish_recording(self) -> None: ...
+
+class SemanticRetainedReplayMember:
+    """Original historical invocation retained through both target banks."""
+
+    def group_update_vjp(
+        self, update_step: SemanticPreparedStep, bank: int, *,
+        consumer_stream: int, edit_only: bool = False,
+    ) -> tuple[Any, ...]: ...
+    def confirm_published_target(self) -> None: ...
+    def confirm_unpublished_target(self, update_step: SemanticPreparedStep) -> None: ...
+    def finish(self) -> None: ...
+    def finish_without_published_update(self, update_step: SemanticPreparedStep) -> None: ...
+    def finish_cancelled_private_segment(self) -> None: ...
 
 class SemanticSegmentInstructionAdmission:
     """Native-issued original instruction custody; construction is not public."""

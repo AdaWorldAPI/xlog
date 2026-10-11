@@ -11440,6 +11440,33 @@ impl PreparedSegmentState {
     }
 }
 
+#[cfg(feature = "semantic-policy")]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ImportedPolicyContributionKind {
+    HistoricalCombined,
+    HistoricalEdit,
+    CurrentActor,
+}
+
+#[cfg(feature = "semantic-policy")]
+type ImportedPolicyContributionKey = (u64, ImportedPolicyContributionKind);
+
+#[cfg(feature = "semantic-policy")]
+struct ImportedPolicyContributionSource {
+    issuer: Arc<()>,
+    token: u64,
+    invocation: Option<SemanticRngBinding>,
+}
+
+#[cfg(feature = "semantic-policy")]
+impl ImportedPolicyContributionSource {
+    fn matches(&self, issuer: &Arc<()>, token: u64, invocation: Option<SemanticRngBinding>) -> bool {
+        Arc::ptr_eq(&self.issuer, issuer)
+            && self.token == token
+            && self.invocation == invocation
+    }
+}
+
 struct PreparedStepStorage {
     reader: TrackedCudaSlice<PublicationLease>,
     replay_custody: Option<PreparedReplayCustody>,
@@ -11483,9 +11510,9 @@ struct PreparedStepStorage {
     #[cfg(feature = "semantic-policy")]
     group_edit_members: [BTreeSet<u64>; 2],
     #[cfg(feature = "semantic-policy")]
-    group_imported_vjp_members: [BTreeSet<u64>; 2],
+    group_imported_vjp_members: [BTreeSet<ImportedPolicyContributionKey>; 2],
     #[cfg(feature = "semantic-policy")]
-    group_gradient_members: [BTreeSet<u64>; 2],
+    group_gradient_members: [BTreeMap<ImportedPolicyContributionKey, ImportedPolicyContributionSource>; 2],
     #[cfg(feature = "semantic-policy")]
     group_critic_recorded: u8,
     #[cfg(feature = "semantic-policy")]
@@ -20076,7 +20103,7 @@ impl SemanticTransitionSession {
                     #[cfg(feature = "semantic-policy")]
                     group_imported_vjp_members: [BTreeSet::new(), BTreeSet::new()],
                     #[cfg(feature = "semantic-policy")]
-                    group_gradient_members: [BTreeSet::new(), BTreeSet::new()],
+                    group_gradient_members: [BTreeMap::new(), BTreeMap::new()],
                     #[cfg(feature = "semantic-policy")]
                     group_critic_recorded: 0,
                     #[cfg(feature = "semantic-policy")]
@@ -24152,6 +24179,49 @@ impl SemanticTransitionSession {
         tensors: Vec<SemanticTensorInput>,
         consumer_stream: u64,
     ) -> Result<SemanticGradientDeliveryBinding, SemanticTransitionError> {
+        self.bind_imported_policy_gradient_delivery(
+            step, bank, source, source_lease, invocation, member_ordinal, member_row,
+            false, tensors, consumer_stream,
+        )
+    }
+
+    /// Bind the original demonstration's delivery independently of a CURRENT
+    /// actor contribution for the same frozen row.
+    #[cfg(feature = "semantic-policy")]
+    #[expect(clippy::too_many_arguments, reason = "retain each original contribution owner explicitly")]
+    pub fn bind_imported_edit_gradient_delivery(
+        &mut self,
+        step: &SemanticPreparedStep,
+        bank: usize,
+        source: &SemanticTransitionSession,
+        source_lease: &SemanticPublishedLease,
+        invocation: SemanticRngBinding,
+        member_ordinal: u64,
+        member_row: &SemanticTrainingViewRow,
+        tensors: Vec<SemanticTensorInput>,
+        consumer_stream: u64,
+    ) -> Result<SemanticGradientDeliveryBinding, SemanticTransitionError> {
+        self.bind_imported_policy_gradient_delivery(
+            step, bank, source, source_lease, invocation, member_ordinal, member_row,
+            true, tensors, consumer_stream,
+        )
+    }
+
+    #[cfg(feature = "semantic-policy")]
+    #[expect(clippy::too_many_arguments, reason = "retain each original contribution owner explicitly")]
+    fn bind_imported_policy_gradient_delivery(
+        &mut self,
+        step: &SemanticPreparedStep,
+        bank: usize,
+        source: &SemanticTransitionSession,
+        source_lease: &SemanticPublishedLease,
+        invocation: SemanticRngBinding,
+        member_ordinal: u64,
+        member_row: &SemanticTrainingViewRow,
+        edit_only: bool,
+        tensors: Vec<SemanticTensorInput>,
+        consumer_stream: u64,
+    ) -> Result<SemanticGradientDeliveryBinding, SemanticTransitionError> {
         self.check_prepared_cold(step)?;
         if bank > 1 {
             return Err(publication_input_error(
@@ -24176,26 +24246,30 @@ impl SemanticTransitionSession {
             .prepared
             .as_ref()
             .expect("checked prepared step");
-        if prepared.group_gradient_members[bank].contains(&member_ordinal) {
-            return Err(publication_input_error(
-                "original replay already owns this Update bank's physical gradient delivery",
-            ));
-        }
         let training = prepared.training_view.as_ref().ok_or_else(|| {
             publication_input_error(
                 "group gradient delivery requires the frozen Update training view",
             )
         })?;
-        if training
-            .actor_group_member_index(member_ordinal, member_row)
-            .is_err()
-            && training
-                .edit_group_member_index(member_ordinal, member_row)?
-                .is_none()
-        {
+        let actor_member = training.actor_group_member_index(member_ordinal, member_row).is_ok();
+        let edit_member = training.edit_group_member_index(member_ordinal, member_row)?.is_some();
+        if (!actor_member && !edit_member) || (edit_only && !edit_member) {
             return Err(publication_input_error(
                 "original replay is absent from the frozen actor and edit groups",
             ));
+        }
+        let contribution = (member_ordinal, if edit_only || !actor_member {
+            ImportedPolicyContributionKind::HistoricalEdit
+        } else {
+            ImportedPolicyContributionKind::HistoricalCombined
+        });
+        if prepared.group_gradient_members[bank].contains_key(&contribution) {
+            return Err(publication_input_error(
+                "original replay contribution already owns this Update bank's physical gradient delivery",
+            ));
+        }
+        if edit_only && actor_member {
+            self.require_current_actor_overlap(step, bank, member_ordinal, member_row, false)?;
         }
         let model = source.steps[&source_lease.token]
             .content
@@ -24230,8 +24304,44 @@ impl SemanticTransitionSession {
             .as_mut()
             .expect("checked prepared owner")
             .group_gradient_members[bank]
-            .insert(member_ordinal);
+            .insert(contribution, ImportedPolicyContributionSource {
+                issuer: Arc::clone(&source.publication_issuer),
+                token: source_lease.token,
+                invocation: Some(invocation),
+            });
         Ok(binding)
+    }
+
+    #[cfg(feature = "semantic-policy")]
+    fn require_current_actor_overlap(
+        &self,
+        step: &SemanticPreparedStep,
+        bank: usize,
+        member_ordinal: u64,
+        member_row: &SemanticTrainingViewRow,
+        recorded: bool,
+    ) -> Result<(), SemanticTransitionError> {
+        let build = self.prepared_segment.as_ref().ok_or(SemanticTransitionError::NotBound)?;
+        build.check_retained(step, &self.publication_issuer)?;
+        let proof = self.actor_refresh_preparations.get(&(step.token, member_ordinal))
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| publication_input_error("overlapping historical Edit requires its original CURRENT actor owner"))?;
+        let prepared = self.steps[&step.token].prepared.as_ref().ok_or(SemanticTransitionError::NotBound)?;
+        let key = (member_ordinal, ImportedPolicyContributionKind::CurrentActor);
+        if bank > 1 || proof.step != step.token || proof.member.ordinal != member_ordinal
+            || member_row.origin.map(crate::semantic_training_view::origin_record) != Some(proof.member.origin)
+            || !Arc::ptr_eq(&proof.issuer, &self.publication_issuer)
+            || !Arc::ptr_eq(&proof.scope, &build.scope)
+            || !Arc::ptr_eq(&proof.cancelled, &build.cancelled)
+            || !Arc::ptr_eq(&proof.execution, &build.actor_refresh_execution)
+            || proof.cancelled.load(Ordering::Acquire)
+            || self.steps[&step.token].inputs.as_ref().is_none_or(|inputs| !Arc::ptr_eq(inputs, &proof.inputs))
+            || (recorded && (!prepared.group_imported_vjp_members[bank].contains(&key)
+                || !prepared.group_gradient_members[bank].contains_key(&key)))
+        {
+            return Err(publication_input_error("historical Edit lacks its separately owned CURRENT actor contribution"));
+        }
+        Ok(())
     }
 
     /// Bind the fresh actor child's physical leaves to its original Update.
@@ -24269,7 +24379,9 @@ impl SemanticTransitionSession {
             || build.tokens.get(1) != Some(&proposal.token)
             || build.transitions != [SemanticTransitionKind::Recompute, SemanticTransitionKind::Proposal]
             || !Arc::ptr_eq(self.steps[&step.token].inputs.as_ref().ok_or(SemanticTransitionError::NotBound)?, &proof.inner.inputs)
-            || target.group_gradient_members[bank].contains(&proof.inner.member.ordinal)
+            || target.group_gradient_members[bank].contains_key(&(
+                proof.inner.member.ordinal, ImportedPolicyContributionKind::CurrentActor,
+            ))
         {
             return Err(publication_input_error("actor gradient delivery requires its original staged child and unused Update bank"));
         }
@@ -24289,7 +24401,12 @@ impl SemanticTransitionSession {
             Some((&model.tensors, parameters)))?;
         self.steps.get_mut(&step.token).expect("retained actor Update").prepared.as_mut()
             .expect("retained actor Update owner").group_gradient_members[bank]
-            .insert(proof.inner.member.ordinal);
+            .insert((proof.inner.member.ordinal, ImportedPolicyContributionKind::CurrentActor),
+                ImportedPolicyContributionSource {
+                    issuer: Arc::clone(&source.publication_issuer),
+                    token: proposal.token,
+                    invocation: None,
+                });
         Ok(binding)
     }
 
@@ -26065,8 +26182,8 @@ impl SemanticTransitionSession {
                     ));
                 }
                 if (0..2).any(|bank| {
-                    prepared.group_imported_vjp_members[bank]
-                        != prepared.group_gradient_members[bank]
+                    !prepared.group_imported_vjp_members[bank].iter()
+                        .eq(prepared.group_gradient_members[bank].keys())
                 }) {
                     return Err(publication_input_error(
                         "every imported group VJP requires its original physical gradient delivery in the same bank",
@@ -36457,7 +36574,8 @@ impl SemanticTransitionSession {
         }
     }
 
-    /// Record a historical supervised-edit row that is not an actor member.
+    /// Record the original historical demonstration independently of a
+    /// separately owned CURRENT actor contribution for the same row.
     #[cfg(feature = "semantic-policy")]
     #[expect(
         clippy::too_many_arguments,
@@ -36567,15 +36685,24 @@ impl SemanticTransitionSession {
         let edit_member = training
             .edit_group_member_index(member_ordinal, member_row)?
             .is_some();
-        if edit_only
-            && (!edit_member
-                || training
-                    .actor_group_members()
-                    .iter()
-                    .any(|row| row.ordinal == member_ordinal))
-        {
+        if edit_only && !edit_member {
             return Err(publication_input_error(
-                "edit-only VJP requires a frozen edit row outside the actor group",
+                "edit-only VJP requires its original frozen edit row",
+            ));
+        }
+        if edit_only && training.actor_group_members().iter().any(|row| row.ordinal == member_ordinal) {
+            self.require_current_actor_overlap(update_step, bank, member_ordinal, member_row, true)?;
+        }
+        let contribution = (member_ordinal, if edit_only {
+            ImportedPolicyContributionKind::HistoricalEdit
+        } else {
+            ImportedPolicyContributionKind::HistoricalCombined
+        });
+        if prepared.group_gradient_members[bank].get(&contribution).is_none_or(|delivery| {
+            !delivery.matches(&source.publication_issuer, source_lease.token, Some(invocation))
+        }) {
+            return Err(publication_input_error(
+                "imported VJP must use its original source-qualified physical gradient delivery",
             ));
         }
         let critic_term = member_index.map(|index| training.critic_term(index));
@@ -36690,7 +36817,7 @@ impl SemanticTransitionSession {
         if edit_member {
             update.group_edit_members[bank].insert(member_ordinal);
         }
-        update.group_imported_vjp_members[bank].insert(member_ordinal);
+        update.group_imported_vjp_members[bank].insert(contribution);
         Ok(SemanticPreparedPolicyGradients {
             layout,
             parameters,
@@ -36754,8 +36881,15 @@ impl SemanticTransitionSession {
         }
         let training = update.training_view.as_ref().ok_or(SemanticTransitionError::NotBound)?;
         let member_index = training.actor_group_member_index(member_ordinal, member_row)?;
-        let edit_member = training.edit_group_member_index(member_ordinal, member_row)?.is_some();
         let critic_term = training.critic_term(member_index);
+        let contribution = (member_ordinal, ImportedPolicyContributionKind::CurrentActor);
+        if update.group_gradient_members[bank].get(&contribution).is_none_or(|delivery| {
+            !delivery.matches(&source.publication_issuer, proposal_step.token, None)
+        }) {
+            return Err(publication_input_error(
+                "CURRENT actor VJP must use its fresh Proposal's original physical gradient delivery",
+            ));
+        }
         let proposal = source.steps.get(&proposal_step.token).and_then(|step| step.prepared.as_ref())
             .ok_or(SemanticTransitionError::ObservationMismatch)?;
         let origin_bank = 1;
@@ -36802,8 +36936,7 @@ impl SemanticTransitionSession {
         let update = self.steps.get_mut(&update_step.token).expect("retained Update").prepared.as_mut()
             .expect("retained prepared Update");
         update.group_vjp_members[bank].insert(member_ordinal);
-        update.group_imported_vjp_members[bank].insert(member_ordinal);
-        if edit_member { update.group_edit_members[bank].insert(member_ordinal); }
+        update.group_imported_vjp_members[bank].insert(contribution);
         Ok(SemanticPreparedPolicyGradients { layout, parameters, text_logits, component_baselines,
             provider: Arc::clone(&source.provider), step_aliases, publication, continuation, owner, support_cells })
     }

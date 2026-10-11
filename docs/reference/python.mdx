@@ -258,6 +258,19 @@ allocation. This is distinct from the full model-content witness, which also
 retains buffers. Buffers do not gain fabricated gradient, presence or phase-mask
 leaves; all genuine parameter destinations must still be present exactly once.
 
+An Update with a fresh actor execution and an overlapping historical Edit row
+retains two independent contributions for the same original ordinal and bank.
+Register the fresh actor's delivery with `actor_refresh=refresh`. Register the
+historical demonstration with `group_member=member, edit_only=True`, and pass
+the same `edit_only=True` to `member.group_update_vjp(...)`. The native owner
+freezes each source's exact Session, Proposal or invocation, and delivery role;
+the two deliveries cannot replace each other. Record the fresh actor VJP before
+the overlapping historical Edit VJP. Both original roots, together with the
+other critic and supervised roots, belong to the same single backward. Each
+contribution retains its original group denominator, model realization and
+demonstration prefix. Without a fresh actor overlap, the default
+`edit_only=False` preserves the existing native actor/Edit membership dispatch.
+
 After genuine whole-target cancellation and confirmed original graph destruction,
 the same prepared producer may call
 `member.finish_cancelled_private_segment()` in the original private-retirement

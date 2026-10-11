@@ -12709,7 +12709,9 @@ impl PySemanticPreparedStep {
     /// ``leaves`` are ``(GradientEdge_or_None, effective_input,
     /// gradient_input_or_None, presence_input, phase_mask_input)`` in the
     /// original physical parameter order.
-    #[pyo3(signature = (bank, phase, accumulation, leaves, *, consumer_stream, group_member=None, actor_refresh=None))]
+    /// ``edit_only`` freezes the historical demonstration's distinct delivery;
+    /// it cannot select or replace a CURRENT actor source.
+    #[pyo3(signature = (bank, phase, accumulation, leaves, *, consumer_stream, group_member=None, actor_refresh=None, edit_only=false))]
     fn register_gradient_delivery(
         &self,
         bank: &Bound<'_, PyAny>,
@@ -12719,6 +12721,7 @@ impl PySemanticPreparedStep {
         consumer_stream: &Bound<'_, PyAny>,
         group_member: Option<Py<PySemanticRetainedReplayMember>>,
         actor_refresh: Option<&Bound<'_, PyAny>>,
+        edit_only: bool,
     ) -> PyResult<Py<PySemanticGradientDelivery>> {
         let py = bank.py();
         let session = self.session.borrow(py);
@@ -12730,6 +12733,9 @@ impl PySemanticPreparedStep {
         }
         if group_member.is_some() && actor_refresh.is_some() {
             return Err(invalid("gradient delivery must name one original historical or CURRENT member"));
+        }
+        if edit_only && group_member.is_none() {
+            return Err(invalid("edit-only delivery requires its original historical replay member"));
         }
         #[cfg(feature = "semantic-policy")]
         let actor_refresh = actor_refresh.map(|owner| owner
@@ -12773,6 +12779,7 @@ impl PySemanticPreparedStep {
                 .lock()
                 .map_err(|_| PyRuntimeError::new_err("retained group use is poisoned"))?;
             if group.gradient_banks[bank]
+                || group.edit_only.is_some_and(|original| original != edit_only)
                 || group
                     .target
                     .as_ref()
@@ -12927,7 +12934,12 @@ impl PySemanticPreparedStep {
             let parent = member.parent.borrow(py);
             let lease = parent.lease()?;
             let invocation = member.invocation.borrow(py);
-            owner.bind_imported_group_gradient_delivery(
+            let bind = if edit_only {
+                SemanticTransitionSession::bind_imported_edit_gradient_delivery
+            } else {
+                SemanticTransitionSession::bind_imported_group_gradient_delivery
+            };
+            bind(&mut owner,
                 &self.inner,
                 bank,
                 &source_owner,
@@ -13073,6 +13085,7 @@ impl PySemanticPreparedStep {
                 .lock()
                 .map_err(|_| PyRuntimeError::new_err("retained group use is poisoned"))?;
             if group.gradient_banks[bank]
+                || group.edit_only.is_some_and(|original| original != edit_only)
                 || group
                     .target
                     .as_ref()
@@ -13087,6 +13100,7 @@ impl PySemanticPreparedStep {
             })?[bank]
                 .push(delivery.clone_ref(py));
             group.gradient_banks[bank] = true;
+            group.edit_only = Some(edit_only);
             group.deliveries[bank] = Some(delivery.clone_ref(py));
             if group.target.is_none() {
                 group.target = Some(self.inner.clone());
@@ -14467,6 +14481,7 @@ struct RetainedGroupUse {
     completion: Option<RetainedTargetCompletion>,
     banks: [bool; 2],
     gradient_banks: [bool; 2],
+    edit_only: Option<bool>,
     deliveries: [Option<Py<PySemanticGradientDelivery>>; 2],
 }
 
@@ -14524,13 +14539,15 @@ impl PySemanticRetainedReplayMember {
     /// Record this original replay's single actor or edit contribution to the
     /// target Update graph. The original model output, published reader and
     /// tape stay owned by this handle through both mutually exclusive banks.
-    #[pyo3(signature = (update_step, bank, *, consumer_stream))]
+    /// ``edit_only`` must match the role frozen by gradient registration.
+    #[pyo3(signature = (update_step, bank, *, consumer_stream, edit_only=false))]
     fn group_update_vjp(
         &self,
         py: Python<'_>,
         update_step: Py<PySemanticPreparedStep>,
         bank: &Bound<'_, PyAny>,
         consumer_stream: &Bound<'_, PyAny>,
+        edit_only: bool,
     ) -> PyResult<Py<PyTuple>> {
         let bank = usize::try_from(ColdValue::read(bank, &mut 128, 0)?.unsigned()?)
             .map_err(|_| invalid("group Update bank exceeds native address space"))?;
@@ -14579,6 +14596,7 @@ impl PySemanticRetainedReplayMember {
         }
         drop(delivery);
         if !use_state.gradient_banks[bank]
+            || use_state.edit_only != Some(edit_only)
             || use_state.banks[bank]
             || use_state
                 .target
@@ -14595,8 +14613,12 @@ impl PySemanticRetainedReplayMember {
         let parent = self.parent.borrow(py);
         let lease = parent.lease()?;
         let invocation = self.invocation.borrow(py);
-        let gradients = target_owner
-            .record_imported_policy_group_vjp(
+        let record = if edit_only {
+            SemanticTransitionSession::record_imported_edit_member_policy_vjp
+        } else {
+            SemanticTransitionSession::record_imported_policy_group_vjp
+        };
+        let gradients = record(&mut target_owner,
                 &update.inner,
                 bank,
                 &mut source_owner,
@@ -22398,6 +22420,7 @@ impl PySemanticTransitionController {
                                     completion: None,
                                     banks: [false; 2],
                                     gradient_banks: [false; 2],
+                                    edit_only: None,
                                     deliveries: std::array::from_fn(|_| None),
                                 }),
                                 final_use: Mutex::new(RetainedReplayFinalUse::default()),
