@@ -198,6 +198,7 @@ struct ColdReportCompletion {
 pub(super) struct ColdModelWorkStorage {
     invocation: Arc<()>,
     aliases: Arc<()>,
+    purpose: SemanticColdModelWorkPurpose,
     prepared_scope: Option<Arc<()>>,
     operation_ordinal: u64,
     admission: Arc<[u8]>,
@@ -797,6 +798,92 @@ impl SemanticTransitionSession {
         Ok(())
     }
 
+    pub fn bind_shared_admitted_retirement_cold_model_work(
+        &mut self,
+        admission: &SemanticSegmentInstructionAdmission,
+        parent: &SemanticPublishedLease,
+        source: &Self,
+        handle: &SemanticColdModelWork,
+        cancellation: Option<&SemanticPreparedSegmentNonSubmission>,
+    ) -> Result<(), SemanticTransitionError> {
+        self.require_segment_instruction_admission(admission, parent)?;
+        let build = self.prepared_segment.as_ref().ok_or_else(|| {
+            publication_input_error("shared retirement lost its original prepared owner")
+        })?;
+        if build.program_admission.as_ref().is_none_or(|original| !original.same_handle(admission)) {
+            return Err(publication_input_error("shared retirement changed its original admitted segment"));
+        }
+        if let Some(proof) = cancellation {
+            build.require_non_submission(proof)?;
+        } else if !build.completed {
+            return Err(publication_input_error("shared retirement requires actual original segment completion"));
+        }
+        let storage = source.cold_model_work(handle)?;
+        let allowance = self.graph.cold_work_allowance().ok_or_else(|| {
+            publication_input_error("instruction retirement lost its original shared tally")
+        })?;
+        let original = self.instruction_admission_mut(admission)?;
+        let same_cancellation = match (&original.retirement_cancellation, cancellation) {
+            (None, None) => true,
+            (Some(stored), Some(proof)) => stored.matches(&proof.steps),
+            _ => false,
+        };
+        if !matches!(original.state,
+                actor_refresh_program::InstructionState::Bound | actor_refresh_program::InstructionState::Completed)
+            || storage.purpose != SemanticColdModelWorkPurpose::PrivateRetirement
+            || !Arc::ptr_eq(&allowance, &storage.allowance)
+            || !matches!(storage.state, RecordingState::Waiting | RecordingState::Recording)
+            || original.retirement_work.as_ref().is_some_and(|work| !work.same_invocation(handle) || !same_cancellation)
+        {
+            return Err(publication_input_error("shared retirement changed its original invocation, allowance or disposition"));
+        }
+        original.retirement_work = Some(handle.clone());
+        original.retirement_cancellation = cancellation.cloned();
+        Ok(())
+    }
+
+    pub fn adopt_shared_admitted_retirement_cold_model_work_result(
+        &mut self,
+        admission: &SemanticSegmentInstructionAdmission,
+        parent: &SemanticPublishedLease,
+        source: &Self,
+        handle: &SemanticColdModelWork,
+    ) -> Result<SemanticColdModelWorkResult, SemanticTransitionError> {
+        self.require_segment_instruction_admission(admission, parent)?;
+        let original = self.instruction_admission(admission)?;
+        if original.retirement_work.as_ref().is_none_or(|work| !work.same_invocation(handle))
+            || !Arc::ptr_eq(&handle.issuer, &source.publication_issuer)
+        {
+            return Err(publication_input_error("shared retirement report changed its original invocation"));
+        }
+        if let Some(result) = original.retirement_result {
+            return Ok(result);
+        }
+        // Only the canonical resource-retirement path removes the prepared
+        // owner, after graph destruction and every joined step/alias release.
+        // Admission custody also proves full retirement when its parent is gone.
+        if self.prepared_segment.is_some() || self.captured.is_some()
+            || self.steps.contains_key(&parent.token)
+            || !matches!((original.state, original.retirement_cancellation.is_some()),
+                (actor_refresh_program::InstructionState::Completed, false)
+                    | (actor_refresh_program::InstructionState::Bound, true))
+        {
+            return Err(publication_input_error("shared retirement report requires fully retired original native storage"));
+        }
+        let storage = source.cold_model_work(handle)?;
+        let result = storage.result.ok_or_else(|| {
+            publication_input_error("retain the original unfinished shared retirement report")
+        })?;
+        if storage.purpose != SemanticColdModelWorkPurpose::PrivateRetirement
+            || storage.state != RecordingState::Completed
+            || storage.disposition != Some(SemanticColdModelWorkDisposition::Complete)
+        {
+            return Err(publication_input_error("shared retirement requires its original completed report"));
+        }
+        self.instruction_admission_mut(admission)?.retirement_result = Some(result);
+        Ok(result)
+    }
+
     pub fn admitted_retirement_cold_model_work_buffer(
         &mut self,
         admission: &SemanticSegmentInstructionAdmission,
@@ -1147,6 +1234,7 @@ impl SemanticTransitionSession {
             .cold_model_work = Some(ColdModelWorkStorage {
             invocation,
             aliases: Arc::new(()),
+            purpose,
             prepared_scope,
             operation_ordinal,
             admission,

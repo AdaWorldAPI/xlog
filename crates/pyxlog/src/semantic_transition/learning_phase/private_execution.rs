@@ -51,6 +51,7 @@ pub(super) struct PrivateExecutionGroup {
     retirement_work: Option<Py<PySemanticColdModelWork>>,
     retirement_custody: Option<SemanticColdNativeWork>,
     retirement_report: Option<SemanticColdModelWorkResult>,
+    retirement_instruction: Option<Arc<SegmentInstructionCustody>>,
     retirement_ready: bool,
     retirement_entered: bool,
     retirement_children_ready: bool,
@@ -2357,6 +2358,23 @@ impl PySemanticLearningPhaseTransition {
             .lock()
             .map_err(|_| invalid("original instruction owner mutex is poisoned"))?
             .clone();
+        if role == PrivateColdRole::Retirement {
+            if let Some(instruction) = &instruction {
+                let mut retained = self.private_group()?;
+                let group = retained.as_mut().expect("retained original group");
+                if !std::ptr::eq(session, &*instruction.session.borrow(py))
+                    || instruction.task_use.as_ptr() != group.restored.borrow(py).task_use.as_ptr()
+                    || instruction.instruction.as_ref() != group.instruction.as_slice()
+                    || group.retirement_instruction.as_ref()
+                        .is_some_and(|original| !Arc::ptr_eq(original, instruction))
+                {
+                    return Err(invalid("private retirement changed its original instruction owner"));
+                }
+                // Keep the exact native claim before retirement can clear its
+                // prepared owner or the candidate's public instruction slot.
+                group.retirement_instruction = Some(Arc::clone(instruction));
+            }
+        }
         let admitted = match instruction {
             Some(instruction)
                 if std::ptr::eq(&*instruction.parent.borrow(py), &*parent.borrow(py)) =>
@@ -2382,6 +2400,25 @@ impl PySemanticLearningPhaseTransition {
                 .map_err(xlog_err)?;
         }
         if role == PrivateColdRole::Retirement {
+            let (instruction, cancellation) = {
+                let retained = self.private_group()?;
+                let group = retained.as_ref().expect("retained original group");
+                (group.retirement_instruction.as_ref().map(Arc::clone), group.non_submission.clone())
+            };
+            if let Some(instruction) = instruction {
+                let source = self.source.borrow(py);
+                if std::ptr::eq(&*source, session) {
+                    return Err(invalid("shared private retirement requires its original source owner"));
+                }
+                let source = source.owner()?;
+                session.owner()?.bind_shared_admitted_retirement_cold_model_work(
+                    &instruction.inner,
+                    &*instruction.parent.borrow(py).lease()?,
+                    &source,
+                    &work.borrow(py).inner,
+                    cancellation.as_ref(),
+                ).map_err(xlog_err)?;
+            }
             self.private_group()?
                 .as_mut()
                 .expect("retained original group")
@@ -2789,7 +2826,54 @@ impl PySemanticLearningPhaseTransition {
         // reporting that same retirement interval or admitting adoption work.
         self.release_replay_children(py)?;
         self.finish_private_cold_report(py, PrivateColdRole::Retirement)?;
+        self.adopt_private_instruction_retirement(py, session)?;
         self.issue_private_cold_callback(py, session, PrivateColdRole::Adoption, &parent, ordinal)
+    }
+
+    fn adopt_private_instruction_retirement(
+        &self,
+        py: Python<'_>,
+        session: &PySemanticTransitionSession,
+    ) -> PyResult<()> {
+        let (instruction, work) = {
+            let retained = self.private_group()?;
+            let group = retained.as_ref().expect("retained original group");
+            let Some(instruction) = &group.retirement_instruction else {
+                return Ok(());
+            };
+            if !group.native_retired || group.retirement_report.is_none() {
+                return Err(invalid("private instruction adoption requires actual original retirement and report"));
+            }
+            (
+                Arc::clone(instruction),
+                group.retirement_work.as_ref()
+                    .ok_or_else(|| invalid("private retirement lost its original report owner"))?
+                    .clone_ref(py),
+            )
+        };
+        let report = {
+            let source = self.source.borrow(py);
+            if std::ptr::eq(&*source, session) {
+                return Err(invalid("shared private retirement requires its original source owner"));
+            }
+            let source = source.owner()?;
+            session.owner()?.adopt_shared_admitted_retirement_cold_model_work_result(
+                &instruction.inner,
+                &*instruction.parent.borrow(py).lease()?,
+                &source,
+                &work.borrow(py).inner,
+            ).map_err(xlog_err)?
+        };
+        instruction.preparation()?.retirement_report = Some(report);
+        let mut slot = session.segment_instruction.lock()
+            .map_err(|_| invalid("original instruction owner mutex is poisoned"))?;
+        if slot.as_ref().is_some_and(|original| !Arc::ptr_eq(original, &instruction)) {
+            return Err(invalid("private retirement cannot clear another original instruction owner"));
+        }
+        let retired = slot.take();
+        drop(slot);
+        drop(retired);
+        Ok(())
     }
 
     pub(in crate::semantic_transition) fn private_adoption_due(&self) -> PyResult<bool> {
@@ -3139,6 +3223,7 @@ impl PySemanticLearningPhaseTransition {
                 retirement_work: None,
                 retirement_custody: None,
                 retirement_report: None,
+                retirement_instruction: None,
                 retirement_ready: false,
                 retirement_entered: false,
                 retirement_children_ready: false,
