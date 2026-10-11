@@ -1322,9 +1322,26 @@ impl PySemanticTransitionSession {
 #[pymethods]
 impl PySemanticPublishedParent {
     fn source_model_contract_metadata(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        let prepared = self.original_prepared_import(py)?;
-        let result = prepared.borrow(py).source_model_contract_metadata(py);
-        result
+        let session = self.session.borrow(py);
+        session.require_creator()?;
+        let owner = session.owner()?;
+        self.task_use.borrow(py).require_original_identity(&owner)?;
+        let (bytes, layout) = owner
+            .published_model_contract_metadata(&*self.lease()?)
+            .map_err(xlog_err)?;
+        Ok((
+            PyBytes::new(py, &bytes),
+            (
+                layout.schema_begin,
+                layout.schema_bytes,
+                layout.schema_digest_offset,
+                layout.generation_offset,
+                layout.numerical_digest_offset,
+                layout.identity_offset,
+            ),
+        )
+            .into_pyobject(py)?
+            .unbind())
     }
 
     fn source_model_memory_geometry(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {

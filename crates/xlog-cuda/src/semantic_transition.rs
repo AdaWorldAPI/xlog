@@ -19,6 +19,7 @@ pub use actor_refresh_program::SemanticSegmentInstructionAdmission;
 mod cold_model_work;
 mod late_replay;
 mod learning_phase;
+mod model_contract;
 use late_replay::{PendingReplayDelivery, ReplayAuthentication};
 #[cfg(feature = "semantic-policy")]
 mod model_evaluation;
@@ -8722,6 +8723,7 @@ struct PublicationStorage {
     physical_parameter_coordinates: Option<BTreeSet<(u64, u64)>>,
     model_slots: Vec<[usize; 2]>,
     model_generations: Vec<Vec<usize>>,
+    model_contract_record: Arc<[u8]>,
     bank_templates: [Vec<PublicationRange>; 2],
     continuation_templates: Vec<PublicationRange>,
     layouts: BTreeMap<(u64, u64), SemanticTensorLayout>,
@@ -8921,28 +8923,29 @@ impl PublicationStorage {
                 "historical model leases differ from the complete allocation roster",
             ));
         }
-        let physical_parameter_roster = plans
-            .iter()
-            .find(|plan| (plan.role, plan.index) == (44, 0))
-            .and_then(|plan| match &plan.payload {
-                PublicationPayload::Metadata(bytes) => Some(bytes.as_slice()),
-                _ => None,
-            })
-            .map(|record| model_physical_parameter_roster(record, contract.model_contract_layout))
-            .transpose()?
-            .flatten();
-        let physical_parameter_coordinates = plans
-            .iter()
-            .find(|plan| (plan.role, plan.index) == (44, 0))
-            .and_then(|plan| match &plan.payload {
-                PublicationPayload::Metadata(bytes) => Some(bytes.as_slice()),
-                _ => None,
-            })
-            .map(|record| {
-                model_physical_parameter_coordinates(record, contract.model_contract_layout)
-            })
-            .transpose()?
-            .flatten();
+        let model_contract_record: Arc<[u8]> = Arc::from(
+            plans
+                .iter()
+                .find(|plan| (plan.role, plan.index) == (44, 0))
+                .and_then(|plan| match &plan.payload {
+                    PublicationPayload::Metadata(bytes) => Some(bytes.as_slice()),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    publication_input_error("publication lacks its original host model contract")
+                })?,
+        );
+        contract
+            .model_contract_layout
+            .validate(model_contract_record.len() as u64)?;
+        let physical_parameter_roster = model_physical_parameter_roster(
+            &model_contract_record,
+            contract.model_contract_layout,
+        )?;
+        let physical_parameter_coordinates = model_physical_parameter_coordinates(
+            &model_contract_record,
+            contract.model_contract_layout,
+        )?;
         let mut model_slots = Vec::new();
         for (index, (&bytes, payload)) in model_memory
             .allocation_bytes
@@ -9108,6 +9111,7 @@ impl PublicationStorage {
                 physical_parameter_coordinates,
                 model_generations: model_slots.iter().map(|slots| slots.to_vec()).collect(),
                 model_slots,
+                model_contract_record,
                 bank_templates,
                 continuation_templates,
                 layouts,
@@ -9229,6 +9233,7 @@ impl PublicationStorage {
                 physical_parameter_coordinates: self.physical_parameter_coordinates.clone(),
                 model_slots: self.model_slots.clone(),
                 model_generations,
+                model_contract_record: Arc::clone(&self.model_contract_record),
                 bank_templates: self.bank_templates.clone(),
                 continuation_templates: self.continuation_templates.clone(),
                 layouts: self.layouts.clone(),

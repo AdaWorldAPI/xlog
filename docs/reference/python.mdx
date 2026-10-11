@@ -204,18 +204,25 @@ outcome. Its read-only `task_use` and `parent` refer to those same owners;
 original preparation or execution, checking the exact parent and TaskUse. It
 does not create another import or grant numerical execution authority.
 
-During that callback, `parent.source_model_contract_metadata()` returns the
-authenticated original host record bytes and
+For every genuine acquired parent, `parent.source_model_contract_metadata()`
+returns the complete authenticated host record bytes and
 `(schema_begin, schema_bytes, schema_digest_offset, generation_offset,
-numerical_digest_offset, identity_offset)`. It does not read device values.
-`parent.source_model_memory_geometry()` returns the full original
+numerical_digest_offset, identity_offset)`, including during the original SOURCE
+preparation callback. Native code retains the original structural bytes and
+projects only the schema digest, generation, numerical digest and identity
+written by the publication finalizer. Every returned byte must match that
+parent's original record seal. This planning metadata does not copy device
+values or grant numerical execution or SOURCE import authority.
+`parent.source_model_memory_geometry()` remains specific to the original
+prepared SOURCE import and returns its full original
 `(allocation_bytes, storages, views)`; each storage is
 `(allocation, byte_offset, span_bytes)` and each view is
 `(role, index, storage, byte_offset, layout)` with the existing tensor layout.
 Use `parent.resident_model_memory(consumer_stream=...)` for the actual resident
-allocation aliases, not metadata as a replacement for physical ownership.
-Numerical record reads and gradient-presence values remain in the original
-charged execution callback.
+allocation aliases of an acquired parent, not metadata as a replacement for
+physical ownership. Actual numerical record reads, full material comparison,
+gradient-presence values and live-state guards remain in the original charged
+execution callback.
 
 Bind future historical deliveries with
 `step.register_gradient_delivery(..., group_member=prepared_import, edit_only=True)`

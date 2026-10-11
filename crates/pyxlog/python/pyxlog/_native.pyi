@@ -630,7 +630,11 @@ class SemanticPublishedParent:
         """The genuine retained owner for this same SOURCE parent and task."""
         ...
     def source_model_contract_metadata(self) -> _SourceModelContractMetadata:
-        """Authenticated original host record and six layout byte offsets."""
+        """Complete seal-authenticated host contract of this acquired parent.
+
+        Returns record bytes and six layout byte offsets without a device read.
+        Planning metadata does not grant numerical or SOURCE import access.
+        """
         ...
     def source_model_memory_geometry(self) -> _SourceModelMemoryGeometry:
         """Original full model allocation, storage, view and tensor geometry."""
