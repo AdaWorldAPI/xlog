@@ -368,13 +368,11 @@ fn actor_initialize_native_work_ceiling(
     let t = storage.layouts.len() as u64;
     let contract = storage.contract_value;
     let rows = actor_work_add(contract.window_capacity, contract.feedback_capacity)?;
-    let queries = child
-        .task_evaluation
+    let (task, _) = child
+        .task
         .as_ref()
-        .ok_or(SemanticTransitionError::NotBound)?
-        .spec
-        .statement_records
-        .len() as u64;
+        .ok_or(SemanticTransitionError::NotBound)?;
+    let queries = task.spec.statement_records.len() as u64;
     let mut ceiling = [0; 9];
     // Both original directories traverse the same canonical table, layout,
     // alias and storage validators. The complete step-input validator is a
@@ -430,10 +428,7 @@ fn actor_initialize_native_work_ceiling(
     // Resident preflight scans each finite arena table and the original heads.
     // Noneditable restored queries perform at most two original truth calls
     // per query (initial query and feedback), each one statement-table scan.
-    let truth_calls = if child
-        .task_evaluation
-        .as_ref()
-        .ok_or(SemanticTransitionError::NotBound)?
+    let truth_calls = if task
         .spec
         .program
         .editable_program()
@@ -1229,7 +1224,7 @@ impl SemanticTransitionSession {
             let marker = PreparedActorRefreshDevice {
                 abi: 1, status: 1,
                 target_control: proof.inner.target.control.device_ptr_value(),
-                target_lease: proof.inner.inputs.reader.device_ptr_value(),
+                target_lease: *proof.inner.inputs.reader.device_ptr(),
                 target_header: proof.inner.inputs.header.device_ptr_value(),
                 target_bank: target_bank as u64,
                 child_control: child.control.device_ptr_value(),
@@ -1465,23 +1460,23 @@ impl SemanticTransitionSession {
                             .ok_or(SemanticTransitionError::ObservationMismatch)?;
                         Ok(ActorRefreshWorkEntry {
                             member_ordinal: component.member_ordinal,
-                            proof: component.marker.device_ptr_value(),
-                            native_work: component.native_work.device_ptr_value(),
+                            proof: *component.marker.device_ptr(),
+                            native_work: *component.native_work.device_ptr(),
                             states: [
-                                component.states[0].device_ptr_value(),
-                                component.states[1].device_ptr_value(),
+                                *component.states[0].device_ptr(),
+                                *component.states[1].device_ptr(),
                             ],
                             readers: [
-                                component.readers[0].device_ptr_value(),
-                                component.readers[1].device_ptr_value(),
+                                *component.readers[0].device_ptr(),
+                                *component.readers[1].device_ptr(),
                             ],
                             results: [
-                                component.results[0].device_ptr_value(),
-                                component.results[1].device_ptr_value(),
+                                *component.results[0].device_ptr(),
+                                *component.results[1].device_ptr(),
                             ],
                             parents: [
-                                component.parents[0].device_ptr_value(),
-                                component.parents[1].device_ptr_value(),
+                                *component.parents[0].device_ptr(),
+                                *component.parents[1].device_ptr(),
                             ],
                             model_work: component.model_inputs,
                             native_ceiling: component.native_ceiling,
@@ -2200,7 +2195,7 @@ impl SemanticTransitionSession {
             || marker.status != 2
             || marker.target_bank != staged.target_bank as u64
             || marker.target_control != proof.target.control.device_ptr_value()
-            || marker.target_lease != proof.inputs.reader.device_ptr_value()
+            || marker.target_lease != *proof.inputs.reader.device_ptr()
             || marker.target_header != proof.inputs.header.device_ptr_value()
             || marker.child_control
                 != self

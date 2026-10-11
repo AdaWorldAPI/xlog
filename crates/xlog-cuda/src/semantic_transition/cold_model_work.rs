@@ -457,6 +457,7 @@ impl SemanticTransitionSession {
         let original = self.cold_model_work(handle)?;
         let view = original.native_work.view();
         let custody = Arc::clone(&original.aliases);
+        let allowance = Arc::clone(&original.allowance);
         let regions = original.regions.len();
         self.graph
             .require_cold_work_owner(&view, false)
@@ -476,10 +477,10 @@ impl SemanticTransitionSession {
             .map_err(SemanticTransitionError::Semantic)?;
         survivor
             .graph
-            .begin_cold_work(view.clone())
+            .begin_cold_work(view.clone(), Arc::clone(&allowance))
             .map_err(SemanticTransitionError::Semantic)?;
         self.graph
-            .begin_borrowed_cold_work(view, custody)
+            .begin_borrowed_cold_work(view, custody, allowance)
             .map_err(SemanticTransitionError::Semantic)?;
         let storage = self
             .steps

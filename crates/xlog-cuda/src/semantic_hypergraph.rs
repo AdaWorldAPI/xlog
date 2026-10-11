@@ -5398,7 +5398,7 @@ fn enqueue_device_command_original(
     Ok(())
 }
 
-fn runtime_error(operation: &'static str, error: XlogError) -> SemanticHypergraphError {
+fn runtime_error(operation: &'static str, error: impl fmt::Display) -> SemanticHypergraphError {
     SemanticHypergraphError::Runtime {
         operation,
         detail: error.to_string(),

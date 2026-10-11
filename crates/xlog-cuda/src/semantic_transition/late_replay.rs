@@ -546,7 +546,7 @@ impl SemanticTransitionSession {
                     .iter()
                     .find(|range| range.role == role && range.index == 0)
                     .ok_or(SemanticTransitionError::ObservationMismatch)?;
-                if role == 57 && storage.contract.replay_payload_capacity_bytes == 0 {
+                if role == 57 && storage.contract_value.replay_payload_capacity_bytes == 0 {
                     if range.length_bytes != 0 || range.offset_bytes != 0 {
                         return Err(SemanticTransitionError::ObservationMismatch);
                     }
@@ -630,14 +630,14 @@ impl SemanticTransitionSession {
             .iter()
             .find(|original| original.range.role == role)
             .ok_or(SemanticTransitionError::ObservationMismatch)?;
-        let bytes =
-            if let Some(read) = &original.read {
-                self.resolve_publication_read(&mut read.lock().map_err(|_| {
-                    publication_input_error("receiver archive read owner poisoned")
-                })?)?
-            } else {
-                Vec::new()
-            };
+        let bytes = if let Some(read) = &original.read {
+            let mut read = read
+                .lock()
+                .map_err(|_| publication_input_error("receiver archive read owner poisoned"))?;
+            self.resolve_publication_read(&mut read)?
+        } else {
+            Vec::new()
+        };
         let material = PublicationMaterialRange {
             range: original.range,
             capacity: original.capacity,
@@ -710,7 +710,7 @@ impl SemanticTransitionSession {
             crate::cuda_graph::reserve_uncaptured_stream(&self.stream).map_err(|error| {
                 runtime_error("receiver authentication retirement stream admission", error)
             })?;
-        self.retire_published_reader(&mut lease)?;
+        self.retire_original_published_reader(&mut lease, &[], false)?;
         self.steps.remove(&lease.token);
         self.replay_authentication
             .as_mut()
@@ -941,10 +941,12 @@ impl SemanticTransitionSession {
                 .and_then(|original| original.reads.as_ref())
                 .ok_or(SemanticTransitionError::NoPendingLaunch)?,
         );
-        let current =
-            self.resolve_publication_read(&mut reads.control.lock().map_err(|_| {
+        let current = {
+            let mut control = reads.control.lock().map_err(|_| {
                 publication_input_error("receiver publication read owner poisoned")
-            })?)?[0];
+            })?;
+            self.resolve_publication_read(&mut control)?[0]
+        };
         if current.word != lease.identity.word || current.instance != lease.identity.instance {
             return Err(publication_input_error(
                 "append authentication changed its original acquired publication",
@@ -1323,9 +1325,9 @@ impl SemanticTransitionSession {
                 + 40
                 + size_of::<TrainingViewRowDescriptor>() as u64,
             row_bytes_len: row.bytes.len() as u64,
-            arena_descriptors: descriptors.device_ptr_value(),
+            arena_descriptors: *descriptors.device_ptr(),
             arena_descriptor_count: descriptors.len() as u64,
-            arena_raw: raw.device_ptr_value(),
+            arena_raw: *raw.device_ptr(),
             arena_raw_bytes: raw.len() as u64,
             observations: observations.device.device_ptr_value(),
             observation_count: authenticated.observations.len() as u64,
@@ -1333,7 +1335,7 @@ impl SemanticTransitionSession {
             supports: supports.device.device_ptr_value(),
             native_work: native_work
                 .as_ref()
-                .map_or(0, DeviceMemoryView::device_ptr_value),
+                .map_or(0, |work| *work.device_ptr()),
         };
         let input = ReplayUpload::new(&self.provider, &self.stream, &[input])?;
         let control = Arc::new(std::sync::Mutex::new(
@@ -1563,20 +1565,24 @@ impl SemanticTransitionSession {
             "replay acknowledgement completion",
             CudaStream::synchronize,
         )?;
-        let control =
-            self.resolve_publication_read(&mut control_read.lock().map_err(|_| {
+        let control = {
+            let mut read = control_read.lock().map_err(|_| {
                 publication_input_error("replay completion control owner poisoned")
-            })?)?[0];
+            })?;
+            self.resolve_publication_read(&mut read)?[0]
+        };
         let expected_word = ((base.word >> 1) + 1) << 1 | ((base.word & 1) ^ 1);
         if control.word == base.word && control.refusal != 0 {
             let status = control.refusal;
             self.pending_replay_delivery = None;
             return Err(SemanticTransitionError::PublicationRefused { status });
         }
-        let header =
-            self.resolve_publication_read(&mut header_read.lock().map_err(|_| {
+        let header = {
+            let mut read = header_read.lock().map_err(|_| {
                 publication_input_error("replay completion header owner poisoned")
-            })?)?[0];
+            })?;
+            self.resolve_publication_read(&mut read)?[0]
+        };
         if control.word != expected_word
             || header.publication_word != expected_word
             || header.instance != base.instance

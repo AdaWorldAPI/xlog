@@ -1595,7 +1595,7 @@ impl SemanticTransitionSession {
         }
         let losses = output.tensors[0].clone();
         let admissible = output.tensors[1].clone();
-        let slab = &output.tensors[2];
+        let slab = output.tensors[2].clone();
         let vector = |tensor: &PreparedSemanticTensor, scalar, bytes, extent| {
             tensor.layout.role == 0
                 && tensor.layout.scalar_type == scalar
@@ -1612,7 +1612,7 @@ impl SemanticTransitionSession {
             || slab.layout.index != 2
             || !vector(&losses, 6, 4, 6)
             || !vector(&admissible, 8, 1, 1)
-            || !vector(slab, 1, 1, slab.layout.dimensions[0])
+            || !vector(&slab, 1, 1, slab.layout.dimensions[0])
             || slab.layout.dimensions[0] == 0
         {
             return Err(publication_input_error(
@@ -1620,7 +1620,7 @@ impl SemanticTransitionSession {
             ));
         }
         let (slab_base, slab_allocation_bytes) =
-            accounted_tensor_allocations(&[&losses, &admissible], slab)?;
+            accounted_tensor_allocations(&[&losses, &admissible], &slab)?;
         let slab_bytes = tensor_layout_bytes(&slab.layout)?;
         for allocation in &self
             .publication

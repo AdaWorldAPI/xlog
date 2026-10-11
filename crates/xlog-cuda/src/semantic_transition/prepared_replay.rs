@@ -856,7 +856,10 @@ impl SemanticTransitionSession {
                 })
             });
             let counts = self.publication_read(storage.role_counts.view())?;
-            let mut role_counts = [0; 55];
+            if counts.len() != PUBLICATION_ROLE_COUNT {
+                return Err(SemanticTransitionError::ObservationMismatch);
+            }
+            let mut role_counts = [0; PUBLICATION_ROLE_COUNT];
             for (index, count) in counts.iter().enumerate() {
                 if count.role != index as u64 + 1 {
                     return Err(SemanticTransitionError::ObservationMismatch);

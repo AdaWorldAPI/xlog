@@ -114,7 +114,7 @@ type PreparedPolicyStorage = (
 
 /// Canonical 256-bit identity, preserving byte order without native-word conversion.
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Identity256([u8; 32]);
 
 impl Identity256 {
@@ -6473,7 +6473,7 @@ fn validate_program_query_receipts(
                 .truth
                 .iter()
                 .zip(&baseline.truth)
-                .filter(|(current, original)| **current != *original)
+                .filter(|(current, original)| **current != **original)
                 .count() as u64;
             let work = state.work[slot - 1];
             if work.edit_commands != rules.len() as u64
@@ -8444,7 +8444,7 @@ impl PublicationMaterial {
                     || item.range.generation != 1
                     || item.range.length_bytes != item.bytes.len() as u64
                     || (item.capacity == 0
-                        && !(role == SemanticStateRole::ReplayAppendPayload.code()
+                        && !(role == SemanticStateRole::ReplayAppendPayload as u64
                             && index == 0
                             && item.bytes.is_empty()
                             && contract.replay_payload_capacity_bytes == 0)
@@ -8806,7 +8806,7 @@ impl PublicationStorage {
         }
         for plan in plans {
             if (plan.capacity == 0
-                && !(plan.role == SemanticStateRole::ReplayAppendPayload.code()
+                && !(plan.role == SemanticStateRole::ReplayAppendPayload as u64
                     && plan.index == 0
                     && plan.length == 0
                     && contract.replay_payload_capacity_bytes == 0)
@@ -10360,6 +10360,30 @@ impl PreparedStepInputs {
                 poisoned,
                 recorder,
                 |enqueue, entered, submitted| {
+                    let (control, reader, bindings0, bindings1, count, header, source,
+                        ranges, digests, tally) = arguments;
+                    let control = control.into_kernel_param_storage();
+                    let reader = reader.into_kernel_param_storage();
+                    let bindings0 = bindings0.into_kernel_param_storage();
+                    let bindings1 = bindings1.into_kernel_param_storage();
+                    let count = count.into_kernel_param_storage();
+                    let header = header.into_kernel_param_storage();
+                    let source = source.into_kernel_param_storage();
+                    let ranges = ranges.into_kernel_param_storage();
+                    let digests = digests.into_kernel_param_storage();
+                    let tally = tally.into_kernel_param_storage();
+                    let mut parameters = [
+                        control.as_kernel_param(),
+                        reader.as_kernel_param(),
+                        bindings0.as_kernel_param(),
+                        bindings1.as_kernel_param(),
+                        count.as_kernel_param(),
+                        header.as_kernel_param(),
+                        source.as_kernel_param(),
+                        ranges.as_kernel_param(),
+                        digests.as_kernel_param(),
+                        tally.as_kernel_param(),
+                    ];
                     // SAFETY: the original owner retains both fixed metadata banks,
                     // all actual sources/outputs and the exact original tally.
                     unsafe {
@@ -10370,7 +10394,8 @@ impl PreparedStepInputs {
                                 block_dim: (1, 1, 1),
                                 shared_mem_bytes: 0,
                             },
-                            arguments,
+                            &mut parameters,
+                            false,
                             entered,
                             submitted,
                         )
@@ -14263,14 +14288,14 @@ fn validate_replay_append_records(
         .iter()
         .find(|item| {
             (item.range.role, item.range.index)
-                == (SemanticStateRole::ReplayAppendEntries.code(), 0)
+                == (SemanticStateRole::ReplayAppendEntries as u64, 0)
         })
         .ok_or_else(|| publication_input_error("publication omits its acquired replay entries"))?;
     let payload = ranges
         .iter()
         .find(|item| {
             (item.range.role, item.range.index)
-                == (SemanticStateRole::ReplayAppendPayload.code(), 0)
+                == (SemanticStateRole::ReplayAppendPayload as u64, 0)
         })
         .ok_or_else(|| publication_input_error("publication omits its acquired replay payload"))?;
     if entries.bytes.len() < size_of::<SemanticTrainingReplayAppendHeader>() {
@@ -19346,11 +19371,24 @@ impl SemanticTransitionSession {
             );
             let execute = original.execute.clone();
             original.command.run(&self.domain, poisoned, recorder, |enqueue, entered, submitted| {
+                let (control, original_storage, original_count, expanded_storage, expanded_count) = args;
+                let control = control.into_kernel_param_storage();
+                let original_storage = original_storage.into_kernel_param_storage();
+                let original_count = original_count.into_kernel_param_storage();
+                let expanded_storage = expanded_storage.into_kernel_param_storage();
+                let expanded_count = expanded_count.into_kernel_param_storage();
+                let mut parameters = [
+                    control.as_kernel_param(),
+                    original_storage.as_kernel_param(),
+                    original_count.as_kernel_param(),
+                    expanded_storage.as_kernel_param(),
+                    expanded_count.as_kernel_param(),
+                ];
                 // SAFETY: the original roster owns both catalogues, the idle
                 // control and all banks before this one driver boundary.
                 unsafe { execute.launch_raw_in_original(enqueue, LaunchConfig {
                     grid_dim: (1, 1, 1), block_dim: (1, 1, 1), shared_mem_bytes: 0,
-                }, args, entered, submitted) }
+                }, &mut parameters, false, entered, submitted) }
                     .map_err(|error| XlogError::Kernel(error.to_string()))
             })?;
         }
@@ -28057,7 +28095,7 @@ impl SemanticTransitionSession {
             lease: token.map_or(0, |token| self.readers[&token].device.device_ptr_value()),
             native_work: native_work
                 .as_ref()
-                .map_or(0, DeviceMemoryView::device_ptr_value),
+                .map_or(0, |work| *work.device_ptr()),
         };
         let mut recorder = self.kernel_recorder();
         if let Some(token) = token {
@@ -28488,7 +28526,7 @@ impl SemanticTransitionSession {
                 .as_ref()
                 .ok_or(SemanticTransitionError::ObservationMismatch)?,
         );
-        let lease = self.resolve_acquisition_read(&mut observation.lock().map_err(|_| {
+        let lease = self.resolve_acquisition_read(&mut *observation.lock().map_err(|_| {
             publication_input_error("publication acquisition read owner poisoned")
         })?, may_submit, poisoned)?[0];
         if lease.status != 0 {
@@ -32281,46 +32319,6 @@ impl SemanticTransitionSession {
         self.release_prepared_step_storage(step)
     }
 
-    /// Join the original cancelled construction's final consumers while
-    /// retaining all storage needed by graph and producer retirement.
-    pub fn quiesce_cancelled_prepared_step(
-        &mut self,
-        step: &SemanticPreparedStep,
-        proof: &SemanticPreparedSegmentNonSubmission,
-        consumer_streams: &[u64],
-    ) -> Result<(), SemanticTransitionError> {
-        self.checked_original_prepared_consumer_step(step)?;
-        self.prepared_segment
-            .as_ref()
-            .expect("checked prepared scope")
-            .require_non_submission(proof)?;
-        #[cfg(feature = "semantic-policy")]
-        if self
-            .policy_tapes
-            .iter()
-            .any(|tape| tape.policy.text_binding._witness.reader_token == step.token)
-        {
-            return Err(SemanticTransitionError::UnconsumedPolicyTape);
-        }
-        let final_streams = self.step_consumer_streams(step.token, consumer_streams)?;
-        if let Some(original) = self.prepared_segment.as_ref()
-            .expect("checked cancelled scope").final_consumers.get(&step.token)
-        {
-            if original != &final_streams {
-                return Err(publication_input_error(
-                    "cancelled final use changed its original consumer roster",
-                ));
-            }
-            return self.ensure_quiescent();
-        }
-        let _ordinary = crate::cuda_graph::reserve_uncaptured_stream(&self.stream)
-            .map_err(|error| runtime_error("cancelled preparation retirement admission", error))?;
-        self.complete_step_consumers_by_token(step.token, consumer_streams)?;
-        self.prepared_segment.as_mut().expect("joined cancelled scope")
-            .final_consumers.insert(step.token, final_streams);
-        Ok(())
-    }
-
     fn release_prepared_step_storage(
         &mut self,
         step: &SemanticPreparedStep,
@@ -33974,7 +33972,7 @@ impl SemanticTransitionSession {
             original_prefix_identity: prepared.prefix_identity,
         };
         for (index, destination) in destinations.iter().enumerate() {
-            input.destinations[index] = destination.device_ptr_value();
+            input.destinations[index] = *destination.device_ptr();
             input.lengths[index] = destination.len() as u64;
         }
         let input_device = allocate_publication::<
@@ -34256,7 +34254,7 @@ impl SemanticTransitionSession {
                     return Err(SemanticTransitionError::ObservationMismatch);
                 }
                 if actual.active == 0 {
-                    self.finish_retired_reader(source)?;
+                    self.finish_retired_reader(source, &[actual])?;
                     self.poisoned = false;
                     return Ok(());
                 }
