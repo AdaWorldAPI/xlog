@@ -497,7 +497,8 @@ def restore_cancelled_checkpoint(
     """Authenticate without CUDA and raise SemanticTransitionCheckpointCancelled.
 
     Invalid or nonterminal material raises ValueError instead. The original
-    Program, native task identity and independent checkpoint issuer are required.
+    Program and independently pinned Session checkpoint issuer are required;
+    the authenticated native task identity is returned only in the exception.
     """
     ...
 
@@ -514,6 +515,16 @@ class SemanticPublishedParent:
         ...
 
 class SemanticTransitionSession:
+    @property
+    def learning_phase_checkpoint_issuer(self) -> Optional[bytes]:
+        """Original Session signing issuer, also before the first learning phase.
+
+        Read it from the live owner before durable publication and retain it in
+        the trusted create-only store, never from the checkpoint being restored.
+        This is not phase-completion evidence or a device observation.
+        """
+        ...
+
     @staticmethod
     def restore_checkpoint(
         checkpoint: bytes, *, device_ordinal: int, snapshot: Any,
