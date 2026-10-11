@@ -1969,6 +1969,15 @@ At lazy private adoption, issue the original callback through the existing
 getter reads already-issued work and never releases children, finishes the prior
 report, adopts an instruction or allocates the next report.
 
+For the original intermediate-restoration roster,
+`original_work.restore_material_mode()` reads the already-decoded transport
+before its first snapshot. It returns `"phase-reset"` when the original restore
+factory receives `None`, or `"checkpoint-model"` when it receives the verified
+checkpoint model material. The latter is a new carrier, not the snapshot callback's
+Python object. This pure getter authenticates the original four-region registrar;
+it does not invoke a factory, begin a recorder or grant a future parent access.
+Callers must still verify the actual material and complete model contract.
+
 `original_work.report_cursor()` returns
 `(region_begin, region_end, declared_cursor, recorded_slots,
 skipped_declared_spans, skipped_region_ordinals, recording_closed,

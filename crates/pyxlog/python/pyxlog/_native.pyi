@@ -344,6 +344,9 @@ class SemanticPrivateReplayChild:
 class SemanticColdModelWork:
     """Original registrar; numerical rights remain callback-scoped."""
 
+    def restore_material_mode(self) -> Literal["phase-reset", "checkpoint-model"]:
+        """Original decoded restoration mode, without invoking its factory."""
+        ...
     def report_cursor(self) -> tuple[
         int, int, int, int, tuple[tuple[int, int], ...], tuple[int, ...], bool, bool,
     ]:

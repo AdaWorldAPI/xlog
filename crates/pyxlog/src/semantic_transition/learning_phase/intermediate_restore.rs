@@ -57,6 +57,44 @@ pub(super) struct IntermediateRestore {
 }
 
 impl PySemanticLearningPhaseTransition {
+    pub(super) fn intermediate_restore_material_mode(
+        &self,
+        py: Python<'_>,
+        work: &PySemanticColdModelWork,
+    ) -> PyResult<&'static str> {
+        self.require_intermediate_entry(py)?;
+        let retained = self.intermediate()?;
+        let current = retained
+            .as_ref()
+            .ok_or_else(|| invalid("restore metadata lost its original intermediate owner"))?;
+        let custody = work.custody(py)?;
+        if !current.decode_verified
+            || !current.started
+            || !current.ready
+            || current.error.is_some()
+            || current.closed
+            || current
+                .work
+                .as_ref()
+                .is_none_or(|original| !original.same_invocation(&custody.inner))
+            || custody.reader.as_ptr() != self.parent.as_ptr()
+            || !current
+                .callbacks
+                .iter()
+                .flatten()
+                .any(|original| std::ptr::eq(&*original.borrow(py), work))
+        {
+            return Err(invalid(
+                "restore metadata requires its original decoded four-region registrar",
+            ));
+        }
+        Ok(if current.recipe.is_some() {
+            "phase-reset"
+        } else {
+            "checkpoint-model"
+        })
+    }
+
     pub(super) fn require_intermediate_cold_callback(
         &self,
         py: Python<'_>,

@@ -348,6 +348,26 @@ impl PySemanticColdModelWorkOperation {
 
 #[pymethods]
 impl PySemanticColdModelWork {
+    /// Original intermediate-restoration transport, before its first snapshot.
+    #[cfg(feature = "semantic-policy")]
+    fn restore_material_mode(&self, py: Python<'_>) -> PyResult<&'static str> {
+        let custody = self.custody(py)?;
+        let reader = custody.reader.borrow(py);
+        let session = reader.session.borrow(py);
+        session.require_creator()?;
+        let phase = session
+            .learning_transition
+            .lock()
+            .map_err(|_| invalid("restore metadata lost its original phase mutex"))?
+            .as_ref()
+            .map(|original| original.clone_ref(py))
+            .ok_or_else(|| invalid("restore metadata requires its original phase owner"))?;
+        let result = phase
+            .borrow(py)
+            .intermediate_restore_material_mode(py, self);
+        result
+    }
+
     /// Native declaration/physical-slot proof, retained after known completion.
     fn report_cursor(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
         let custody = self.custody(py)?;
