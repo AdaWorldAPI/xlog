@@ -5444,7 +5444,7 @@ const _: () = assert!(size_of::<ModelUpdateEvidenceSource>() == 48);
 const _: () = assert!(size_of::<ModelForwardSealInput>() == 32);
 const _: () = assert!(size_of::<ModelForwardReceipt>() == 232);
 const _: () = assert!(size_of::<ModelForwardReceiptInputs>() == 128);
-const _: () = assert!(size_of::<PublicationCommand>() == 24);
+const _: () = assert!(size_of::<PublicationCommand>() == 32);
 const _: () = assert!(size_of::<PublicationDeliveryInput>() == 88);
 const _: () = assert!(size_of::<PublicationLease>() == 88);
 const _: () = assert!(size_of::<SemanticTensorLayout>() == 112);
@@ -38845,6 +38845,7 @@ impl SemanticTransitionSession {
                     .map_or(0, |storage| storage.control.device_ptr_value()),
                 lease: 0,
                 operation: 0,
+                native_work: 0,
             },
             text: TextBinding::default(),
             model_work: ModelWorkInput::default(),

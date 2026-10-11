@@ -1173,7 +1173,7 @@ static_assert(sizeof(ContinuationInputs)==208,"continuation input ABI");
 static_assert(sizeof(TextRow)==16,"compact text row ABI");
 static_assert(sizeof(TextBinding)==24,"compact text binding ABI");
 static_assert(sizeof(ModelUpdateBinding)==32,"model update binding ABI");
-static_assert(sizeof(PublicationCommand)==24,"publication command ABI");
+static_assert(sizeof(PublicationCommand)==32,"publication command ABI");
 static_assert(sizeof(PublicationDeliveryInput)==88,"publication delivery input ABI");
 static_assert(sizeof(PublicationLease)==88,"publication lease ABI");
 static_assert(sizeof(PublicationStepResult)==sizeof(PublicationHeader)+32+sizeof(AttemptReceipt),"publication step result ABI");
