@@ -26241,6 +26241,16 @@ impl SemanticTransitionSession {
         tensors: Vec<SemanticTensorInput>,
         consumer_stream: u64,
     ) -> Result<SemanticTensorContentWitness, SemanticTransitionError> {
+        self.capture_prepared_tensor_roster(step, tensors, consumer_stream, None)
+    }
+
+    fn capture_prepared_tensor_roster(
+        &mut self,
+        step: &SemanticPreparedStep,
+        tensors: Vec<SemanticTensorInput>,
+        consumer_stream: u64,
+        forward_role: Option<usize>,
+    ) -> Result<SemanticTensorContentWitness, SemanticTransitionError> {
         self.check_prepared_content_stream(step, consumer_stream)?;
         if tensors.is_empty() {
             return Err(publication_input_error(
@@ -26262,11 +26272,21 @@ impl SemanticTransitionSession {
         let result = (|| {
             let owner = &self.steps[&step.token];
             let original = &owner.content[index].tensors;
-            validate_content_coordinates(
-                original
-                    .iter()
-                    .map(|tensor| (tensor.layout.role, tensor.layout.index)),
-            )?;
+            if let Some(role) = forward_role {
+                if !matches!(original.as_slice(), [tensor]
+                    if tensor.layout.role == 0 && tensor.layout.index == role as u64)
+                {
+                    return Err(publication_input_error(
+                        "model forward content requires its exact baseline or candidate logits occurrence",
+                    ));
+                }
+            } else {
+                validate_content_coordinates(
+                    original
+                        .iter()
+                        .map(|tensor| (tensor.layout.role, tensor.layout.index)),
+                )?;
+            }
             let mut digests = Vec::with_capacity(original.len());
             let prepared = owner.prepared.as_ref().expect("prepared content owner");
             let mut next = prepared.next_digest;
@@ -26664,7 +26684,8 @@ impl SemanticTransitionSession {
                 "model forward receipts belong only to a prepared update",
             ));
         }
-        let content = self.capture_prepared_tensor_content(step, vec![logits], consumer_stream)?;
+        let content =
+            self.capture_prepared_tensor_roster(step, vec![logits], consumer_stream, Some(role))?;
         let storage = Arc::clone(self.prepared_publication()?);
         let owner = self
             .steps
