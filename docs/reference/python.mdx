@@ -266,6 +266,15 @@ for an ordinary producer to authenticate its exact target task and original
 issued child before binding the model realization. This checks retained native
 CURRENT model owners and the original child scope; it does not execute a graph,
 read device storage, or infer CURRENT ownership from equal tensor contents.
+Inside that child's original one-shot `prepared.finish_segment()` callback,
+`refresh.retirement_observation(bank, task_use, prepared, steps)` returns exactly
+`"observed"`, `"cancelled"` or `"initializer_refused"`. It authenticates the same
+retained child objects and the ordered step tuple actually delivered to the
+producer, or an empty tuple if preparation stopped before that handoff. It is
+available only after native graph retirement and final-use quiescence; it
+returns no R/P outcomes and starts no numerical work.
+The callback window closes on every return or error. An uncertain callback
+retains the original owners and cannot be repeated as another cleanup attempt.
 Register the fresh actor's delivery with `actor_refresh=refresh`. Register the
 historical demonstration with `group_member=member, edit_only=True`, and pass
 the same `edit_only=True` to `member.group_update_vjp(...)`. The native owner

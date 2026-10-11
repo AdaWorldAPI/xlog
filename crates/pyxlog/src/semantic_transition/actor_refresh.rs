@@ -397,6 +397,7 @@ struct ActorRefreshChild {
     producer: Option<Py<PyAny>>,
     prepared: Option<Py<PyAny>>,
     original_prepared: Option<Py<PyAny>>,
+    producer_step_roster: Option<Py<PyTuple>>,
     resources: Option<Arc<PreparedProducerResources>>,
     cold_work: Option<SemanticColdNativeWork>,
     retirement_work: Option<SemanticColdNativeWork>,
@@ -416,6 +417,7 @@ struct ActorRefreshChild {
     vjp_recorded: bool,
     completion: Option<ActorRefreshCompletion>,
     producer_retirement_entered: bool,
+    producer_retirement_callback_active: Arc<AtomicBool>,
     producer_retired: bool,
     graph_retired: bool,
     resources_retired: bool,
@@ -442,6 +444,7 @@ impl ActorRefreshChild {
             && self.producer.is_none()
             && self.prepared.is_none()
             && self.original_prepared.is_none()
+            && self.producer_step_roster.is_none()
             && self.resources.is_none()
             && self.cold_work.is_none()
             && self.retirement_work.is_none()
@@ -461,6 +464,7 @@ impl ActorRefreshChild {
             && !self.vjp_recorded
             && self.completion.is_none()
             && !self.producer_retirement_entered
+            && !self.producer_retirement_callback_active.load(Ordering::Acquire)
             && !self.producer_retired
             && !self.graph_retired
             && !self.resources_retired
@@ -484,6 +488,7 @@ impl ActorRefreshChild {
             && self.producer.is_none()
             && self.prepared.is_none()
             && self.original_prepared.is_none()
+            && self.producer_step_roster.is_none()
             && self.resources.is_none()
             && self.retirement_work.is_none()
             && !self.retirement_attached
@@ -502,6 +507,7 @@ impl ActorRefreshChild {
             && !self.vjp_recorded
             && self.completion.is_none()
             && !self.producer_retirement_entered
+            && !self.producer_retirement_callback_active.load(Ordering::Acquire)
             && !self.producer_retired
             && !self.graph_retired
             && !self.resources_retired
@@ -839,7 +845,7 @@ impl ActorRefreshCustody {
                 }
                 .map_err(xlog_err)?;
             }
-            {
+            let callback_active = {
                 let mut children = self.children()?;
                 let child = &mut children[bank];
                 if child.producer_retirement_entered {
@@ -848,10 +854,17 @@ impl ActorRefreshCustody {
                     ));
                 }
                 child.producer_retirement_entered = true;
-            }
+                Arc::clone(&child.producer_retirement_callback_active)
+            };
             let check = || self.require_access(py);
-            let finished =
-                recording_callback(check, || prepared.bind(py).call_method0("finish_segment"))?;
+            let finish = recording_callback(check, || prepared.bind(py).getattr("finish_segment"))?;
+            let finished = recording_callback(check, || {
+                if callback_active.swap(true, Ordering::AcqRel) {
+                    return Err(invalid("original actor retirement callback cannot reenter"));
+                }
+                let _callback = PreparedRetirementGuard(callback_active.as_ref());
+                finish.call0()
+            })?;
             if !finished.is_none() {
                 return Err(invalid(
                     "actor finish_segment must return None after original producer retirement",
@@ -977,6 +990,8 @@ impl ActorRefreshCustody {
             if !resources_done {
                 // Alias finalizers run only after the caller's cached outer
                 // acknowledgement, never under the native Session mutex.
+                let producer_steps = self.children()?[bank].producer_step_roster.take();
+                drop(producer_steps);
                 for step in &steps {
                     step.borrow(py).release_recorded_producer_aliases(py)?;
                 }
@@ -1779,6 +1794,78 @@ impl ActorRefreshCustody {
 
 #[pymethods]
 impl PySemanticPreparedActorRefresh {
+    /// Expose only the cached native disposition to this child's original
+    /// one-shot producer retirement callback, after real final-use quiescence.
+    #[pyo3(signature = (bank, task_use, prepared, steps))]
+    fn retirement_observation(
+        &self,
+        py: Python<'_>,
+        bank: &Bound<'_, PyAny>,
+        task_use: Py<PySemanticTransitionTaskUse>,
+        prepared: &Bound<'_, PyAny>,
+        steps: &Bound<'_, PyAny>,
+    ) -> PyResult<&'static str> {
+        self.inner.require_access(py)?;
+        let bank = usize::try_from(ColdValue::read(bank, &mut 128, 0)?.unsigned()?)
+            .map_err(|_| invalid("actor retirement bank exceeds native address space"))?;
+        if bank > 1 || !steps.is_exact_instance_of::<PyTuple>() {
+            return Err(invalid(
+                "actor retirement requires its original bank and step tuple",
+            ));
+        }
+        let steps = steps.cast::<PyTuple>()?;
+        let work = self.inner.original_retirement_work(py)?;
+        let children = self.inner.children()?;
+        let child = &children[bank];
+        if !child
+            .producer_retirement_callback_active
+            .load(Ordering::Acquire)
+            || !child.producer_retirement_entered
+            || child.producer_retired
+            || child.resources_retired
+            || child.native_released
+            || child.retired
+            || !child.graph_retired
+            || !child.retirement_attached
+            || child
+                .retirement_work
+                .as_ref()
+                .is_none_or(|original| !original.same_custody(&work))
+            || child
+                .task
+                .as_ref()
+                .is_none_or(|original| original.as_ptr() != task_use.as_ptr())
+            || child
+                .prepared
+                .as_ref()
+                .or(child.original_prepared.as_ref())
+                .is_none_or(|original| original.as_ptr() != prepared.as_ptr())
+            || child
+                .producer_step_roster
+                .as_ref()
+                .map_or(!steps.is_empty(), |roster| {
+                    let original = roster.bind(py);
+                    steps.len() != original.len()
+                        || steps.iter().zip(original.iter()).any(|(actual, original)| {
+                            !actual.is_exact_instance_of::<PySemanticPreparedStep>()
+                                || actual.as_ptr() != original.as_ptr()
+                        })
+                })
+        {
+            return Err(invalid(
+                "actor retirement requires its exact retained child inside the original callback",
+            ));
+        }
+        match child.completion.as_ref() {
+            Some(ActorRefreshCompletion::Observed { .. }) => Ok("observed"),
+            Some(ActorRefreshCompletion::Cancelled { .. }) => Ok("cancelled"),
+            Some(ActorRefreshCompletion::InitializerRefused { .. }) => Ok("initializer_refused"),
+            None => Err(invalid(
+                "actor retirement has no original cached native disposition",
+            )),
+        }
+    }
+
     #[pyo3(signature = (template_task_use, bank, child_step))]
     fn require_current_target_basis(
         &self,
@@ -2169,20 +2256,21 @@ impl PySemanticPreparedActorRefresh {
                 .prepared_stream(&steps[0].borrow(py).inner)
                 .map_err(xlog_err)?;
             let kwargs = PyDict::new(py);
-            kwargs.set_item(
-                "steps",
-                PyTuple::new(py, steps.iter().map(|step| step.clone_ref(py)))?,
-            )?;
+            let step_roster = PyTuple::new(py, steps.iter().map(|step| step.clone_ref(py)))?;
+            kwargs.set_item("steps", &step_roster)?;
             kwargs.set_item("consumer_stream", stream.cu_stream() as u64)?;
             kwargs.set_item("memory_scope", memory.clone_ref(py))?;
             self.inner.children()?[bank].preparation_entered = true;
+            let prepare = recording_callback(
+                || self.inner.check_child(py, bank),
+                || producer.bind(py).getattr("prepare_segment"),
+            )?;
             let prepared = recording_callback(
                 || self.inner.check_child(py, bank),
                 || {
-                    producer
-                        .bind(py)
-                        .getattr("prepare_segment")?
-                        .call((task_use.clone_ref(py),), Some(&kwargs))
+                    self.inner.children()?[bank].producer_step_roster =
+                        Some(step_roster.clone().unbind());
+                    prepare.call((task_use.clone_ref(py),), Some(&kwargs))
                 },
             )?;
             if prepared.as_ptr() != original_prepared.as_ptr()

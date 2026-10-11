@@ -155,6 +155,15 @@ class SemanticPreparedActorRefresh:
     """
     def source_task(self, *, refresh_snapshot: Any) -> tuple[Any, ...]: ...
     def prepare_bank(self, bank: int, task_use: SemanticTransitionTaskUse, producer: Any) -> Any: ...
+    def retirement_observation(
+        self, bank: int, task_use: SemanticTransitionTaskUse,
+        prepared: Any, steps: tuple[SemanticPreparedStep, ...],
+    ) -> Literal["observed", "cancelled", "initializer_refused"]:
+        """Cached native disposition only inside the original finish_segment.
+
+        Exact original child owners are required; no outcomes or work are issued.
+        """
+        ...
     def require_current_target_basis(
         self, template_task_use: SemanticTransitionTaskUse,
         bank: int, child_step: SemanticPreparedStep,
