@@ -17945,7 +17945,8 @@ impl PySemanticTransitionTaskUse {
                 if bank.is_some() {
                     return Err(invalid("acquired policy layouts require bank=None"));
                 }
-                owner.policy_numerical_domain_layouts(&*parent.lease()?)
+                let layouts = owner.policy_numerical_domain_layouts(&*parent.lease()?);
+                layouts
             }
         }
         .map_err(xlog_err)?;
@@ -23869,7 +23870,7 @@ impl PySemanticTransitionController {
                                 };
                                 return Err(prepared_segment_pending(py, error));
                             }
-                        }
+                        };
                     }
                     issued.state()?.phase = TaskUsePhase::CancelledPrivate {
                         scope: Arc::clone(&original.scope),

@@ -1313,7 +1313,7 @@ impl ActorRefreshCustody {
                 let update = self.update.borrow(py);
                 let target = update.session.borrow(py);
                 let child = session.borrow(py);
-                target
+                let result = target
                     .owner()?
                     .record_prepared_actor_refresh(
                         &update.inner,
@@ -1321,7 +1321,8 @@ impl ActorRefreshCustody {
                         &mut *child.owner()?,
                         &self.proof,
                     )
-                    .map_err(xlog_err)
+                    .map_err(xlog_err);
+                result
             })();
             if let Err(error) = &result {
                 *capture_error.borrow_mut() = Some(error.clone_ref(py));
