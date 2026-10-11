@@ -2321,6 +2321,7 @@ impl PySemanticLearningPhaseTransition {
         py: Python<'_>,
         session: &PySemanticTransitionSession,
         parent: &Py<PySemanticPublishedParent>,
+        planning: bool,
     ) -> PyResult<Option<Py<PyTuple>>> {
         if !self.phase_evaluation_active.load(Ordering::Acquire) {
             return Ok(None);
@@ -2344,15 +2345,21 @@ impl PySemanticLearningPhaseTransition {
         }
         Self::require_evaluation_entry(py, current)?;
         if !current.ready
-            || !(current.evaluation_admitted
-                || (current.completed_segment.is_some() || current.cancelled_segment.is_some())
-                    && current.refusal.is_some()
-                    && matches!(
-                        current.cold_stage,
-                        EvaluationColdStage::TerminalPrivateCheckpoint
-                            | EvaluationColdStage::TerminalExecutionCleanup
-                            | EvaluationColdStage::TerminalPrivateRetirement
-                    ))
+            || planning
+                && (!current.started
+                    || !current.callback_entered
+                    || current.callback_error.is_some()
+                    || current.cold_stage != EvaluationColdStage::Preparation)
+            || !planning
+                && !(current.evaluation_admitted
+                    || (current.completed_segment.is_some() || current.cancelled_segment.is_some())
+                        && current.refusal.is_some()
+                        && matches!(
+                            current.cold_stage,
+                            EvaluationColdStage::TerminalPrivateCheckpoint
+                                | EvaluationColdStage::TerminalExecutionCleanup
+                                | EvaluationColdStage::TerminalPrivateRetirement
+                        ))
             || current.callback_result.is_some()
             || parent.as_ptr() != current.owners()?.parent.as_ptr()
             || !std::ptr::eq(
@@ -2527,6 +2534,7 @@ impl PySemanticLearningPhaseTransition {
         py: Python<'_>,
         session: &PySemanticTransitionSession,
         parent: &Py<PySemanticPublishedParent>,
+        planning: bool,
     ) -> PyResult<()> {
         if !std::ptr::eq(session, &*self.source.borrow(py))
             || parent.as_ptr() != self.parent.as_ptr()
@@ -2573,7 +2581,12 @@ impl PySemanticLearningPhaseTransition {
             Self::require_evaluation_entry(py, current)?;
             if current.branch != "source"
                 || !current.ready
-                || !current.evaluation_admitted
+                || !planning && !current.evaluation_admitted
+                || planning
+                    && (!current.started
+                        || !current.callback_entered
+                        || current.callback_error.is_some()
+                        || current.cold_stage != EvaluationColdStage::Preparation)
                 || current.callback_result.is_some()
             {
                 return Err(invalid(

@@ -544,6 +544,16 @@ _PolicyOutputLayout = tuple[
 class SemanticTransitionTaskUse:
     """Native-issued task; no public constructor."""
 
+    def learning_feedback_intervention(
+        self, parent: Union[SemanticPublishedParent, SemanticPreparedStep],
+    ) -> Optional[tuple[bytes, bool]]:
+        """Original phase planning metadata, without a numerical model witness.
+
+        Private evaluation requires its genuine entered Preparation callback;
+        metadata does not grant admission, bind, capture or verify authority.
+        """
+        ...
+
     def cold_model_work_report_layouts(self) -> tuple[
         tuple[SemanticColdModelWork, _NativeWorkBufferLayout, int], ...,
     ]:
