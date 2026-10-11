@@ -1005,13 +1005,13 @@ impl PySemanticLearningPhaseTransition {
                     .map_err(xlog_err)?;
                 let work = Py::new(
                     py,
-                    PySemanticColdModelWork {
-                        parent: self.parent.clone_ref(py),
-                        reader: self.parent.clone_ref(py),
+                    PySemanticColdModelWork::new(
+                        Some(self.parent.clone_ref(py)),
+                        self.parent.clone_ref(py),
                         inner,
-                        region: None,
-                        active: AtomicBool::new(false),
-                    },
+                        None,
+                        false,
+                    ),
                 )?;
                 self.source_preparation()?
                     .as_mut()
@@ -1038,7 +1038,9 @@ impl PySemanticLearningPhaseTransition {
                 let result = snapshot_model_state.call0();
                 #[cfg(feature = "semantic-policy")]
                 if result.is_err() {
-                    source.owner()?.fail_cold_model_work(&work.inner);
+                    source
+                        .owner()?
+                        .fail_cold_model_work(&work.custody(py)?.inner);
                 }
                 let result = result?;
                 self.source_preparation()?
@@ -1090,7 +1092,7 @@ impl PySemanticLearningPhaseTransition {
                 owner
                     .finish_cold_model_work(
                         &lease,
-                        &work.inner,
+                        &work.custody(py)?.inner,
                         &streams,
                         xlog_cuda::SemanticColdModelWorkDisposition::Complete,
                     )

@@ -58,6 +58,77 @@ pub(super) struct DeliveryExpense {
 }
 
 impl PySemanticLearningPhaseTransition {
+    pub(super) fn require_delivery_cold_callback(
+        &self,
+        py: Python<'_>,
+        work: &PySemanticColdModelWork,
+    ) -> PyResult<bool> {
+        let retained = self.delivery_expense()?;
+        let Some(current) = retained.as_ref() else {
+            return Ok(false);
+        };
+        let Some(index) = current
+            .regions
+            .iter()
+            .position(|region| std::ptr::eq(&*region.borrow(py), work))
+        else {
+            return Ok(false);
+        };
+        let call = &current.calls[index];
+        let custody = work.custody(py)?;
+        let expected = if current.refusal.as_ref().is_some_and(|tail| tail.handed_off)
+            && (index == 8 || index % 2 == 1)
+            || index % 2 == 1
+        {
+            &current
+                .owners
+                .as_ref()
+                .ok_or_else(|| invalid("delivery callback lost its original private owners"))?
+                .parent
+        } else {
+            &self.parent
+        };
+        if !current.ready
+            || current.work_closed
+            || current.source_retired
+            || !call.entered
+            || call.result.is_some()
+            || call.error.is_some()
+            || custody.parent()?.as_ptr() != expected.as_ptr()
+            || custody.reader.as_ptr() != current.reader.as_ptr()
+        {
+            return Err(invalid(
+                "delivery cold callback changed its actual original region or owners",
+            ));
+        }
+        Ok(true)
+    }
+
+    pub(super) fn delivery_cold_report_regions(
+        &self,
+        py: Python<'_>,
+        work: &PySemanticColdModelWork,
+    ) -> PyResult<Option<Vec<Py<PySemanticColdModelWork>>>> {
+        let retained = self.delivery_expense()?;
+        let Some(current) = retained.as_ref() else {
+            return Ok(None);
+        };
+        if !current
+            .regions
+            .iter()
+            .any(|region| std::ptr::eq(&*region.borrow(py), work))
+        {
+            return Ok(None);
+        }
+        Ok(Some(
+            current
+                .regions
+                .iter()
+                .map(|region| region.clone_ref(py))
+                .collect(),
+        ))
+    }
+
     pub(super) fn terminal_refusal_retained(&self) -> PyResult<bool> {
         Ok(self.readonly_terminal_refusal_retained()?
             || self
@@ -80,7 +151,7 @@ impl PySemanticLearningPhaseTransition {
             || tail.retired
             || !current.calls[8].entered
             || !std::ptr::eq(&*current.regions[8].borrow(py), work)
-            || current.reader.as_ptr() != work.reader.as_ptr()
+            || current.reader.as_ptr() != work.custody(py)?.reader.as_ptr()
         {
             return Err(invalid(
                 "terminal private retirement changed its original admitted region",
@@ -507,34 +578,40 @@ impl PySemanticLearningPhaseTransition {
                         .expect("original region states"),
                 )
             };
-            let mut original = Vec::with_capacity(regions.len());
-            for (index, region) in regions.into_iter().enumerate() {
-                original.push(Py::new(
-                    py,
-                    PySemanticColdModelWork {
-                        parent: if index == 8 || index % 2 == 1 {
-                            parent.clone_ref(py)
-                        } else {
-                            self.parent.clone_ref(py)
-                        },
-                        reader: self.parent.clone_ref(py),
-                        inner: work.clone(),
-                        region: Some(region),
-                        active: AtomicBool::new(false),
-                    },
-                )?);
-            }
-            let replaced = {
-                let mut retained = self.delivery_expense()?;
-                let current = retained.as_mut().expect("original delivery");
-                current
-                    .refusal
-                    .as_mut()
-                    .expect("original refusal")
-                    .transferred_regions = None;
-                std::mem::replace(&mut current.regions, original)
+            let original = {
+                let retained = self.delivery_expense()?;
+                retained
+                    .as_ref()
+                    .expect("original delivery")
+                    .regions
+                    .iter()
+                    .map(|region| region.clone_ref(py))
+                    .collect::<Vec<_>>()
             };
-            drop(replaced);
+            if original.len() != regions.len() {
+                return Err(invalid("report handoff changed its original region roster"));
+            }
+            for (index, (original, region)) in original.iter().zip(regions).enumerate() {
+                let callback_parent = if index == 8 || index % 2 == 1 {
+                    parent.clone_ref(py)
+                } else {
+                    self.parent.clone_ref(py)
+                };
+                original.borrow(py).handoff_custody(
+                    py,
+                    callback_parent,
+                    self.parent.clone_ref(py),
+                    work.clone(),
+                    Some(region),
+                )?;
+            }
+            self.delivery_expense()?
+                .as_mut()
+                .expect("original delivery")
+                .refusal
+                .as_mut()
+                .expect("original refusal")
+                .transferred_regions = None;
         }
         Ok(())
     }
@@ -1084,17 +1161,17 @@ impl PySemanticLearningPhaseTransition {
             for (index, region) in native_regions.into_iter().enumerate() {
                 let original = Py::new(
                     py,
-                    PySemanticColdModelWork {
-                        parent: if index % 2 == 0 {
+                    PySemanticColdModelWork::new(
+                        Some(if index % 2 == 0 {
                             self.parent.clone_ref(py)
                         } else {
                             selected.parent.clone_ref(py)
-                        },
-                        reader: selected.parent.clone_ref(py),
-                        inner: work.clone(),
-                        region: Some(region),
-                        active: AtomicBool::new(false),
-                    },
+                        }),
+                        selected.parent.clone_ref(py),
+                        work.clone(),
+                        Some(region),
+                        false,
+                    ),
                 )?;
                 self.delivery_expense()?
                     .as_mut()
@@ -1150,7 +1227,8 @@ impl PySemanticLearningPhaseTransition {
             result
         } else {
             let source_call = index % 2 == 0;
-            let parent = region.borrow(py).parent.clone_ref(py);
+            let region_custody = region.borrow(py).custody(py)?;
+            let parent = region_custody.parent()?.clone_ref(py);
             let published = parent.borrow(py);
             let session = published.session.borrow(py);
             let task = published.task_use.borrow(py);
@@ -1218,9 +1296,9 @@ impl PySemanticLearningPhaseTransition {
                 }
             }
         };
-        let reader = region.borrow(py).reader.clone_ref(py);
-        let original = region
-            .borrow(py)
+        let region_custody = region.borrow(py).custody(py)?;
+        let reader = region_custody.reader.clone_ref(py);
+        let original = region_custody
             .region
             .clone()
             .expect("original delivery region");

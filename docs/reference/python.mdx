@@ -1942,6 +1942,44 @@ counts are nondecreasing and the final count equals the complete operation count
 A report without regions uses the default empty tuple. Region boundaries belong
 to the same admitted plan; entering or closing a region cannot replace them.
 
+During that genuine callback, `task_use.cold_model_work_report_layouts()` returns
+an immutable tuple of `(original_work, buffer_layout, consumer_stream)` rows for
+every original region, in native order. An unsegmented callback has one row.
+Delivery has nine original handles, ordinary source/private evaluation has
+five/seven, and intermediate restoration has four. All rows name the same
+authentic scratch allocation, offset, span, UInt64 layout and stream. Future
+handles already retain their identity but have no callback rights; a genuinely
+restored parent is attached only by the original native phase transition.
+Terminal report handoff updates those same handles through native invocation,
+admission and region authentication, without replacing them. This projection
+does not begin a recorder, export a tensor, admit a plan or enqueue work.
+At lazy private adoption, issue the original callback through the existing
+`active_cold_model_work()` boundary before reading this roster. The metadata
+getter reads already-issued work and never releases children, finishes the prior
+report, adopts an instruction or allocates the next report.
+
+`original_work.report_cursor()` returns
+`(region_begin, region_end, declared_cursor, recorded_slots,
+skipped_declared_spans, skipped_region_ordinals, recording_closed,
+report_completed)`. Declaration and physical-slot cursors differ only by
+native-proven skips. Whole NotEntered regions, including empty ones, appear in
+`skipped_region_ordinals`; visited cancelled-evaluation cleanup remains Closed
+and exposes only its genuinely skipped CopyBytes spans. Pending, Unknown,
+failed or stopped live work cannot authorize continuation. Outside its callback,
+the live projection requires known native recording closure. Recording closure
+does not certify report completion. The original native result finalizer retains
+immutable final cursor proof in those same handles, readable on the creator
+thread after Session release without reacquiring a parent. A genuine completed
+refusal may retain a partial declared prefix; neither that proof nor an empty
+region fabricates an unused-tail skip or successful whole-plan completion.
+Keep the single actual scratch Tensor through all entered report recorders.
+After the last successfully completed original recorder, drop its last actual
+Tensor alias before native report finish or reader/Session release; those
+existing joins require no outstanding scratch aliases. Retain the plan and
+original handles independently for final cursor verification after native finish.
+An Unknown recorder keeps its scratch and owners and cannot take this release
+boundary.
+
 For a source or private evaluation, supply `evaluation_content=(output, objective)`
 in that same sole admission. The immutable rosters contain the actual three output
 and eight objective tensor inputs. Each uses the existing five-field form

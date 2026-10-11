@@ -133,8 +133,8 @@ pub use semantic_transition::{
 #[cfg(feature = "semantic-policy")]
 pub use semantic_transition::{
     SemanticColdModelWork, SemanticColdModelWorkDisposition, SemanticColdModelWorkOperation,
-    SemanticColdModelWorkPurpose, SemanticColdModelWorkRegion, SemanticColdModelWorkResult,
-    SemanticColdNativeWork,
+    SemanticColdModelWorkPurpose, SemanticColdModelWorkRegion, SemanticColdModelWorkReportCursor,
+    SemanticColdModelWorkResult, SemanticColdNativeWork,
 };
 pub use semantic_work::ModelWorkKind;
 

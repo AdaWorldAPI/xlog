@@ -3961,13 +3961,13 @@ impl PySemanticSegmentInstructionAdmission {
                 .map_err(xlog_err)?;
             Py::new(
                 py,
-                learning_phase::cold_model_work::PySemanticColdModelWork {
-                    parent: self.inner.parent.clone_ref(py),
-                    reader: self.inner.parent.clone_ref(py),
+                learning_phase::cold_model_work::PySemanticColdModelWork::new(
+                    Some(self.inner.parent.clone_ref(py)),
+                    self.inner.parent.clone_ref(py),
                     inner,
-                    region: None,
-                    active: AtomicBool::new(false),
-                },
+                    None,
+                    false,
+                ),
             )?
         };
         {
@@ -4115,7 +4115,7 @@ fn require_admitted_cold_callback(
         .require_admitted_cold_model_work(
             &instruction.inner,
             &*instruction.parent.borrow(py).lease()?,
-            &work.inner,
+            &work.custody(py)?.inner,
         )
         .map_err(xlog_err)?;
     Ok(true)
@@ -4213,7 +4213,7 @@ fn prepared_cold_callback_step(
                     &instruction.inner,
                     &*instruction.parent.borrow(py).lease()?,
                     &step.inner,
-                    &work.inner,
+                    &work.custody(py)?.inner,
                 )
                 .map_err(xlog_err)?;
         } else {
@@ -4274,7 +4274,7 @@ fn admitted_retirement_cold_callback(
     }
     session
         .owner()?
-        .require_admitted_retirement_cold_model_work(&instruction.inner, &work.inner)
+        .require_admitted_retirement_cold_model_work(&instruction.inner, &work.custody(py)?.inner)
         .map_err(xlog_err)?;
     drop(state);
     Ok(Some(instruction))
@@ -13149,13 +13149,13 @@ impl PySemanticPreparedStep {
                     .map_err(xlog_err)?;
                 Py::new(
                     py,
-                    learning_phase::cold_model_work::PySemanticColdModelWork {
-                        parent: instruction.parent.clone_ref(py),
-                        reader: instruction.parent.clone_ref(py),
+                    learning_phase::cold_model_work::PySemanticColdModelWork::new(
+                        Some(instruction.parent.clone_ref(py)),
+                        instruction.parent.clone_ref(py),
                         inner,
-                        region: None,
-                        active: AtomicBool::new(false),
-                    },
+                        None,
+                        false,
+                    ),
                 )?
             };
             retained()?.work = Some(work.clone_ref(py));
@@ -13167,7 +13167,7 @@ impl PySemanticPreparedStep {
                             &instruction.inner,
                             &*instruction.parent.borrow(py).lease()?,
                             &step.inner,
-                            &work.borrow(py).inner,
+                            &work.borrow(py).custody(py)?.inner,
                         )
                         .map_err(xlog_err)?;
                 }
@@ -13211,7 +13211,7 @@ impl PySemanticPreparedStep {
                     &instruction.inner,
                     &*instruction.parent.borrow(py).lease()?,
                     &step.inner,
-                    &work.borrow(py).inner,
+                    &work.borrow(py).custody(py)?.inner,
                     &streams,
                 )
                 .map_err(xlog_err)?;
@@ -19734,13 +19734,13 @@ impl PySemanticTransitionController {
                 .map_err(xlog_err)?;
                 let work = Py::new(
                     py,
-                    learning_phase::cold_model_work::PySemanticColdModelWork {
-                        parent: instruction.parent.clone_ref(py),
-                        reader: instruction.parent.clone_ref(py),
+                    learning_phase::cold_model_work::PySemanticColdModelWork::new(
+                        Some(instruction.parent.clone_ref(py)),
+                        instruction.parent.clone_ref(py),
                         inner,
-                        region: None,
-                        active: AtomicBool::new(false),
-                    },
+                        None,
+                        false,
+                    ),
                 )?;
                 instruction.preparation()?.retirement_work = Some(work.clone_ref(py));
                 Some(work)
@@ -19754,7 +19754,7 @@ impl PySemanticTransitionController {
                 if original.retirement_custody.is_none() {
                     let custody = session
                         .owner()?
-                        .share_cold_native_work(&work.borrow(py).inner)
+                        .share_cold_native_work(&work.borrow(py).custody(py)?.inner)
                         .map_err(xlog_err)?;
                     original.retirement_custody = Some(custody);
                 }
@@ -19940,13 +19940,13 @@ impl PySemanticTransitionController {
                         .finish_cancelled_admitted_retirement_cold_model_work(
                             &instruction.inner,
                             proof,
-                            &work.borrow(py).inner,
+                            &work.borrow(py).custody(py)?.inner,
                             &streams,
                         )
                 } else {
                     session.owner()?.finish_admitted_retirement_cold_model_work(
                         &instruction.inner,
-                        &work.borrow(py).inner,
+                        &work.borrow(py).custody(py)?.inner,
                         &streams,
                     )
                 }
@@ -24322,7 +24322,8 @@ impl PySemanticTransitionController {
                     .map(|work| work.clone_ref(py))
                     .ok_or_else(|| invalid("shared preparation lost its original source work"))?;
                 let work = work.borrow(py);
-                let reader = work.reader.borrow(py);
+                let work_custody = work.custody(py)?;
+                let reader = work_custody.reader.borrow(py);
                 let source = reader.session.borrow(py);
                 let source = source.owner()?;
                 let report = session
@@ -24331,7 +24332,7 @@ impl PySemanticTransitionController {
                         &instruction.inner,
                         &*instruction.parent.borrow(py).lease()?,
                         &source,
-                        &work.inner,
+                        &work.custody(py)?.inner,
                     )
                     .map_err(xlog_err)?;
                 instruction.preparation()?.report = Some(report);
@@ -24349,7 +24350,7 @@ impl PySemanticTransitionController {
                     .finish_admitted_cold_model_work(
                         &instruction.inner,
                         &*instruction.parent.borrow(py).lease()?,
-                        &work.borrow(py).inner,
+                        &work.borrow(py).custody(py)?.inner,
                         streams,
                     )
                     .map_err(xlog_err)?;
@@ -24430,7 +24431,7 @@ impl PySemanticTransitionController {
                 &instruction.inner,
                 &*instruction.parent.borrow(py).lease()?,
                 proof,
-                &work.borrow(py).inner,
+                &work.borrow(py).custody(py)?.inner,
                 streams,
             )
             .map_err(xlog_err)?;

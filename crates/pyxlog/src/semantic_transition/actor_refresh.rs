@@ -665,13 +665,14 @@ impl ActorRefreshCustody {
                 invalid("actor final use requires the original outer retirement report")
             })?;
         let work = work.borrow(py);
-        let result = work
+        let work_custody = work.custody(py)?;
+        let result = work_custody
             .reader
             .borrow(py)
             .session
             .borrow(py)
             .owner()?
-            .share_cold_native_work(&work.inner)
+            .share_cold_native_work(&work.custody(py)?.inner)
             .map_err(xlog_err);
         result
     }
@@ -1459,6 +1460,7 @@ impl ActorRefreshCustody {
                 invalid("actor construction requires its original Update cold callback")
             })?;
         let work = work.borrow(py);
+        let work_custody = work.custody(py)?;
         require_actor_refresh_cold_callback(py, &session, &update, &work)?;
         let mut children = self.children()?;
         if children[bank].construction_entered {
@@ -1466,13 +1468,13 @@ impl ActorRefreshCustody {
                 "retain the original actor child constructor without repeating it",
             ));
         }
-        let cold_work = work
+        let cold_work = work_custody
             .reader
             .borrow(py)
             .session
             .borrow(py)
             .owner()?
-            .share_cold_native_work(&work.inner)
+            .share_cold_native_work(&work.custody(py)?.inner)
             .map_err(xlog_err)?;
         let owner = session.owner()?;
         let (provider, domain) = owner.checkpoint_allocation_domain().map_err(xlog_err)?;

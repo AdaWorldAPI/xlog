@@ -211,6 +211,29 @@ impl Drop for EvaluationColdVisibility<'_> {
 }
 
 impl PySemanticLearningPhaseTransition {
+    pub(super) fn evaluation_cold_report_regions(
+        &self,
+        py: Python<'_>,
+        work: &PySemanticColdModelWork,
+    ) -> PyResult<Option<Vec<Py<PySemanticColdModelWork>>>> {
+        let retained = self.phase_evaluations()?;
+        let Some(current) = retained.iter().find(|current| {
+            current
+                .regions
+                .iter()
+                .any(|region| std::ptr::eq(&*region.borrow(py), work))
+        }) else {
+            return Ok(None);
+        };
+        Ok(Some(
+            current
+                .regions
+                .iter()
+                .map(|region| region.clone_ref(py))
+                .collect(),
+        ))
+    }
+
     pub(super) fn cancelled_segment_terminal_matches(
         &self,
         branch: &str,
@@ -422,17 +445,17 @@ impl PySemanticLearningPhaseTransition {
         for (index, region) in regions.into_iter().enumerate() {
             let region = Py::new(
                 py,
-                PySemanticColdModelWork {
-                    parent: if index == 3 {
+                PySemanticColdModelWork::new(
+                    Some(if index == 3 {
                         self.parent.clone_ref(py)
                     } else {
                         parent.clone_ref(py)
-                    },
-                    reader: self.parent.clone_ref(py),
-                    inner: work.clone(),
-                    region: Some(region),
-                    active: AtomicBool::new(false),
-                },
+                    }),
+                    self.parent.clone_ref(py),
+                    work.clone(),
+                    Some(region),
+                    false,
+                ),
             )?;
             self.phase_evaluations()?
                 .last_mut()
@@ -541,7 +564,11 @@ impl PySemanticLearningPhaseTransition {
             .borrow(py)
             .owner()?
             .require_closed_cold_model_work_region(
-                region.region.as_ref().expect("original cleanup region"),
+                region
+                    .custody(py)?
+                    .region
+                    .as_ref()
+                    .expect("original cleanup region"),
             )
             .map_err(xlog_err)?;
         let cause = if branch == "source" {
@@ -960,7 +987,8 @@ impl PySemanticLearningPhaseTransition {
             }
             // The full retirement registrar remains held until known Session release.
             let region = current.regions[current.private_retirement_region()].clone_ref(py);
-            let parent = region.borrow(py).parent.clone_ref(py);
+            let region_custody = region.borrow(py).custody(py)?;
+            let parent = region_custody.parent()?.clone_ref(py);
             let task = parent.borrow(py).task_use.clone_ref(py);
             let session = parent.borrow(py).session.clone_ref(py);
             let state = (
@@ -1061,12 +1089,13 @@ impl PySemanticLearningPhaseTransition {
                     if result.is_err() {
                         // Keep uncertain work/storage owners, not an entered
                         // Python context. Visibility is still active here.
-                        work.reader
+                        work.custody(py)?
+                            .reader
                             .borrow(py)
                             .session
                             .borrow(py)
                             .owner()?
-                            .fail_cold_model_work(&work.inner);
+                            .fail_cold_model_work(&work.custody(py)?.inner);
                     }
                     result?;
                 } else {
@@ -1230,7 +1259,8 @@ impl PySemanticLearningPhaseTransition {
                 current.regions[current.execution_cleanup_region()].clone_ref(py),
             )
         };
-        let parent = region.borrow(py).parent.clone_ref(py);
+        let region_custody = region.borrow(py).custody(py)?;
+        let parent = region_custody.parent()?.clone_ref(py);
         let session_owner = parent.borrow(py).session.clone_ref(py);
         let session = session_owner.borrow(py);
         session.require_creator()?;
@@ -2150,7 +2180,11 @@ impl PySemanticLearningPhaseTransition {
                 .borrow(py)
                 .owner()?
                 .require_closed_cold_model_work_region(
-                    region.region.as_ref().expect("original evaluation region"),
+                    region
+                        .custody(py)?
+                        .region
+                        .as_ref()
+                        .expect("original evaluation region"),
                 )
                 .map_err(xlog_err)?;
         }
@@ -2214,11 +2248,11 @@ impl PySemanticLearningPhaseTransition {
                 .get(index)
                 .is_none_or(|original| !std::ptr::eq(&*original.borrow(py), work))
             || if terminal_source {
-                self.parent.as_ptr() != work.parent.as_ptr()
+                self.parent.as_ptr() != work.custody(py)?.parent()?.as_ptr()
             } else {
-                current.owners()?.parent.as_ptr() != work.parent.as_ptr()
+                current.owners()?.parent.as_ptr() != work.custody(py)?.parent()?.as_ptr()
             }
-            || self.parent.as_ptr() != work.reader.as_ptr()
+            || self.parent.as_ptr() != work.custody(py)?.reader.as_ptr()
         {
             return Err(invalid(
                 "evaluation cold callback changed its actual region, TaskUse or parent",
@@ -2908,17 +2942,17 @@ impl PySemanticLearningPhaseTransition {
             for (index, region) in regions.into_iter().enumerate() {
                 let original = Py::new(
                     py,
-                    PySemanticColdModelWork {
-                        parent: if branch != "source" && index == 6 {
+                    PySemanticColdModelWork::new(
+                        Some(if branch != "source" && index == 6 {
                             self.parent.clone_ref(py)
                         } else {
                             parent_owner.clone_ref(py)
-                        },
-                        reader: self.parent.clone_ref(py),
-                        inner: work.clone(),
-                        region: Some(region),
-                        active: AtomicBool::new(false),
-                    },
+                        }),
+                        self.parent.clone_ref(py),
+                        work.clone(),
+                        Some(region),
+                        false,
+                    ),
                 )?;
                 self.phase_evaluations()?
                     .last_mut()

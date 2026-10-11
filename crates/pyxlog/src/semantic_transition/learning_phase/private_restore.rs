@@ -326,17 +326,17 @@ impl PySemanticLearningPhaseTransition {
         }
         let work = Py::new(
             py,
-            PySemanticColdModelWork {
-                parent: parent.clone_ref(py),
-                reader: self.parent.clone_ref(py),
-                inner: operation
+            PySemanticColdModelWork::new(
+                Some(parent.clone_ref(py)),
+                self.parent.clone_ref(py),
+                operation
                     .work
                     .as_ref()
                     .expect("retained original work")
                     .clone(),
-                region: None,
-                active: AtomicBool::new(false),
-            },
+                None,
+                false,
+            ),
         )?;
         operation.callback_work = Some(work.clone_ref(py));
         Ok(work)

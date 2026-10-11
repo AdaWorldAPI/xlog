@@ -453,13 +453,13 @@ impl PySemanticLearningPhaseTransition {
                 .work = Some(work.clone());
             let callback_work = Py::new(
                 py,
-                PySemanticColdModelWork {
-                    parent: parent.clone_ref(py),
-                    reader: self.parent.clone_ref(py),
-                    inner: work.clone(),
-                    region: None,
-                    active: AtomicBool::new(false),
-                },
+                PySemanticColdModelWork::new(
+                    Some(parent.clone_ref(py)),
+                    self.parent.clone_ref(py),
+                    work.clone(),
+                    None,
+                    false,
+                ),
             )?;
             self.private_checkpoints()?
                 .last_mut()

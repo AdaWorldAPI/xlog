@@ -238,13 +238,13 @@ impl PySemanticLearningPhaseTransition {
                 .work = Some(work.clone());
             let callback_work = Py::new(
                 py,
-                PySemanticColdModelWork {
-                    parent: parent.clone_ref(py),
-                    reader: self.parent.clone_ref(py),
-                    inner: work.clone(),
-                    region: None,
-                    active: AtomicBool::new(false),
-                },
+                PySemanticColdModelWork::new(
+                    Some(parent.clone_ref(py)),
+                    self.parent.clone_ref(py),
+                    work.clone(),
+                    None,
+                    false,
+                ),
             )?;
             self.control_retirement()?
                 .as_mut()
@@ -519,7 +519,7 @@ impl PySemanticLearningPhaseTransition {
         self.source
             .borrow(py)
             .owner()?
-            .require_closed_cold_model_work(&work.borrow(py).inner)
+            .require_closed_cold_model_work(&work.borrow(py).custody(py)?.inner)
             .map_err(xlog_err)?;
         let session = parent.borrow(py).session.clone_ref(py);
         let (released, entered, custody) = {

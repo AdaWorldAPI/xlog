@@ -39,8 +39,8 @@ mod verification_receipts;
 #[cfg(feature = "semantic-policy")]
 pub use cold_model_work::{
     SemanticColdModelWork, SemanticColdModelWorkDisposition, SemanticColdModelWorkOperation,
-    SemanticColdModelWorkPurpose, SemanticColdModelWorkRegion, SemanticColdModelWorkResult,
-    SemanticColdNativeWork,
+    SemanticColdModelWorkPurpose, SemanticColdModelWorkRegion, SemanticColdModelWorkReportCursor,
+    SemanticColdModelWorkResult, SemanticColdNativeWork,
 };
 pub use learning_phase::{
     SemanticLearningCopyReset, SemanticLearningPhase, SemanticLearningPhaseRecord,

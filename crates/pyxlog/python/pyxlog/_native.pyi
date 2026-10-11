@@ -342,7 +342,19 @@ class SemanticPrivateReplayChild:
     ) -> tuple[bytes, tuple[Any, ...], tuple[Any, ...]]: ...
 
 class SemanticColdModelWork:
-    """Original native cold registrar, available only in its admitted callback."""
+    """Original registrar; numerical rights remain callback-scoped."""
+
+    def report_cursor(self) -> tuple[
+        int, int, int, int, tuple[tuple[int, int], ...], tuple[int, ...], bool, bool,
+    ]:
+        """Native region bounds, declared cursor, physical slots, proven skips,
+        skipped region ordinals, recording closure and actual report completion.
+
+        Pending, Unknown and stopped live work cannot authorize continuation.
+        The same original handle retains final native proof after Session release;
+        a completed refusal may retain a partial declared prefix.
+        """
+        ...
 
     @property
     def plan_admitted(self) -> bool: ...
@@ -531,6 +543,18 @@ _PolicyOutputLayout = tuple[
 
 class SemanticTransitionTaskUse:
     """Native-issued task; no public constructor."""
+
+    def cold_model_work_report_layouts(self) -> tuple[
+        tuple[SemanticColdModelWork, _NativeWorkBufferLayout, int], ...,
+    ]:
+        """Complete original region roster, identical scratch layout and stream.
+
+        Metadata only during the genuine callback. Future region handles retain
+        identity without activation, buffer export or a fabricated parent.
+        Lazy adoption must already have issued its original callback through
+        active_cold_model_work; this getter never advances that transition.
+        """
+        ...
 
     @property
     def original_program(self) -> Optional[bytes]:

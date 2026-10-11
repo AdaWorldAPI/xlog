@@ -57,6 +57,103 @@ pub(super) struct IntermediateRestore {
 }
 
 impl PySemanticLearningPhaseTransition {
+    pub(super) fn require_intermediate_cold_callback(
+        &self,
+        py: Python<'_>,
+        work: &PySemanticColdModelWork,
+    ) -> PyResult<bool> {
+        let retained = self.intermediate()?;
+        let Some(current) = retained.as_ref() else {
+            return Ok(false);
+        };
+        let Some(index) = current.callbacks.iter().position(|original| {
+            original
+                .as_ref()
+                .is_some_and(|original| std::ptr::eq(&*original.borrow(py), work))
+        }) else {
+            return Ok(false);
+        };
+        let custody = work.custody(py)?;
+        let bound = custody.parent()?;
+        let expected =
+            match index {
+                0 => {
+                    current
+                        .owners
+                        .as_ref()
+                        .is_some_and(|owners| owners.parent.as_ptr() == bound.as_ptr())
+                        && current.snapshots[0].entered
+                        && current.snapshots[0].saved.is_none()
+                        && current.snapshots[0].error.is_none()
+                }
+                1 => {
+                    current.retiring_parent.as_ptr() == bound.as_ptr()
+                        && current.retirement_entered
+                        && !current.retirement_completed
+                }
+                2 => {
+                    current.restore_entered
+                        && current.restored.is_none()
+                        && self
+                            .private_restore()?
+                            .as_ref()
+                            .and_then(|owners| owners.parent.as_ref())
+                            .is_some_and(|parent| parent.as_ptr() == bound.as_ptr())
+                }
+                3 => {
+                    current.restored.as_ref().is_some_and(|restored| {
+                        restored.borrow(py).parent.as_ptr() == bound.as_ptr()
+                    }) && current.snapshots[1].entered
+                        && current.snapshots[1].saved.is_none()
+                        && current.snapshots[1].error.is_none()
+                }
+                _ => false,
+            };
+        if !current.ready
+            || current.closed
+            || current.error.is_some()
+            || !expected
+            || custody.reader.as_ptr() != self.parent.as_ptr()
+        {
+            return Err(invalid(
+                "intermediate cold callback changed its actual original region or owners",
+            ));
+        }
+        Ok(true)
+    }
+
+    pub(super) fn intermediate_cold_report_regions(
+        &self,
+        py: Python<'_>,
+        work: &PySemanticColdModelWork,
+    ) -> PyResult<Option<Vec<Py<PySemanticColdModelWork>>>> {
+        let retained = self.intermediate()?;
+        let Some(current) = retained.as_ref() else {
+            return Ok(None);
+        };
+        if !current
+            .callbacks
+            .iter()
+            .flatten()
+            .any(|region| std::ptr::eq(&*region.borrow(py), work))
+        {
+            return Ok(None);
+        }
+        current
+            .callbacks
+            .iter()
+            .map(|region| {
+                region
+                    .as_ref()
+                    .map(|region| region.clone_ref(py))
+                    .ok_or_else(|| {
+                        invalid("intermediate report lost its original complete registrar roster")
+                    })
+            })
+            .collect::<PyResult<Vec<_>>>()
+            .map(Some)
+    }
+
     fn intermediate(&self) -> PyResult<MutexGuard<'_, Option<IntermediateRestore>>> {
         self.intermediate_restore
             .lock()
@@ -355,29 +452,18 @@ impl PySemanticLearningPhaseTransition {
         index: usize,
         parent: &Py<PySemanticPublishedParent>,
     ) -> PyResult<Py<PySemanticColdModelWork>> {
-        let mut retained = self.intermediate()?;
-        let current = retained.as_mut().expect("original intermediate restore");
-        if let Some(original) = &current.callbacks[index] {
-            if original.borrow(py).parent.as_ptr() != parent.as_ptr() {
-                return Err(invalid("intermediate callback changed its original parent"));
-            }
-            return Ok(original.clone_ref(py));
-        }
-        let original = Py::new(
-            py,
-            PySemanticColdModelWork {
-                parent: parent.clone_ref(py),
-                reader: self.parent.clone_ref(py),
-                inner: current
-                    .work
-                    .as_ref()
-                    .expect("original restore report")
-                    .clone(),
-                region: Some(current.regions[index].clone()),
-                active: AtomicBool::new(false),
-            },
-        )?;
-        current.callbacks[index] = Some(original.clone_ref(py));
+        let original = self
+            .intermediate()?
+            .as_ref()
+            .expect("original intermediate restore")
+            .callbacks
+            .get(index)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| {
+                invalid("intermediate callback lost its original preallocated registrar")
+            })?
+            .clone_ref(py);
+        original.borrow(py).bind_callback_parent(py, parent)?;
         Ok(original)
     }
 
@@ -397,13 +483,15 @@ impl PySemanticLearningPhaseTransition {
             ));
         }
         drop(construction);
-        if self
+        let original = self
             .intermediate()?
             .as_ref()
             .expect("original intermediate restore")
             .callbacks[2]
-            .is_some()
-        {
+            .as_ref()
+            .expect("original factory registrar")
+            .clone_ref(py);
+        if original.borrow(py).custody(py)?.parent.is_some() {
             return Err(invalid(
                 "intermediate factory cannot replace its original registrar",
             ));
@@ -416,11 +504,16 @@ impl PySemanticLearningPhaseTransition {
         py: Python<'_>,
     ) -> PyResult<Option<(&'static str, Py<PySemanticColdModelWork>)>> {
         let retained = self.intermediate()?;
-        Ok(retained.as_ref().and_then(|current| {
-            current.callbacks[2]
-                .as_ref()
-                .map(|work| (current.branch, work.clone_ref(py)))
-        }))
+        let Some(current) = retained.as_ref() else {
+            return Ok(None);
+        };
+        let Some(work) = current.callbacks[2].as_ref() else {
+            return Ok(None);
+        };
+        if work.borrow(py).custody(py)?.parent.is_none() {
+            return Ok(None);
+        }
+        Ok(Some((current.branch, work.clone_ref(py))))
     }
 
     pub(super) fn require_intermediate_snapshot_save(
@@ -853,10 +946,29 @@ impl PySemanticLearningPhaseTransition {
                 .owner()?
                 .prepare_cold_model_work_regions(&work, 4)
                 .map_err(xlog_err)?;
-            self.intermediate()?
-                .as_mut()
-                .expect("original intermediate restore")
-                .regions = regions;
+            let mut callbacks = [None, None, None, None];
+            for (index, region) in regions.iter().enumerate() {
+                callbacks[index] = Some(Py::new(
+                    py,
+                    PySemanticColdModelWork::new(
+                        if index < 2 {
+                            Some(parent.clone_ref(py))
+                        } else {
+                            None
+                        },
+                        self.parent.clone_ref(py),
+                        work.clone(),
+                        Some(region.clone()),
+                        false,
+                    ),
+                )?);
+            }
+            {
+                let mut retained = self.intermediate()?;
+                let current = retained.as_mut().expect("original intermediate restore");
+                current.regions = regions;
+                current.callbacks = callbacks;
+            }
             self.source
                 .borrow(py)
                 .owner()?

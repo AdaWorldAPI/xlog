@@ -591,7 +591,7 @@ impl PrivateReplayChildCustody {
             self.session
                 .borrow(py)
                 .owner()?
-                .share_cold_native_work(&work.inner)
+                .share_cold_native_work(&work.custody(py)?.inner)
                 .map_err(xlog_err)?
         } else {
             let phase = self.phase(py)?;
@@ -1552,12 +1552,13 @@ impl PySemanticLearningPhaseTransition {
             return Ok(());
         }
         work.check(py)?;
-        let reader = work.reader.borrow(py);
+        let work_custody = work.custody(py)?;
+        let reader = work_custody.reader.borrow(py);
         let source = reader.session.borrow(py);
         for child in children {
             let custody = source
                 .owner()?
-                .share_cold_native_work(&work.inner)
+                .share_cold_native_work(&work.custody(py)?.inner)
                 .map_err(xlog_err)?;
             child.attach_retirement_work(py, custody)?;
         }
@@ -2601,7 +2602,7 @@ impl PySemanticLearningPhaseTransition {
             self.source
                 .borrow(py)
                 .owner()?
-                .require_closed_cold_model_work(&work.inner)
+                .require_closed_cold_model_work(&work.custody(py)?.inner)
                 .map_err(xlog_err)?;
         }
         // Structural allocation retained the same roster; recording follows
@@ -2838,7 +2839,7 @@ impl PySemanticLearningPhaseTransition {
             .owner()?
             .finish_cold_model_work(
                 &*self.parent.borrow(py).lease()?,
-                &work.borrow(py).inner,
+                &work.borrow(py).custody(py)?.inner,
                 &streams,
                 xlog_cuda::SemanticColdModelWorkDisposition::Complete,
             )
@@ -2905,13 +2906,13 @@ impl PySemanticLearningPhaseTransition {
             .map_err(xlog_err)?;
         let work = Py::new(
             py,
-            PySemanticColdModelWork {
-                parent: parent.clone_ref(py),
-                reader: self.parent.clone_ref(py),
+            PySemanticColdModelWork::new(
+                Some(parent.clone_ref(py)),
+                self.parent.clone_ref(py),
                 inner,
-                region: None,
-                active: AtomicBool::new(true),
-            },
+                None,
+                true,
+            ),
         )?;
         {
             let mut retained = self.private_group()?;
@@ -3009,7 +3010,7 @@ impl PySemanticLearningPhaseTransition {
                         &instruction.inner,
                         &*instruction.parent.borrow(py).lease()?,
                         &source,
-                        &work.borrow(py).inner,
+                        &work.borrow(py).custody(py)?.inner,
                         cancellation.as_ref(),
                     )
                     .map_err(xlog_err)?;
@@ -3096,7 +3097,7 @@ impl PySemanticLearningPhaseTransition {
         self.source
             .borrow(py)
             .owner()?
-            .require_closed_cold_model_work(&work.inner)
+            .require_closed_cold_model_work(&work.custody(py)?.inner)
             .map_err(xlog_err)?;
         if group.preparation_custody.is_some() {
             return Err(invalid(
@@ -3462,7 +3463,7 @@ impl PySemanticLearningPhaseTransition {
                     &instruction.inner,
                     &*instruction.parent.borrow(py).lease()?,
                     &source,
-                    &work.borrow(py).inner,
+                    &work.borrow(py).custody(py)?.inner,
                 )
                 .map_err(xlog_err)?
         };
@@ -3502,7 +3503,8 @@ impl PySemanticLearningPhaseTransition {
         py: Python<'_>,
         work: &PySemanticColdModelWork,
     ) -> PyResult<()> {
-        let parent = work.parent.borrow(py);
+        let work_custody = work.custody(py)?;
+        let parent = work_custody.parent()?.borrow(py);
         self.require_private_group_owner(
             py,
             &parent.session.borrow(py),
@@ -3907,13 +3909,13 @@ impl PySemanticLearningPhaseTransition {
                 .map_err(xlog_err)?;
             let work = Py::new(
                 py,
-                PySemanticColdModelWork {
-                    parent: child.parent.clone_ref(py),
-                    reader: self.parent.clone_ref(py),
+                PySemanticColdModelWork::new(
+                    Some(child.parent.clone_ref(py)),
+                    self.parent.clone_ref(py),
                     inner,
-                    region: None,
-                    active: AtomicBool::new(false),
-                },
+                    None,
+                    false,
+                ),
             )?;
             {
                 let mut retained = self.private_group()?;
