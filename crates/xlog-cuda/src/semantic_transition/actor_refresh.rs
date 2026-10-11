@@ -1584,6 +1584,73 @@ impl SemanticTransitionSession {
             .ok_or(SemanticTransitionError::GenerationExhausted)
     }
 
+    /// Authenticate a child step's retained CURRENT model owners without
+    /// reading, recording, or executing the original Update or child.
+    pub fn require_prepared_actor_refresh_basis(
+        &self,
+        update: &SemanticPreparedStep,
+        bank: usize,
+        child: &SemanticTransitionSession,
+        child_step: &SemanticPreparedStep,
+        proof: &SemanticPreparedActorRefresh,
+    ) -> Result<(), SemanticTransitionError> {
+        self.require_actor_refresh_construction_target(update, bank, proof)?;
+        let staged = child
+            .actor_refresh
+            .as_ref()
+            .ok_or(SemanticTransitionError::NotBound)?;
+        let build = child
+            .prepared_segment
+            .as_ref()
+            .ok_or(SemanticTransitionError::NotCaptured)?;
+        build.check_retained(child_step, &child.publication_issuer)?;
+        let storage = child
+            .publication
+            .as_ref()
+            .ok_or(SemanticTransitionError::NotBound)?;
+        let inputs = child
+            .steps
+            .get(&child_step.token)
+            .and_then(|owner| owner.inputs.as_ref())
+            .ok_or(SemanticTransitionError::NotBound)?;
+        if staged.target_bank != bank
+            || !Arc::ptr_eq(&staged.proof.inner, &proof.inner)
+            || staged.context_pending.load(Ordering::Acquire)
+            || proof.inner.cancelled.load(Ordering::Acquire)
+            || !Arc::ptr_eq(&child.provider, &proof.inner.provider)
+            || !Arc::ptr_eq(
+                child.domain.execution_stream(),
+                proof.inner.domain.execution_stream(),
+            )
+            || !Arc::ptr_eq(&build.cancelled, &proof.inner.cancelled)
+            || !Arc::ptr_eq(&build.actor_refresh_execution, &proof.inner.execution)
+            || build.transitions
+                != [
+                    SemanticTransitionKind::Recompute,
+                    SemanticTransitionKind::Proposal,
+                ]
+            || !Arc::ptr_eq(&inputs.storage, storage)
+            || inputs.model_slots.len() != proof.inner.models.len()
+            || inputs
+                .model_slots
+                .iter()
+                .zip(&proof.inner.models)
+                .any(|(slots, expected)| {
+                    slots[0] != slots[1]
+                        || storage
+                            .allocations
+                            .get(slots[0])
+                            .and_then(PublicationAllocation::model_owner)
+                            .is_none_or(|owner| !Arc::ptr_eq(&owner, expected))
+                })
+        {
+            return Err(publication_input_error(
+                "actor basis requires its original target and child model owners",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn require_prepared_actor_refresh(
         &self,
         update: &SemanticPreparedStep,

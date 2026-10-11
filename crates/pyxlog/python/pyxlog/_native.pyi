@@ -155,6 +155,15 @@ class SemanticPreparedActorRefresh:
     """
     def source_task(self, *, refresh_snapshot: Any) -> tuple[Any, ...]: ...
     def prepare_bank(self, bank: int, task_use: SemanticTransitionTaskUse, producer: Any) -> Any: ...
+    def require_current_target_basis(
+        self, template_task_use: SemanticTransitionTaskUse,
+        bank: int, child_step: SemanticPreparedStep,
+    ) -> None:
+        """Authenticate the exact target and issued child's CURRENT model owners.
+
+        This retained metadata check does not read or execute device storage.
+        """
+        ...
     def group_update_vjp(self, update_step: SemanticPreparedStep, bank: int, *, consumer_stream: int) -> tuple[Any, ...]: ...
 
 class SemanticPreparedStep:

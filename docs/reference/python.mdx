@@ -260,6 +260,12 @@ leaves; all genuine parameter destinations must still be present exactly once.
 
 An Update with a fresh actor execution and an overlapping historical Edit row
 retains two independent contributions for the same original ordinal and bank.
+The issued actor owner provides
+`refresh.require_current_target_basis(template_task_use, bank, child_step)`
+for an ordinary producer to authenticate its exact target task and original
+issued child before binding the model realization. This checks retained native
+CURRENT model owners and the original child scope; it does not execute a graph,
+read device storage, or infer CURRENT ownership from equal tensor contents.
 Register the fresh actor's delivery with `actor_refresh=refresh`. Register the
 historical demonstration with `group_member=member, edit_only=True`, and pass
 the same `edit_only=True` to `member.group_update_vjp(...)`. The native owner

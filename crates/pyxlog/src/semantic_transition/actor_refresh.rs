@@ -1779,6 +1779,66 @@ impl ActorRefreshCustody {
 
 #[pymethods]
 impl PySemanticPreparedActorRefresh {
+    #[pyo3(signature = (template_task_use, bank, child_step))]
+    fn require_current_target_basis(
+        &self,
+        py: Python<'_>,
+        template_task_use: Py<PySemanticTransitionTaskUse>,
+        bank: usize,
+        child_step: Py<PySemanticPreparedStep>,
+    ) -> PyResult<()> {
+        self.inner.require_access(py)?;
+        let update = self.inner.update.borrow(py);
+        if bank > 1 || update.task_use.as_ptr() != template_task_use.as_ptr() {
+            return Err(invalid(
+                "actor basis changed its original target task or bank",
+            ));
+        }
+        let session = {
+            let children = self.inner.children()?;
+            let child = &children[bank];
+            let step = child_step.borrow(py);
+            let session = child
+                .session
+                .as_ref()
+                .ok_or_else(|| invalid("actor basis lost its original child Session"))?;
+            if !child.context_ready
+                || child
+                    .task
+                    .as_ref()
+                    .is_none_or(|task| task.as_ptr() != step.task_use.as_ptr())
+                || child
+                    .scope
+                    .as_ref()
+                    .is_none_or(|scope| !Arc::ptr_eq(scope, &step.scope))
+                || session.as_ptr() != step.session.as_ptr()
+                || !child
+                    .steps
+                    .iter()
+                    .any(|original| original.as_ptr() == child_step.as_ptr())
+            {
+                return Err(invalid(
+                    "actor basis requires its exact issued child step and scope",
+                ));
+            }
+            session.clone_ref(py)
+        };
+        let target = update.session.borrow(py);
+        let target_owner = target.owner()?;
+        let child = session.borrow(py);
+        let child_owner = child.owner()?;
+        let result = target_owner
+            .require_prepared_actor_refresh_basis(
+                &update.inner,
+                bank,
+                &child_owner,
+                &child_step.borrow(py).inner,
+                &self.inner.proof,
+            )
+            .map_err(xlog_err);
+        result
+    }
+
     #[pyo3(signature = (update_step, bank, *, consumer_stream))]
     fn group_update_vjp(
         &self,
