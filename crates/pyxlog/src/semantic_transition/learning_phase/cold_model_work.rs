@@ -404,6 +404,81 @@ impl PySemanticColdModelWork {
             .map_err(xlog_err)
     }
 
+    /// Exact future scratch port; no export, admission or numerical access.
+    #[pyo3(signature = (*, consumer_stream))]
+    fn model_work_buffer_layout(
+        &self,
+        py: Python<'_>,
+        consumer_stream: &Bound<'_, PyAny>,
+    ) -> PyResult<(
+        Py<PyNativeTensorAllocation>,
+        Py<PyTuple>,
+        Py<PyTuple>,
+        (u8, u8),
+    )> {
+        self.check(py)?;
+        let stream = parse_witness_consumer_stream(consumer_stream, &mut 128)?;
+        let parent = self.reader.borrow(py);
+        let source = parent.session.borrow(py);
+        #[cfg(feature = "semantic-policy")]
+        let prepared = prepared_cold_callback_step(py, &source, self)?;
+        #[cfg(feature = "semantic-policy")]
+        let retirement = admitted_retirement_cold_callback(py, &source, self)?;
+        let owner = source.owner()?;
+        #[cfg(feature = "semantic-policy")]
+        let (provenance, layout) = if let Some(instruction) = retirement {
+            owner.admitted_retirement_cold_model_work_buffer_layout(
+                &instruction.inner,
+                &self.inner,
+                stream,
+            )
+        } else if let Some(step) = prepared {
+            owner.prepared_cold_model_work_buffer_layout(
+                &step.borrow(py).inner,
+                &*parent.lease()?,
+                &self.inner,
+                stream,
+                self.region.as_ref(),
+            )
+        } else {
+            owner.cold_model_work_buffer_layout(
+                &*parent.lease()?,
+                &self.inner,
+                stream,
+                self.region.as_ref(),
+            )
+        }
+        .map_err(xlog_err)?;
+        #[cfg(not(feature = "semantic-policy"))]
+        let (provenance, layout) = owner
+            .cold_model_work_buffer_layout(
+                &*parent.lease()?,
+                &self.inner,
+                stream,
+                self.region.as_ref(),
+            )
+            .map_err(xlog_err)?;
+        drop(owner);
+        Ok((
+            Py::new(
+                py,
+                PyNativeTensorAllocation {
+                    provenance,
+                    policy_layout: None,
+                },
+            )?,
+            PyTuple::new(py, layout.dimensions[..2].iter().copied())?.unbind(),
+            PyTuple::new(
+                py,
+                layout.strides_bytes[..2]
+                    .iter()
+                    .map(|stride| stride / layout.element_bytes),
+            )?
+            .unbind(),
+            (1, 64),
+        ))
+    }
+
     /// Native U64[capacity,3] actual-work slots on the original CUDA stream.
     #[pyo3(signature = (*, consumer_stream))]
     fn model_work_buffer(

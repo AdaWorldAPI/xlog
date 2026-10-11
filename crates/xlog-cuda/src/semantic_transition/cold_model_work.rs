@@ -690,7 +690,9 @@ impl SemanticTransitionSession {
                 != SemanticTransitionKind::Update
             || !parent.active
         {
-            return Err(publication_input_error("structural cold callback requires its exact admitted Update and original active source"));
+            return Err(publication_input_error(
+                "structural cold callback requires its exact admitted Update and original active source",
+            ));
         }
         if original.purpose != SemanticColdModelWorkPurpose::PrivatePrefix
             || !matches!(
@@ -880,7 +882,7 @@ impl SemanticTransitionSession {
             _ => {
                 return Err(publication_input_error(
                     "cancelled preparation retains its failed or unresolved original recorder",
-                ))
+                ));
             }
         }
         let result = self.finish_cold_model_work_for_reader(
@@ -1889,7 +1891,9 @@ impl SemanticTransitionSession {
                 publication_input_error("original cold native allowance is poisoned")
             })?;
             if allowance_guard.is_evaluation() != evaluation_content.is_some() {
-                return Err(publication_input_error("the native evaluation purpose requires its original output and objective content"));
+                return Err(publication_input_error(
+                    "the native evaluation purpose requires its original output and objective content",
+                ));
             }
             if let Some(content) = evaluation_content {
                 if !Arc::ptr_eq(&allowance, &content.allowance) {
@@ -1945,6 +1949,55 @@ impl SemanticTransitionSession {
         self.cold_model_work_buffer_for_region(lease, handle, stream, None)
     }
 
+    /// Project original scratch geometry without exporting or admitting a plan.
+    pub fn cold_model_work_buffer_layout(
+        &self,
+        lease: &SemanticPublishedLease,
+        handle: &SemanticColdModelWork,
+        stream: u64,
+        region: Option<&SemanticColdModelWorkRegion>,
+    ) -> Result<(DeviceAllocationProvenance, SemanticTensorLayout), SemanticTransitionError> {
+        let (_, allocation, layout) = self.cold_model_work_buffer_metadata(
+            ColdWorkReader::Published(lease),
+            handle,
+            stream,
+            region,
+        )?;
+        Ok((allocation, layout))
+    }
+
+    pub fn prepared_cold_model_work_buffer_layout(
+        &self,
+        step: &SemanticPreparedStep,
+        parent: &SemanticPublishedLease,
+        handle: &SemanticColdModelWork,
+        stream: u64,
+        region: Option<&SemanticColdModelWorkRegion>,
+    ) -> Result<(DeviceAllocationProvenance, SemanticTensorLayout), SemanticTransitionError> {
+        let (_, allocation, layout) = self.cold_model_work_buffer_metadata(
+            ColdWorkReader::Prepared(step, parent),
+            handle,
+            stream,
+            region,
+        )?;
+        Ok((allocation, layout))
+    }
+
+    pub fn admitted_retirement_cold_model_work_buffer_layout(
+        &self,
+        admission: &SemanticSegmentInstructionAdmission,
+        handle: &SemanticColdModelWork,
+        stream: u64,
+    ) -> Result<(DeviceAllocationProvenance, SemanticTensorLayout), SemanticTransitionError> {
+        let (_, allocation, layout) = self.cold_model_work_buffer_metadata(
+            ColdWorkReader::AdmittedRetirement(admission),
+            handle,
+            stream,
+            None,
+        )?;
+        Ok((allocation, layout))
+    }
+
     pub fn cold_model_work_region_buffer(
         &mut self,
         lease: &SemanticPublishedLease,
@@ -1985,16 +2038,22 @@ impl SemanticTransitionSession {
         )
     }
 
-    fn cold_model_work_buffer_for_reader(
-        &mut self,
+    fn cold_model_work_buffer_metadata(
+        &self,
         reader: ColdWorkReader<'_>,
         handle: &SemanticColdModelWork,
         stream: u64,
         region: Option<&SemanticColdModelWorkRegion>,
-    ) -> Result<DlpackManagedTensor, SemanticTransitionError> {
+    ) -> Result<(u64, DeviceAllocationProvenance, SemanticTensorLayout), SemanticTransitionError>
+    {
         let token = self.check_cold_work_reader(reader, handle)?;
         let storage = self.cold_model_work(handle)?;
         let available = if let Some(region) = region {
+            if !region.work.same_invocation(handle) {
+                return Err(publication_input_error(
+                    "cold model scratch region belongs to another original invocation",
+                ));
+            }
             self.require_cold_model_work_region(region, RecordingState::Waiting)?;
             storage.state == RecordingState::Recording
         } else {
@@ -2005,20 +2064,60 @@ impl SemanticTransitionSession {
                 "cold model scratch requires its original reader and stream before recording",
             ));
         }
+        let words = storage.work.actual.len();
+        if words == 0 || words % 3 != 0 {
+            return Err(publication_input_error(
+                "original cold work buffer has invalid slot geometry",
+            ));
+        }
+        let capacity =
+            i64::try_from(words / 3).map_err(|_| SemanticTransitionError::GenerationExhausted)?;
+        let layout = canonical_tensor_layout(SemanticTensorLayout {
+            role: 0,
+            index: 0,
+            scalar_type: 3,
+            element_bytes: size_of::<u64>() as u64,
+            rank: 2,
+            dimensions: [capacity as u64, 3, 0, 0],
+            logical_axis: u64::MAX,
+            strides_bytes: [0; 4],
+        })?;
+        let allocation = storage
+            .work
+            .actual
+            .view()
+            .allocation_provenance()
+            .ok_or_else(|| {
+                publication_input_error("original cold work buffer lost its native allocation")
+            })?;
+        Ok((token, allocation, layout))
+    }
+
+    fn cold_model_work_buffer_for_reader(
+        &mut self,
+        reader: ColdWorkReader<'_>,
+        handle: &SemanticColdModelWork,
+        stream: u64,
+        region: Option<&SemanticColdModelWorkRegion>,
+    ) -> Result<DlpackManagedTensor, SemanticTransitionError> {
+        let (token, _, layout) =
+            self.cold_model_work_buffer_metadata(reader, handle, stream, region)?;
+        let storage = self.cold_model_work(handle)?;
         storage.plan()?;
         // SAFETY: reset initialized all three words of every original slot.
         let view = unsafe { storage.work.actual.view().cast::<u8>() }
             .ok_or(SemanticTransitionError::ObservationMismatch)?;
-        let capacity = i64::try_from(storage.work.actual.len() / 3)
-            .map_err(|_| SemanticTransitionError::GenerationExhausted)?;
         // This is the Session's own stream, already joined by cold completion,
         // not an additional external consumer omitted from the frozen roster.
         let scratch = Arc::clone(&storage.aliases);
         let guard = Arc::clone(&self.steps[&token].aliases);
         self.export_owned_view(
             view,
-            vec![capacity, 3],
-            vec![3, 1],
+            layout.dimensions[..2].iter().map(|&n| n as i64).collect(),
+            layout.strides_bytes[..2]
+                .iter()
+                .map(|&n| (n / layout.element_bytes) as i64)
+                .collect(),
             (1, 64),
             guard,
             stream,

@@ -1965,8 +1965,21 @@ finalize it. It cannot authorize a second attempt or a successful report.
 Model-invocation markers and native saved-content witnesses retain their existing
 specialized producers; a generic operation cannot fabricate either receipt.
 
-Obtain its `consumer_stream` and `model_work_buffer(consumer_stream=...)`, an
-original CUDA UInt64 `[capacity, 3]` buffer, before calling `begin()`.
+Before plan admission, obtain its `consumer_stream` and
+`model_work_buffer_layout(consumer_stream=...)`. The metadata-only result is
+`(NativeTensorAllocation, shape, element_strides, dlpack_dtype)` from the same
+original CUDA UInt64 `[capacity, 3]` allocation, with element strides `[3, 1]`
+and DLPack dtype `(1, 64)`. It retains the actual allocation lifetime, not a
+tensor, reader right or numerical content. The original reader, region order
+and Session stream are authenticated without exporting a capsule, admitting a
+plan or charging work. Bind this future port into the complete original
+compiler plan, then freeze and admit that plan once.
+
+Only after admission, obtain the single real
+`model_work_buffer(consumer_stream=...)` export and match its import against
+that retained allocation and exact layout before calling `begin()`.
+The actual exporter still requires the admitted original plan and retains the
+same scratch and reader aliases; metadata cannot bypass that boundary.
 The existing model-work recorder
 uses `record_model_work`, `record_model_device_work` and
 `record_model_invocation`, then calls `end()` on normal exit or `fail()` on an

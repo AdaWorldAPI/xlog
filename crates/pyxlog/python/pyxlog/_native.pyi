@@ -370,6 +370,9 @@ class SemanticColdModelWork:
         using the existing five-field tensor inputs, not caller native prices.
         """
         ...
+    def model_work_buffer_layout(self, *, consumer_stream: int) -> _NativeWorkBufferLayout:
+        """Exact original U64 scratch allocation geometry before plan admission."""
+        ...
     def model_work_buffer(self, *, consumer_stream: int) -> Any: ...
     def begin(self) -> None: ...
     def end(self) -> None: ...
@@ -500,6 +503,10 @@ class NativeTensorAllocation:
     @property
     def view_bytes(self) -> int: ...
 
+_NativeWorkBufferLayout = tuple[
+    NativeTensorAllocation, tuple[int, int], tuple[int, int],
+    tuple[Literal[1], Literal[64]],
+]
 _PolicyNumericalDomainLayout = tuple[
     NativeTensorAllocation, tuple[int, ...], tuple[int, ...],
     tuple[Literal[2], Literal[64]],
