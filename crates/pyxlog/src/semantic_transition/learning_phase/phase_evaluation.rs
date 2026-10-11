@@ -2261,7 +2261,7 @@ impl PySemanticLearningPhaseTransition {
         Ok(())
     }
 
-    pub(in crate::semantic_transition) fn evaluation_cold_work(
+    pub(in crate::semantic_transition) fn already_issued_evaluation_cold_work(
         &self,
         py: Python<'_>,
         task: &PySemanticTransitionTaskUse,
@@ -2291,6 +2291,17 @@ impl PySemanticLearningPhaseTransition {
             .clone_ref(py);
         drop(retained);
         self.require_evaluation_cold_callback(py, &original.borrow(py))?;
+        Ok(Some(original))
+    }
+
+    pub(in crate::semantic_transition) fn evaluation_cold_work(
+        &self,
+        py: Python<'_>,
+        task: &PySemanticTransitionTaskUse,
+    ) -> PyResult<Option<Py<PySemanticColdModelWork>>> {
+        let Some(original) = self.already_issued_evaluation_cold_work(py, task)? else {
+            return Ok(None);
+        };
         let session = task.session.borrow(py);
         let mut visible = session
             .active_cold_model_work

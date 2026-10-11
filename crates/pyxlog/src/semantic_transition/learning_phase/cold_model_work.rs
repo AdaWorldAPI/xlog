@@ -947,10 +947,11 @@ fn retained_work(
     Ok(work)
 }
 
-#[pymethods]
 impl PySemanticTransitionTaskUse {
-    /// Original complete registrar roster and one authentic scratch allocation.
-    fn cold_model_work_report_layouts(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+    pub(in crate::semantic_transition) fn already_issued_cold_model_work(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<Py<PySemanticColdModelWork>> {
         let issuing_session = self.session.borrow(py);
         issuing_session.require_creator()?;
         let pending = issuing_session
@@ -961,7 +962,7 @@ impl PySemanticTransitionTaskUse {
             .map(|pending| pending.clone_ref(py));
         let active = if let Some(pending) = pending {
             let phase = pending.borrow(py);
-            if let Some(work) = phase.evaluation_cold_work(py, self)? {
+            if let Some(work) = phase.already_issued_evaluation_cold_work(py, self)? {
                 work
             } else {
                 if phase.private_adoption_due()? {
@@ -980,6 +981,20 @@ impl PySemanticTransitionTaskUse {
         if !std::ptr::eq(&*callback.task_use.borrow(py), self) {
             return Err(invalid("cold metadata belongs to another original TaskUse"));
         }
+        drop(callback);
+        drop(work);
+        Ok(active)
+    }
+}
+
+#[pymethods]
+impl PySemanticTransitionTaskUse {
+    /// Original complete registrar roster and one authentic scratch allocation.
+    fn cold_model_work_report_layouts(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+        let active = self.already_issued_cold_model_work(py)?;
+        let work = active.borrow(py);
+        let custody = work.custody(py)?;
+        let callback = custody.parent()?.borrow(py);
         let callback_session = callback.session.borrow(py);
         let mut regions = None;
         #[cfg(feature = "semantic-policy")]
