@@ -31,6 +31,7 @@ from pyxlog._native import (
     SemanticPreparedStep as SemanticPreparedStep,
     SemanticGradientDelivery as SemanticGradientDelivery,
     SemanticRetainedReplayMember as SemanticRetainedReplayMember,
+    SemanticPreparedTaskImport as SemanticPreparedTaskImport,
     SemanticPrivateExecutionContinuation as SemanticPrivateExecutionContinuation,
     SemanticRetainedFinalUsePending as SemanticRetainedFinalUsePending,
     SemanticTransitionColdTask as SemanticTransitionColdTask,

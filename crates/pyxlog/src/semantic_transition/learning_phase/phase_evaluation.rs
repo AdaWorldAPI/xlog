@@ -1730,12 +1730,12 @@ impl PySemanticLearningPhaseTransition {
             fence.as_any(),
             None,
         )?;
-        let expense = closure
+        let expense = &closure
             .refusal
             .as_ref()
             .expect("verified native cancellation")
             .expense;
-        if expense != self.task_use.borrow(py).checkpoint.proposal_expense()? {
+        if expense != &self.task_use.borrow(py).checkpoint.proposal_expense()? {
             return Err(invalid(
                 "terminal Source custody changed its original cumulative Proposal expense",
             ));
@@ -1927,29 +1927,31 @@ impl PySemanticLearningPhaseTransition {
                 "phase evaluation cannot replace its original native invocation",
             ));
         }
-        let cleanup = current
-            .regions
-            .get(2)
-            .ok_or_else(|| invalid("phase evaluation lost its original cleanup region"))?
-            .borrow(py);
-        let source = self.source.borrow(py);
-        let parent = current.owners()?.parent.borrow(py);
-        let region = cleanup
-            .region
-            .as_ref()
-            .expect("original evaluation cleanup");
-        if parent.session.as_ptr() == self.source.as_ptr() {
-            source
-                .owner()?
-                .bind_cold_model_work_evaluation_cleanup(region, native, None)
-                .map_err(xlog_err)?;
-        } else {
-            let session = parent.session.borrow(py);
-            let owner = session.owner()?;
-            source
-                .owner()?
-                .bind_cold_model_work_evaluation_cleanup(region, native, Some(&owner))
-                .map_err(xlog_err)?;
+        {
+            let cleanup = current
+                .regions
+                .get(2)
+                .ok_or_else(|| invalid("phase evaluation lost its original cleanup region"))?
+                .borrow(py);
+            let source = self.source.borrow(py);
+            let parent = current.owners()?.parent.borrow(py);
+            let region = cleanup
+                .region
+                .as_ref()
+                .expect("original evaluation cleanup");
+            if parent.session.as_ptr() == self.source.as_ptr() {
+                source
+                    .owner()?
+                    .bind_cold_model_work_evaluation_cleanup(region, native, None)
+                    .map_err(xlog_err)?;
+            } else {
+                let session = parent.session.borrow(py);
+                let owner = session.owner()?;
+                source
+                    .owner()?
+                    .bind_cold_model_work_evaluation_cleanup(region, native, Some(&owner))
+                    .map_err(xlog_err)?;
+            }
         }
         current.native_evaluation = Some(original.clone_ref(py));
         Ok(())

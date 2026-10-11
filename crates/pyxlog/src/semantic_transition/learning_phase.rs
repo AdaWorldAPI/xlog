@@ -996,6 +996,7 @@ impl PySemanticLearningPhaseTransition {
                         inputs.cold_model_work_capacity,
                         0,
                         admission,
+                        xlog_cuda::SemanticColdModelWorkPurpose::PrivateCheckpoint,
                     )
                     .map_err(xlog_err)?;
                 let work = Py::new(

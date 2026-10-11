@@ -44,6 +44,7 @@ pub(super) struct PreparedActorRefreshOwner {
     pub(super) domain: ResidentExecutionDomain,
     pub(super) execution: Arc<Mutex<ActorRefreshParentExecution>>,
     pub(super) cancelled: Arc<AtomicBool>,
+    pub(super) recording_ready: Arc<AtomicBool>,
     pub(super) target: Arc<PublicationStorage>,
     work: Arc<ActorRefreshWork>,
     children: Mutex<[Option<Arc<()>>; 2]>,
@@ -715,6 +716,7 @@ impl SemanticTransitionSession {
         batch_bytes: &[u8],
     ) -> Result<SemanticPreparedActorRefresh, SemanticTransitionError> {
         self.require_prepared_replay_parent(step, released_parent)?;
+        self.require_prepared_structure_mutable()?;
         if self
             .actor_refresh_preparations
             .contains_key(&(step.token, member_ordinal))
@@ -888,10 +890,11 @@ impl SemanticTransitionSession {
                         .ok_or(SemanticTransitionError::NotBound)?
                         .cancelled,
                 ),
+                recording_ready: Arc::clone(
+                    &self.prepared_segment.as_ref().expect("original Update scope").recording_ready,
+                ),
                 target: Arc::clone(
-                    self.publication
-                        .as_ref()
-                        .ok_or(SemanticTransitionError::NotBound)?,
+                    self.prepared_publication()?,
                 ),
                 work,
                 children: Mutex::new([None, None]),
@@ -930,6 +933,7 @@ impl SemanticTransitionSession {
     ) -> Result<SemanticTransitionSessionConstruction, SemanticTransitionError> {
         self.ensure_quiescent()?;
         self.require_actor_refresh_construction_target(update, bank, proof)?;
+        self.require_prepared_structure_mutable()?;
         if proof.inner.cancelled.load(Ordering::Acquire)
             || matches!(*proof.inner.execution.lock().map_err(|_| publication_input_error(
                 "original actor submission custody lock is poisoned"

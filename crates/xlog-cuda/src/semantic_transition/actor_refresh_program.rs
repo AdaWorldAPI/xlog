@@ -114,8 +114,8 @@ pub(super) struct InstructionAdmission {
     assignment_prefix: Identity256,
     assignment_prefix_has_rng: bool,
     checkpoint_source: Option<InstructionCheckpointSource>,
-    parent: SemanticPublishedIdentity,
-    parent_token: u64,
+    pub(super) parent: SemanticPublishedIdentity,
+    pub(super) parent_token: u64,
     pub(super) state: InstructionState,
     pub(super) cold_work: Option<SemanticColdModelWork>,
     pub(super) cold_result: Option<SemanticColdModelWorkResult>,
@@ -994,18 +994,38 @@ impl SemanticTransitionSession {
         Ok(())
     }
 
-    pub fn prepare_admitted_segment_steps(&mut self, admission: &SemanticSegmentInstructionAdmission,
+    /// Issue this instruction's exact allocation roster while retaining its
+    /// original source reader. No initializer, release or outcome is entered.
+    pub fn prepare_admitted_segment_structure(&mut self, admission: &SemanticSegmentInstructionAdmission,
         parent: &SemanticPublishedLease,
         transitions: impl ExactSizeIterator<Item = SemanticTransitionKind> + Clone,
         cold_capacity: SemanticSegmentColdCapacity) -> Result<Vec<SemanticPreparedStep>, SemanticTransitionError> {
         self.require_segment_instruction_admission(admission, parent)?;
         self.checked_step(parent)?;
-        if self.instruction_admission(admission)?.state != InstructionState::Released || parent.active
+        let state = self.instruction_admission(admission)?.state;
+        if !matches!(state, InstructionState::Admitted | InstructionState::Released)
+            || (state == InstructionState::Admitted) != parent.active
             || transitions.clone().collect::<Vec<_>>() != self.admitted_segment_transitions(admission)?
             || cold_capacity != self.admitted_segment_cold_capacity(admission)? { return Err(invalid_program()); }
-        self.instruction_admission_mut(admission)?.state = InstructionState::BuildEntered;
         self.prepare_segment_steps_from_source(transitions, cold_capacity,
-            PreparedSegmentSource::Publication, Some((admission, parent)))
+            PreparedSegmentSource::AdmittedPublication, Some((admission, parent)))
+    }
+
+    /// Admit recording only after positive retirement of the original source.
+    /// Resolve the same retained initializer and return the same issued handles.
+    pub fn enter_admitted_segment_recording(&mut self, admission: &SemanticSegmentInstructionAdmission,
+        parent: &SemanticPublishedLease) -> Result<Vec<SemanticPreparedStep>, SemanticTransitionError> {
+        self.require_segment_instruction_admission(admission, parent)?;
+        let build = self.prepared_segment.as_ref().ok_or_else(invalid_program)?;
+        if parent.active || self.readers.contains_key(&parent.token)
+            || build.program_admission.as_ref().is_none_or(|original| !original.same_handle(admission))
+            || !matches!(self.instruction_admission(admission)?.state,
+                InstructionState::Released | InstructionState::BuildEntered | InstructionState::Bound)
+        { return Err(invalid_program()); }
+        let handles = self.enter_segment_recording()?;
+        self.prepared_segment.as_mut().expect("original initialized instruction").parent_quiescent = true;
+        self.instruction_admission_mut(admission)?.state = InstructionState::Bound;
+        Ok(handles)
     }
 
     // Bind the issued complete allocation roster before the first initializer
@@ -1016,7 +1036,7 @@ impl SemanticTransitionSession {
         let first = steps.first().ok_or_else(invalid_program)?;
         self.require_original_prepared_program_parent(first, parent)?;
         let claim = self.instruction_admission(admission)?;
-        if claim.state != InstructionState::BuildEntered { return Err(invalid_program()); }
+        if !matches!(claim.state, InstructionState::Admitted | InstructionState::Released) { return Err(invalid_program()); }
         let program = self.actor_refresh_program.as_ref().expect("original program");
         let expected = &program.steps[claim.first as usize..claim.end as usize];
         let build = self.prepared_segment.as_ref().ok_or_else(invalid_program)?;
@@ -1030,8 +1050,6 @@ impl SemanticTransitionSession {
         let build = self.prepared_segment.as_mut().expect("original scope");
         build.program_steps = mapping;
         build.program_admission = Some(admission.clone());
-        build.parent_quiescent = true;
-        self.instruction_admission_mut(admission)?.state = InstructionState::Bound;
         Ok(())
     }
 
@@ -1120,7 +1138,8 @@ impl SemanticTransitionSession {
             return Err(publication_input_error("cancelled instruction still owns prepared execution"));
         }
         let claim = self.instruction_admission(admission)?;
-        if !matches!(claim.state, InstructionState::Bound | InstructionState::Cancelled)
+        if !matches!(claim.state, InstructionState::Admitted | InstructionState::Released
+            | InstructionState::BuildEntered | InstructionState::Bound | InstructionState::Cancelled)
             || claim.retirement_cancellation.is_none()
         { return Err(publication_input_error("cancelled checkpoint requires the original whole non-submission proof")); }
         require_cancelled_instruction_material(claim)?;

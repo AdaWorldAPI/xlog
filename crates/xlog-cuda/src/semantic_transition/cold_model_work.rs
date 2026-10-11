@@ -171,6 +171,11 @@ enum ColdWorkReader<'a> {
         &'a SemanticSegmentInstructionAdmission,
         &'a SemanticPublishedLease,
     ),
+    AdmittedCancellation(
+        &'a SemanticSegmentInstructionAdmission,
+        &'a SemanticPublishedLease,
+        &'a SemanticPreparedSegmentNonSubmission,
+    ),
     AdmittedRetirement(&'a SemanticSegmentInstructionAdmission),
     Prepared(&'a SemanticPreparedStep, &'a SemanticPublishedLease),
 }
@@ -646,6 +651,35 @@ impl SemanticTransitionSession {
         Ok(())
     }
 
+    /// Borrow the one original instruction preparation report while issuing
+    /// structural Update ports. No report is closed, replaced or fabricated.
+    pub fn require_admitted_structural_cold_model_work(
+        &self,
+        admission: &SemanticSegmentInstructionAdmission,
+        parent: &SemanticPublishedLease,
+        step: &SemanticPreparedStep,
+        work: &SemanticColdModelWork,
+    ) -> Result<(), SemanticTransitionError> {
+        self.require_admitted_cold_model_work(admission, parent, work)?;
+        self.require_original_prepared_structure()?;
+        let build = self.prepared_segment.as_ref().ok_or(SemanticTransitionError::NotBound)?;
+        build.check_retained(step, &self.publication_issuer)?;
+        if build.program_admission.as_ref().is_none_or(|original| !original.same_handle(admission))
+            || build.requested_kind(step, &self.publication_issuer)? != SemanticTransitionKind::Update
+            || !parent.active
+        {
+            return Err(publication_input_error("structural cold callback requires its exact admitted Update and original active source"));
+        }
+        let original = self.original_cold_model_work(work)?;
+        if original.purpose != SemanticColdModelWorkPurpose::PrivatePrefix
+            || original.state != RecordingState::Recording || original.result.is_some()
+            || original.prepared_scope.is_some()
+        {
+            return Err(publication_input_error("structural callback must borrow its same still-open original prefix recorder"));
+        }
+        Ok(())
+    }
+
     pub fn adopt_shared_admitted_cold_model_work_result(
         &mut self,
         admission: &SemanticSegmentInstructionAdmission,
@@ -686,6 +720,67 @@ impl SemanticTransitionSession {
             work,
             streams,
             SemanticColdModelWorkDisposition::Complete,
+        )?;
+        self.instruction_admission_mut(admission)?.cold_result = Some(result);
+        Ok(result)
+    }
+
+    /// Close only the known actual prefix of the original cancelled build.
+    /// Its live parent remains admitted until genuine source retirement.
+    pub fn finish_cancelled_admitted_cold_model_work(
+        &mut self,
+        admission: &SemanticSegmentInstructionAdmission,
+        parent: &SemanticPublishedLease,
+        proof: &SemanticPreparedSegmentNonSubmission,
+        work: &SemanticColdModelWork,
+        streams: &[u64],
+    ) -> Result<SemanticColdModelWorkResult, SemanticTransitionError> {
+        let reader = ColdWorkReader::AdmittedCancellation(admission, parent, proof);
+        self.check_cold_work_completion_reader(reader, work)?;
+        let storage = self.original_cold_model_work(work)?;
+        match storage.state {
+            RecordingState::Recording => {
+                let regions = storage.regions.len();
+                self.cancel_unentered_cold_model_work_regions(work, regions)?;
+                self.close_cold_model_work(work)?;
+            }
+            RecordingState::Waiting => {
+                // Metadata preparation may complete before any recorder entry.
+                // Do not invent a begin marker or an executed model span.
+                self.ensure_quiescent()?;
+                let storage = self.original_cold_model_work(work)?;
+                if storage.pending_operation.is_some()
+                    || !storage.work.recording.events().is_empty()
+                    || storage.regions.iter().any(|state| {
+                        !matches!(state, RecordingState::Waiting | RecordingState::NotEntered)
+                    })
+                {
+                    return Err(publication_input_error(
+                        "cancelled preparation cannot close entered or unknown original work",
+                    ));
+                }
+                let storage = self.steps.get_mut(&work.token)
+                    .expect("checked original reader").cold_model_work.as_mut()
+                    .expect("checked original work");
+                for (index, state) in storage.regions.iter_mut().enumerate() {
+                    if *state == RecordingState::Waiting {
+                        if let Some(plan) = &mut storage.plan {
+                            plan.skip_unentered_region(index).map_err(publication_input_error)?;
+                        }
+                        *state = RecordingState::NotEntered;
+                    }
+                }
+                storage.work.uncaptured_recording = false;
+                storage.state = RecordingState::Closed;
+            }
+            RecordingState::Closed | RecordingState::Submitting
+            | RecordingState::Submitted | RecordingState::Completed => (),
+            _ => return Err(publication_input_error(
+                "cancelled preparation retains its failed or unresolved original recorder",
+            )),
+        }
+        let result = self.finish_cold_model_work_for_reader(
+            reader, work, streams, SemanticColdModelWorkDisposition::KnownRefusal,
         )?;
         self.instruction_admission_mut(admission)?.cold_result = Some(result);
         Ok(result)
@@ -829,8 +924,13 @@ impl SemanticTransitionSession {
             (Some(stored), Some(proof)) => stored.matches(&proof.steps),
             _ => false,
         };
-        if !matches!(original.state,
-                actor_refresh_program::InstructionState::Bound | actor_refresh_program::InstructionState::Completed)
+        let original_state = matches!(original.state,
+            actor_refresh_program::InstructionState::Bound | actor_refresh_program::InstructionState::Completed)
+            || (cancellation.is_some() && matches!(original.state,
+                actor_refresh_program::InstructionState::Admitted
+                    | actor_refresh_program::InstructionState::Released
+                    | actor_refresh_program::InstructionState::BuildEntered));
+        if !original_state
             || storage.purpose != SemanticColdModelWorkPurpose::PrivateRetirement
             || !Arc::ptr_eq(&allowance, &storage.allowance)
             || !matches!(storage.state, RecordingState::Waiting | RecordingState::Recording)
@@ -867,7 +967,10 @@ impl SemanticTransitionSession {
             || self.steps.contains_key(&parent.token)
             || !matches!((original.state, original.retirement_cancellation.is_some()),
                 (actor_refresh_program::InstructionState::Completed, false)
-                    | (actor_refresh_program::InstructionState::Bound, true))
+                    | (actor_refresh_program::InstructionState::Bound, true)
+                    | (actor_refresh_program::InstructionState::Admitted, true)
+                    | (actor_refresh_program::InstructionState::Released, true)
+                    | (actor_refresh_program::InstructionState::BuildEntered, true))
         {
             return Err(publication_input_error("shared retirement report requires fully retired original native storage"));
         }
@@ -1013,6 +1116,7 @@ impl SemanticTransitionSession {
         admission: Arc<[u8]>,
     ) -> Result<SemanticColdModelWork, SemanticTransitionError> {
         self.require_prepared_replay_parent(step, parent)?;
+        self.require_prepared_structure_mutable()?;
         self.require_completed_cold_model_work()?;
         let owner = self.checked_prepared_step(step, false)?;
         if capacity == 0
@@ -1441,6 +1545,30 @@ impl SemanticTransitionSession {
                 {
                     return Err(publication_input_error(
                         "cold completion requires its same handed-off instruction and original invocation",
+                    ));
+                }
+                self.checked_original_consumer_step(parent)?;
+                parent.token
+            }
+            ColdWorkReader::AdmittedCancellation(admission, parent, proof) => {
+                self.require_segment_instruction_admission(admission, parent)?;
+                let original = self.instruction_admission(admission)?;
+                let build = self.prepared_segment.as_ref().ok_or_else(|| {
+                    publication_input_error("cancelled preparation lost its original prepared owner")
+                })?;
+                build.require_non_submission(proof)?;
+                if original.state != actor_refresh_program::InstructionState::Admitted
+                    || !parent.active
+                    || build.program_admission.as_ref()
+                        .is_none_or(|retained| !retained.same_handle(admission))
+                    || original.cold_work.as_ref()
+                        .is_none_or(|work| !work.same_invocation(handle))
+                    || storage.purpose != SemanticColdModelWorkPurpose::PrivatePrefix
+                    || !Arc::ptr_eq(&storage.admission, &original.instruction)
+                    || storage.prepared_scope.is_some()
+                {
+                    return Err(publication_input_error(
+                        "cancelled preparation changed its original admission, parent or prefix invocation",
                     ));
                 }
                 self.checked_original_consumer_step(parent)?;
@@ -2632,6 +2760,7 @@ impl SemanticTransitionSession {
             ColdWorkReader::Published(lease) => self.quiesce_published_reader(lease, streams)?,
             ColdWorkReader::Prepared(_, _)
             | ColdWorkReader::Admitted(_, _)
+            | ColdWorkReader::AdmittedCancellation(_, _, _)
             | ColdWorkReader::AdmittedRetirement(_) => {
                 let _ordinary = crate::cuda_graph::reserve_uncaptured_stream(&self.stream)
                     .map_err(|error| {

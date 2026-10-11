@@ -193,6 +193,53 @@ The target retains its complete frozen roster and original objective for the
 Update. Other retained rows keep their own authenticated task identities; they
 need not describe the selected source task.
 
+For a whole instruction, pass `prepare_invocation=` to the same retained
+`import_task(..., retain_policy=True)` call. Its callback receives the original
+`(task_use, parent)` and returns `None`, retaining the source model and all
+exports in the original invocation lifetime without running its forward.
+The result is a `SemanticPreparedTaskImport`, not an imported task or a policy
+outcome. Its read-only `task_use` and `parent` refer to those same owners;
+`session.prepared_task_import` recovers the identical owner after a lost return.
+`parent.original_prepared_import()` returns that same retained owner during its
+original preparation or execution, checking the exact parent and TaskUse. It
+does not create another import or grant numerical execution authority.
+
+During that callback, `parent.source_model_contract_metadata()` returns the
+authenticated original host record bytes and
+`(schema_begin, schema_bytes, schema_digest_offset, generation_offset,
+numerical_digest_offset, identity_offset)`. It does not read device values.
+`parent.source_model_memory_geometry()` returns the full original
+`(allocation_bytes, storages, views)`; each storage is
+`(allocation, byte_offset, span_bytes)` and each view is
+`(role, index, storage, byte_offset, layout)` with the existing tensor layout.
+Use `parent.resident_model_memory(consumer_stream=...)` for the actual resident
+allocation aliases, not metadata as a replacement for physical ownership.
+Numerical record reads and gradient-presence values remain in the original
+charged execution callback.
+
+Bind future historical deliveries with
+`step.register_gradient_delivery(..., group_member=prepared_import, edit_only=True)`
+before the whole instruction freezes. This requires the original replay child,
+source parameter allocations and target gradient destinations; it grants no
+current-policy result. The single `build_segment` call takes
+`execute_prepared_imports=`. After all outer and CURRENT resources and successors
+exist in the original allocation scope, it freezes the complete import roster
+and invokes this callback once. Call
+`source_controller.execute_task_import(prepared_import)` there in original
+Update/replay order. Each call performs its retained restore, pack and finalize
+once and returns `(same_task_use, genuine_retained_member)`; successful repeats
+return the cached pair. An unknown invocation cannot be rerun or skipped.
+Completion authenticates every original physical Parameter and restored SOURCE
+gradient slot against that same completed model witness, preserving its slot as
+the deferred delivery's restoration intent. It does not replace leaves or edges.
+The prepared owner's `group_update_vjp` delegates only to that genuine completed
+member. Retain the same owner, model, aliases and graph through actual final use.
+If the target is genuinely cancelled before this import executes, native retires
+the same prepared source and invokes its original cleanup once. The prepared
+owner's `finish_cancelled_private_segment()` only acknowledges that cached
+positive retirement; it cannot initiate cleanup, create a retained member or
+turn an unknown numerical invocation into cancellation.
+
 The getter checks fresh target read rights, but its content projection grants
 no source execution authority. The ordinary child import validates the source's
 current grants with its own fresh snapshot. The retained original phase refreshes
@@ -425,9 +472,17 @@ application’s fresh use permissions. Importing a carrier does not establish th
 device-side training, Update publication or restoration has completed.
 
 `task_observation_roots` requires the same `task_scope` and `live_authorities`
-that will be passed to `import_task`. It binds a live anchor to that original
+and the same original `task_ground` that will be passed to `import_task`.
+It uses the Session's admitted editable source and query roster, without a
+separate observer for a coding task. It binds a live anchor to that original
 authority before computing coverage; `import_task` still independently checks
 the current snapshot and use rights.
+
+Each coverage contributor is `(query_ordinal, original_target_or_None, support)`.
+The support is either `("admitted", record_index)` or
+`("authenticated", binding_ordinal, original_observation_words)`; the latter
+retains all eighteen original signed-reference words, not a replacement admitted
+support index. These metadata grant no publication or execution authority.
 
 During replay, `restore_invocation(task_use, restored_parent, full_row,
 transition)` returns `(original_model_output, finalize_continuation,
@@ -949,11 +1004,14 @@ callback retains its original owners and cannot be replaced by another callback.
 The existing `build_segment` then requires `instruction_admission=admission` and
 the actual `consumer_streams`, replacing its late parent/instruction/ordinal
 keywords. It validates the actual complete roster and all four capacities before
-Recording, joins the original cold consumers, and hands off that same native
-reader once while retaining model allocations, witnesses, continuation and
-autograd owners. The original tally includes that reader release; its report
-finishes after handoff and before step allocation. Build consumes the already
-admitted instruction, not a second admission. Do not move application-level
+Recording. It first allocates the actual structural step roster while the source
+reader remains active, prepares every outer and CURRENT resource, then executes
+the complete frozen import roster. Only genuine import completion allows it to
+join the original cold consumers and hand off that same native reader once while
+retaining model allocations, witnesses, continuation and autograd owners. The
+original tally includes that reader release; its report finishes after handoff
+and before the original numerical initializers and capture. Build consumes the
+already admitted instruction, not a second admission. Do not move application-level
 model/export cleanup before the last cold use. Private graph submission does not
 decrement the handed-off reader again.
 
@@ -974,8 +1032,18 @@ An issued Update may prepare its actual model resources with
 `step.prepare_cold_model_work(original_callback, consumer_streams=...)` before
 capture. The same prepared segment retains the exact Update, callback, report and
 result; ordinary callbacks receive their actual native registrar without a fake
-private phase. This preparation grants no current-policy numerical result or
+private phase. Structural callbacks share the original instruction Prefix
+registrar until all imports and the reader handoff genuinely complete; they do
+not create per-Update receipts for that same work. This preparation grants no current-policy numerical result or
 permission to replay an unknown callback.
+
+If the original structural construction is genuinely cancelled before producer
+entry, native closes its same preparation Prefix as known refusal under the
+complete non-submission proof. The report preserves actual recorded work and
+the original consumer streams; it does not pretend that imports completed or
+that the source reader was handed off. Entered, failed or pending work remains
+retained until its original completion is known. Source cleanup and final reader
+release still occur through the original retirement path.
 
 The same ordinary `retire_segment` call exposes the original final-use registrar
 during `finish_segment`, joins actual replay-child release, and completes a
@@ -2150,8 +2218,13 @@ the builder calls `prepared.prepare_unpublished_successors()` exactly once on
 the creator thread. It must return `None` and create every unpublished Update
 successor and its retained learning inputs inside that same private allocation
 scope; preparing them before the scope would put their backing outside the
-required slab. A callback failure exits the scope through the original cleanup
-path and aborts the segment; the builder never retries it.
+required slab. The builder prepares the CURRENT child successors in that scope
+too, freezes future historical bindings, and calls `execute_prepared_imports`
+before reader handoff and numerical recording. The same scope spans preparation,
+ordered original imports and graph instantiation; there is no second builder or
+pool re-entry. A callback failure exits the scope through the original cleanup
+path while native unknown work and its owners remain retained; the builder never
+retries the callback.
 Call `step.reserve_tensor_content(tensor_content_capacity)` and
 `step.reserve_model_work(model_work_capacity)` during `prepare_segment`, before
 capture. Each positive capacity must exactly match its frozen segment value.
@@ -2745,7 +2818,8 @@ before exposing the material.
 `controller.structural_cost_descriptor` returns `(unit_identity_bytes, cap)`
 before `import_task`: the native versioned structural-work law for this
 Session's graph-only or editable-program mode. The graph-only cap is 6; the
-editable-program cap is 4101, including at most 4096 new materialized facts.
+editable-program cap is `4098 + original_query_count`, including at most 4096
+new materialized facts and the Session's complete admitted query roster.
 The unit is independent of task identity and sampled outcomes. Use
 `unit_identity_bytes.hex()` and `cap` as the objective's cost pair. Native cold
 binding rejects any different pair for the actual bound task. The completed

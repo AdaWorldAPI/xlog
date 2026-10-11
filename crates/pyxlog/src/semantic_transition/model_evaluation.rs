@@ -484,7 +484,7 @@ impl PySemanticModelEvaluation {
         let parent = self.parent.borrow(py);
         let session = parent.session.borrow(py);
         session.require_creator()?;
-        self.check(py, &session.owner()?)?;
+        self.check(py, &*session.owner()?)?;
         let witness = output_witness.borrow(py);
         if witness.session.as_ptr() != parent.session.as_ptr()
             || !matches!(&witness.parent, ContentStepOwner::Published(original)
@@ -519,7 +519,7 @@ impl PySemanticModelEvaluation {
         )?;
         let check = || {
             session.require_creator()?;
-            self.check(py, &session.owner()?)
+            self.check(py, &*session.owner()?)
         };
         let mut memory = PreparedMemoryScope::new(py, memory_scope.bind(py), &check)?;
         recording_callback(&check, || {

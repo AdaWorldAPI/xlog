@@ -1276,6 +1276,7 @@ fn pyxlog(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<semantic_transition::learning_phase::PySemanticPrivateExecutionContinuation>()?;
         m.add_class::<semantic_transition::actor_refresh::PySemanticPreparedActorRefresh>()?;
         m.add_class::<semantic_transition::PySemanticSegmentInstructionAdmission>()?;
+        m.add_class::<semantic_transition::prepared_import::PySemanticPreparedTaskImport>()?;
         m.add(
             "SemanticTransitionCheckpointCancelled",
             m.py().get_type::<semantic_transition::cancelled_checkpoint::SemanticTransitionCheckpointCancelled>(),

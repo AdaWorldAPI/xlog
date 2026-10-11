@@ -263,6 +263,7 @@ pub(super) fn record_prepared_steps(
 
 use super::*;
 use std::sync::Weak;
+use xlog_cuda::SemanticColdNativeWork;
 
 pub(super) fn finish_actor_refresh_children(
     py: Python<'_>,
@@ -1171,6 +1172,7 @@ impl ActorRefreshCustody {
         stream: u64,
     ) -> PyResult<SemanticGradientDeliveryBinding> {
         self.require_update(py, update, bank)?;
+        self.instruction.require_structural_mutation()?;
         let (session, proposal) = {
             let children = self.children()?;
             let child = &children[bank];
@@ -1275,7 +1277,7 @@ impl ActorRefreshCustody {
                     .record_prepared_actor_refresh(
                         &update.inner,
                         bank,
-                        &mut child.owner()?,
+                        &mut *child.owner()?,
                         &self.proof,
                     )
                     .map_err(xlog_err)
@@ -1349,7 +1351,7 @@ impl ActorRefreshCustody {
                 .finish_prepared_actor_refresh(
                     &update.inner,
                     bank,
-                    &mut session.borrow(py).owner()?,
+                    &mut *session.borrow(py).owner()?,
                     &self.proof,
                 )
                 .map_err(xlog_err)?;
@@ -1402,6 +1404,7 @@ impl ActorRefreshCustody {
         if let Some(original) = self.children()?[bank].allocation.as_ref() {
             return Ok(original.clone());
         }
+        self.instruction.require_structural_mutation()?;
         let update = self.update.borrow(py);
         let session = update.session.borrow(py);
         let work = session
@@ -1714,9 +1717,10 @@ impl ActorRefreshCustody {
         };
         let task = task.borrow(py);
         let snapshot = task.state()?.snapshot.canonical.clone();
-        controller
+        let result = controller
             .borrow(py)
-            .check_recording(py, &task, &scope, &snapshot)
+            .check_recording(py, &task, &scope, &snapshot);
+        result
     }
 
     pub(super) fn prepare_successors(&self, py: Python<'_>) -> PyResult<()> {
@@ -1758,6 +1762,50 @@ impl ActorRefreshCustody {
                 },
             )?;
             self.children()?[bank].successors_ready = true;
+        }
+        Ok(())
+    }
+
+    pub(super) fn freeze_structure(&self, py: Python<'_>) -> PyResult<()> {
+        self.require_access(py)?;
+        for bank in 0..2 {
+            let session = {
+                let children = self.children()?;
+                let child = &children[bank];
+                if !child.successors_ready || child.recording_entered || child.recorded {
+                    return Err(invalid("actor structure freezes only after all original successors exist"));
+                }
+                child.session.as_ref()
+                    .ok_or_else(|| invalid("actor freeze lost its original Session"))?
+                    .clone_ref(py)
+            };
+            session.borrow(py).owner()?.freeze_prepared_segment_structure().map_err(xlog_err)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn enter_recording(&self, py: Python<'_>) -> PyResult<()> {
+        self.require_access(py)?;
+        for bank in 0..2 {
+            let (session, original_steps) = {
+                let children = self.children()?;
+                let child = &children[bank];
+                if !child.successors_ready || child.recording_entered || child.recorded {
+                    return Err(invalid("actor initialization requires its original complete structural preparation"));
+                }
+                (
+                    child.session.as_ref()
+                        .ok_or_else(|| invalid("actor initialization lost its original Session"))?
+                        .clone_ref(py),
+                    child.native_steps.clone(),
+                )
+            };
+            let entered = session.borrow(py).owner()?.enter_segment_recording().map_err(xlog_err)?;
+            if entered.len() != original_steps.len()
+                || entered.iter().zip(&original_steps).any(|(actual, original)| !actual.same_handle(original))
+            {
+                return Err(invalid("actor initialization changed its original prepared allocation roster"));
+            }
         }
         Ok(())
     }
@@ -1978,7 +2026,7 @@ impl PySemanticPreparedActorRefresh {
             .record_imported_prepared_actor_policy_vjp(
                 &update.inner,
                 bank,
-                &mut source.owner()?,
+                &mut *source.owner()?,
                 &proposal.borrow(py).inner,
                 &self.inner.proof,
                 &self.inner.row,
@@ -2029,6 +2077,7 @@ impl PySemanticPreparedActorRefresh {
         producer: Py<PyAny>,
     ) -> PyResult<Py<PyAny>> {
         self.inner.require_access(py)?;
+        self.inner.instruction.require_structural_mutation()?;
         if bank > 1 {
             return Err(invalid("actor child bank must be zero or one"));
         }
@@ -2143,11 +2192,11 @@ impl PySemanticPreparedActorRefresh {
                 let mut owner = source.owner()?;
                 if owner.prepared_segment_preparation_started() {
                     owner
-                        .resolve_prepared_segment_preparation()
+                        .prepared_segment_preparation_handles()
                         .map_err(xlog_err)?
                 } else {
                     owner
-                        .prepare_segment_steps(
+                        .prepare_segment_structure(
                             [
                                 SemanticTransitionKind::Recompute,
                                 SemanticTransitionKind::Proposal,
@@ -2239,6 +2288,7 @@ impl PySemanticPreparedActorRefresh {
                     graph_retired: false,
                     outcomes: None,
                     completion: None,
+                    execution: None,
                     cold_callbacks: Vec::new(),
                     actor_refreshes: Vec::new(),
                 });

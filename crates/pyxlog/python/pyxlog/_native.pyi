@@ -186,7 +186,7 @@ class SemanticPreparedStep:
             Optional[Any], _SemanticTensorInput, Optional[_SemanticTensorInput],
             _SemanticTensorInput, _SemanticTensorInput,
         ]], *, consumer_stream: int,
-        group_member: Optional[SemanticRetainedReplayMember] = None,
+        group_member: Optional[Union[SemanticRetainedReplayMember, SemanticPreparedTaskImport]] = None,
         actor_refresh: Optional[SemanticPreparedActorRefresh] = None,
         edit_only: bool = False,
     ) -> SemanticGradientDelivery:
@@ -254,6 +254,38 @@ class SemanticRetainedReplayMember:
     def finish(self) -> None: ...
     def finish_without_published_update(self, update_step: SemanticPreparedStep) -> None: ...
     def finish_cancelled_private_segment(self) -> None: ...
+
+_SourceModelContractMetadata = tuple[bytes, tuple[int, int, int, int, int, int]]
+_SourceModelMemoryGeometry = tuple[
+    tuple[int, ...], tuple[tuple[int, int, int], ...],
+    tuple[tuple[
+        int, int, int, int,
+        tuple[int, int, int, int, tuple[int, ...], tuple[int, ...]],
+    ], ...],
+]
+
+class SemanticPreparedTaskImport:
+    """Original SOURCE import before its sole numerical invocation.
+
+    Created only by import_task with prepare_invocation. Metadata and future
+    physical gradient bindings are not an Imported use or a policy outcome.
+    """
+
+    @property
+    def task_use(self) -> SemanticTransitionTaskUse: ...
+    @property
+    def parent(self) -> SemanticPublishedParent: ...
+    def source_model_contract_metadata(self) -> _SourceModelContractMetadata: ...
+    def source_model_memory_geometry(self) -> _SourceModelMemoryGeometry: ...
+    def group_update_vjp(
+        self, update_step: SemanticPreparedStep, bank: int, *,
+        consumer_stream: int, edit_only: bool = False,
+    ) -> tuple[Any, ...]:
+        """Requires genuine completion of this same original import."""
+        ...
+    def finish_cancelled_private_segment(self) -> None:
+        """Acknowledge only its cached positive, unexecuted cancellation."""
+        ...
 
 class SemanticSegmentInstructionAdmission:
     """Native-issued original instruction custody; construction is not public."""
@@ -510,11 +542,24 @@ class SemanticRetainedFinalUsePending(RuntimeError):
     """
 
 class SemanticPublishedParent:
+    def original_prepared_import(self) -> SemanticPreparedTaskImport:
+        """The genuine retained owner for this same SOURCE parent and task."""
+        ...
+    def source_model_contract_metadata(self) -> _SourceModelContractMetadata:
+        """Authenticated original host record and six layout byte offsets."""
+        ...
+    def source_model_memory_geometry(self) -> _SourceModelMemoryGeometry:
+        """Original full model allocation, storage, view and tensor geometry."""
+        ...
     def resolve_model_context_preparation(self) -> bool:
         """Join only the original submitted context preparation; never submit a suffix."""
         ...
 
 class SemanticTransitionSession:
+    @property
+    def prepared_task_import(self) -> Optional[SemanticPreparedTaskImport]:
+        """Recover the identical retained owner, without repeating callbacks."""
+        ...
     @property
     def learning_phase_checkpoint_issuer(self) -> Optional[bytes]:
         """Original Session signing issuer, also before the first learning phase.
@@ -538,6 +583,24 @@ class SemanticTransitionSession:
     ) -> Any: ...
 
 class SemanticTransitionController:
+    def task_observation_roots(
+        self, *, task_scope: Sequence[str], live_authorities: Any,
+        statement_records: Sequence[int], allowed_support_records: Sequence[int],
+        task_program_source: Optional[str], task_query_ordinals: Sequence[int],
+        task_scoring: Sequence[int], admissible_truth_masks: Sequence[int],
+        actor_eligible: bool, task_ground: Any, replay_rows: Any,
+        replay_selection: Any, max_material_bytes: int,
+        max_total_material_bytes: int, max_evidence_bytes: int,
+    ) -> tuple[
+        bytes, tuple[int, ...], tuple[int, ...],
+        tuple[tuple[int, Optional[int], Union[
+            tuple[Literal["admitted"], int],
+            tuple[Literal["authenticated"], int, tuple[int, ...]],
+        ]], ...],
+    ]:
+        """Original coverage, including the complete signed support reference."""
+        ...
+
     @property
     def session(self) -> SemanticTransitionSession:
         """The identical retained Session owner, checked on its creator thread.
@@ -565,7 +628,14 @@ class SemanticTransitionController:
         actor_refresh_initial_kit: Optional[tuple[bytes, tuple[Any, ...]]] = None,
         resolve_checkpoint: Any = None, max_checkpoint_bytes: Any = None,
         max_total_checkpoint_bytes: Any = None, retain_policy: bool = False,
-    ) -> Union[SemanticTransitionTaskUse, tuple[SemanticTransitionTaskUse, Any]]: ...
+        prepare_invocation: Optional[Callable[[SemanticTransitionTaskUse, SemanticPublishedParent], None]] = None,
+    ) -> Union[SemanticTransitionTaskUse, tuple[SemanticTransitionTaskUse, Any], SemanticPreparedTaskImport]: ...
+
+    def execute_task_import(
+        self, prepared_import: SemanticPreparedTaskImport,
+    ) -> tuple[SemanticTransitionTaskUse, SemanticRetainedReplayMember]:
+        """Execute its original restore/pack/finalize once; cache the same result."""
+        ...
 
     def admit_segment_instruction(
         self, task_use: SemanticTransitionTaskUse, *, parent: SemanticPublishedParent,
@@ -590,7 +660,14 @@ class SemanticTransitionController:
         segment_capacity_bytes: int, other_external_cuda_bytes: int,
         instruction_admission: Optional[SemanticSegmentInstructionAdmission],
         consumer_streams: Sequence[int],
-    ) -> None: ...
+        execute_prepared_imports: Optional[Callable[[], None]] = None,
+    ) -> None:
+        """Prepare the whole roster, execute imports, then hand off and capture.
+
+        The original allocation pool spans all stages through instantiation.
+        Recording requires genuine completion of every original future import.
+        """
+        ...
 
     def close(self, parent: SemanticPublishedParent) -> None:
         """Confirm terminal native release after the original parent and steps retire."""
