@@ -52,6 +52,8 @@ pub(crate) mod learning_phase;
 #[cfg(feature = "semantic-policy")]
 pub(crate) mod actor_refresh;
 #[cfg(feature = "semantic-policy")]
+pub(crate) mod cancelled_checkpoint;
+#[cfg(feature = "semantic-policy")]
 pub(crate) mod model_evaluation;
 
 pyo3::create_exception!(
@@ -755,7 +757,7 @@ impl PySemanticTransitionSession {
             segment_instruction: Mutex::new(None),
             learning_preparing: AtomicBool::new(false),
             learning_transition: Mutex::new(None),
-            checkpoint_custody: Mutex::new(None),
+            checkpoint_custody: Mutex::new(Some(learning_phase::cold_restore::CheckpointCustody::issue())),
             #[cfg(feature = "semantic-policy")]
             pending_content_binding: Mutex::new(None),
             #[cfg(feature = "semantic-policy")]
@@ -2145,53 +2147,26 @@ impl PySemanticTransitionSession {
         }
         let raw = checkpoint.cast::<PyBytes>()?.as_bytes();
         let manifest = SemanticCheckpointManifest::decode(raw)?;
-        let (seed, _, _, _) = TaskCheckpointSeed::decode(&manifest.task)?;
+        let (seed, _, phase, binding) = TaskCheckpointSeed::decode(&manifest.task)?;
         let expense = seed.proposal_expense()?;
         let expected_program = original_program.map(exact_replay_bytes).transpose()?;
         if expected_program != expense.original_admission.as_ref().map(|admission| admission.program.as_ref()) {
             return Err(invalid("checkpoint original Program differs from the expected complete bytes"));
         }
-        let closure = match (
+        let closure = learning_phase::cold_restore::read_checkpoint_restore_closure(
+            raw,
+            Some(snapshot),
             learning_phase_issuer,
             learning_phase_records,
             learning_phase_record_limits,
             learning_phase_fence,
-        ) {
-            (None, None, None, None) if learning_phase_checkpoint_issuer.is_none() => None,
-            (Some(issuer), Some(records), Some(limits), Some(fence)) => {
-                let verified = learning_phase::cold_restore::VerifiedClosure::read(
-                    raw,
-                    issuer,
-                    records,
-                    limits,
-                    fence,
-                    learning_phase_checkpoint_issuer,
-                )?;
-                let current = AuthoritySnapshot::parse(&ColdValue::read(
-                    snapshot,
-                    &mut (16 * 1024 * 1024),
-                    0,
-                )?)?;
-                current.newer_than(&verified.snapshot)?;
-                Some(Arc::new(verified))
-            }
-            _ => {
-                return Err(invalid(
-                    "cold phase restoration requires all original proof fields together",
-                ))
-            }
-        };
-        if closure.is_none() {
-            let manifest = SemanticCheckpointManifest::decode(raw)?;
-            if !manifest.phase_seal.is_empty()
-                || !SemanticTransitionSession::checkpoint_learning_phase_history(&manifest.native)
-                    .map_err(xlog_err)?
-                    .is_empty()
-            {
-                return Err(invalid(
-                    "phase-marked checkpoint requires its original complete signed lifecycle",
-                ));
-            }
+            learning_phase_checkpoint_issuer,
+        )?;
+        #[cfg(feature = "semantic-policy")]
+        if let Some(terminal) = cancelled_checkpoint::terminal_checkpoint(&manifest, &seed, &phase, binding)? {
+            // Authentication and the terminal decision precede memory admission,
+            // provider allocation, task acquisition and every model callback.
+            return Err(cancelled_checkpoint::terminal_error(py, raw, &terminal)?);
         }
         let expense = closure
             .as_ref()
@@ -2222,13 +2197,15 @@ impl PySemanticTransitionSession {
             None,
             None,
         )?;
+        let origin = Sha256::digest(raw).into();
+        let restored_owner = restored.borrow(py);
+        let session = restored_owner.session.borrow(py);
+        session.retain_checkpoint_restore_source(origin)?;
         if let Some(closure) = closure {
-            restored
-                .borrow(py)
-                .session
-                .borrow(py)
-                .install_checkpoint_custody(closure, Sha256::digest(raw).into())?;
+            session.install_checkpoint_custody(closure, origin)?;
         }
+        drop(session);
+        drop(restored_owner);
         Ok(restored)
     }
 
@@ -2276,11 +2253,12 @@ impl PySemanticTransitionSession {
         }
         self.checkpoint_custody()?
             .as_ref()
-            .map(|custody| {
+            .and_then(|custody| custody.closure.as_ref().zip(custody.origin.as_ref()))
+            .map(|(closure, origin)| {
                 Ok((
-                    PyBytes::new(py, &custody.closure.phase_id),
-                    PyBytes::new(py, &custody.closure.completion_digest),
-                    PyBytes::new(py, &custody.origin),
+                    PyBytes::new(py, &closure.phase_id),
+                    PyBytes::new(py, &closure.completion_digest),
+                    PyBytes::new(py, origin),
                 )
                     .into_pyobject(py)?
                     .unbind())
@@ -2305,27 +2283,38 @@ impl PySemanticTransitionSession {
     ) -> PyResult<()> {
         self.require_creator()?;
         let mut retained = self.checkpoint_custody()?;
-        if let Some(current) = retained.as_ref() {
-            if current.closure.phase_id != closure.phase_id
-                || current.closure.completion_digest != closure.completion_digest
-                || current.origin != origin
-            {
-                return Err(invalid(
-                    "known checkpoint issuer cannot replace its original closure or origin",
-                ));
-            }
-        } else {
-            *retained = Some(learning_phase::cold_restore::CheckpointCustody::issue(
-                closure, origin,
+        let current = retained.as_mut()
+            .ok_or_else(|| invalid("Session lost its original checkpoint signing owner"))?;
+        if current.closure.as_ref().is_some_and(|original|
+            original.phase_id != closure.phase_id || original.completion_digest != closure.completion_digest)
+            || current.origin.is_some_and(|original| original != origin)
+        {
+            return Err(invalid(
+                "known checkpoint issuer cannot replace its original closure or origin",
             ));
         }
+        current.closure = Some(closure);
+        current.origin = Some(origin);
+        Ok(())
+    }
+
+    fn retain_checkpoint_restore_source(&self, origin: [u8; 32]) -> PyResult<()> {
+        self.require_creator()?;
+        let mut retained = self.checkpoint_custody()?;
+        let current = retained.as_mut()
+            .ok_or_else(|| invalid("restored Session lost its original checkpoint signing owner"))?;
+        if current.origin.is_some_and(|original| original != origin) {
+            return Err(invalid("restored Session changed its authenticated checkpoint source"));
+        }
+        current.origin = Some(origin);
         Ok(())
     }
 
     fn seal_owned_checkpoint(&self, mut manifest: SemanticCheckpointManifest) -> PyResult<Vec<u8>> {
-        if let Some(custody) = self.checkpoint_custody()?.as_ref() {
-            manifest.phase_seal = custody.seal(&manifest)?;
-        }
+        let retained = self.checkpoint_custody()?;
+        let custody = retained.as_ref()
+            .ok_or_else(|| invalid("checkpoint export lost its original Session signing owner"))?;
+        manifest.phase_seal = custody.seal(&manifest)?;
         manifest.encode()
     }
 
@@ -3349,6 +3338,7 @@ struct SegmentInstructionCustody {
     transitions: Vec<SemanticTransitionKind>,
     cold_capacity: SemanticSegmentColdCapacity,
     replay_model_backings: Arc<xlog_cuda::SemanticReplayModelBackings>,
+    cancelled_checkpoint: Option<Arc<cancelled_checkpoint::OriginalCancelledCheckpointCustody>>,
     preparation: Mutex<SegmentInstructionPreparation>,
 }
 
@@ -3376,6 +3366,7 @@ struct SegmentInstructionPreparation {
     retirement_children_ready: bool,
     preparation_total: Option<xlog_cuda::SemanticColdModelWorkResult>,
     preparation_totals_frozen: bool,
+    cancelled_retirement_streams: Option<Vec<u64>>,
 }
 
 #[cfg(feature = "semantic-policy")]
@@ -3394,6 +3385,27 @@ impl SegmentInstructionCustody {
         self.preparation
             .lock()
             .map_err(|_| invalid("original instruction custody mutex is poisoned"))
+    }
+
+    fn finish_cancelled_checkpoint(&self, py: Python<'_>, streams: &[u64]) -> PyResult<()> {
+        if self.preparation()?.cancelled_retirement_streams.as_deref() != Some(streams) {
+            return Err(invalid("cancelled checkpoint lost its original completed retirement"));
+        }
+        let session = self.session.borrow(py);
+        let task = self.task_use.borrow(py);
+        let checkpoint = self.cancelled_checkpoint.as_ref()
+            .ok_or_else(|| invalid("ordinary cancelled instruction lost its source checkpoint"))?;
+        checkpoint.seal(&session, &task, &mut *session.owner()?, &self.inner)?;
+        // Cache the positive terminal bytes before either the public task state
+        // or its instruction slot can change. A lost return needs only the cache.
+        task.state()?.phase = TaskUsePhase::Refused;
+        let mut retained = session.segment_instruction.lock()
+            .map_err(|_| invalid("original instruction owner mutex is poisoned"))?;
+        if retained.as_ref().is_none_or(|owner| !std::ptr::eq(self, owner.as_ref())) {
+            return Err(invalid("cancelled checkpoint changed its original instruction owner"));
+        }
+        retained.take();
+        Ok(())
     }
 
     fn require_owner(&self, py: Python<'_>) -> PyResult<()> {
@@ -3448,6 +3460,16 @@ impl SegmentInstructionCustody {
 #[cfg(feature = "semantic-policy")]
 #[pymethods]
 impl PySemanticSegmentInstructionAdmission {
+    /// The charged terminal capsule is available only after genuine retirement.
+    #[getter]
+    fn cancelled_checkpoint(&self, py: Python<'_>) -> PyResult<Option<Py<PyBytes>>> {
+        self.inner.session.borrow(py).require_creator()?;
+        self.inner.cancelled_checkpoint.as_ref()
+            .map(|original| original.sealed_bytes())
+            .transpose()
+            .map(|sealed| sealed.flatten().map(|bytes| PyBytes::new(py, &bytes).unbind()))
+    }
+
     #[getter]
     fn preparation_result(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let session = self.inner.session.borrow(py);
@@ -10467,7 +10489,7 @@ impl PySemanticTransitionRestoredCheckpoint {
         let closure = session
             .checkpoint_custody()?
             .as_ref()
-            .map(|custody| Arc::clone(&custody.closure));
+            .and_then(|custody| custody.closure.as_ref().map(Arc::clone));
         closure
             .filter(|closure| closure.refusal.is_none())
             .map(|closure| closure.python_value(py))
@@ -10487,7 +10509,7 @@ impl PySemanticTransitionRestoredCheckpoint {
         let program = session
             .checkpoint_custody()?
             .as_ref()
-            .map(|custody| Arc::clone(&custody.closure.program));
+            .and_then(|custody| custody.closure.as_ref().map(|closure| Arc::clone(&closure.program)));
         if program.as_ref().is_some_and(|program| program.is_empty()) {
             return Err(invalid(
                 "authenticated phase custody lost its original frozen program",
@@ -10509,7 +10531,7 @@ impl PySemanticTransitionRestoredCheckpoint {
         let closure = session
             .checkpoint_custody()?
             .as_ref()
-            .map(|custody| Arc::clone(&custody.closure));
+            .and_then(|custody| custody.closure.as_ref().map(Arc::clone));
         match closure {
             Some(closure) => closure.refusal_value(py),
             None => Ok(None),
@@ -16944,7 +16966,7 @@ impl PySemanticTransitionController {
     /// Admit the original instruction while its selected parent is still active.
     /// This metadata-only owner precedes cold imports and native step allocation.
     #[cfg(feature = "semantic-policy")]
-    #[pyo3(signature = (task_use, *, parent, instruction_bytes, first_program_ordinal))]
+    #[pyo3(signature = (task_use, *, parent, instruction_bytes, first_program_ordinal, checkpoint=None))]
     fn admit_segment_instruction(
         &self,
         py: Python<'_>,
@@ -16952,6 +16974,7 @@ impl PySemanticTransitionController {
         parent: Py<PySemanticPublishedParent>,
         instruction_bytes: &Bound<'_, PyAny>,
         first_program_ordinal: &Bound<'_, PyAny>,
+        checkpoint: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Py<PySemanticSegmentInstructionAdmission>> {
         let session = self.session.borrow(py);
         session.require_creator()?;
@@ -16975,6 +16998,17 @@ impl PySemanticTransitionController {
             ));
         }
         let ordinal = ColdValue::read(first_program_ordinal, &mut 128, 0)?.unsigned()?;
+        let cancelled_checkpoint = match (private_execution_owner(py, &session)?, checkpoint) {
+            (None, Some(checkpoint)) => Some(Arc::new(
+                cancelled_checkpoint::OriginalCancelledCheckpointCustody::prepare(
+                    py, &session, &issued, &parent.borrow(py), exact_replay_bytes(checkpoint)?,
+                )?,
+            )),
+            (Some(_), None) => None,
+            _ => return Err(invalid(
+                "ordinary instruction requires its original checkpoint; private execution retains its own checkpoint owner",
+            )),
+        };
         let mut retained = session
             .segment_instruction
             .lock()
@@ -17011,12 +17045,18 @@ impl PySemanticTransitionController {
             transitions,
             cold_capacity,
             replay_model_backings: Arc::new(xlog_cuda::SemanticReplayModelBackings::default()),
+            cancelled_checkpoint,
             preparation: Mutex::new(SegmentInstructionPreparation::default()),
         });
         // Retention precedes Python allocation/return; losing that handoff never
         // grants a second native admission or a new attempt.
         *retained = Some(Arc::clone(&custody));
         drop(retained);
+        if let Some(checkpoint) = &custody.cancelled_checkpoint {
+            checkpoint.bind_source(
+                &mut *session.owner()?, &custody.inner, &*custody.parent.borrow(py).lease()?,
+            )?;
+        }
         Py::new(py, PySemanticSegmentInstructionAdmission { inner: custody })
     }
 
@@ -18039,6 +18079,27 @@ impl PySemanticTransitionController {
         let session = self.session.borrow(py);
         session.require_creator()?;
         self.require_read_issued(&task_use.borrow(py))?;
+        // Native and Python storage have already retired if only terminal
+        // encoding/signing failed. Join that same metadata suffix, never repeat
+        // producer callbacks, report work, deallocation or graph destruction.
+        let retired_instruction = session.segment_instruction.lock()
+            .map_err(|_| invalid("original instruction owner mutex is poisoned"))?
+            .as_ref().map(Arc::clone);
+        if let Some(instruction) = retired_instruction {
+            if instruction.preparation()?.cancelled_retirement_streams.is_some() {
+                if instruction.task_use.as_ptr() != task_use.as_ptr()
+                    || session.importing.load(Ordering::Acquire)
+                    || session.recording.load(Ordering::Acquire)
+                    || session.retiring.load(Ordering::Acquire)
+                {
+                    return Err(invalid("cancelled checkpoint metadata continuation changed its owner"));
+                }
+                let streams = ColdValue::read(consumer_streams, &mut (16 * 1024 * 1024), 0)?;
+                let streams = streams.sequence()?.iter().map(ColdValue::unsigned)
+                    .collect::<PyResult<Vec<_>>>()?;
+                return instruction.finish_cancelled_checkpoint(py, &streams);
+            }
+        }
         let cancellation = self.original_segment_cancellation(py, &session, &task_use)?;
         if cancellation.is_none() {
             task_use.borrow(py).state()?.require_public_use()?;
@@ -18391,12 +18452,17 @@ impl PySemanticTransitionController {
             )?;
         }
         if private.is_none() {
-            let instruction = session
-                .segment_instruction
-                .lock()
-                .map_err(|_| invalid("original instruction owner mutex is poisoned"))?
-                .take();
-            drop(instruction);
+            if let Some(instruction) = instruction.as_ref().filter(|_| cancellation.is_some()) {
+                instruction.preparation()?.cancelled_retirement_streams = Some(streams.clone());
+                instruction.finish_cancelled_checkpoint(py, &streams)?;
+            } else {
+                let instruction = session
+                    .segment_instruction
+                    .lock()
+                    .map_err(|_| invalid("original instruction owner mutex is poisoned"))?
+                    .take();
+                drop(instruction);
+            }
         }
         if cancellation.is_some() {
             task_use.borrow(py).state()?.phase = TaskUsePhase::Refused;
@@ -23517,7 +23583,7 @@ mod tests {
             segment_instruction: Mutex::new(None),
             learning_preparing: AtomicBool::new(false),
             learning_transition: Mutex::new(None),
-            checkpoint_custody: Mutex::new(None),
+            checkpoint_custody: Mutex::new(Some(learning_phase::cold_restore::CheckpointCustody::issue())),
             #[cfg(feature = "semantic-policy")]
             active_cold_model_work: Mutex::new(None),
             #[cfg(feature = "semantic-policy")]

@@ -286,6 +286,45 @@ the same retirement report closes and before model adoption begins.
 Unknown child import, final use or graph destruction retains its
 own original custody; target non-submission does not prove that child's outcome.
 
+### Cancelled instruction checkpoints
+
+Every actual Session owns one native checkpoint signer before its first
+instruction, including before any completed learning phase. Persist
+`session.learning_phase_checkpoint_issuer` independently before the first
+admission. Completion or refusal adds genuine phase ancestry without replacing
+that Session's key. A fresh restored Session has a new key, which must also be
+pinned before admitting another operation. The checkpoint issuer selector is
+untrusted lookup metadata: it cannot establish its own trusted pin.
+
+An ordinary `admit_segment_instruction(...)` requires
+`checkpoint=original_checkpoint_bytes`, the same pre-request capsule retained by
+the caller. Private execution instead uses its original private checkpoint owner
+and omits this argument. Native authenticates the original bytes before charging
+or handing off the instruction. Genuine whole-instruction non-submission does
+not refund any charged Proposal.
+
+After the original cancellation, graph, producers, aliases, reports and storage
+have all retired, `admission.cancelled_checkpoint` exposes the signed terminal
+capsule. Until then it is `None`. Keep the admission through durable handoff;
+after a lost successful return, read this same cache rather than reconstructing
+or repeating retirement. If only terminal encoding failed after retirement,
+`retire_segment` continues that original metadata suffix with the same task and
+consumer streams, without repeating producer callbacks or device retirement.
+
+`restore_cancelled_checkpoint(checkpoint, *, program_bytes, task_identity, ...)`
+authenticates the exact original Program, native task identity and independently
+pinned `learning_phase_checkpoint_issuer`. Phase-marked capsules additionally
+require the complete existing lifecycle proof and current snapshot. A valid
+terminal raises `SemanticTransitionCheckpointCancelled`, carrying `checkpoint`,
+`task_identity`, `first_program_ordinal`, `end_program_ordinal`, `proposal_spent`
+and the full `parent_identity`. Invalid or nonterminal input is rejected. This
+metadata-only entry creates no CUDA provider, task, model or Runtime. Normal
+`restore_checkpoint` makes the same authenticated terminal decision before
+memory admission or any device/model entry. Cancelled is terminal; an unknown
+execution cannot acquire this disposition or admit a replacement instruction.
+
+### Semantic task authority
+
 The semantic controller's `task_observation_roots` and `import_task` methods
 share five explicit keyword arguments in addition to their admission and
 authority inputs. `import_task` also requires `task_priority_levels`:

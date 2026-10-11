@@ -2120,9 +2120,14 @@ impl PySemanticLearningPhaseTransition {
         let custody = retained
             .as_ref()
             .ok_or_else(|| invalid("known Source refusal lost its original checkpoint issuer"))?;
-        if custody.closure.phase_id != phase_id
-            || custody.closure.completion_digest != digest
-            || custody.origin != <[u8; 32]>::from(Sha256::digest(&self.source_checkpoint))
+        let (closure, checkpoint_origin) = custody
+            .closure
+            .as_ref()
+            .zip(custody.origin.as_ref())
+            .ok_or_else(|| invalid("known Source refusal lost its original checkpoint custody"))?;
+        if closure.phase_id != phase_id
+            || closure.completion_digest != digest
+            || *checkpoint_origin != <[u8; 32]>::from(Sha256::digest(&self.source_checkpoint))
         {
             return Err(invalid(
                 "Source refusal issuer differs from this original known terminal origin",
@@ -2131,7 +2136,7 @@ impl PySemanticLearningPhaseTransition {
         let origin = (
             PyBytes::new(py, &phase_id),
             PyBytes::new(py, &digest),
-            PyBytes::new(py, &custody.origin),
+            PyBytes::new(py, checkpoint_origin),
         )
             .into_pyobject(py)?;
         Ok(Some(

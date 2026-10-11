@@ -409,17 +409,19 @@ impl PySemanticLearningPhaseTransition {
         let origin: [u8; 32] = Sha256::digest(&self.source_checkpoint).into();
         let source = self.source.borrow(py);
         let mut custody = source.checkpoint_custody()?;
-        if custody.as_ref().is_some_and(|current| {
-            current.closure.phase_id == closure.phase_id
-                && current.closure.completion_digest == closure.completion_digest
-                && current.origin == origin
+        let current = custody.as_mut().ok_or_else(|| {
+            invalid("source Session lost its original checkpoint signing owner")
+        })?;
+        if current.closure.as_ref().is_some_and(|previous| {
+            previous.phase_id == closure.phase_id
+                && previous.completion_digest == closure.completion_digest
+                && current.origin == Some(origin)
         }) {
             return Ok(());
         }
-        // A distinct terminal origin gets exactly one distinct issuer. Existing
-        // immutable public pins and signed records remain with the consumer.
-        // The Source is still held; no public pin is visible until resumption.
-        *custody = Some(cold_restore::CheckpointCustody::issue(closure, origin));
+        // The actual Source closure changes; its original Session key does not.
+        current.closure = Some(closure);
+        current.origin = Some(origin);
         Ok(())
     }
 
@@ -874,8 +876,8 @@ impl PySemanticLearningPhaseTransition {
         ))
     }
 
-    /// Known signed Delivery alone authorizes a checkpoint signer. This cold
-    /// CPU custody does not repeat model work, change Q or enter another region.
+    /// Known signed Delivery binds completed-phase ancestry to the original
+    /// Session signer without repeating model work or entering another region.
     pub(super) fn install_delivered_checkpoint_custody(&self, py: Python<'_>) -> PyResult<()> {
         let (phase_id, delivery_digest, admission) = self.records()?.delivered_identity()?;
         let payload = self

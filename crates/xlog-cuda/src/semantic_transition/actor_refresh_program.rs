@@ -98,13 +98,22 @@ pub(super) enum InstructionState {
     Cancelled = 6,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct InstructionCheckpointSource {
+    native: Identity256,
+    checkpoint: Identity256,
+    proposal_spent: u64,
+}
+
 pub(super) struct InstructionAdmission {
     issuance: Arc<()>,
     first: u64,
     end: u64,
     pub(super) instruction: Arc<[u8]>,
     instruction_identity: Identity256,
-    checkpoint_source: Option<Identity256>,
+    assignment_prefix: Identity256,
+    assignment_prefix_has_rng: bool,
+    checkpoint_source: Option<InstructionCheckpointSource>,
     parent: SemanticPublishedIdentity,
     parent_token: u64,
     pub(super) state: InstructionState,
@@ -547,6 +556,99 @@ fn require_cancelled_instruction_material(claim: &InstructionAdmission) -> Resul
     Ok(())
 }
 
+fn instruction_proposals(program: &ActorRefreshProgram, claim: &InstructionAdmission) -> u64 {
+    program.steps[claim.first as usize..claim.end as usize].iter()
+        .filter(|step| step.kind == Some(SemanticTransitionKind::Proposal)).count() as u64
+}
+
+fn assignment_material(
+    program: Identity256,
+    initial_index: Identity256,
+    rng: Option<SemanticRngBinding>,
+    admissions: &[InstructionAdmission],
+    assignments: &[&MainActorAssignment],
+) -> Vec<u8> {
+    let mut bytes = b"XLOG-ACTOR-REFRESH-ASSIGNMENTS\0".to_vec();
+    material_u64(&mut bytes, 5);
+    bytes.extend_from_slice(program.as_bytes());
+    bytes.extend_from_slice(initial_index.as_bytes());
+    material_u64(&mut bytes, u64::from(rng.is_some()));
+    if let Some(rng) = rng {
+        for value in [rng.stream_serial, u64::from(rng.family_id), u64::from(rng.proposal)] {
+            material_u64(&mut bytes, value);
+        }
+    }
+    material_u64(&mut bytes, admissions.len() as u64);
+    for claim in admissions {
+        for value in [claim.first, claim.end, claim.state as u64, claim.parent.word, claim.parent_token,
+            u64::from(claim.parent_fully_retired), u64::from(claim.resources_retired)] {
+            material_u64(&mut bytes, value);
+        }
+        bytes.extend_from_slice(claim.parent.instance.as_bytes());
+        bytes.extend_from_slice(claim.parent.logical_digest.as_bytes());
+        bytes.extend_from_slice(claim.parent.state_digest.as_bytes());
+        bytes.extend_from_slice(claim.instruction_identity.as_bytes());
+        material_u64(&mut bytes, claim.instruction.len() as u64);
+        bytes.extend_from_slice(&claim.instruction);
+        bytes.extend_from_slice(claim.assignment_prefix.as_bytes());
+        material_u64(&mut bytes, u64::from(claim.assignment_prefix_has_rng));
+        material_u64(&mut bytes, u64::from(claim.checkpoint_source.is_some()));
+        if let Some(source) = claim.checkpoint_source {
+            bytes.extend_from_slice(source.native.as_bytes());
+            bytes.extend_from_slice(source.checkpoint.as_bytes());
+            material_u64(&mut bytes, source.proposal_spent);
+        }
+        for result in [claim.cold_result, claim.retirement_result] {
+            write_instruction_cold_result(&mut bytes, result);
+        }
+        material_u64(&mut bytes, claim.prepared_cold_results.len() as u64);
+        for (ordinal, result) in &claim.prepared_cold_results {
+            material_u64(&mut bytes, *ordinal);
+            write_instruction_cold_result(&mut bytes, *result);
+        }
+    }
+    material_u64(&mut bytes, assignments.len() as u64);
+    let mut assignments = assignments.to_vec();
+    assignments.sort_by_key(|assignment| assignment.ordinal);
+    for assignment in assignments {
+        material_u64(&mut bytes, assignment.ordinal);
+        bytes.extend_from_slice(&publication_abi_bytes(&[assignment.origin]));
+        bytes.extend_from_slice(assignment.batch.as_bytes());
+        bytes.extend_from_slice(&assignment.batch_bytes);
+    }
+    bytes
+}
+
+fn require_cancelled_assignment_prefix(
+    program: &ActorRefreshProgram,
+    initial_index: Identity256,
+    rng: Option<SemanticRngBinding>,
+    admissions: &[InstructionAdmission],
+    assignments: &[MainActorAssignment],
+) -> Result<(), SemanticTransitionError> {
+    let (claim, previous) = admissions.split_last().ok_or_else(invalid_program)?;
+    let source = claim.checkpoint_source.ok_or_else(invalid_program)?;
+    let rng = if claim.assignment_prefix_has_rng {
+        Some(rng.ok_or_else(invalid_program)?)
+    } else {
+        if !previous.is_empty() { return Err(invalid_program()); }
+        None
+    };
+    let prefix_assignments: Vec<_> = assignments.iter().filter(|assignment|
+        previous.iter().any(|original| original.first <= assignment.ordinal && assignment.ordinal < original.end))
+        .collect();
+    let prefix = assignment_material(program.identity, initial_index, rng, previous, &prefix_assignments);
+    if Identity256::from_bytes(Sha256::digest(&prefix).into()) != claim.assignment_prefix {
+        return Err(publication_input_error("cancelled instruction changed its original assignment prefix"));
+    }
+    let previous_proposals = previous.iter().try_fold(0u64, |spent, original|
+        spent.checked_add(instruction_proposals(program, original)).ok_or(SemanticTransitionError::GenerationExhausted))?;
+    if source.proposal_spent < previous_proposals || source.proposal_spent > program.proposals {
+        return Err(publication_input_error("cancelled instruction changed its original cumulative Proposal expense"));
+    }
+    Ok(())
+}
+
 // One canonical parser serves both live restoration and terminal preflight.
 // It authenticates every original instruction and assignment before GPU entry.
 fn decode_assignment_material(
@@ -558,7 +660,7 @@ fn decode_assignment_material(
     let magic = b"XLOG-ACTOR-REFRESH-ASSIGNMENTS\0";
     let semantic = SemanticTransitionError::Semantic;
     if reader.take(magic.len()).map_err(semantic)? != magic
-        || reader.u64().map_err(semantic)? != 4
+        || reader.u64().map_err(semantic)? != 5
         || reader.take(32).map_err(semantic)? != program.identity.as_bytes()
         || reader.take(32).map_err(semantic)? != initial_index.as_bytes() { return Err(invalid_program()); }
     let rng = match reader.u64().map_err(semantic)? {
@@ -599,9 +701,19 @@ fn decode_assignment_material(
         let instruction_len = usize::try_from(reader.u64().map_err(semantic)?).map_err(|_| invalid_program())?;
         if instruction_len == 0 || instruction_len > PROGRAM_BYTES { return Err(invalid_program()); }
         let instruction: Arc<[u8]> = Arc::from(reader.take(instruction_len).map_err(semantic)?);
+        let assignment_prefix = Identity256::from_bytes(reader.take(32).map_err(semantic)?.try_into().map_err(|_| invalid_program())?);
+        let assignment_prefix_has_rng = match reader.u64().map_err(semantic)? {
+            0 => false,
+            1 => true,
+            _ => return Err(invalid_program()),
+        };
         let checkpoint_source = match reader.u64().map_err(semantic)? {
             0 => None,
-            1 => Some(Identity256::from_bytes(reader.take(32).map_err(semantic)?.try_into().map_err(|_| invalid_program())?)),
+            1 => Some(InstructionCheckpointSource {
+                native: Identity256::from_bytes(reader.take(32).map_err(semantic)?.try_into().map_err(|_| invalid_program())?),
+                checkpoint: Identity256::from_bytes(reader.take(32).map_err(semantic)?.try_into().map_err(|_| invalid_program())?),
+                proposal_spent: reader.u64().map_err(semantic)?,
+            }),
             _ => return Err(invalid_program()),
         };
         let original = usize::try_from(first).ok().and_then(|index| program.steps.get(index)).ok_or_else(invalid_program)?;
@@ -624,7 +736,7 @@ fn decode_assignment_material(
         // An incomplete restored attempt is retained, not re-issued. Only
         // the original live handle can resolve its asynchronous owners.
         admissions.push(InstructionAdmission { issuance: Arc::new(()), first, end,
-            instruction, instruction_identity, checkpoint_source,
+            instruction, instruction_identity, assignment_prefix, assignment_prefix_has_rng, checkpoint_source,
             parent: SemanticPublishedIdentity { instance, word, logical_digest, state_digest }, parent_token, state,
             cold_work: None, cold_result, retirement_work: None, retirement_result,
             retirement_cancellation: None,
@@ -660,6 +772,7 @@ fn decode_assignment_material(
             for previous in &admissions[..index] {
                 require_retired_instruction_expense(previous)?;
             }
+            require_cancelled_assignment_prefix(program, initial_index, rng, &admissions, &assignments)?;
         }
         if claim.state == InstructionState::Completed {
             for step in &program.steps[claim.first as usize..claim.end as usize] {
@@ -725,6 +838,10 @@ impl SemanticTransitionSession {
         } else if original.before_proposals != 0 {
             return Err(invalid_program());
         }
+        // Freeze the actual source prefix before the first admission installs
+        // its RNG binding or any admission changes the canonical assignment map.
+        let assignment_prefix = Identity256::from_bytes(Sha256::digest(self.actor_refresh_assignment_material()?).into());
+        let assignment_prefix_has_rng = program.original_rng.is_some();
         let issuance = Arc::new(());
         let admission = SemanticSegmentInstructionAdmission {
             issuer: Arc::clone(&self.publication_issuer), issuance: Arc::clone(&issuance), first: first_program_ordinal,
@@ -732,7 +849,7 @@ impl SemanticTransitionSession {
         let claim = InstructionAdmission {
             issuance, first: first_program_ordinal, end: end as u64,
             instruction: Arc::from(instruction_bytes), instruction_identity: Identity256::from_bytes(Sha256::digest(instruction_bytes).into()),
-            checkpoint_source: None,
+            assignment_prefix, assignment_prefix_has_rng, checkpoint_source: None,
             parent: parent.identity, parent_token: parent.token, state: InstructionState::Admitted,
             cold_work: None, cold_result: None,
             retirement_work: None, retirement_result: None, retirement_cancellation: None,
@@ -765,20 +882,42 @@ impl SemanticTransitionSession {
     }
 
     /// Bind the original sealed source to this native claim before any charge,
-    /// handoff, cold callback or initializer. A repeated binding is identical.
+    /// handoff, cold callback or initializer. The authenticated checkpoint owner
+    /// supplies its full digest and actual cumulative expense; this native owner
+    /// compares the exact assignment prefix it retained before admission.
+    /// A repeated binding is identical.
     pub fn bind_segment_checkpoint_source(
         &mut self,
         admission: &SemanticSegmentInstructionAdmission,
         parent: &SemanticPublishedLease,
         source_material: &[u8],
+        source_checkpoint: Identity256,
+        source_proposal_spent: u64,
+        source_assignments: &[u8],
     ) -> Result<(), SemanticTransitionError> {
         self.require_segment_instruction_admission(admission, parent)?;
         let (digest, _) = self.verify_checkpoint_source_material(parent, source_material)?;
+        let program = self.actor_refresh_program.as_ref().ok_or_else(invalid_program)?;
+        let spent = program.admissions.iter().take_while(|claim| !Arc::ptr_eq(&claim.issuance, &admission.issuance))
+            .try_fold(0u64, |spent, claim| {
+                // Every serialized report and retirement bit in the retained
+                // prefix is final before this source can authorize a charge.
+                require_retired_instruction_expense(claim)?;
+                spent.checked_add(instruction_proposals(program, claim))
+                    .ok_or(SemanticTransitionError::GenerationExhausted)
+            })?;
+        if source_proposal_spent < spent || source_proposal_spent > program.proposals { return Err(invalid_program()); }
+        let source = InstructionCheckpointSource {
+            native: digest,
+            checkpoint: source_checkpoint,
+            proposal_spent: source_proposal_spent,
+        };
         let claim = self.instruction_admission_mut(admission)?;
         if claim.state != InstructionState::Admitted
-            || claim.checkpoint_source.is_some_and(|original| original != digest)
+            || Identity256::from_bytes(Sha256::digest(source_assignments).into()) != claim.assignment_prefix
+            || claim.checkpoint_source.is_some_and(|original| original != source)
         { return Err(invalid_program()); }
-        claim.checkpoint_source = Some(digest);
+        claim.checkpoint_source = Some(source);
         Ok(())
     }
 
@@ -965,51 +1104,9 @@ impl SemanticTransitionSession {
     pub fn actor_refresh_assignment_material(&self) -> Result<Vec<u8>, SemanticTransitionError> {
         let program = self.actor_refresh_program.as_ref().ok_or_else(invalid_program)?;
         let initial = self.actor_refresh_initial.as_ref().ok_or_else(invalid_program)?;
-        let mut bytes = b"XLOG-ACTOR-REFRESH-ASSIGNMENTS\0".to_vec();
-        material_u64(&mut bytes, 4);
-        bytes.extend_from_slice(program.identity.as_bytes());
-        bytes.extend_from_slice(initial.index.as_bytes());
-        material_u64(&mut bytes, u64::from(program.original_rng.is_some()));
-        if let Some(rng) = program.original_rng {
-            for value in [rng.stream_serial, u64::from(rng.family_id), u64::from(rng.proposal)] {
-                material_u64(&mut bytes, value);
-            }
-        }
-        material_u64(&mut bytes, program.admissions.len() as u64);
-        for claim in &program.admissions {
-            for value in [claim.first, claim.end, claim.state as u64, claim.parent.word, claim.parent_token,
-                u64::from(claim.parent_fully_retired), u64::from(claim.resources_retired)] {
-                material_u64(&mut bytes, value);
-            }
-            bytes.extend_from_slice(claim.parent.instance.as_bytes());
-            bytes.extend_from_slice(claim.parent.logical_digest.as_bytes());
-            bytes.extend_from_slice(claim.parent.state_digest.as_bytes());
-            bytes.extend_from_slice(claim.instruction_identity.as_bytes());
-            material_u64(&mut bytes, claim.instruction.len() as u64);
-            bytes.extend_from_slice(&claim.instruction);
-            material_u64(&mut bytes, u64::from(claim.checkpoint_source.is_some()));
-            if let Some(source) = claim.checkpoint_source {
-                bytes.extend_from_slice(source.as_bytes());
-            }
-            for result in [claim.cold_result, claim.retirement_result] {
-                write_instruction_cold_result(&mut bytes, result);
-            }
-            material_u64(&mut bytes, claim.prepared_cold_results.len() as u64);
-            for (ordinal, result) in &claim.prepared_cold_results {
-                material_u64(&mut bytes, *ordinal);
-                write_instruction_cold_result(&mut bytes, *result);
-            }
-        }
-        material_u64(&mut bytes, program.main_origins.len() as u64);
-        let mut assignments: Vec<_> = program.main_origins.iter().collect();
-        assignments.sort_by_key(|assignment| assignment.ordinal);
-        for assignment in assignments {
-            material_u64(&mut bytes, assignment.ordinal);
-            bytes.extend_from_slice(&publication_abi_bytes(&[assignment.origin]));
-            bytes.extend_from_slice(assignment.batch.as_bytes());
-            bytes.extend_from_slice(&assignment.batch_bytes);
-        }
-        Ok(bytes)
+        let assignments: Vec<_> = program.main_origins.iter().collect();
+        Ok(assignment_material(program.identity, initial.index, program.original_rng,
+            &program.admissions, &assignments))
     }
 
     /// Seal the original non-submitted instruction after actual owner retirement
@@ -1046,17 +1143,18 @@ impl SemanticTransitionSession {
         program_bytes: &[u8],
         initial_index: Identity256,
         bytes: &[u8],
-    ) -> Result<Option<(u64, u64, SemanticPublishedIdentity, u64, Identity256)>, SemanticTransitionError> {
+    ) -> Result<Option<(u64, u64, SemanticPublishedIdentity, u64, Identity256, Identity256)>, SemanticTransitionError> {
         let program = ActorRefreshProgram::decode(program_bytes)?;
         let (_, admissions, _) = decode_assignment_material(&program, initial_index, bytes)?;
         let Some(claim) = admissions.last().filter(|claim| claim.state == InstructionState::Cancelled) else { return Ok(None); };
-        let charged = admissions.iter().try_fold(0u64, |total, original| {
-            let count = program.steps[original.first as usize..original.end as usize].iter()
-                .filter(|step| step.kind == Some(SemanticTransitionKind::Proposal)).count() as u64;
-            total.checked_add(count).ok_or(SemanticTransitionError::GenerationExhausted)
-        })?;
-        Ok(Some((claim.first, claim.end, claim.parent, charged,
-            claim.checkpoint_source.ok_or_else(invalid_program)?)))
+        let source = claim.checkpoint_source.ok_or_else(invalid_program)?;
+        // The source may already include charged work from retired sibling
+        // trajectories. Preserve that cumulative expense without pretending
+        // their admissions belong to this physical native branch.
+        let charged = source.proposal_spent.checked_add(instruction_proposals(&program, claim))
+            .filter(|charged| *charged <= program.proposals)
+            .ok_or_else(invalid_program)?;
+        Ok(Some((claim.first, claim.end, claim.parent, charged, source.native, source.checkpoint)))
     }
 
     /// Restore every native-issued assignment from the authenticated checkpoint.

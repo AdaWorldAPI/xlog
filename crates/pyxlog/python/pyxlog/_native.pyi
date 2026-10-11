@@ -10,7 +10,7 @@ importable from Python.
 from __future__ import annotations
 
 from os import PathLike
-from typing import Any, Callable, Literal, Optional, Sequence, TypedDict, Union
+from typing import Any, Callable, Literal, NoReturn, Optional, Sequence, TypedDict, Union
 
 # ---------------------------------------------------------------------------
 # Module-level constant
@@ -244,6 +244,10 @@ class SemanticSegmentInstructionAdmission:
     def parent_identity(self) -> _PublishedIdentity: ...
     def resolve_parent_handoff(self) -> None: ...
     @property
+    def cancelled_checkpoint(self) -> Optional[bytes]:
+        """Cached terminal capsule only after genuine cancellation retirement."""
+        ...
+    @property
     def preparation_result(self) -> Optional[tuple[
         int, int, int, int, int, tuple[int, int, int, int, int, int, int, int, int]
     ]]: ...
@@ -456,6 +460,29 @@ class SemanticPreparedSegmentCancelled(RuntimeError):
     original attempt, Program progression or nominal proposal expense.
     """
 
+class SemanticTransitionCheckpointCancelled(RuntimeError):
+    """Authenticated terminal checkpoint; no further request can be admitted."""
+
+    checkpoint: bytes
+    task_identity: bytes
+    first_program_ordinal: int
+    end_program_ordinal: int
+    proposal_spent: int
+    parent_identity: _PublishedIdentity
+
+def restore_cancelled_checkpoint(
+    checkpoint: bytes, *, program_bytes: bytes, task_identity: bytes,
+    snapshot: Any = None, learning_phase_issuer: Any = None,
+    learning_phase_records: Any = None, learning_phase_record_limits: Any = None,
+    learning_phase_fence: Any = None, learning_phase_checkpoint_issuer: Any = None,
+) -> NoReturn:
+    """Authenticate without CUDA and raise SemanticTransitionCheckpointCancelled.
+
+    Invalid or nonterminal material raises ValueError instead. The original
+    Program, native task identity and independent checkpoint issuer are required.
+    """
+    ...
+
 class SemanticRetainedFinalUsePending(RuntimeError):
     """Retain the original target retirement and members until final use joins.
 
@@ -506,7 +533,13 @@ class SemanticTransitionController:
     def admit_segment_instruction(
         self, task_use: SemanticTransitionTaskUse, *, parent: SemanticPublishedParent,
         instruction_bytes: bytes, first_program_ordinal: int,
-    ) -> SemanticSegmentInstructionAdmission: ...
+        checkpoint: Optional[bytes] = None,
+    ) -> SemanticSegmentInstructionAdmission:
+        """Ordinary admission requires its exact original pre-request checkpoint.
+
+        An original private child uses its already-retained checkpoint custody.
+        """
+        ...
 
     def prepare_private_replay_child(
         self, task_use: SemanticTransitionTaskUse, *,
