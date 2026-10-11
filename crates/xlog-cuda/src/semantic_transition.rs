@@ -19643,12 +19643,14 @@ impl SemanticTransitionSession {
             !staged.proof.inner.recording_ready.load(Ordering::Acquire)) {
             return Err(publication_input_error("CURRENT recording requires its original outer reader handoff"));
         }
-        if let Some((original, _)) = &build.original_parent {
+        if let Some((instance, word)) = build.original_parent.as_ref()
+            .map(|(original, _)| (original.instance, original.word))
+        {
             let storage = Arc::clone(self.publication.as_ref().ok_or(SemanticTransitionError::NotBound)?);
             let control = self.publication_read(storage.control.view())?[0];
             if !self.readers.is_empty() || self.admitted_transition.is_some()
                 || control.abi != 1 || control.reader_counts != [0; 2] || control.reader_gate != 0
-                || control.instance != original.instance || control.word != original.word {
+                || control.instance != instance || control.word != word {
                 return Err(publication_input_error("original catalogue initialization requires genuine source reader quiescence"));
             }
         }
