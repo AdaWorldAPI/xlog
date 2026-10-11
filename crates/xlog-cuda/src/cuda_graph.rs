@@ -1196,10 +1196,15 @@ impl ConditionalCudaGraphBody {
         populate: F,
     ) -> std::result::Result<(), CudaConditionalGraphUnavailable>
     where
-        F: FnOnce(&mut ConditionalCudaGraphBodySequence) -> std::result::Result<(), CudaConditionalGraphUnavailable>,
+        F: FnOnce(
+            &mut ConditionalCudaGraphBodySequence,
+        ) -> std::result::Result<(), CudaConditionalGraphUnavailable>,
     {
-        let context = stream_context(stream).map_err(CudaConditionalGraphUnavailable::body_population)?;
-        if context != self.context { return Err(CudaConditionalGraphUnavailable::ContextMismatch); }
+        let context =
+            stream_context(stream).map_err(CudaConditionalGraphUnavailable::body_population)?;
+        if context != self.context {
+            return Err(CudaConditionalGraphUnavailable::ContextMismatch);
+        }
         // Resolve every fallible prerequisite before wrapping a borrowed raw
         // graph in the canonical owner's storage representation.
         let api = ConditionalGraphDriverApi::load()?;
@@ -1316,20 +1321,37 @@ pub struct ConditionalCudaGraphBodySequence {
 }
 
 impl ConditionalCudaGraphBodySequence {
-    pub fn capture_segment_on_stream<F, E>(&mut self, stream: &CudaStream, record: F)
-        -> std::result::Result<(), CudaConditionalGraphUnavailable>
-    where F: FnOnce() -> std::result::Result<(), E>, E: fmt::Display {
+    pub fn capture_segment_on_stream<F, E>(
+        &mut self,
+        stream: &CudaStream,
+        record: F,
+    ) -> std::result::Result<(), CudaConditionalGraphUnavailable>
+    where
+        F: FnOnce() -> std::result::Result<(), E>,
+        E: fmt::Display,
+    {
         self.builder.capture_segment_on_stream(stream, record)
     }
 
-    pub fn add_conditional_if<P, F, E>(&mut self, stream: &CudaStream, preflight: P, body: F)
-        -> std::result::Result<u64, CudaConditionalGraphUnavailable>
-    where P: FnOnce(u64) -> std::result::Result<(), E>, E: fmt::Display,
-        F: FnOnce(&ConditionalCudaGraphBody) -> std::result::Result<(), CudaConditionalGraphUnavailable> {
+    pub fn add_conditional_if<P, F, E>(
+        &mut self,
+        stream: &CudaStream,
+        preflight: P,
+        body: F,
+    ) -> std::result::Result<u64, CudaConditionalGraphUnavailable>
+    where
+        P: FnOnce(u64) -> std::result::Result<(), E>,
+        E: fmt::Display,
+        F: FnOnce(
+            &ConditionalCudaGraphBody,
+        ) -> std::result::Result<(), CudaConditionalGraphUnavailable>,
+    {
         self.builder.add_conditional_if(stream, preflight, body)
     }
 
-    pub(crate) fn retirement(&self) -> CudaGraphRetirement { self.builder.retirement() }
+    pub(crate) fn retirement(&self) -> CudaGraphRetirement {
+        self.builder.retirement()
+    }
 }
 
 impl Drop for ConditionalCudaGraphBodySequence {

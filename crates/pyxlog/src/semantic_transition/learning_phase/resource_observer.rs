@@ -32,8 +32,7 @@ type ReadStep = unsafe extern "C" fn(*mut c_void, *mut c_void, u64, *mut TraceVi
 type ReadCertificate = unsafe extern "C" fn(*mut c_void, *const u8, *mut DeviceCertificate) -> u32;
 type RecordRoot =
     unsafe extern "C" fn(*mut c_void, *const xlog_cuda::memory::GpuBackingRoot) -> u32;
-type ResolveStepCancellation =
-    unsafe extern "C" fn(*mut c_void, *mut c_void, u64, u64, u64) -> u32;
+type ResolveStepCancellation = unsafe extern "C" fn(*mut c_void, *mut c_void, u64, u64, u64) -> u32;
 
 // These are the exact layouts of the installed xlog_resource_observer.h.
 // Event storage remains producer-owned; this memory consumer never dereferences it.
@@ -753,13 +752,19 @@ impl ResourceObserver {
             .as_mut()
             .ok_or_else(|| invalid("capture cancellation lost its original interval"))?;
         let count = Self::require_original_step_cancellation(
-            interval, ordinal, steps, capture_stream, proof,
+            interval,
+            ordinal,
+            steps,
+            capture_stream,
+            proof,
         )?;
         if interval.cancelled_roster && interval.cancellation_status == COMPLETE {
             return Ok(());
         }
         if !matches!(interval.cancellation_status, INCOMPLETE | UNKNOWN) {
-            return Err(invalid("a known failed capture cancellation cannot be resolved as success"));
+            return Err(invalid(
+                "a known failed capture cancellation cannot be resolved as success",
+            ));
         }
         // SAFETY: the immutable capsule pins this exact resolver/context. The
         // retained tuple and native proof authenticate the only prior handoff.
@@ -791,13 +796,16 @@ impl ResourceObserver {
     ) -> PyResult<bool> {
         self.require_original(py)?;
         let retained = self.interval()?;
-        let interval = retained.as_ref()
+        let interval = retained
+            .as_ref()
             .ok_or_else(|| invalid("capture cancellation lost its original interval"))?;
         Self::require_original_step_cancellation(interval, ordinal, steps, capture_stream, proof)?;
         match interval.cancellation_status {
             COMPLETE if interval.cancelled_roster => Ok(false),
             INCOMPLETE | UNKNOWN if !interval.cancelled_roster => Ok(true),
-            _ => Err(invalid("capture cancellation has no genuine pending original result")),
+            _ => Err(invalid(
+                "capture cancellation has no genuine pending original result",
+            )),
         }
     }
 

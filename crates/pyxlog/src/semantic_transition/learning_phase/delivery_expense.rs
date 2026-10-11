@@ -409,9 +409,9 @@ impl PySemanticLearningPhaseTransition {
         let origin: [u8; 32] = Sha256::digest(&self.source_checkpoint).into();
         let source = self.source.borrow(py);
         let mut custody = source.checkpoint_custody()?;
-        let current = custody.as_mut().ok_or_else(|| {
-            invalid("source Session lost its original checkpoint signing owner")
-        })?;
+        let current = custody
+            .as_mut()
+            .ok_or_else(|| invalid("source Session lost its original checkpoint signing owner"))?;
         if current.closure.as_ref().is_some_and(|previous| {
             previous.phase_id == closure.phase_id
                 && previous.completion_digest == closure.completion_digest

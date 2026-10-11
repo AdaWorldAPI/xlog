@@ -381,7 +381,10 @@ impl RetainedDeviceMemoryCommand {
         with_memory_access(Arc::clone(stream), accesses, |proof| {
             let mut destination = proof.write(destination)?;
             let (destination_ptr, _destination_guard) = destination.device_ptr_mut(stream);
-            let source = source.as_ref().map(|source| proof.read(source)).transpose()?;
+            let source = source
+                .as_ref()
+                .map(|source| proof.read(source))
+                .transpose()?;
             let source = source.as_ref().map(|source| source.device_ptr(stream));
             // A failed event/manifest prefix is distinct from memory-command
             // entry. Only a positively unentered memory suffix may be rearmed.
@@ -393,11 +396,14 @@ impl RetainedDeviceMemoryCommand {
                     *entered = true;
                     match source.as_ref() {
                         Some((source_ptr, _guard)) => sys::cuMemcpyDtoDAsync_v2(
-                            destination_ptr, *source_ptr, bytes, stream.cu_stream(),
-                        ).result()?,
-                        None => sys::cuMemsetD8Async(
-                            destination_ptr, 0, bytes, stream.cu_stream(),
-                        ).result()?,
+                            destination_ptr,
+                            *source_ptr,
+                            bytes,
+                            stream.cu_stream(),
+                        )
+                        .result()?,
+                        None => sys::cuMemsetD8Async(destination_ptr, 0, bytes, stream.cu_stream())
+                            .result()?,
                     }
                     *submitted = true;
                 }
@@ -436,7 +442,10 @@ impl Drop for RetainedDeviceMemoryCommand {
         crate::cuda_graph::retire_resources_after_completion(
             retained,
             |(_, _, stream, completion)| {
-                stream.context().bind_to_thread().and_then(|()| completion.wait())
+                stream
+                    .context()
+                    .bind_to_thread()
+                    .and_then(|()| completion.wait())
             },
             |_| Ok(()),
             |_| Ok(()),
@@ -618,7 +627,8 @@ impl<T: DeviceRepr + Copy> RetainedDeviceRead<T> {
 
     /// The caller must record this exact retained source in its execution domain.
     pub(crate) fn enqueue(&mut self, stream: &CudaStream) -> std::result::Result<(), DriverError> {
-        if self.entered || self.retired
+        if self.entered
+            || self.retired
             || crate::cuda_graph::stream_execution_id(stream)? != self.original_stream_id
         {
             return Err(DriverError(sys::CUresult::CUDA_ERROR_INVALID_VALUE));

@@ -1273,7 +1273,8 @@ fn pyxlog(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<semantic_transition::PySemanticPreparedStep>()?;
     #[cfg(feature = "semantic-policy")]
     {
-        m.add_class::<semantic_transition::learning_phase::PySemanticPrivateExecutionContinuation>()?;
+        m.add_class::<semantic_transition::learning_phase::PySemanticPrivateExecutionContinuation>(
+        )?;
         m.add_class::<semantic_transition::actor_refresh::PySemanticPreparedActorRefresh>()?;
         m.add_class::<semantic_transition::PySemanticSegmentInstructionAdmission>()?;
         m.add_class::<semantic_transition::prepared_import::PySemanticPreparedTaskImport>()?;
@@ -1294,15 +1295,18 @@ fn pyxlog(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         )?;
         m.add(
             "SemanticPreparedSegmentPending",
-            m.py().get_type::<semantic_transition::SemanticPreparedSegmentPending>(),
+            m.py()
+                .get_type::<semantic_transition::SemanticPreparedSegmentPending>(),
         )?;
         m.add(
             "SemanticPreparedSegmentCancelled",
-            m.py().get_type::<semantic_transition::SemanticPreparedSegmentCancelled>(),
+            m.py()
+                .get_type::<semantic_transition::SemanticPreparedSegmentCancelled>(),
         )?;
         m.add(
             "SemanticRetainedFinalUsePending",
-            m.py().get_type::<semantic_transition::SemanticRetainedFinalUsePending>(),
+            m.py()
+                .get_type::<semantic_transition::SemanticRetainedFinalUsePending>(),
         )?;
         m.add(
             "SemanticModelEvaluationPending",

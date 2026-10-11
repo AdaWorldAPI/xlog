@@ -287,7 +287,11 @@ impl SemanticTrainingCanarySource {
         statements: Vec<(Identity256, SemanticTruth)>,
         memory: Arc<crate::memory::GpuMemoryManager>,
     ) -> Self {
-        Self { content, statements, memory }
+        Self {
+            content,
+            statements,
+            memory,
+        }
     }
 
     /// Immutable metadata from the original native Logical observation.
@@ -2002,7 +2006,10 @@ impl SemanticTrainingViewArena {
             .row_capacity
             .checked_mul(8)
             .ok_or(SemanticTransitionError::GenerationExhausted)?;
-        let protected_capacity = canary_source.statements.len().checked_mul(7)
+        let protected_capacity = canary_source
+            .statements
+            .len()
+            .checked_mul(7)
             .and_then(|words| words.checked_add(13))
             .and_then(|words| words.checked_add(capacity))
             .ok_or(SemanticTransitionError::GenerationExhausted)?;
@@ -2428,8 +2435,11 @@ fn validate_objective(
                         .obligation_positions
                         .iter()
                         .all(|position| *position < row.window)
-                    && canary.obligation_positions.iter().zip(&canary_source.statements).all(
-                        |(position, (_, truth))| {
+                    && canary
+                        .obligation_positions
+                        .iter()
+                        .zip(&canary_source.statements)
+                        .all(|(position, (_, truth))| {
                             position
                                 .checked_add(1)
                                 .filter(|target| {
@@ -2461,8 +2471,7 @@ fn validate_objective(
                                     ) == objective.truth_tokens[*truth as usize]
                                 })
                                 .unwrap_or(false)
-                        },
-                    )
+                        })
             })
         } else {
             canary.obligation_positions.is_empty()
@@ -2862,7 +2871,9 @@ fn validate_row(
     })
 }
 
-pub(crate) fn origin_record(origin: SemanticTrainingViewOrigin) -> SemanticTrainingViewOriginRecord {
+pub(crate) fn origin_record(
+    origin: SemanticTrainingViewOrigin,
+) -> SemanticTrainingViewOriginRecord {
     SemanticTrainingViewOriginRecord {
         present: 1,
         transition: match origin.transition {

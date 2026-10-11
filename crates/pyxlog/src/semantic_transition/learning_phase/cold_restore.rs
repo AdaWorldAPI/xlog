@@ -1330,7 +1330,8 @@ impl VerifiedClosure {
             || source_seed.original_training_roster()? != final_seed.original_training_roster()?
             || source_seed.checkpoint_source_limits()? != final_seed.checkpoint_source_limits()?
             || source_seed.proposal_expense()?.capacity != final_seed.proposal_expense()?.capacity
-            || source_seed.proposal_expense()?.original_admission != final_seed.proposal_expense()?.original_admission
+            || source_seed.proposal_expense()?.original_admission
+                != final_seed.proposal_expense()?.original_admission
             || source_seed.proposal_expense()?.spent > final_seed.proposal_expense()?.spent
         {
             return Err(invalid(
@@ -1611,8 +1612,9 @@ impl CheckpointCustody {
             bytes.extend_from_slice(&field);
         }
         if let Some(closure) = &self.closure {
-            let phases = SemanticTransitionSession::checkpoint_learning_phase_history(&manifest.native)
-                .map_err(xlog_err)?;
+            let phases =
+                SemanticTransitionSession::checkpoint_learning_phase_history(&manifest.native)
+                    .map_err(xlog_err)?;
             let valid = if let Some(refusal) = &closure.refusal {
                 let original = SemanticTransitionSession::checkpoint_learning_phase_history(
                     &refusal.source_native,
@@ -1638,7 +1640,8 @@ impl CheckpointCustody {
             for field in [
                 closure.phase_id,
                 closure.completion_digest,
-                self.origin.ok_or_else(|| invalid("known checkpoint phase lost its original source"))?,
+                self.origin
+                    .ok_or_else(|| invalid("known checkpoint phase lost its original source"))?,
             ] {
                 bytes.extend_from_slice(&field);
             }
@@ -1664,9 +1667,7 @@ pub(in crate::semantic_transition) fn checkpoint_issuer_selector(
 
 fn checkpoint_seal(bytes: &[u8]) -> PyResult<CheckpointSeal> {
     if !bytes.starts_with(SEAL_DOMAIN) {
-        return Err(invalid(
-            "checkpoint seal has another domain or version",
-        ));
+        return Err(invalid("checkpoint seal has another domain or version"));
     }
     let mut reader = RecordReader(&bytes[SEAL_DOMAIN.len()..]);
     let issuer = reader.take(32)?.try_into().unwrap();
@@ -1679,14 +1680,22 @@ fn checkpoint_seal(bytes: &[u8]) -> PyResult<CheckpointSeal> {
             // The signature covers the origin; the retained restore owner
             // authenticates the exact source material when it is consumed.
             reader.take(32)?;
-            Some(CheckpointPhaseSeal { phase_id, completion_digest })
+            Some(CheckpointPhaseSeal {
+                phase_id,
+                completion_digest,
+            })
         }
         _ => return Err(invalid("checkpoint seal has another ancestry tag")),
     };
     let signature = ed25519_dalek::Signature::from_slice(reader.take(64)?)
         .map_err(|_| invalid("checkpoint has an invalid signature encoding"))?;
     reader.finish()?;
-    Ok(CheckpointSeal { issuer, root, phase, signature })
+    Ok(CheckpointSeal {
+        issuer,
+        root,
+        phase,
+        signature,
+    })
 }
 
 fn authenticated_checkpoint_seal(
@@ -1696,7 +1705,9 @@ fn authenticated_checkpoint_seal(
     let issuer: [u8; 32] = original_bytes(checkpoint_issuer, 32)?.try_into().unwrap();
     let seal = checkpoint_seal(&manifest.phase_seal)?;
     if seal.issuer != issuer || seal.root != manifest.unsigned_phase_root() {
-        return Err(invalid("checkpoint changed its independently pinned issuer or complete state"));
+        return Err(invalid(
+            "checkpoint changed its independently pinned issuer or complete state",
+        ));
     }
     VerifyingKey::from_bytes(&issuer)
         .map_err(|_| invalid("independent checkpoint issuer has an invalid encoding"))?
@@ -1714,7 +1725,9 @@ pub(in crate::semantic_transition) fn verify_checkpoint_signature(
     manifest: &SemanticCheckpointManifest,
     checkpoint_issuer: &Bound<'_, PyAny>,
 ) -> PyResult<bool> {
-    Ok(authenticated_checkpoint_seal(manifest, checkpoint_issuer)?.phase.is_some())
+    Ok(authenticated_checkpoint_seal(manifest, checkpoint_issuer)?
+        .phase
+        .is_some())
 }
 
 impl VerifiedClosure {

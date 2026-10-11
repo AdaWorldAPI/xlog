@@ -662,20 +662,30 @@ impl SemanticTransitionSession {
     ) -> Result<(), SemanticTransitionError> {
         self.require_admitted_cold_model_work(admission, parent, work)?;
         self.require_original_prepared_structure()?;
-        let build = self.prepared_segment.as_ref().ok_or(SemanticTransitionError::NotBound)?;
+        let build = self
+            .prepared_segment
+            .as_ref()
+            .ok_or(SemanticTransitionError::NotBound)?;
         build.check_retained(step, &self.publication_issuer)?;
-        if build.program_admission.as_ref().is_none_or(|original| !original.same_handle(admission))
-            || build.requested_kind(step, &self.publication_issuer)? != SemanticTransitionKind::Update
+        if build
+            .program_admission
+            .as_ref()
+            .is_none_or(|original| !original.same_handle(admission))
+            || build.requested_kind(step, &self.publication_issuer)?
+                != SemanticTransitionKind::Update
             || !parent.active
         {
             return Err(publication_input_error("structural cold callback requires its exact admitted Update and original active source"));
         }
         let original = self.original_cold_model_work(work)?;
         if original.purpose != SemanticColdModelWorkPurpose::PrivatePrefix
-            || original.state != RecordingState::Recording || original.result.is_some()
+            || original.state != RecordingState::Recording
+            || original.result.is_some()
             || original.prepared_scope.is_some()
         {
-            return Err(publication_input_error("structural callback must borrow its same still-open original prefix recorder"));
+            return Err(publication_input_error(
+                "structural callback must borrow its same still-open original prefix recorder",
+            ));
         }
         Ok(())
     }
@@ -759,13 +769,18 @@ impl SemanticTransitionSession {
                         "cancelled preparation cannot close entered or unknown original work",
                     ));
                 }
-                let storage = self.steps.get_mut(&work.token)
-                    .expect("checked original reader").cold_model_work.as_mut()
+                let storage = self
+                    .steps
+                    .get_mut(&work.token)
+                    .expect("checked original reader")
+                    .cold_model_work
+                    .as_mut()
                     .expect("checked original work");
                 for (index, state) in storage.regions.iter_mut().enumerate() {
                     if *state == RecordingState::Waiting {
                         if let Some(plan) = &mut storage.plan {
-                            plan.skip_unentered_region(index).map_err(publication_input_error)?;
+                            plan.skip_unentered_region(index)
+                                .map_err(publication_input_error)?;
                         }
                         *state = RecordingState::NotEntered;
                     }
@@ -773,14 +788,21 @@ impl SemanticTransitionSession {
                 storage.work.uncaptured_recording = false;
                 storage.state = RecordingState::Closed;
             }
-            RecordingState::Closed | RecordingState::Submitting
-            | RecordingState::Submitted | RecordingState::Completed => (),
-            _ => return Err(publication_input_error(
-                "cancelled preparation retains its failed or unresolved original recorder",
-            )),
+            RecordingState::Closed
+            | RecordingState::Submitting
+            | RecordingState::Submitted
+            | RecordingState::Completed => (),
+            _ => {
+                return Err(publication_input_error(
+                    "cancelled preparation retains its failed or unresolved original recorder",
+                ))
+            }
         }
         let result = self.finish_cold_model_work_for_reader(
-            reader, work, streams, SemanticColdModelWorkDisposition::KnownRefusal,
+            reader,
+            work,
+            streams,
+            SemanticColdModelWorkDisposition::KnownRefusal,
         )?;
         self.instruction_admission_mut(admission)?.cold_result = Some(result);
         Ok(result)
@@ -848,9 +870,9 @@ impl SemanticTransitionSession {
             publication_input_error("instruction retirement lost its original prepared owner")
         })?;
         if build
-                .program_admission
-                .as_ref()
-                .is_none_or(|original| !original.same_handle(admission))
+            .program_admission
+            .as_ref()
+            .is_none_or(|original| !original.same_handle(admission))
         {
             return Err(publication_input_error(
                 "cold retirement requires the same original admitted segment",
@@ -873,7 +895,8 @@ impl SemanticTransitionSession {
         let ordinal = self.admitted_segment_first_program_ordinal(admission)?;
         // Freeze the native disposition before installing or initializing the
         // original report. An uncertain initialization cannot change its mode.
-        self.instruction_admission_mut(admission)?.retirement_cancellation = cancellation.cloned();
+        self.instruction_admission_mut(admission)?
+            .retirement_cancellation = cancellation.cloned();
         self.install_cold_model_work(
             token,
             capacity,
@@ -906,13 +929,21 @@ impl SemanticTransitionSession {
         let build = self.prepared_segment.as_ref().ok_or_else(|| {
             publication_input_error("shared retirement lost its original prepared owner")
         })?;
-        if build.program_admission.as_ref().is_none_or(|original| !original.same_handle(admission)) {
-            return Err(publication_input_error("shared retirement changed its original admitted segment"));
+        if build
+            .program_admission
+            .as_ref()
+            .is_none_or(|original| !original.same_handle(admission))
+        {
+            return Err(publication_input_error(
+                "shared retirement changed its original admitted segment",
+            ));
         }
         if let Some(proof) = cancellation {
             build.require_non_submission(proof)?;
         } else if !build.completed {
-            return Err(publication_input_error("shared retirement requires actual original segment completion"));
+            return Err(publication_input_error(
+                "shared retirement requires actual original segment completion",
+            ));
         }
         let storage = source.cold_model_work(handle)?;
         let allowance = self.graph.cold_work_allowance().ok_or_else(|| {
@@ -924,19 +955,32 @@ impl SemanticTransitionSession {
             (Some(stored), Some(proof)) => stored.matches(&proof.steps),
             _ => false,
         };
-        let original_state = matches!(original.state,
-            actor_refresh_program::InstructionState::Bound | actor_refresh_program::InstructionState::Completed)
-            || (cancellation.is_some() && matches!(original.state,
+        let original_state = matches!(
+            original.state,
+            actor_refresh_program::InstructionState::Bound
+                | actor_refresh_program::InstructionState::Completed
+        ) || (cancellation.is_some()
+            && matches!(
+                original.state,
                 actor_refresh_program::InstructionState::Admitted
                     | actor_refresh_program::InstructionState::Released
-                    | actor_refresh_program::InstructionState::BuildEntered));
+                    | actor_refresh_program::InstructionState::BuildEntered
+            ));
         if !original_state
             || storage.purpose != SemanticColdModelWorkPurpose::PrivateRetirement
             || !Arc::ptr_eq(&allowance, &storage.allowance)
-            || !matches!(storage.state, RecordingState::Waiting | RecordingState::Recording)
-            || original.retirement_work.as_ref().is_some_and(|work| !work.same_invocation(handle) || !same_cancellation)
+            || !matches!(
+                storage.state,
+                RecordingState::Waiting | RecordingState::Recording
+            )
+            || original
+                .retirement_work
+                .as_ref()
+                .is_some_and(|work| !work.same_invocation(handle) || !same_cancellation)
         {
-            return Err(publication_input_error("shared retirement changed its original invocation, allowance or disposition"));
+            return Err(publication_input_error(
+                "shared retirement changed its original invocation, allowance or disposition",
+            ));
         }
         original.retirement_work = Some(handle.clone());
         original.retirement_cancellation = cancellation.cloned();
@@ -952,10 +996,15 @@ impl SemanticTransitionSession {
     ) -> Result<SemanticColdModelWorkResult, SemanticTransitionError> {
         self.require_segment_instruction_admission(admission, parent)?;
         let original = self.instruction_admission(admission)?;
-        if original.retirement_work.as_ref().is_none_or(|work| !work.same_invocation(handle))
+        if original
+            .retirement_work
+            .as_ref()
+            .is_none_or(|work| !work.same_invocation(handle))
             || !Arc::ptr_eq(&handle.issuer, &source.publication_issuer)
         {
-            return Err(publication_input_error("shared retirement report changed its original invocation"));
+            return Err(publication_input_error(
+                "shared retirement report changed its original invocation",
+            ));
         }
         if let Some(result) = original.retirement_result {
             return Ok(result);
@@ -963,16 +1012,21 @@ impl SemanticTransitionSession {
         // Only the canonical resource-retirement path removes the prepared
         // owner, after graph destruction and every joined step/alias release.
         // Admission custody also proves full retirement when its parent is gone.
-        if self.prepared_segment.is_some() || self.captured.is_some()
+        if self.prepared_segment.is_some()
+            || self.captured.is_some()
             || self.steps.contains_key(&parent.token)
-            || !matches!((original.state, original.retirement_cancellation.is_some()),
+            || !matches!(
+                (original.state, original.retirement_cancellation.is_some()),
                 (actor_refresh_program::InstructionState::Completed, false)
                     | (actor_refresh_program::InstructionState::Bound, true)
                     | (actor_refresh_program::InstructionState::Admitted, true)
                     | (actor_refresh_program::InstructionState::Released, true)
-                    | (actor_refresh_program::InstructionState::BuildEntered, true))
+                    | (actor_refresh_program::InstructionState::BuildEntered, true)
+            )
         {
-            return Err(publication_input_error("shared retirement report requires fully retired original native storage"));
+            return Err(publication_input_error(
+                "shared retirement report requires fully retired original native storage",
+            ));
         }
         let storage = source.cold_model_work(handle)?;
         let result = storage.result.ok_or_else(|| {
@@ -982,7 +1036,9 @@ impl SemanticTransitionSession {
             || storage.state != RecordingState::Completed
             || storage.disposition != Some(SemanticColdModelWorkDisposition::Complete)
         {
-            return Err(publication_input_error("shared retirement requires its original completed report"));
+            return Err(publication_input_error(
+                "shared retirement requires its original completed report",
+            ));
         }
         self.instruction_admission_mut(admission)?.retirement_result = Some(result);
         Ok(result)
@@ -1030,7 +1086,8 @@ impl SemanticTransitionSession {
         match (&original.retirement_cancellation, cancellation) {
             (None, None) => Ok(SemanticColdModelWorkDisposition::Complete),
             (Some(stored), Some(proof)) if stored.matches(&proof.steps) => {
-                self.prepared_segment.as_ref()
+                self.prepared_segment
+                    .as_ref()
                     .ok_or(SemanticTransitionError::NotBound)?
                     .require_non_submission(proof)?;
                 Ok(SemanticColdModelWorkDisposition::KnownRefusal)
@@ -1203,8 +1260,13 @@ impl SemanticTransitionSession {
                 // Canonical installation retains storage before its first
                 // reset or transfer. Resume only this unentered allocation
                 // prefix, preserving the original ordinal and report claim.
-                return self
-                    .prepare_prepared_cold_model_work(step, parent, capacity, ordinal, instruction);
+                return self.prepare_prepared_cold_model_work(
+                    step,
+                    parent,
+                    capacity,
+                    ordinal,
+                    instruction,
+                );
             };
             if storage.operation_ordinal != ordinal
                 || !Arc::ptr_eq(&storage.admission, &instruction)
@@ -1469,9 +1531,10 @@ impl SemanticTransitionSession {
     pub(super) fn has_pending_cold_model_work_completion(&self, except_token: Option<u64>) -> bool {
         self.steps.iter().any(|(token, step)| {
             except_token != Some(*token)
-                && step.cold_model_work.as_ref().is_some_and(|storage| {
-                    storage.completion.is_some() && storage.result.is_none()
-                })
+                && step
+                    .cold_model_work
+                    .as_ref()
+                    .is_some_and(|storage| storage.completion.is_some() && storage.result.is_none())
         })
     }
 
@@ -1554,14 +1617,20 @@ impl SemanticTransitionSession {
                 self.require_segment_instruction_admission(admission, parent)?;
                 let original = self.instruction_admission(admission)?;
                 let build = self.prepared_segment.as_ref().ok_or_else(|| {
-                    publication_input_error("cancelled preparation lost its original prepared owner")
+                    publication_input_error(
+                        "cancelled preparation lost its original prepared owner",
+                    )
                 })?;
                 build.require_non_submission(proof)?;
                 if original.state != actor_refresh_program::InstructionState::Admitted
                     || !parent.active
-                    || build.program_admission.as_ref()
+                    || build
+                        .program_admission
+                        .as_ref()
                         .is_none_or(|retained| !retained.same_handle(admission))
-                    || original.cold_work.as_ref()
+                    || original
+                        .cold_work
+                        .as_ref()
                         .is_none_or(|work| !work.same_invocation(handle))
                     || storage.purpose != SemanticColdModelWorkPurpose::PrivatePrefix
                     || !Arc::ptr_eq(&storage.admission, &original.instruction)
@@ -1589,9 +1658,9 @@ impl SemanticTransitionSession {
                     ));
                 }
                 if build
-                        .program_admission
-                        .as_ref()
-                        .is_none_or(|original| !original.same_handle(admission))
+                    .program_admission
+                    .as_ref()
+                    .is_none_or(|original| !original.same_handle(admission))
                     || original
                         .retirement_work
                         .as_ref()
@@ -2877,9 +2946,10 @@ impl SemanticTransitionSession {
                     return Err(error);
                 }
                 if !completion.metadata_counted {
-                    self.provider.admit_launch_metadata_htod(
-                        std::mem::size_of_val(storage.work.recording.events()),
-                    );
+                    self.provider
+                        .admit_launch_metadata_htod(std::mem::size_of_val(
+                            storage.work.recording.events(),
+                        ));
                     completion.metadata_counted = true;
                 }
                 metadata
@@ -2894,7 +2964,10 @@ impl SemanticTransitionSession {
                 runtime_error("cold model work metadata completion", error)
             })?;
         }
-        if !completion.command.resolve_entered(&mut completion.poisoned)? {
+        if !completion
+            .command
+            .resolve_entered(&mut completion.poisoned)?
+        {
             if let Some(error) = admission_error.take() {
                 return Err(error);
             }
@@ -2902,8 +2975,13 @@ impl SemanticTransitionSession {
                 .provider
                 .device()
                 .inner()
-                .get_func("xlog_semantic_transition", "semantic_cold_model_work_result")
-                .ok_or_else(|| runtime_error("kernel lookup", "cold model work result unavailable"))?;
+                .get_func(
+                    "xlog_semantic_transition",
+                    "semantic_cold_model_work_result",
+                )
+                .ok_or_else(|| {
+                    runtime_error("kernel lookup", "cold model work result unavailable")
+                })?;
             let input = if storage.work.recording.events().is_empty() {
                 ModelWorkInput::default()
             } else {

@@ -63,13 +63,29 @@ impl SemanticProgramAdmission {
                 .iter()
                 .chain(&self.initial_facts)
                 .any(|fact| fact.predicate >= self.predicate_count)
-            || self.observation_facts.iter().any(|(_, fact)| fact.predicate >= self.predicate_count)
-            || self.observation_facts.iter().enumerate().any(|(index, (record, _))| {
-                self.observation_facts[..index].iter().any(|(before, _)| before == record)
-            })
-            || self.query_records.iter().zip(&self.queries).any(|(record, fact)| {
-                !self.observation_facts.iter().any(|(original, tuple)| original == record && tuple == fact)
-            })
+            || self
+                .observation_facts
+                .iter()
+                .any(|(_, fact)| fact.predicate >= self.predicate_count)
+            || self
+                .observation_facts
+                .iter()
+                .enumerate()
+                .any(|(index, (record, _))| {
+                    self.observation_facts[..index]
+                        .iter()
+                        .any(|(before, _)| before == record)
+                })
+            || self
+                .query_records
+                .iter()
+                .zip(&self.queries)
+                .any(|(record, fact)| {
+                    !self
+                        .observation_facts
+                        .iter()
+                        .any(|(original, tuple)| original == record && tuple == fact)
+                })
         {
             return Err("binary program has an invalid predicate or fact count");
         }

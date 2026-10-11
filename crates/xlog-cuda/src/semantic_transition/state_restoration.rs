@@ -21,8 +21,13 @@ impl SemanticTransitionSession {
         };
         let digest = Identity256::from_bytes(Sha256::digest(bytes).into());
         if source == parent.identity {
-            let storage = self.publication.as_ref().ok_or(SemanticTransitionError::NotBound)?;
-            let sources = storage.material_sources.lock()
+            let storage = self
+                .publication
+                .as_ref()
+                .ok_or(SemanticTransitionError::NotBound)?;
+            let sources = storage
+                .material_sources
+                .lock()
                 .map_err(|_| SemanticTransitionError::Poisoned)?;
             let source = &sources[(parent.identity.word & 1) as usize];
             if source.identity != Some(parent.identity) || !source.digests.contains(&digest) {
@@ -30,18 +35,27 @@ impl SemanticTransitionSession {
             }
             return Ok((digest, false));
         }
-        let restoration = self.state_material_restore.as_ref()
+        let restoration = self
+            .state_material_restore
+            .as_ref()
             .ok_or(SemanticTransitionError::ObservationMismatch)?;
         if !Arc::ptr_eq(&restoration.issuer, &self.publication_issuer)
             || restoration.pending.load(Ordering::Acquire)
             || restoration.source_digest != digest
-        { return Err(SemanticTransitionError::ObservationMismatch); }
-        let original = restoration.original.lock()
+        {
+            return Err(SemanticTransitionError::ObservationMismatch);
+        }
+        let original = restoration
+            .original
+            .lock()
             .map_err(|_| SemanticTransitionError::Poisoned)?;
         if original.stage != StateRestoreStage::Completed
-            || original.transitioned || original.retain_current_models
+            || original.transitioned
+            || original.retain_current_models
             || original.result != Some(parent.identity)
-        { return Err(SemanticTransitionError::ObservationMismatch); }
+        {
+            return Err(SemanticTransitionError::ObservationMismatch);
+        }
         Ok((digest, true))
     }
 
@@ -1410,9 +1424,10 @@ impl SemanticTransitionSession {
                 && !original.fold_completed
             {
                 self.apply_learning_fold(
-                    original.fold_work.as_mut().ok_or(
-                        SemanticTransitionError::ObservationMismatch,
-                    )?,
+                    original
+                        .fold_work
+                        .as_mut()
+                        .ok_or(SemanticTransitionError::ObservationMismatch)?,
                     &owner,
                     restoration,
                 )?;

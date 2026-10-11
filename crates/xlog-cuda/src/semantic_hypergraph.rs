@@ -958,7 +958,9 @@ impl SemanticRootMaterial {
     ) -> Result<crate::semantic_transition::SemanticTaskObservationRoots, SemanticHypergraphError>
     {
         self.validate_lineage(admission)?;
-        let queries = query_records.iter().map(|&record| admission.statement_key(record));
+        let queries = query_records
+            .iter()
+            .map(|&record| admission.statement_key(record));
         let mut contributors = Vec::new();
         for (ordinal, query) in queries.into_iter().enumerate() {
             let query = query?;
@@ -2741,9 +2743,9 @@ impl OriginalSemanticGraphConstruction {
         graph: SemanticHypergraph,
         records: Option<(SemanticAdmissionRecords, SemanticAdmissionLimits)>,
     ) -> Result<Self, SemanticHypergraphError> {
-        let admission = records.map(|(records, limits)| {
-            prepare_semantic_records(records, limits, graph.empty_root)
-        }).transpose()?;
+        let admission = records
+            .map(|(records, limits)| prepare_semantic_records(records, limits, graph.empty_root))
+            .transpose()?;
         Ok(Self {
             graph: Some(graph),
             scope: Arc::new(()),
@@ -2763,19 +2765,29 @@ impl OriginalSemanticGraphConstruction {
         if self.complete {
             return Ok(());
         }
-        let graph = self.graph.as_mut().ok_or_else(|| admission_error("original semantic storage is absent"))?;
+        let graph = self
+            .graph
+            .as_mut()
+            .ok_or_else(|| admission_error("original semantic storage is absent"))?;
         if self.initialization.is_none() {
             let command = graph.command_for(OP_INITIALIZE);
             self.initialization = Some(graph.run_original_with_submission(
-                command, ArenaAccess::ReadWrite, Some(&self.scope), may_submit,
+                command,
+                ArenaAccess::ReadWrite,
+                Some(&self.scope),
+                may_submit,
             )?);
         }
         if !self.initialized {
-            let receipt = self.initialization.as_ref().expect("original initialization receipt");
+            let receipt = self
+                .initialization
+                .as_ref()
+                .expect("original initialization receipt");
             graph.expect_success(receipt)?;
             if receipt.words[3] != 0 || receipt.words[4] != 1 {
                 return Err(SemanticHypergraphError::CorruptLineage {
-                    detail: "CUDA initialization did not publish empty root slot 0 generation 1".into(),
+                    detail: "CUDA initialization did not publish empty root slot 0 generation 1"
+                        .into(),
                 });
             }
             graph.roots[0].live = true;
@@ -2786,15 +2798,27 @@ impl OriginalSemanticGraphConstruction {
                 let mut command = graph.command_for(OP_SNAPSHOT);
                 write_view(&mut command, SemanticView::Root(graph.empty_root));
                 self.snapshot = Some(graph.run_original_with_submission(
-                    command, ArenaAccess::Read, Some(&self.scope), may_submit,
+                    command,
+                    ArenaAccess::Read,
+                    Some(&self.scope),
+                    may_submit,
                 )?);
             }
-            let receipt = self.snapshot.as_ref().expect("original admission snapshot receipt");
+            let receipt = self
+                .snapshot
+                .as_ref()
+                .expect("original admission snapshot receipt");
             graph.expect_success(receipt)?;
             let snapshot = SemanticRootSnapshot::new(
-                SemanticRootDigest(receipt_identity(receipt, 16)), receipt_extents(receipt)?,
+                SemanticRootDigest(receipt_identity(receipt, 16)),
+                receipt_extents(receipt)?,
             );
-            graph.admission = Some(self.admission.take().expect("original prepared admission").finish(snapshot));
+            graph.admission = Some(
+                self.admission
+                    .take()
+                    .expect("original prepared admission")
+                    .finish(snapshot),
+            );
         }
         self.complete = true;
         Ok(())
@@ -2802,17 +2826,26 @@ impl OriginalSemanticGraphConstruction {
 
     pub(crate) fn take_graph(&mut self) -> Result<SemanticHypergraph, SemanticHypergraphError> {
         if !self.complete || self.retired {
-            return Err(admission_error("original semantic constructor is not complete"));
+            return Err(admission_error(
+                "original semantic constructor is not complete",
+            ));
         }
-        self.graph.take().ok_or_else(|| admission_error("original semantic storage was already consumed"))
+        self.graph
+            .take()
+            .ok_or_else(|| admission_error("original semantic storage was already consumed"))
     }
 
     fn entered(&self) -> bool {
-        self.initialization.is_some() || self.snapshot.is_some()
+        self.initialization.is_some()
+            || self.snapshot.is_some()
             || self.graph.as_ref().is_some_and(|graph| {
                 graph.original_command.as_ref().is_some_and(|(_, command)| {
-                    command.lock().map_or(true, |command| command.upload.entered()
-                        || command.completion_entered || command.kernel_entered || command.receipt.entered())
+                    command.lock().map_or(true, |command| {
+                        command.upload.entered()
+                            || command.completion_entered
+                            || command.kernel_entered
+                            || command.receipt.entered()
+                    })
                 })
             })
     }
@@ -2822,20 +2855,35 @@ impl OriginalSemanticGraphConstruction {
             return Ok(());
         }
         if self.entered() {
-            let graph = self.graph.as_ref().ok_or_else(|| admission_error("original semantic storage is absent"))?;
+            let graph = self
+                .graph
+                .as_ref()
+                .ok_or_else(|| admission_error("original semantic storage is absent"))?;
             {
                 let _ordinary = crate::cuda_graph::reserve_uncaptured_stream(&graph.stream)
-                    .map_err(|error| runtime_error("semantic constructor retirement capture exclusion", error))?;
-                graph.stream.synchronize()
-                    .map_err(|error| runtime_error("original semantic constructor retirement", error))?;
+                    .map_err(|error| {
+                        runtime_error("semantic constructor retirement capture exclusion", error)
+                    })?;
+                graph.stream.synchronize().map_err(|error| {
+                    runtime_error("original semantic constructor retirement", error)
+                })?;
             }
             if let Some((_, original)) = &graph.original_command {
-                let mut original = original.lock()
+                let mut original = original
+                    .lock()
                     .map_err(|_| admission_error("original semantic command lock is poisoned"))?;
-                original.upload.retire_without_result(&graph.stream)
-                    .map_err(|error| runtime_error("original semantic constructor upload retirement", error))?;
-                original.receipt.retire_without_result(&graph.stream)
-                    .map_err(|error| runtime_error("original semantic constructor receipt retirement", error))?;
+                original
+                    .upload
+                    .retire_without_result(&graph.stream)
+                    .map_err(|error| {
+                        runtime_error("original semantic constructor upload retirement", error)
+                    })?;
+                original
+                    .receipt
+                    .retire_without_result(&graph.stream)
+                    .map_err(|error| {
+                        runtime_error("original semantic constructor receipt retirement", error)
+                    })?;
             }
         }
         self.graph = None;
@@ -2850,7 +2898,8 @@ impl Drop for OriginalSemanticGraphConstruction {
         if !self.complete && !self.retired && self.entered() {
             if let Some(graph) = self.graph.take() {
                 let graph = std::mem::ManuallyDrop::new(graph);
-                let _ = UNRELEASED_SEMANTIC_CONSTRUCTIONS.try_with(|owners| owners.borrow_mut().push(graph));
+                let _ = UNRELEASED_SEMANTIC_CONSTRUCTIONS
+                    .try_with(|owners| owners.borrow_mut().push(graph));
             }
         }
     }
@@ -3319,7 +3368,8 @@ impl CudaKernelProvider {
         limits: SemanticAdmissionLimits,
         work: crate::SemanticColdNativeWork,
     ) -> Result<OriginalSemanticGraphConstruction, SemanticHypergraphError> {
-        let custody = work.graph_custody(self, domain)
+        let custody = work
+            .graph_custody(self, domain)
             .map_err(|error| runtime_error("cold graph custody", error))?;
         let graph = self.allocate_semantic_hypergraph_storage(domain, capacities, Some(custody))?;
         OriginalSemanticGraphConstruction::new(graph, Some((records, limits)))
@@ -3701,7 +3751,9 @@ impl SemanticHypergraph {
         if original.material.is_none() {
             self.require_original_root_export(original)?;
         } else if self.root_export.is_some() {
-            return Err(admission_error("another root export replaced the completed original"));
+            return Err(admission_error(
+                "another root export replaced the completed original",
+            ));
         }
         Ok(())
     }
@@ -3711,9 +3763,12 @@ impl SemanticHypergraph {
         original: &SemanticRootExport,
     ) -> Result<bool, SemanticHypergraphError> {
         self.require_root_export_continuation(original)?;
-        Ok(original.material.is_none() && original.command.poisoned
-            && (original.command.upload.entered() || original.command.completion_entered
-                || original.command.kernel_entered || original.command.receipt.entered()
+        Ok(original.material.is_none()
+            && original.command.poisoned
+            && (original.command.upload.entered()
+                || original.command.completion_entered
+                || original.command.kernel_entered
+                || original.command.receipt.entered()
                 || original.arena.entered()))
     }
 
@@ -3773,8 +3828,15 @@ impl SemanticHypergraph {
         material: &SemanticRootMaterial,
     ) -> Result<SemanticRootHandle, SemanticHypergraphError> {
         if let Some((_, original)) = &self.root_restoration {
-            if original.lock().map_err(|_| admission_error("original root restoration lock is poisoned"))?.material != *material {
-                return Err(admission_error("root continuation changed its original material"));
+            if original
+                .lock()
+                .map_err(|_| admission_error("original root restoration lock is poisoned"))?
+                .material
+                != *material
+            {
+                return Err(admission_error(
+                    "root continuation changed its original material",
+                ));
             }
             return self.resolve_root_restore();
         }
@@ -3829,7 +3891,11 @@ impl SemanticHypergraph {
         let empty = material.insertions.is_empty();
         let original = OriginalRootRestoration {
             material: material.clone(),
-            stage: if empty { RootRestoreStage::Snapshot } else { RootRestoreStage::Fork },
+            stage: if empty {
+                RootRestoreStage::Snapshot
+            } else {
+                RootRestoreStage::Fork
+            },
             next: 0,
             fork: None,
             root: empty.then_some(self.empty_root),
@@ -3842,7 +3908,9 @@ impl SemanticHypergraph {
         self.resolve_root_restore()
     }
 
-    pub(crate) fn resolve_root_restore(&mut self) -> Result<SemanticRootHandle, SemanticHypergraphError> {
+    pub(crate) fn resolve_root_restore(
+        &mut self,
+    ) -> Result<SemanticRootHandle, SemanticHypergraphError> {
         self.resolve_root_restore_with_submission(true)
     }
 
@@ -3857,11 +3925,16 @@ impl SemanticHypergraph {
         result
     }
 
-    fn resume_original_root_restore(&mut self) -> Result<SemanticRootHandle, SemanticHypergraphError> {
-        let (scope, original) = self.root_restoration.as_ref()
+    fn resume_original_root_restore(
+        &mut self,
+    ) -> Result<SemanticRootHandle, SemanticHypergraphError> {
+        let (scope, original) = self
+            .root_restoration
+            .as_ref()
             .map(|(scope, original)| (Arc::clone(scope), Arc::clone(original)))
             .ok_or_else(|| admission_error("no original root restoration is retained"))?;
-        let mut original = original.lock()
+        let mut original = original
+            .lock()
             .map_err(|_| admission_error("original root restoration lock is poisoned"))?;
         loop {
             match original.stage {
@@ -3876,16 +3949,24 @@ impl SemanticHypergraph {
                     }
                     let insertion = &original.material.insertions[original.next];
                     let admission = self.admission.as_ref().expect("original typed admission");
-                    let key = material_statement_key(admission, insertion.statement, &insertion.reconstruction)?;
+                    let key = material_statement_key(
+                        admission,
+                        insertion.statement,
+                        &insertion.reconstruction,
+                    )?;
                     let event = insertion.support.event(admission, insertion.statement)?;
                     let outcome = self.insert_support_original(
-                        original.fork.expect("original restore fork"), &key, &event,
-                        &insertion.reconstruction, Some(&scope),
+                        original.fork.expect("original restore fork"),
+                        &key,
+                        &event,
+                        &insertion.reconstruction,
+                        Some(&scope),
                     )?;
                     if !matches!(outcome, SemanticInsertOutcome::Inserted(inserted)
                         if inserted.version.identity.0 == insertion.version)
                     {
-                        return self.corrupt("restored insertion differs from canonical root material");
+                        return self
+                            .corrupt("restored insertion differs from canonical root material");
                     }
                     original.next += 1;
                     if original.next == original.material.admission_base_extents[2] as usize
@@ -3895,16 +3976,23 @@ impl SemanticHypergraph {
                     }
                 }
                 RootRestoreStage::SealAdmission => {
-                    original.admission_root = self.seal_original(original.fork.expect("original restore fork"), Some(&scope))?;
+                    original.admission_root = self.seal_original(
+                        original.fork.expect("original restore fork"),
+                        Some(&scope),
+                    )?;
                     original.fork = None;
                     original.stage = RootRestoreStage::ForkAfterAdmission;
                 }
                 RootRestoreStage::ForkAfterAdmission => {
-                    original.fork = Some(self.fork_original(original.admission_root, Some(&scope))?);
+                    original.fork =
+                        Some(self.fork_original(original.admission_root, Some(&scope))?);
                     original.stage = RootRestoreStage::Insert;
                 }
                 RootRestoreStage::Seal => {
-                    let root = self.seal_original(original.fork.expect("original restore fork"), Some(&scope))?;
+                    let root = self.seal_original(
+                        original.fork.expect("original restore fork"),
+                        Some(&scope),
+                    )?;
                     original.root = Some(root);
                     original.fork = None;
                     if original.next == original.material.admission_base_extents[2] as usize {
@@ -3914,11 +4002,19 @@ impl SemanticHypergraph {
                 }
                 RootRestoreStage::Snapshot => {
                     let root = original.root.expect("original restored root");
-                    let snapshot = self.snapshot_original(SemanticView::Root(root), Some(&scope))?;
+                    let snapshot =
+                        self.snapshot_original(SemanticView::Root(root), Some(&scope))?;
                     if snapshot.digest.0 != original.material.digest
-                        || snapshot.extents != SemanticExtents::new(original.material.extents[0], original.material.extents[1], original.material.extents[2])
+                        || snapshot.extents
+                            != SemanticExtents::new(
+                                original.material.extents[0],
+                                original.material.extents[1],
+                                original.material.extents[2],
+                            )
                     {
-                        return self.corrupt("fresh native root differs from restored digest or reachable extents");
+                        return self.corrupt(
+                            "fresh native root differs from restored digest or reachable extents",
+                        );
                     }
                     original.snapshot = Some(snapshot);
                     if root == original.admission_root {
@@ -3929,13 +4025,23 @@ impl SemanticHypergraph {
                     }
                 }
                 RootRestoreStage::AdmissionSnapshot => {
-                    original.admission_snapshot = Some(self.snapshot_original(SemanticView::Root(original.admission_root), Some(&scope))?);
+                    original.admission_snapshot = Some(self.snapshot_original(
+                        SemanticView::Root(original.admission_root),
+                        Some(&scope),
+                    )?);
                     original.stage = RootRestoreStage::BindAdmission;
                 }
                 RootRestoreStage::BindAdmission => {
-                    let snapshot = original.admission_snapshot.expect("original admission snapshot");
+                    let snapshot = original
+                        .admission_snapshot
+                        .expect("original admission snapshot");
                     if snapshot.digest.0 != original.material.admission_base_digest
-                        || snapshot.extents != SemanticExtents::new(original.material.admission_base_extents[0], original.material.admission_base_extents[1], original.material.admission_base_extents[2])
+                        || snapshot.extents
+                            != SemanticExtents::new(
+                                original.material.admission_base_extents[0],
+                                original.material.admission_base_extents[1],
+                                original.material.admission_base_extents[2],
+                            )
                     {
                         return self.corrupt("fresh native admission base differs from its retained original binding");
                     }
@@ -3943,19 +4049,27 @@ impl SemanticHypergraph {
                     admission.base = original.admission_root;
                     admission.base_snapshot = snapshot;
                     admission.identity = derive_admission_identity(
-                        &admission.records, admission.schema_generation, &admission.encoded_records,
-                        &admission.statement_keys, &admission.support_events, &snapshot,
+                        &admission.records,
+                        admission.schema_generation,
+                        &admission.encoded_records,
+                        &admission.statement_keys,
+                        &admission.support_events,
+                        &snapshot,
                     );
                     original.stage = RootRestoreStage::Completed;
                 }
-                RootRestoreStage::Completed => return Ok(original.root.expect("original restored root")),
+                RootRestoreStage::Completed => {
+                    return Ok(original.root.expect("original restored root"))
+                }
             }
         }
     }
 
     pub(crate) fn root_restore_pending(&self) -> bool {
         self.root_restoration.as_ref().is_some_and(|(_, original)| {
-            original.lock().map_or(true, |original| original.stage != RootRestoreStage::Completed)
+            original.lock().map_or(true, |original| {
+                original.stage != RootRestoreStage::Completed
+            })
         })
     }
 
@@ -3963,21 +4077,32 @@ impl SemanticHypergraph {
         &self,
         root: SemanticRootHandle,
     ) -> Result<SemanticRootSnapshot, SemanticHypergraphError> {
-        let (_, original) = self.root_restoration.as_ref()
+        let (_, original) = self
+            .root_restoration
+            .as_ref()
             .ok_or_else(|| admission_error("no original root restoration is retained"))?;
-        let original = original.lock()
+        let original = original
+            .lock()
             .map_err(|_| admission_error("original root restoration lock is poisoned"))?;
         if original.stage != RootRestoreStage::Completed || original.root != Some(root) {
-            return Err(admission_error("restored snapshot requires its original completed root"));
+            return Err(admission_error(
+                "restored snapshot requires its original completed root",
+            ));
         }
-        original.snapshot.ok_or_else(|| admission_error("original restored snapshot is absent"))
+        original
+            .snapshot
+            .ok_or_else(|| admission_error("original restored snapshot is absent"))
     }
 
     pub(crate) fn original_root_restore_may_submit(&self) -> bool {
-        !self.poisoned && !self.device_controlled && self.root_export.is_none()
+        !self.poisoned
+            && !self.device_controlled
+            && self.root_export.is_none()
             && self.original_command.as_ref().is_none_or(|(scope, _)| {
                 self.root_restoration.as_ref().is_some_and(|(original, _)| {
-                    scope.as_ref().is_some_and(|scope| Arc::ptr_eq(scope, original))
+                    scope
+                        .as_ref()
+                        .is_some_and(|scope| Arc::ptr_eq(scope, original))
                 })
             })
     }
@@ -4107,11 +4232,17 @@ impl SemanticHypergraph {
         let mut command = self.command_for(OP_INSERT_SUPPORT);
         encode_support_insertion(&mut command, fork, statement, event, reconstruction);
         let current = self.current_fork.as_mut().expect("validated live fork");
-        current.staged_statements.try_reserve(1)
+        current
+            .staged_statements
+            .try_reserve(1)
             .map_err(|error| runtime_error("statement ledger reservation", error))?;
-        current.staged_supports.try_reserve(1)
+        current
+            .staged_supports
+            .try_reserve(1)
             .map_err(|error| runtime_error("support ledger reservation", error))?;
-        current.staged_versions.try_reserve(1)
+        current
+            .staged_versions
+            .try_reserve(1)
             .map_err(|error| runtime_error("version ledger reservation", error))?;
         let receipt = self.run_original(command, ArenaAccess::ReadWrite, scope)?;
         self.expect_success(&receipt)?;
@@ -4208,7 +4339,10 @@ impl SemanticHypergraph {
         self.ensure_original_host_facade(scope)?;
         self.validate_fork(fork)?;
         self.fork.generation.checked_add(1).ok_or(
-            SemanticHypergraphError::GenerationExhausted { kind: SemanticHandleKind::Fork, slot: 0 },
+            SemanticHypergraphError::GenerationExhausted {
+                kind: SemanticHandleKind::Fork,
+                slot: 0,
+            },
         )?;
         let mut command = self.command_for(OP_SEAL);
         command.words[1] = fork.owner;
@@ -4615,8 +4749,11 @@ impl SemanticHypergraph {
             command,
             access,
             upload: crate::device::RetainedDeviceWrite::new(
-                &self.stream, &[command], self.command.view(),
-            ).map_err(|error| runtime_error("semantic command staging", error))?,
+                &self.stream,
+                &[command],
+                self.command.view(),
+            )
+            .map_err(|error| runtime_error("semantic command staging", error))?,
             upload_admitted: false,
             completion_entered: false,
             kernel_entered: false,
@@ -4650,16 +4787,27 @@ impl SemanticHypergraph {
     ) -> Result<DeviceReceipt, SemanticHypergraphError> {
         if let Some((original_scope, original)) = &self.original_command {
             if !same_optional_scope(original_scope.as_ref(), scope) {
-                return Err(admission_error("another original semantic command is pending"));
+                return Err(admission_error(
+                    "another original semantic command is pending",
+                ));
             }
-            let original = original.lock()
+            let original = original
+                .lock()
                 .map_err(|_| admission_error("original semantic command lock is poisoned"))?;
-            if original.owner != self.owner || original.command != command || original.access != access {
-                return Err(admission_error("semantic continuation changed its original command"));
+            if original.owner != self.owner
+                || original.command != command
+                || original.access != access
+            {
+                return Err(admission_error(
+                    "semantic continuation changed its original command",
+                ));
             }
         } else {
-            if !may_submit || self.poisoned || self.root_export.is_some()
-                || (scope.is_some() && !self.root_restore_submission_allowed) {
+            if !may_submit
+                || self.poisoned
+                || self.root_export.is_some()
+                || (scope.is_some() && !self.root_restore_submission_allowed)
+            {
                 return Err(SemanticHypergraphError::Poisoned);
             }
             let original = self.prepare_original_command(command, access)?;
@@ -4667,10 +4815,16 @@ impl SemanticHypergraph {
         }
         let original = Arc::clone(&self.original_command.as_ref().expect("original command").1);
         let receipt = {
-            let mut original = original.lock()
+            let mut original = original
+                .lock()
                 .map_err(|_| admission_error("original semantic command lock is poisoned"))?;
-            self.resolve_original_command(&mut original, may_submit && !self.poisoned && self.root_export.is_none()
-                && (scope.is_none() || self.root_restore_submission_allowed))?
+            self.resolve_original_command(
+                &mut original,
+                may_submit
+                    && !self.poisoned
+                    && self.root_export.is_none()
+                    && (scope.is_none() || self.root_restore_submission_allowed),
+            )?
         };
         self.original_command = None;
         Ok(receipt)
@@ -4692,7 +4846,8 @@ impl SemanticHypergraph {
                 return Err(SemanticHypergraphError::Poisoned);
             }
             if !original.upload_admitted {
-                self.provider.admit_launch_metadata_htod(std::mem::size_of::<DeviceCommand>());
+                self.provider
+                    .admit_launch_metadata_htod(std::mem::size_of::<DeviceCommand>());
                 original.upload_admitted = true;
             }
             original.upload.enqueue(&self.stream).map_err(|error| {
@@ -4715,8 +4870,9 @@ impl SemanticHypergraph {
                 return Err(SemanticHypergraphError::Poisoned);
             }
             if original.completion_entered {
-                original.completion = crate::device::ExecutionCompletion::new(self.stream.context())
-                    .map_err(|error| runtime_error("semantic completion allocation", error))?;
+                original.completion =
+                    crate::device::ExecutionCompletion::new(self.stream.context())
+                        .map_err(|error| runtime_error("semantic completion allocation", error))?;
                 original.completion_entered = false;
             }
             let next_launches = self.next_launch_count()?;
@@ -4735,7 +4891,10 @@ impl SemanticHypergraph {
                     SemanticKernelLaunchIo {
                         arena: &mut self.arena,
                         arena_access: original.access,
-                        input: SemanticKernelInput::HostCommand { commands: &self.command, index: 0 },
+                        input: SemanticKernelInput::HostCommand {
+                            commands: &self.command,
+                            index: 0,
+                        },
                         receipts: &mut self.receipt,
                         receipt_index: 0,
                     },
@@ -4745,15 +4904,21 @@ impl SemanticHypergraph {
                 );
                 let successful = result.is_ok();
                 submitted = Some(result);
-                if successful { Ok(()) } else {
-                    Err(DriverError(cudarc::driver::sys::CUresult::CUDA_ERROR_UNKNOWN))
+                if successful {
+                    Ok(())
+                } else {
+                    Err(DriverError(
+                        cudarc::driver::sys::CUresult::CUDA_ERROR_UNKNOWN,
+                    ))
                 }
             });
             if original.kernel_submitted && !original.launch_counted {
                 self.stats.cuda_kernel_launches = next_launches;
                 original.launch_counted = true;
             }
-            submitted.ok_or_else(|| runtime_error("semantic submission", "original command did not enter"))??;
+            submitted.ok_or_else(|| {
+                runtime_error("semantic submission", "original command did not enter")
+            })??;
             completion.map_err(|error| {
                 original.poisoned = true;
                 runtime_error("original semantic completion fence", error)
@@ -4764,23 +4929,33 @@ impl SemanticHypergraph {
             runtime_error("original semantic completion", error)
         })?;
         if !original.kernel_submitted {
-            return Err(runtime_error("original semantic completion", "original command has no successful kernel submission"));
+            return Err(runtime_error(
+                "original semantic completion",
+                "original command has no successful kernel submission",
+            ));
         }
         if !original.receipt.entered() {
             if !may_submit {
                 return Err(SemanticHypergraphError::Poisoned);
             }
             if !original.receipt_admitted {
-                self.provider.admit_small_metadata_dtoh(std::mem::size_of::<DeviceReceipt>())
+                self.provider
+                    .admit_small_metadata_dtoh(std::mem::size_of::<DeviceReceipt>())
                     .map_err(|error| runtime_error("semantic receipt transfer admission", error))?;
                 original.receipt_admitted = true;
             }
             self.enqueue_original_read(&mut original.receipt, &mut original.poisoned)?;
         }
-        let receipt = original.receipt.resolve().map_err(|error| {
-            original.poisoned = true;
-            runtime_error("original semantic receipt completion", error)
-        })?.into_iter().next().ok_or_else(|| admission_error("original semantic receipt is absent"))?;
+        let receipt = original
+            .receipt
+            .resolve()
+            .map_err(|error| {
+                original.poisoned = true;
+                runtime_error("original semantic receipt completion", error)
+            })?
+            .into_iter()
+            .next()
+            .ok_or_else(|| admission_error("original semantic receipt is absent"))?;
         original.value = Some(receipt);
         original.poisoned = false;
         Ok(receipt)
@@ -5036,9 +5211,13 @@ impl SemanticHypergraph {
         if self.poisoned {
             Err(SemanticHypergraphError::Poisoned)
         } else if self.original_command.is_some() {
-            Err(admission_error("original semantic command must resolve before another graph operation"))
+            Err(admission_error(
+                "original semantic command must resolve before another graph operation",
+            ))
         } else if self.root_restore_pending() {
-            Err(admission_error("original root restoration must resolve before another graph operation"))
+            Err(admission_error(
+                "original root restoration must resolve before another graph operation",
+            ))
         } else if self.root_export.is_some() {
             Err(admission_error(
                 "original root export must resolve before another graph operation",
@@ -5056,16 +5235,23 @@ impl SemanticHypergraph {
         Ok(())
     }
 
-    fn ensure_original_host_facade(&self, scope: Option<&Arc<()>>) -> Result<(), SemanticHypergraphError> {
+    fn ensure_original_host_facade(
+        &self,
+        scope: Option<&Arc<()>>,
+    ) -> Result<(), SemanticHypergraphError> {
         let Some(scope) = scope else {
             return self.ensure_host_facade_available();
         };
-        if self.root_restoration.as_ref().is_none_or(|(issuer, _)| !Arc::ptr_eq(issuer, scope))
+        if self
+            .root_restoration
+            .as_ref()
+            .is_none_or(|(issuer, _)| !Arc::ptr_eq(issuer, scope))
             || self.root_export.is_some()
             || self.device_controlled
-            || self.original_command.as_ref().is_some_and(|(issuer, _)| {
-                !same_optional_scope(issuer.as_ref(), Some(scope))
-            })
+            || self
+                .original_command
+                .as_ref()
+                .is_some_and(|(issuer, _)| !same_optional_scope(issuer.as_ref(), Some(scope)))
             || (self.poisoned && self.original_command.is_none())
         {
             return Err(SemanticHypergraphError::Poisoned);

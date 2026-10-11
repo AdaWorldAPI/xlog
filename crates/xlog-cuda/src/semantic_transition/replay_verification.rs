@@ -395,9 +395,13 @@ impl SemanticTransitionSession {
             || self.has_pending_state_restoration_except(None, None)
             || {
                 #[cfg(feature = "semantic-policy")]
-                { self.has_pending_actor_refresh_context_except(None) }
+                {
+                    self.has_pending_actor_refresh_context_except(None)
+                }
                 #[cfg(not(feature = "semantic-policy"))]
-                { false }
+                {
+                    false
+                }
             }
             || self.pending
             || self.pending_replay_delivery.is_some()

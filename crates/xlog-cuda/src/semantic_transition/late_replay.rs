@@ -942,9 +942,10 @@ impl SemanticTransitionSession {
                 .ok_or(SemanticTransitionError::NoPendingLaunch)?,
         );
         let current = {
-            let mut control = reads.control.lock().map_err(|_| {
-                publication_input_error("receiver publication read owner poisoned")
-            })?;
+            let mut control = reads
+                .control
+                .lock()
+                .map_err(|_| publication_input_error("receiver publication read owner poisoned"))?;
             self.resolve_publication_read(&mut control)?[0]
         };
         if current.word != lease.identity.word || current.instance != lease.identity.instance {
@@ -1012,16 +1013,21 @@ impl SemanticTransitionSession {
                     "restored append row exceeds its original reserved storage",
                 ));
             }
-            let target = raw.slice(
-                descriptor.raw_offset as usize..descriptor.raw_offset as usize + raw_len,
-            );
+            let target =
+                raw.slice(descriptor.raw_offset as usize..descriptor.raw_offset as usize + raw_len);
             let physical = arena.physical_ordinal(expected_ordinal)?;
             let target_descriptor = descriptors.slice(physical..physical + 1);
             writes.push(state_restoration::OriginalDeviceWrite::new(
-                &self.stream, row.raw, target, false,
+                &self.stream,
+                row.raw,
+                target,
+                false,
             )?);
             writes.push(state_restoration::OriginalDeviceWrite::new(
-                &self.stream, &[descriptor], target_descriptor, false,
+                &self.stream,
+                &[descriptor],
+                target_descriptor,
+                false,
             )?);
         }
         Ok(writes)
@@ -1333,9 +1339,7 @@ impl SemanticTransitionSession {
             observation_count: authenticated.observations.len() as u64,
             statements: statements.device.device_ptr_value(),
             supports: supports.device.device_ptr_value(),
-            native_work: native_work
-                .as_ref()
-                .map_or(0, |work| *work.device_ptr()),
+            native_work: native_work.as_ref().map_or(0, |work| *work.device_ptr()),
         };
         let input = ReplayUpload::new(&self.provider, &self.stream, &[input])?;
         let control = Arc::new(std::sync::Mutex::new(
@@ -1566,9 +1570,9 @@ impl SemanticTransitionSession {
             CudaStream::synchronize,
         )?;
         let control = {
-            let mut read = control_read.lock().map_err(|_| {
-                publication_input_error("replay completion control owner poisoned")
-            })?;
+            let mut read = control_read
+                .lock()
+                .map_err(|_| publication_input_error("replay completion control owner poisoned"))?;
             self.resolve_publication_read(&mut read)?[0]
         };
         let expected_word = ((base.word >> 1) + 1) << 1 | ((base.word & 1) ^ 1);
@@ -1578,9 +1582,9 @@ impl SemanticTransitionSession {
             return Err(SemanticTransitionError::PublicationRefused { status });
         }
         let header = {
-            let mut read = header_read.lock().map_err(|_| {
-                publication_input_error("replay completion header owner poisoned")
-            })?;
+            let mut read = header_read
+                .lock()
+                .map_err(|_| publication_input_error("replay completion header owner poisoned"))?;
             self.resolve_publication_read(&mut read)?[0]
         };
         if control.word != expected_word

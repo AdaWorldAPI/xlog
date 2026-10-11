@@ -200,7 +200,11 @@ pub(super) struct TaskQueryRecord {
 
 impl Default for TaskQueryRecord {
     fn default() -> Self {
-        Self { receipt: [0; 42], truth: 0, attained: 0 }
+        Self {
+            receipt: [0; 42],
+            truth: 0,
+            attained: 0,
+        }
     }
 }
 
@@ -229,8 +233,13 @@ pub(super) struct TaskGroundLayout {
 }
 
 impl TaskGroundLayout {
-    pub fn new(queries: usize, bindings: usize, initial_rules: Option<usize>) -> Result<Self, SemanticTransitionError> {
-        let overflow = || publication_input_error("task ground geometry exceeds addressable storage");
+    pub fn new(
+        queries: usize,
+        bindings: usize,
+        initial_rules: Option<usize>,
+    ) -> Result<Self, SemanticTransitionError> {
+        let overflow =
+            || publication_input_error("task ground geometry exceeds addressable storage");
         if queries == 0 || queries > u32::MAX as usize || bindings > u32::MAX as usize {
             return Err(overflow());
         }
@@ -243,10 +252,18 @@ impl TaskGroundLayout {
             .and_then(|cells| cells.checked_mul(std::mem::size_of::<TaskQueryRecord>()))
             .and_then(|bytes| bytes.checked_add(query_offset))
             .ok_or_else(overflow)?;
-        let rule_capacity = initial_rules.map(|count| crate::semantic_program::RESIDENT_PROGRAM_RULE_CAPACITY.checked_sub(count)
-            .ok_or_else(overflow)).transpose()?.unwrap_or(0);
-        let bytes = rule_capacity.checked_mul(std::mem::size_of::<crate::SemanticProgramRule>())
-            .and_then(|bytes| bytes.checked_add(rule_offset)).ok_or_else(overflow)?;
+        let rule_capacity = initial_rules
+            .map(|count| {
+                crate::semantic_program::RESIDENT_PROGRAM_RULE_CAPACITY
+                    .checked_sub(count)
+                    .ok_or_else(overflow)
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let bytes = rule_capacity
+            .checked_mul(std::mem::size_of::<crate::SemanticProgramRule>())
+            .and_then(|bytes| bytes.checked_add(rule_offset))
+            .ok_or_else(overflow)?;
         Ok(Self {
             queries,
             bindings,
@@ -284,8 +301,12 @@ impl TaskGroundLayout {
             ));
         }
         for (actual, expected) in bytes[..64].chunks_exact(8).zip([
-            TASK_GROUND_MAGIC, TASK_GROUND_VERSION, self.queries as u64,
-            self.bindings as u64, 44, 18,
+            TASK_GROUND_MAGIC,
+            TASK_GROUND_VERSION,
+            self.queries as u64,
+            self.bindings as u64,
+            44,
+            18,
         ]) {
             if actual != expected.to_le_bytes() {
                 return Err(publication_input_error(
@@ -296,19 +317,28 @@ impl TaskGroundLayout {
         let rule_count = u64::from_le_bytes(bytes[48..56].try_into().expect("rule count"));
         let rule_capacity = u64::from_le_bytes(bytes[56..64].try_into().expect("rule capacity"));
         if rule_capacity != self.rule_capacity as u64 || rule_count > rule_capacity {
-            return Err(publication_input_error("selected rules differ from their original finite bank"));
+            return Err(publication_input_error(
+                "selected rules differ from their original finite bank",
+            ));
         }
-        let used_rules = usize::try_from(rule_count).ok()
+        let used_rules = usize::try_from(rule_count)
+            .ok()
             .and_then(|count| count.checked_mul(std::mem::size_of::<crate::SemanticProgramRule>()))
             .and_then(|bytes| self.rule_offset.checked_add(bytes))
             .ok_or(SemanticTransitionError::GenerationExhausted)?;
         if bytes[used_rules..].iter().any(|byte| *byte != 0) {
-            return Err(publication_input_error("unoccupied selected rule storage is not canonical"));
+            return Err(publication_input_error(
+                "unoccupied selected rule storage is not canonical",
+            ));
         }
         let mut selected = BTreeSet::new();
-        for rule in bytes[self.rule_offset..used_rules].chunks_exact(std::mem::size_of::<crate::SemanticProgramRule>()) {
+        for rule in bytes[self.rule_offset..used_rules]
+            .chunks_exact(std::mem::size_of::<crate::SemanticProgramRule>())
+        {
             if !selected.insert(rule) {
-                return Err(publication_input_error("selected rule storage repeats an authored rule"));
+                return Err(publication_input_error(
+                    "selected rule storage repeats an authored rule",
+                ));
             }
         }
         for observation in bytes[64..self.query_offset].chunks_exact(144) {
@@ -318,9 +348,9 @@ impl TaskGroundLayout {
                 || (present == 0 && observation.iter().any(|byte| *byte != 0))
                 || (present == 1
                     && (truth > 3
-                        || observation[16..].chunks_exact(32).any(|identity| {
-                            identity.iter().all(|byte| *byte == 0)
-                        })))
+                        || observation[16..]
+                            .chunks_exact(32)
+                            .any(|identity| identity.iter().all(|byte| *byte == 0))))
             {
                 return Err(publication_input_error(
                     "task ground observation has invalid original presence or provenance",
@@ -330,14 +360,25 @@ impl TaskGroundLayout {
         Ok(())
     }
 
-    pub fn query(self, bytes: &[u8], candidate: usize, query: usize) -> Result<TaskQueryRecord, SemanticTransitionError> {
+    pub fn query(
+        self,
+        bytes: &[u8],
+        candidate: usize,
+        query: usize,
+    ) -> Result<TaskQueryRecord, SemanticTransitionError> {
         if bytes.len() != self.bytes || candidate >= 3 || query >= self.queries {
-            return Err(publication_input_error("task query is outside its original ground"));
+            return Err(publication_input_error(
+                "task query is outside its original ground",
+            ));
         }
         let offset = self.query_offset + (candidate * self.queries + query) * 352;
         let record = &bytes[offset..offset + 352];
         let word = |index: usize| {
-            u64::from_le_bytes(record[index * 8..index * 8 + 8].try_into().expect("query record word"))
+            u64::from_le_bytes(
+                record[index * 8..index * 8 + 8]
+                    .try_into()
+                    .expect("query record word"),
+            )
         };
         let receipt = std::array::from_fn(word);
         Ok(TaskQueryRecord {
@@ -367,30 +408,42 @@ impl TaskGroundStorage {
     pub fn allocation_bytes(layout: TaskGroundLayout) -> Result<usize, SemanticTransitionError> {
         let facts = crate::semantic_program::RESIDENT_PROGRAM_FACT_CAPACITY;
         let words = layout.bindings.div_ceil(64);
-        facts.checked_mul(3)
+        facts
+            .checked_mul(3)
             .and_then(|cells| cells.checked_mul(2))
             .and_then(|cells| cells.checked_mul(words))
             .and_then(|cells| cells.checked_mul(8))
             .and_then(|bytes| bytes.checked_add(3 * facts))
             .and_then(|bytes| bytes.checked_add(layout.bytes))
-            .ok_or_else(|| publication_input_error("task derivation geometry exceeds addressable storage"))
+            .ok_or_else(|| {
+                publication_input_error("task derivation geometry exceeds addressable storage")
+            })
     }
 
-    pub fn allocate(layout: TaskGroundLayout, reservation: &mut super::GpuMemoryReservation)
-        -> Result<Self, SemanticTransitionError> {
+    pub fn allocate(
+        layout: TaskGroundLayout,
+        reservation: &mut super::GpuMemoryReservation,
+    ) -> Result<Self, SemanticTransitionError> {
         let facts = crate::semantic_program::RESIDENT_PROGRAM_FACT_CAPACITY;
         let words = layout.bindings.div_ceil(64);
-        let cells = facts.checked_mul(3).and_then(|count| count.checked_mul(2))
+        let cells = facts
+            .checked_mul(3)
+            .and_then(|count| count.checked_mul(2))
             .and_then(|count| count.checked_mul(words))
-            .ok_or_else(|| publication_input_error("task derivation geometry exceeds addressable storage"))?;
+            .ok_or_else(|| {
+                publication_input_error("task derivation geometry exceeds addressable storage")
+            })?;
         Self::allocation_bytes(layout)?;
         Ok(Self {
             layout,
-            device: reservation.alloc::<u8>(layout.bytes)
+            device: reservation
+                .alloc::<u8>(layout.bytes)
                 .map_err(|error| super::runtime_error("task ground allocation", error))?,
-            support_truths: reservation.alloc::<u8>(3 * facts)
+            support_truths: reservation
+                .alloc::<u8>(3 * facts)
                 .map_err(|error| super::runtime_error("task support allocation", error))?,
-            support_lineage: reservation.alloc::<u64>(cells)
+            support_lineage: reservation
+                .alloc::<u64>(cells)
                 .map_err(|error| super::runtime_error("task provenance allocation", error))?,
         })
     }
@@ -418,35 +471,57 @@ pub(super) fn decoded_task_facts(
         let records = (0..layout.queries)
             .map(|query| layout.query(bytes, candidate, query))
             .collect::<Result<Vec<_>, _>>()?;
-        let executed = records.iter().any(|record| record.receipt.iter().any(|word| *word != 0));
+        let executed = records
+            .iter()
+            .any(|record| record.receipt.iter().any(|word| *word != 0));
         let mut truth = Vec::new();
         let mut attained = Vec::new();
         if executed {
             for record in &records {
-                if record.truth > 3 || record.attained > 1 || record.receipt.iter().all(|word| *word == 0) {
+                if record.truth > 3
+                    || record.attained > 1
+                    || record.receipt.iter().all(|word| *word == 0)
+                {
                     return Err(SemanticTransitionError::ObservationMismatch);
                 }
                 truth.push(record.truth);
                 attained.push(record.attained);
             }
-            query_count = query_count.checked_add(layout.queries as u64)
+            query_count = query_count
+                .checked_add(layout.queries as u64)
                 .ok_or(SemanticTransitionError::GenerationExhausted)?;
-        } else if records.iter().any(|record| record.truth != 0 || record.attained != 0)
-            || state.facts[candidate].g != 0 || state.facts[candidate].p != 0
+        } else if records
+            .iter()
+            .any(|record| record.truth != 0 || record.attained != 0)
+            || state.facts[candidate].g != 0
+            || state.facts[candidate].p != 0
             || state.facts[candidate].eligible != 0
         {
             return Err(SemanticTransitionError::ObservationMismatch);
         }
-        let correct = expected.map(|values| truth.iter().zip(values)
-            .map(|(actual, expected)| u64::from(*actual == *expected as u64)).collect());
+        let correct = expected.map(|values| {
+            truth
+                .iter()
+                .zip(values)
+                .map(|(actual, expected)| u64::from(*actual == *expected as u64))
+                .collect()
+        });
         let scalar = state.facts[candidate];
         candidates.push(super::SemanticTaskFacts {
-            truth, correct, attained,
-            g: scalar.g, p: scalar.p, c: scalar.c, v: scalar.v, eligible: scalar.eligible,
+            truth,
+            correct,
+            attained,
+            g: scalar.g,
+            p: scalar.p,
+            c: scalar.c,
+            v: scalar.v,
+            eligible: scalar.eligible,
         });
     }
     if query_count != state.query_count {
         return Err(SemanticTransitionError::ObservationMismatch);
     }
-    candidates.try_into().map_err(|_| SemanticTransitionError::ObservationMismatch)
+    candidates
+        .try_into()
+        .map_err(|_| SemanticTransitionError::ObservationMismatch)
 }

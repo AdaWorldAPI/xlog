@@ -267,7 +267,10 @@ impl PreparedReplayCustody {
             .alloc(values.len())
             .map_err(|error| runtime_error("retained input guard reservation", error))?;
         writes.push(state_restoration::OriginalDeviceWrite::new(
-            stream, &values, input_bindings.view(), false,
+            stream,
+            &values,
+            input_bindings.view(),
+            false,
         )?);
         Ok(Self {
             parent,
@@ -726,21 +729,32 @@ impl SemanticTransitionSession {
     ) -> Result<Vec<u8>, SemanticTransitionError> {
         let original = self.checked_prepared_step(step, false)?;
         let prepared = original.prepared.as_ref().expect("checked original owner");
-        if !prepared.observed || !self.prepared_segment.as_ref()
-            .is_some_and(|segment| segment.completed)
+        if !prepared.observed
+            || !self
+                .prepared_segment
+                .as_ref()
+                .is_some_and(|segment| segment.completed)
         {
-            return Err(publication_input_error("retained task ground requires known completed execution"));
+            return Err(publication_input_error(
+                "retained task ground requires known completed execution",
+            ));
         }
-        let parent = &prepared.replay_custody.as_ref()
-            .ok_or(SemanticTransitionError::ObservationMismatch)?.parent;
-        let slot = parent.plan.iter().position(|row|
-            (row.role, row.index) == (SemanticStateRole::TaskGround as u64, 0))
+        let parent = &prepared
+            .replay_custody
+            .as_ref()
+            .ok_or(SemanticTransitionError::ObservationMismatch)?
+            .parent;
+        let slot = parent
+            .plan
+            .iter()
+            .position(|row| (row.role, row.index) == (SemanticStateRole::TaskGround as u64, 0))
             .ok_or(SemanticTransitionError::ObservationMismatch)?;
         let bytes = parent.backings[slot].slice()?.view();
         let bank = parent.bank.view();
         let actual = parent.actual.view();
         let actual = self.publication_read(actual)?;
-        if actual[2] != 1 || actual[1] != header.publication_word
+        if actual[2] != 1
+            || actual[1] != header.publication_word
             || self.publication_read(bank)?[0].header != *header
         {
             self.poisoned = true;
@@ -935,7 +949,8 @@ impl SemanticTransitionSession {
                 &original_generations,
             )?;
             if next.state.actor_eligible == 1 && self.actor_refresh.is_none() {
-                self.register_prepared_actor_refresh_origin(step,
+                self.register_prepared_actor_refresh_origin(
+                    step,
                     crate::semantic_training_view::origin_record(SemanticTrainingViewOrigin {
                         transition: SemanticTransitionKind::Proposal,
                         predecessor: identity(header),
@@ -943,7 +958,10 @@ impl SemanticTransitionSession {
                         invocation: header.rng_binding()?,
                         model_geometry_digest: header.model_geometry_digest,
                         model_numerical_digest: header.model_numerical_digest,
-                    }), next.state.action_batch_root, publication_abi_bytes(&[next.state.action_batch]))?;
+                    }),
+                    next.state.action_batch_root,
+                    publication_abi_bytes(&[next.state.action_batch]),
+                )?;
             }
             Ok(Some(SemanticCompletedReplayMaterials {
                 predecessor: identity(header),
@@ -1067,7 +1085,10 @@ impl ReplaySnapshot {
             .alloc(plan.len())
             .map_err(|error| runtime_error("replay roster reservation", error))?;
         writes.push(state_restoration::OriginalDeviceWrite::new(
-            stream, &plan, rows.view(), false,
+            stream,
+            &plan,
+            rows.view(),
+            false,
         )?);
         let bank = reservation
             .alloc(1)
@@ -1088,7 +1109,10 @@ impl ReplaySnapshot {
             .alloc(3)
             .map_err(|error| runtime_error("replay work reservation", error))?;
         writes.push(state_restoration::OriginalDeviceWrite::new(
-            stream, &[0u64; 3], actual.view(), false,
+            stream,
+            &[0u64; 3],
+            actual.view(),
+            false,
         )?);
         Ok(Self {
             rows,
