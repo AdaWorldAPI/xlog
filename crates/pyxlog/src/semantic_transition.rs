@@ -16948,6 +16948,13 @@ impl PySemanticTransitionController {
         })
     }
 
+    /// The exact retained Session owner, without creating or executing another.
+    #[getter]
+    fn session(&self, py: Python<'_>) -> PyResult<Py<PySemanticTransitionSession>> {
+        self.session.borrow(py).require_creator()?;
+        Ok(self.session.clone_ref(py))
+    }
+
     /// Versioned (unit identity, maximum raw cost) of this Session's native
     /// program mode, available before import_task freezes its objective.
     #[getter]

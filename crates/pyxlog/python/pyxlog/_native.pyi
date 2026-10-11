@@ -538,6 +538,14 @@ class SemanticTransitionSession:
     ) -> Any: ...
 
 class SemanticTransitionController:
+    @property
+    def session(self) -> SemanticTransitionSession:
+        """The identical retained Session owner, checked on its creator thread.
+
+        Reading this carrier does not create a Session or perform native work.
+        """
+        ...
+
     def import_task(
         self, *, task_ref: Any, task_scope: Any, statement_records: Any,
         allowed_support_records: Any, task_program_source: Any,

@@ -340,9 +340,11 @@ memory admission or any device/model entry. Cancelled is terminal; an unknown
 execution cannot acquire this disposition or admit a replacement instruction.
 
 Before publishing the first durable checkpoint or admitting a request, retain
-the live `session.learning_phase_checkpoint_issuer` in the existing trusted
-create-only issuer store. This original 32-byte Session signing issuer is available
+the live `controller.session.learning_phase_checkpoint_issuer` in the existing
+trusted create-only issuer store. This original 32-byte Session signing issuer is available
 before the first learning phase; it does not require a completed phase closure.
+`controller.session` returns the identical retained Session on its creator
+thread; it creates no replacement owner and performs no CUDA or model work.
 Do not derive a trusted pin from the checkpoint being restored. Its issuer
 selector can locate an existing independent pin, but cannot create that trust.
 
