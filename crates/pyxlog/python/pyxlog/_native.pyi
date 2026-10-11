@@ -460,6 +460,29 @@ class SemanticTransitionColdTask:
     def task_ground(self) -> tuple[str, tuple[Any, ...]]: ...
     def close(self) -> None: ...
 
+class NativeTensorAllocation:
+    """Native-issued physical allocation origin; no public constructor.
+
+    Retains allocation lifetime, not reader access or immutable tensor content.
+    """
+
+    def same_allocation(self, other: NativeTensorAllocation) -> bool: ...
+    @property
+    def allocation_bytes(self) -> int: ...
+    @property
+    def byte_offset(self) -> int: ...
+    @property
+    def view_bytes(self) -> int: ...
+
+_PolicyNumericalDomainLayout = tuple[
+    NativeTensorAllocation, tuple[int, ...], tuple[int, ...],
+    tuple[Literal[2], Literal[64]],
+]
+_PolicyNumericalDomainLayouts = tuple[
+    _PolicyNumericalDomainLayout, _PolicyNumericalDomainLayout,
+    _PolicyNumericalDomainLayout,
+]
+
 class SemanticTransitionTaskUse:
     """Native-issued task; no public constructor."""
 
@@ -478,6 +501,30 @@ class SemanticTransitionTaskUse:
         Available before the first Proposal, without a device read. Reading
         the decision grants no training rights and does not reclassify records.
         Missing or stale task bindings raise rather than returning False.
+        """
+        ...
+
+    def policy_numerical_domain_layouts(
+        self, parent: Union[SemanticPublishedParent, SemanticPreparedStep],
+        bank: Optional[int],
+    ) -> _PolicyNumericalDomainLayouts:
+        """Original allocations, shapes, element strides and FP64 dtype.
+
+        Pure structural projection: no tensor export, value read or numerical
+        access. Retained import preparation and prepared banks already own these
+        buffers; ordinary replay queries its original parent after policy bind.
+        """
+        ...
+
+    def policy_numerical_domains(
+        self, parent: Union[SemanticPublishedParent, SemanticPreparedStep],
+        bank: Optional[int], consumer_stream: int, *,
+        expected_layouts: _PolicyNumericalDomainLayouts,
+    ) -> tuple[Any, Any, Any]:
+        """Export the same three genuine domains after all nine snapshots.
+
+        Requires the original projected allocation owners, offsets, spans and
+        layouts. Existing numerical, recording and stream guards still apply.
         """
         ...
 

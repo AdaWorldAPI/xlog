@@ -10690,13 +10690,13 @@ impl PySemanticTransitionRestoredCheckpoint {
 }
 
 /// Native physical allocation origin of one exported tensor view. Instances
-/// come only from an original parent or prepared step's tensor_allocation(),
-/// never Python input.
+/// come only from an original native allocation projection, never Python input.
 /// Retains allocation lifetime but not reader access or immutable content.
 /// Allocation ownership and external tensor version counters are independent.
 #[pyclass(name = "NativeTensorAllocation", module = "pyxlog._native", frozen)]
 pub(crate) struct PyNativeTensorAllocation {
     provenance: DeviceAllocationProvenance,
+    policy_layout: Option<SemanticTensorLayout>,
 }
 
 #[pymethods]
@@ -10720,6 +10720,53 @@ impl PyNativeTensorAllocation {
     fn view_bytes(&self) -> u64 {
         self.provenance.view_bytes()
     }
+}
+
+#[cfg(feature = "semantic-policy")]
+fn policy_domain_expected_layouts(
+    expected: &Bound<'_, PyAny>,
+) -> PyResult<[xlog_cuda::SemanticPolicyNumericalDomainLayout; 3]> {
+    let rows = expected.cast::<PyTuple>()?;
+    if rows.len() != 3 {
+        return Err(invalid("policy domains require their three original immutable layout rows"));
+    }
+    let mut layouts = Vec::with_capacity(3);
+    let mut budget = 4096;
+    for row in rows.iter() {
+        let row = row.cast::<PyTuple>()?;
+        if row.len() != 4 {
+            return Err(invalid("policy domain layout requires its native allocation, shape, strides and dtype"));
+        }
+        let allocation = row.get_item(0)?.extract::<PyRef<'_, PyNativeTensorAllocation>>()?;
+        let layout = allocation.policy_layout.ok_or_else(|| {
+            invalid("policy domain allocation must retain its original native layout projection")
+        })?;
+        let shape_value = row.get_item(1)?;
+        shape_value.cast::<PyTuple>()?;
+        let shape = ColdValue::read(&shape_value, &mut budget, 0)?.sequence()?
+            .iter().map(ColdValue::unsigned).collect::<PyResult<Vec<_>>>()?;
+        let strides_value = row.get_item(2)?;
+        strides_value.cast::<PyTuple>()?;
+        let strides = ColdValue::read(&strides_value, &mut budget, 0)?.sequence()?
+            .iter().map(ColdValue::unsigned).collect::<PyResult<Vec<_>>>()?;
+        let dtype_value = row.get_item(3)?;
+        dtype_value.cast::<PyTuple>()?;
+        let dtype = ColdValue::read(&dtype_value, &mut budget, 0)?.sequence()?
+            .iter().map(ColdValue::unsigned).collect::<PyResult<Vec<_>>>()?;
+        let rank = usize::try_from(layout.rank).map_err(|_| invalid("policy domain rank exceeds usize"))?;
+        if rank > layout.dimensions.len() || layout.element_bytes != 8
+            || shape.as_slice() != &layout.dimensions[..rank]
+            || strides != layout.strides_bytes[..rank].iter().map(|stride| stride / 8).collect::<Vec<_>>()
+            || dtype.as_slice() != [2, 64]
+        {
+            return Err(invalid("policy domain layout changed its original shape, stride or FP64 dtype"));
+        }
+        layouts.push(xlog_cuda::SemanticPolicyNumericalDomainLayout {
+            allocation: allocation.provenance.clone(),
+            layout,
+        });
+    }
+    layouts.try_into().map_err(|_| invalid("policy domain projection lost its original three ports"))
 }
 
 /// Immutable native-owned materials from one completed original Proposal.
@@ -12834,7 +12881,7 @@ impl PySemanticPreparedStep {
             .map_err(xlog_err)?;
         let tensor = retain_export_owner(tensor, self.session.clone_ref(py), session.owner_thread)?;
         Ok((
-            Py::new(py, PyNativeTensorAllocation { provenance })?,
+            Py::new(py, PyNativeTensorAllocation { provenance, policy_layout: None })?,
             crate::dlpack_capsule_from_tensor(py, tensor)?,
         )
             .into_pyobject(py)?
@@ -12869,7 +12916,7 @@ impl PySemanticPreparedStep {
             .map_err(xlog_err)?;
         let tensor = retain_export_owner(tensor, self.session.clone_ref(py), session.owner_thread)?;
         Ok((
-            Py::new(py, PyNativeTensorAllocation { provenance })?,
+            Py::new(py, PyNativeTensorAllocation { provenance, policy_layout: None })?,
             crate::dlpack_capsule_from_tensor(py, tensor)?,
         )
             .into_pyobject(py)?
@@ -16333,7 +16380,7 @@ impl PySemanticPublishedParent {
                 retain_export_owner(tensor, self.session.clone_ref(py), session.owner_thread)?;
             allocations.push(
                 (
-                    Py::new(py, PyNativeTensorAllocation { provenance })?,
+                    Py::new(py, PyNativeTensorAllocation { provenance, policy_layout: None })?,
                     crate::dlpack_capsule_from_tensor(py, tensor)?,
                 )
                     .into_pyobject(py)?
@@ -16716,7 +16763,7 @@ impl PySemanticPublishedParent {
             .map_err(xlog_err)?;
         let tensor = retain_export_owner(tensor, self.session.clone_ref(py), session.owner_thread)?;
         Ok((
-            Py::new(py, PyNativeTensorAllocation { provenance })?,
+            Py::new(py, PyNativeTensorAllocation { provenance, policy_layout: None })?,
             crate::dlpack_capsule_from_tensor(py, tensor)?,
         )
             .into_pyobject(py)?
@@ -17072,21 +17119,82 @@ impl PySemanticTransitionTaskUse {
             .ok_or_else(|| invalid("native task actor decision is absent"))
     }
 
+    /// Project the three original native allocations and immutable FP64 layouts
+    /// without exporting tensors, reading values or granting numerical access.
+    #[cfg(feature = "semantic-policy")]
+    #[pyo3(signature = (parent, bank))]
+    fn policy_numerical_domain_layouts(
+        &self,
+        py: Python<'_>,
+        parent: &Bound<'_, PyAny>,
+        bank: Option<usize>,
+    ) -> PyResult<Py<PyTuple>> {
+        self.session.borrow(py).require_creator()?;
+        let parent = ContentStepOwner::from_python(parent)?;
+        let session = self.session.borrow(py);
+        let owner = session.owner()?;
+        self.require_identity(&owner)?;
+        let layouts = match parent {
+            ContentStepOwner::Prepared(step) => {
+                let step = step.borrow(py);
+                step.require_task(py, self)?;
+                owner.prepared_policy_numerical_domain_layouts(
+                    &step.inner,
+                    bank.ok_or_else(|| {
+                        invalid("prepared policy layouts require their original bank")
+                    })?,
+                )
+            }
+            ContentStepOwner::Published(parent) => {
+                let parent = parent.borrow(py);
+                parent.require_task(py, self)?;
+                if bank.is_some() {
+                    return Err(invalid("acquired policy layouts require bank=None"));
+                }
+                owner.policy_numerical_domain_layouts(&*parent.lease()?)
+            }
+        }
+        .map_err(xlog_err)?;
+        drop(owner);
+        let mut rows = Vec::with_capacity(3);
+        for original in layouts {
+            let layout = original.layout;
+            let rank = usize::try_from(layout.rank)
+                .map_err(|_| invalid("policy domain rank exceeds usize"))?;
+            if rank > layout.dimensions.len() || layout.element_bytes != 8 {
+                return Err(invalid("native policy domain layout is not an original FP64 view"));
+            }
+            let shape = PyTuple::new(py, layout.dimensions[..rank].iter().copied())?;
+            let strides = PyTuple::new(
+                py, layout.strides_bytes[..rank].iter().map(|stride| stride / 8),
+            )?;
+            let allocation = Py::new(py, PyNativeTensorAllocation {
+                provenance: original.allocation,
+                policy_layout: Some(layout),
+            })?;
+            rows.push((allocation, shape, strides, (2u8, 64u8))
+                .into_pyobject(py)?.unbind());
+        }
+        Ok(PyTuple::new(py, rows)?.unbind())
+    }
+
     /// Return original pre-draw actor/full domains as three owner-bearing
     /// DLPack capsules: parameters [2,P,4], text [2,32,V,4], baselines
     /// [2,1,136,4], FP64 (M,O,U,I). These are not selected backward outputs
     /// and not a physical model certificate. Consume them in the same model
     /// numerical owner before freezing its original work/continuation.
     #[cfg(feature = "semantic-policy")]
-    #[pyo3(signature = (parent, bank, consumer_stream))]
+    #[pyo3(signature = (parent, bank, consumer_stream, *, expected_layouts))]
     fn policy_numerical_domains(
         &self,
         py: Python<'_>,
         parent: &Bound<'_, PyAny>,
         bank: Option<usize>,
         consumer_stream: &Bound<'_, PyAny>,
+        expected_layouts: &Bound<'_, PyAny>,
     ) -> PyResult<Py<PyTuple>> {
         self.session.borrow(py).require_creator()?;
+        let expected_layouts = policy_domain_expected_layouts(expected_layouts)?;
         let stream = parse_witness_consumer_stream(consumer_stream, &mut 128)?;
         let parent = ContentStepOwner::from_python(parent)?;
         let session = self.session.borrow(py);
@@ -17104,6 +17212,7 @@ impl PySemanticTransitionTaskUse {
                         invalid("prepared policy domains require their original bank")
                     })?,
                     stream,
+                    &expected_layouts,
                 )
             }
             ContentStepOwner::Published(parent) => {
@@ -17114,7 +17223,7 @@ impl PySemanticTransitionTaskUse {
                     return Err(invalid("acquired policy domains require bank=None"));
                 }
                 let lease = parent.lease()?;
-                owner.policy_numerical_domains(&lease, stream)
+                owner.policy_numerical_domains(&lease, stream, &expected_layouts)
             }
         }
         .map_err(xlog_err)?;

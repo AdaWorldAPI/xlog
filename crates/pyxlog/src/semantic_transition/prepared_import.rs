@@ -145,6 +145,11 @@ impl PySemanticPreparedTaskImport {
         import.deferred = true;
         let original = prepared.borrow(py);
         let acquired = original.parent.borrow(py);
+        // Allocate the original future domain owners only after recovery custody
+        // is installed, before metadata preparation freezes their real geometry.
+        import.session.owner()?.prepare_policy_numerical_domain_storage(
+            &*acquired.lease()?,
+        ).map_err(xlog_err)?;
         {
             let _reads = ImportReadScope::enter(&issued)?;
             if !original.prepare_invocation.bind(py).call1((

@@ -908,7 +908,25 @@ of returning `False`. The getter performs no device read and grants no training
 rights: fresh actor admission still requires authorized observation, total return
 and full episode storage before any draw, and later training must recheck rights.
 
-`task_use.policy_numerical_domains(parent, bank, consumer_stream)` returns three
+`task_use.policy_numerical_domain_layouts(parent, bank)` projects three immutable
+rows `(NativeTensorAllocation, shape, element_strides, (2, 64))` in parameter,
+full-MASK text, and baseline order. The existing native-issued allocation carrier
+retains the actual allocation owner, byte offset and view span. It is not a
+Tensor, a value snapshot or a reader permission. This metadata-only query exports
+no DLPack capsule and performs no numerical initialization or device read.
+
+Retained original import preparation allocates and accounts these same buffers
+after installing recovery custody and before calling `prepare_invocation`.
+Prepared Proposal banks already retain their structural buffers. Save the rows
+at that original preparation boundary to freeze future tensor ports. Ordinary
+non-retained replay instead obtains the same rows from its acquired parent after
+the original policy bind. No second allocation or reconstructed tensor supplies
+the projected layout. Allocation failure remains with the original import owner;
+cancellation and final release retain the original storage through their native
+completion boundary.
+
+`task_use.policy_numerical_domains(parent, bank, consumer_stream,
+expected_layouts=rows)` requires those original rows and returns three
 owner-bearing FP64 DLPack capsules in parameter, full-MASK text, and baseline
 order, with shapes `[2,P,4]`, `[2,32,V,4]`, and `[2,1,136,4]`. Region zero is the
 actor label; region one is the full label. Coordinates are `(M,O,U,I)`, with an
@@ -926,7 +944,14 @@ selected receipt or second forward/backward supplies this domain.
 
 Consume the capsules in the same retained model numerical owner and keep every
 view alive through final use. The declared stream is ordered after the producer
-without a host result read. Export aliases are not authoritative: native retains
+without a host result read. Before export, native checks the same original
+parent or step/bank, allocation owner, byte offset, view span and exact layout.
+The full allocation size remains distinct from a borrowed DLPack storage span;
+that borrowed span is not another allocation. Import the genuine capsules and
+bind their tensors to the previously frozen shapes, element strides and dtype.
+All existing snapshot, numerical and recording guards remain required; an
+unchecked export without `expected_layouts` is not available.
+Export aliases are not authoritative: native retains
 the original coherent labels and checks the exports before draw. Changed bytes
 are content corruption; nonfinite bounds refuse the original proposal before
 its first draw. Reading these outputs grants neither actor eligibility nor a

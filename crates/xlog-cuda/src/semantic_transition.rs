@@ -15355,6 +15355,56 @@ fn paired_cotangent_domain(
     canonical_tensor_layout(layout)
 }
 
+/// Structural geometry of one original uniform-domain allocation. This
+/// retains its physical lifetime, not tensor access or valid numerical content.
+#[cfg(feature = "semantic-policy")]
+#[derive(Clone)]
+pub struct SemanticPolicyNumericalDomainLayout {
+    pub allocation: DeviceAllocationProvenance,
+    pub layout: SemanticTensorLayout,
+}
+
+#[cfg(feature = "semantic-policy")]
+fn policy_uniform_domain_layouts(
+    buffers: &PolicyBuffers,
+    support_cells: usize,
+) -> Result<[SemanticPolicyNumericalDomainLayout; 3], SemanticTransitionError> {
+    let original = policy_numerical_producer_layouts(support_cells, buffers.layout.parameter_cells)?;
+    let project = |index: usize, layout: SemanticTensorLayout| -> Result<_, SemanticTransitionError> {
+        Ok(SemanticPolicyNumericalDomainLayout {
+            allocation: buffers.numerical.uniform.outputs[index]
+                .view()
+                .allocation_provenance()
+                .ok_or_else(|| publication_input_error("original uniform domain has no native allocation origin"))?,
+            layout: paired_cotangent_domain(layout)?,
+        })
+    };
+    Ok([
+        project(0, original[6])?,
+        project(1, original[7])?,
+        project(2, original[8])?,
+    ])
+}
+
+#[cfg(feature = "semantic-policy")]
+fn require_policy_uniform_domain_layouts(
+    buffers: &PolicyBuffers,
+    support_cells: usize,
+    expected: &[SemanticPolicyNumericalDomainLayout; 3],
+) -> Result<(), SemanticTransitionError> {
+    let original = policy_uniform_domain_layouts(buffers, support_cells)?;
+    if original.iter().zip(expected).any(|(original, expected)| {
+        original.layout != expected.layout
+            || !original.allocation.same_allocation(&expected.allocation)
+            || original.allocation.byte_offset() != expected.allocation.byte_offset()
+            || original.allocation.view_bytes() != expected.allocation.view_bytes()
+            || original.allocation.allocation_bytes() != expected.allocation.allocation_bytes()
+    }) {
+        return Err(publication_input_error("uniform domain export changed its original ordered allocation geometry"));
+    }
+    Ok(())
+}
+
 #[cfg(feature = "semantic-policy")]
 fn enqueue_policy_uniform_domains(
     domain: &ResidentExecutionDomain,
@@ -15404,17 +15454,16 @@ fn export_policy_uniform_domains(
     aliases: Arc<()>,
     publication: Arc<PublicationStorage>,
 ) -> Result<[DlpackManagedTensor; 3], SemanticTransitionError> {
-    let original =
-        policy_numerical_producer_layouts(support_cells, buffers.layout.parameter_cells)?;
+    let layouts = policy_uniform_domain_layouts(buffers, support_cells)?;
     let owner: Arc<dyn Send + Sync> = buffers.numerical.uniform.clone();
     let tensors = buffers
         .numerical
         .uniform
         .outputs
         .iter()
-        .zip([original[6], original[7], original[8]])
-        .map(|(buffer, layout)| {
-            let layout = paired_cotangent_domain(layout)?;
+        .zip(layouts)
+        .map(|(buffer, projection)| {
+            let layout = projection.layout;
             let rank = layout.rank as usize;
             // SAFETY: the typed retained FP64 output allocation has the exact
             // native layout; no managed tensor or producer is fabricated.
@@ -15596,6 +15645,17 @@ struct PendingPolicyStorage {
     buffers: PolicyBuffers,
     replacement: PolicyReplacement,
     witness: Option<(SemanticTensorContentWitness, u64)>,
+    invocation: SemanticRngBinding,
+}
+
+/// The exact admitted parent's real allocations before any policy producer
+/// snapshot. Only its original binder may move them into pending numerical work.
+#[cfg(feature = "semantic-policy")]
+struct PreparedPublishedPolicyStorage {
+    buffers: PolicyBuffers,
+    replacement: PolicyReplacement,
+    parent: PolicyRetirementParent,
+    binding: SemanticCatalogueBinding,
     invocation: SemanticRngBinding,
 }
 
@@ -16799,6 +16859,8 @@ pub struct SemanticTransitionSession {
     policy: Option<PolicyStorage>,
     #[cfg(feature = "semantic-policy")]
     pending_policy: Option<PendingPolicyStorage>,
+    #[cfg(feature = "semantic-policy")]
+    prepared_policy: Option<PreparedPublishedPolicyStorage>,
     #[cfg(feature = "semantic-policy")]
     policy_tapes: Vec<PolicyTape>,
     rng: Option<SemanticRngBinding>,
@@ -18745,6 +18807,8 @@ struct UnreleasedPublicationOwners {
     #[cfg(feature = "semantic-policy")]
     _pending_policy: Option<PendingPolicyStorage>,
     #[cfg(feature = "semantic-policy")]
+    _prepared_policy: Option<PreparedPublishedPolicyStorage>,
+    #[cfg(feature = "semantic-policy")]
     _policy_tapes: Vec<PolicyTape>,
     _events: Vec<cudarc::driver::CudaEvent>,
     _uploads: Vec<(usize, PublicationPayload)>,
@@ -18919,6 +18983,8 @@ impl Drop for SemanticTransitionSession {
                     _policy: self.policy.take(),
                     #[cfg(feature = "semantic-policy")]
                     _pending_policy: self.pending_policy.take(),
+                    #[cfg(feature = "semantic-policy")]
+                    _prepared_policy: self.prepared_policy.take(),
                     #[cfg(feature = "semantic-policy")]
                     _policy_tapes: std::mem::take(&mut self.policy_tapes),
                     _uploads: std::mem::take(&mut self.publication_uploads),
@@ -33497,6 +33563,8 @@ impl SemanticTransitionSession {
             #[cfg(feature = "semantic-policy")]
             pending_policy: None,
             #[cfg(feature = "semantic-policy")]
+            prepared_policy: None,
+            #[cfg(feature = "semantic-policy")]
             policy_tapes: Vec::new(),
             rng: None,
             next_proposal: 0,
@@ -34201,14 +34269,73 @@ impl SemanticTransitionSession {
             .map(|(binding, _)| binding.spec.actor_eligible)
     }
 
-    /// Original pre-draw actor/full domains. Reading them grants no execution
-    /// or training use. The consumer retains all capsules through final use;
-    /// aliases must not be written while any original consumer remains live.
+    /// Project the exact original parent's reserved uniform-domain geometry.
+    /// Allocation ownership grants neither tensor access nor numerical validity.
+    #[cfg(feature = "semantic-policy")]
+    pub fn policy_numerical_domain_layouts(
+        &self,
+        parent: &SemanticPublishedLease,
+    ) -> Result<[SemanticPolicyNumericalDomainLayout; 3], SemanticTransitionError> {
+        let invocation = self.admitted_policy_rng(parent)?;
+        if self.captured.is_some() {
+            return Err(publication_input_error("uniform domain geometry must precede original policy capture"));
+        }
+        let buffers = if let Some(prepared) = &self.prepared_policy {
+            if !prepared.parent.matches(parent)
+                || prepared.binding != self.binding()
+                || prepared.invocation != invocation
+            {
+                return Err(publication_input_error("uniform domain geometry changed its original admitted parent"));
+            }
+            &prepared.buffers
+        } else {
+            let pending = self.pending_policy.as_ref().ok_or_else(|| {
+                publication_input_error("uniform domain geometry requires its original policy allocations")
+            })?;
+            if pending.invocation != invocation || pending.witness.as_ref()
+                .is_none_or(|(witness, _)| witness.reader_token != parent.token)
+            {
+                return Err(publication_input_error("uniform domain geometry changed its original snapshot parent"));
+            }
+            &pending.buffers
+        };
+        policy_uniform_domain_layouts(buffers, self.codebooks.input_cells)
+    }
+
+    /// Project only the actual cold bank's allocation geometry. No policy
+    /// producer is read, recorded, exported or granted numerical access.
+    #[cfg(feature = "semantic-policy")]
+    pub fn prepared_policy_numerical_domain_layouts(
+        &self,
+        step: &SemanticPreparedStep,
+        bank: usize,
+    ) -> Result<[SemanticPolicyNumericalDomainLayout; 3], SemanticTransitionError> {
+        self.check_prepared_cold(step)?;
+        if bank > 1 || self.prepared_transition_kind(step)? != SemanticTransitionKind::Proposal {
+            return Err(publication_input_error("uniform domain geometry requires its original Proposal bank"));
+        }
+        let build = self.prepared_segment.as_ref().ok_or(SemanticTransitionError::NotBound)?;
+        let prepared = self.steps[&step.token].prepared.as_ref().expect("checked prepared owner");
+        if self.captured.is_some() || build.submitted || build.completed
+            || prepared.transition_recorded & (1 << bank) != 0
+        {
+            return Err(publication_input_error("uniform domain geometry must precede original policy recording"));
+        }
+        let branch = &prepared.branches[bank];
+        let buffers = branch.policy_buffers.as_ref()
+            .or_else(|| branch.policy.as_ref().map(|policy| &policy.buffers))
+            .ok_or_else(|| publication_input_error("original uniform policy bank is absent"))?;
+        policy_uniform_domain_layouts(buffers, self.codebooks.input_cells)
+    }
+
+    /// Export the original initialized uniform domains only against their
+    /// previously retained complete allocation geometry.
     #[cfg(feature = "semantic-policy")]
     pub fn policy_numerical_domains(
         &mut self,
         parent: &SemanticPublishedLease,
         consumer_stream: u64,
+        expected_layouts: &[SemanticPolicyNumericalDomainLayout; 3],
     ) -> Result<[DlpackManagedTensor; 3], SemanticTransitionError> {
         self.checked_reader(parent)?;
         dlpack_consumer_stream(consumer_stream)?;
@@ -34229,6 +34356,9 @@ impl SemanticTransitionSession {
                 "uniform domains belong to another acquired parent",
             ));
         }
+        require_policy_uniform_domain_layouts(
+            &pending.buffers, self.codebooks.input_cells, expected_layouts,
+        )?;
         let publication = Arc::clone(
             self.publication
                 .as_ref()
@@ -34258,6 +34388,7 @@ impl SemanticTransitionSession {
         step: &SemanticPreparedStep,
         bank: usize,
         consumer_stream: u64,
+        expected_layouts: &[SemanticPolicyNumericalDomainLayout; 3],
     ) -> Result<[DlpackManagedTensor; 3], SemanticTransitionError> {
         self.check_prepared_content_stream(step, consumer_stream)?;
         if bank > 1 {
@@ -34283,6 +34414,7 @@ impl SemanticTransitionSession {
             .as_ref()
             .or_else(|| branch.policy.as_ref().map(|policy| &policy.buffers))
             .ok_or_else(|| publication_input_error("original uniform policy bank is absent"))?;
+        require_policy_uniform_domain_layouts(buffers, self.codebooks.input_cells, expected_layouts)?;
         let tensors = export_policy_uniform_domains(
             buffers,
             self.codebooks.input_cells,
@@ -35205,6 +35337,72 @@ impl SemanticTransitionSession {
     }
 
     #[cfg(feature = "semantic-policy")]
+    /// Reserve the original admitted Proposal's complete policy and replacement
+    /// storage without reading, snapshotting or initializing numerical producers.
+    pub fn prepare_policy_numerical_domain_storage(
+        &mut self,
+        parent: &SemanticPublishedLease,
+    ) -> Result<(), SemanticTransitionError> {
+        let invocation = self.admitted_policy_rng(parent)?;
+        self.ensure_rebinding_ownership()?;
+        if self.pending_policy.is_some() || self.captured.is_some()
+            || invocation.stream_serial >= (1u64 << 56)
+            || self.policy_tapes.iter().any(|tape| tape.invocation == invocation)
+            || self.policy.as_ref().is_some_and(|policy| {
+                policy.text_binding._witness.reader_token == parent.token
+            })
+        {
+            return Err(publication_input_error("policy allocations require their original unused admitted Proposal"));
+        }
+        if let Some(original) = &self.prepared_policy {
+            if !original.parent.matches(parent)
+                || original.binding != self.binding()
+                || original.invocation != invocation
+            {
+                return Err(publication_input_error("prepared policy allocation changed its original admitted parent"));
+            }
+            return Ok(());
+        }
+        let (buffers, replacement) = self.allocate_published_policy_storage()?;
+        self.prepared_policy = Some(PreparedPublishedPolicyStorage {
+            buffers,
+            replacement,
+            parent: PolicyRetirementParent {
+                issuer: Arc::clone(&parent.issuer),
+                token: parent.token,
+                identity: parent.identity,
+                header: parent.header,
+                directory: parent.directory.clone(),
+                active: parent.active,
+            },
+            binding: self.binding(),
+            invocation,
+        });
+        Ok(())
+    }
+
+    #[cfg(feature = "semantic-policy")]
+    fn allocate_published_policy_storage(
+        &self,
+    ) -> Result<(PolicyBuffers, PolicyReplacement), SemanticTransitionError> {
+        let replacement_task_ground = self.task_ground.as_ref().map(|ground| {
+            let bytes = task_ground::TaskGroundStorage::allocation_bytes(ground.layout)?;
+            let mut reservation = self.provider.memory().reserve_bytes(
+                u64::try_from(bytes).map_err(|_| SemanticTransitionError::GenerationExhausted)?,
+            ).map_err(|error| runtime_error("original policy ground reservation", error))?;
+            task_ground::TaskGroundStorage::allocate(ground.layout, &mut reservation)
+        }).transpose()?;
+        let replacement = PolicyReplacement {
+            support: allocate_publication(&self.provider, self.codebooks.input_cells)?,
+            receipts: allocate_publication(&self.provider, COMPONENT_COUNT)?,
+            state: allocate_publication(&self.provider, 1)?,
+            task_ground: replacement_task_ground,
+        };
+        let buffers = self.allocate_policy_buffers()?;
+        Ok((buffers, replacement))
+    }
+
+    #[cfg(feature = "semantic-policy")]
     fn allocate_policy_buffers(&self) -> Result<PolicyBuffers, SemanticTransitionError> {
         let layout = self.policy_layout()?;
         let mut reservation = self
@@ -35955,25 +36153,32 @@ impl SemanticTransitionSession {
                         .into(),
             });
         }
-        let replacement_task_ground = self.task_ground.as_ref().map(|ground| {
-            let bytes = task_ground::TaskGroundStorage::allocation_bytes(ground.layout)?;
-            let mut reservation = self.provider.memory().reserve_bytes(
-                u64::try_from(bytes).map_err(|_| SemanticTransitionError::GenerationExhausted)?,
-            ).map_err(|error| runtime_error("original policy ground reservation", error))?;
-            task_ground::TaskGroundStorage::allocate(ground.layout, &mut reservation)
-        }).transpose()?;
+        let (buffers, replacement) = if let Some(prepared) = &self.prepared_policy {
+            if prepared.binding != binding || prepared.invocation != rng
+                || self.admitted_transition != Some((prepared.parent.token, prepared.parent.identity.word,
+                    SemanticTransitionKind::Proposal))
+                || !prepared.parent.active || !self.readers.contains_key(&prepared.parent.token)
+                || self.steps.get(&prepared.parent.token)
+                    .is_none_or(|step| step.identity != Some(prepared.parent.identity))
+                || policy_witness.as_ref()
+                    .is_some_and(|(witness, _)| witness.reader_token != prepared.parent.token)
+                || self.text_binding.as_ref()
+                    .is_some_and(|text| text._witness.reader_token != prepared.parent.token)
+            {
+                return Err(publication_input_error("policy snapshots changed their original prepared parent or invocation"));
+            }
+            let prepared = self.prepared_policy.take().expect("checked original policy allocations");
+            (prepared.buffers, prepared.replacement)
+        } else {
+            self.allocate_published_policy_storage()?
+        };
         let policy = PendingPolicyStorage {
             witness: policy_witness,
             // Reserve the next working banks before the proposal may publish.
             // Successful observation moves, rather than overwrites, all exact
             // original buffers into its late tape without fallible allocation.
-            replacement: PolicyReplacement {
-                support: allocate_publication(&self.provider, self.codebooks.input_cells)?,
-                receipts: allocate_publication(&self.provider, COMPONENT_COUNT)?,
-                state: allocate_publication(&self.provider, 1)?,
-                task_ground: replacement_task_ground,
-            },
-            buffers: self.allocate_policy_buffers()?,
+            replacement,
+            buffers,
             invocation: rng,
         };
         // Changing captured pointer arguments invalidates the old executable.

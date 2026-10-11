@@ -135,7 +135,8 @@ pub use semantic_transition::{
     SemanticCompletedTaskGroundMaterial, SemanticCompletedTheoryDeltaMaterial,
     SemanticActorRefreshInitializerRefusal, SemanticPreparedActorRefresh,
     SemanticSegmentInstructionAdmission, SemanticTransitionSessionConstruction,
-    SemanticPolicyGradients, SemanticSelectedPolicyGradients, SemanticUpdateCanaryMeasurement,
+    SemanticPolicyGradients, SemanticPolicyNumericalDomainLayout,
+    SemanticSelectedPolicyGradients, SemanticUpdateCanaryMeasurement,
     SemanticUpdateForwardReceipt, SemanticUpdateForwardReceiptMaterial, SemanticUpdateMeasurements,
 };
 pub use semantic_work::ModelWorkKind;
