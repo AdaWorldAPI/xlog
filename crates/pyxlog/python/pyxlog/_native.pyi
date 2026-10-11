@@ -489,7 +489,7 @@ class SemanticTransitionCheckpointCancelled(RuntimeError):
     parent_identity: _PublishedIdentity
 
 def restore_cancelled_checkpoint(
-    checkpoint: bytes, *, program_bytes: bytes, task_identity: bytes,
+    checkpoint: bytes, *, program_bytes: bytes,
     snapshot: Any = None, learning_phase_issuer: Any = None,
     learning_phase_records: Any = None, learning_phase_record_limits: Any = None,
     learning_phase_fence: Any = None, learning_phase_checkpoint_issuer: Any = None,

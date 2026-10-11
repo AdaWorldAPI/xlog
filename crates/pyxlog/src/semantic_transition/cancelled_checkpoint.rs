@@ -381,7 +381,7 @@ pub(super) fn terminal_error(
 }
 
 #[pyfunction]
-#[pyo3(signature = (checkpoint, *, program_bytes, task_identity, snapshot=None, learning_phase_issuer=None, learning_phase_records=None, learning_phase_record_limits=None, learning_phase_fence=None, learning_phase_checkpoint_issuer=None))]
+#[pyo3(signature = (checkpoint, *, program_bytes, snapshot=None, learning_phase_issuer=None, learning_phase_records=None, learning_phase_record_limits=None, learning_phase_fence=None, learning_phase_checkpoint_issuer=None))]
 #[expect(
     clippy::too_many_arguments,
     reason = "terminal recovery authenticates the original complete lifecycle without native execution"
@@ -390,7 +390,6 @@ pub(crate) fn restore_cancelled_checkpoint(
     py: Python<'_>,
     checkpoint: &Bound<'_, PyAny>,
     program_bytes: &Bound<'_, PyAny>,
-    task_identity: &Bound<'_, PyAny>,
     snapshot: Option<&Bound<'_, PyAny>>,
     learning_phase_issuer: Option<&Bound<'_, PyAny>>,
     learning_phase_records: Option<&Bound<'_, PyAny>>,
@@ -400,9 +399,6 @@ pub(crate) fn restore_cancelled_checkpoint(
 ) -> PyResult<()> {
     let raw = exact_replay_bytes(checkpoint)?;
     let program = exact_replay_bytes(program_bytes)?;
-    let identity: [u8; 32] = exact_replay_bytes(task_identity)?.try_into().map_err(|_| {
-        invalid("cancelled checkpoint requires its original native task identity32")
-    })?;
     let manifest = SemanticCheckpointManifest::decode(raw)?;
     let (seed, _, phase, binding) = TaskCheckpointSeed::decode(&manifest.task)?;
     let expense = seed.proposal_expense()?;
@@ -411,10 +407,9 @@ pub(crate) fn restore_cancelled_checkpoint(
         .as_ref()
         .map(|original| original.program.as_ref())
         != Some(program)
-        || binding.identity != identity
     {
         return Err(invalid(
-            "cancelled checkpoint differs from the expected original Program or native task",
+            "cancelled checkpoint differs from the expected original Program",
         ));
     }
     let _closure = learning_phase::cold_restore::read_checkpoint_restore_closure(

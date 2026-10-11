@@ -326,9 +326,10 @@ or repeating retirement. If only terminal encoding failed after retirement,
 `retire_segment` continues that original metadata suffix with the same task and
 consumer streams, without repeating producer callbacks or device retirement.
 
-`restore_cancelled_checkpoint(checkpoint, *, program_bytes, task_identity, ...)`
-authenticates the exact original Program, native task identity and independently
-pinned `learning_phase_checkpoint_issuer`. Phase-marked capsules additionally
+`restore_cancelled_checkpoint(checkpoint, *, program_bytes, ...)` authenticates
+the exact original Program and complete signed state, including its native task
+binding, against the independently pinned `learning_phase_checkpoint_issuer`.
+No caller-derived task identity is accepted. Phase-marked capsules additionally
 require the complete existing lifecycle proof and current snapshot. A valid
 terminal raises `SemanticTransitionCheckpointCancelled`, carrying `checkpoint`,
 `task_identity`, `first_program_ordinal`, `end_program_ordinal`, `proposal_spent`
