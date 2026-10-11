@@ -811,6 +811,13 @@ impl SemanticSelectedTrainingView {
         self.storage.group_members.view()
     }
 
+    /// A finite loop ceiling, not a charge or an observed logical member count.
+    #[cfg(feature = "semantic-policy")]
+    pub(crate) fn objective_member_capacity(&self) -> Result<u64, SemanticTransitionError> {
+        u64::try_from(self.storage.group_members.len())
+            .map_err(|_| SemanticTransitionError::GenerationExhausted)
+    }
+
     #[cfg(feature = "semantic-policy")]
     pub(crate) fn actor_group_member_count(&self) -> u64 {
         self.arena.actor_group_member_count
@@ -1685,6 +1692,24 @@ impl SemanticTrainingViewArena {
         Ok(bytes)
     }
 
+    /// Reserve distinct native cells for every possible original contribution.
+    /// The device producers, not this capacity, determine the actual charge.
+    #[cfg(feature = "semantic-policy")]
+    pub(crate) fn policy_work_capacity(
+        &self,
+        proposal_capacity: usize,
+    ) -> Result<usize, SemanticTransitionError> {
+        self.row_count
+            .checked_mul(3)
+            .and_then(|cells| {
+                proposal_capacity
+                    .checked_mul(2)
+                    .and_then(|proposals| cells.checked_add(proposals))
+            })
+            .and_then(|cells| cells.checked_add(1))
+            .ok_or(SemanticTransitionError::GenerationExhausted)
+    }
+
     pub(crate) fn allocate_selection_reserved(
         self: &Arc<Self>,
         reservation: &mut crate::memory::GpuMemoryReservation,
@@ -1751,7 +1776,9 @@ impl SemanticTrainingViewArena {
             binding.validate()?;
         }
         if objective.is_none() != rows.is_empty() || (rows.is_empty() && replay_binding.is_none()) {
-            return Err(input_error("unmaterialized training storage requires its original finite reservation and no objective"));
+            return Err(input_error(
+                "unmaterialized training storage requires its original finite reservation and no objective",
+            ));
         }
         let replay_capacity = match &replay_binding {
             Some(binding) => SemanticTrainingReplayCapacity {

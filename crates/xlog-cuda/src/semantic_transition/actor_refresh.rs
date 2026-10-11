@@ -2088,7 +2088,11 @@ impl SemanticTransitionSession {
                 }
                 let mut model_bound = target.bound();
                 let mut model_calls = target.model_call_count();
-                let mut native = [0; 9];
+                let mut native = prepared
+                    .policy_work
+                    .as_ref()
+                    .ok_or(SemanticTransitionError::NotBound)?
+                    .native_ceiling(bank)?;
                 for component in &components[bank] {
                     let component = component
                         .as_ref()
@@ -2115,7 +2119,9 @@ impl SemanticTransitionSession {
                     native_work_bound::native_work_ceiling_units(native)?,
                 )?;
                 if known_work > address.budget[0] || model_calls > address.budget[2] {
-                    return Err(publication_input_error("original Update allowance cannot admit its retained actor model and initialization producers"));
+                    return Err(publication_input_error(
+                        "original Update allowance cannot admit its retained actor model and initialization producers",
+                    ));
                 }
             }
         }

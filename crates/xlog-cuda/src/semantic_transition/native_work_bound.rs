@@ -625,6 +625,222 @@ fn repeat_native_ceiling(
     add_native_work_ceiling(total, addition)
 }
 
+fn policy_viability_category_ceiling(
+    source: &SemanticTransitionSession,
+) -> Result<u64, SemanticTransitionError> {
+    let components = &source.codebooks.components;
+    if components.len() != COMPONENT_COUNT {
+        return Err(SemanticTransitionError::ObservationMismatch);
+    }
+    let targets = *source
+        .codebooks
+        .words
+        .get(1)
+        .ok_or(SemanticTransitionError::ObservationMismatch)?;
+    let operands = *source
+        .codebooks
+        .words
+        .get(3)
+        .ok_or(SemanticTransitionError::ObservationMismatch)?;
+    let qualifier = u64::from(components[43].cardinality);
+    let leaf = u64::from(components[49].cardinality);
+    // Four target banks, four supported/operand_matches scans per target,
+    // and all three action branches, including their rejected categories.
+    ceiling_product(
+        4,
+        ceiling_sum([
+            ceiling_product(targets, ceiling_sum([1, ceiling_product(8, operands)?])?)?,
+            18,
+            ceiling_sum([20, qualifier, leaf, targets])?,
+            2,
+        ])?,
+    )
+}
+
+fn rule_prefix_native_work_ceiling(
+    predicate_bound: u64,
+) -> Result<[u64; 9], SemanticTransitionError> {
+    // prefix_completes admits seven trailing nulls and examines three predicate
+    // positions. A fixed predicate costs Category 3 and TableSlot 11 (head) or
+    // 7 (body); a searched predicate costs Category 2 and TableSlot 12 or 8.
+    let predicate_categories = ceiling_product(3, ceiling_product(2, predicate_bound)?.max(3))?;
+    let predicate_slots = ceiling_sum([
+        3,
+        ceiling_product(12, predicate_bound)?.max(11),
+        ceiling_product(2, ceiling_product(8, predicate_bound)?.max(7))?,
+    ])?;
+    // Every first/second pair can visit four positions, sixteen covering masks
+    // per position, four variable candidates per mask, and sixteen final masks.
+    // available_variable includes its rejected candidate, admitted coordinate,
+    // and the six-slot operand decoder: Category 3 and TableSlot 7 at most.
+    let pairs = ceiling_product(4, 4)?;
+    let covering_visits = ceiling_product(pairs, ceiling_product(4, 16)?)?;
+    let final_visits = ceiling_product(pairs, 16)?;
+    let variable_calls = ceiling_sum([4, pairs, ceiling_product(covering_visits, 4)?])?;
+    let loop_slots = ceiling_sum([
+        4,
+        pairs,
+        ceiling_product(pairs, 4)?,
+        covering_visits,
+        final_visits,
+    ])?;
+    let ceiling = [
+        0,
+        ceiling_sum([
+            7,
+            predicate_slots,
+            7, // Optional fixed-variable validation.
+            ceiling_product(variable_calls, 7)?,
+            loop_slots,
+        ])?,
+        0,
+        ceiling_sum([
+            1,
+            7,
+            predicate_categories,
+            3, // Optional fixed-variable validation.
+            ceiling_product(variable_calls, 3)?,
+            covering_visits,
+            final_visits,
+        ])?,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ];
+    native_work_ceiling_units(ceiling)?;
+    Ok(ceiling)
+}
+
+/// Enclose one original backward recording, not its executed work.
+/// `group_member_bound` is the same frozen target's original member-storage
+/// extent, not a measured visit count;
+/// `snapshot_bytes` is the exact DtoD occurrence retained by that recording.
+pub(super) fn policy_vjp_native_work_ceiling(
+    source: &SemanticTransitionSession,
+    snapshot_bytes: u64,
+    group_member_bound: u64,
+) -> Result<[u64; 9], SemanticTransitionError> {
+    let components = &source.codebooks.components;
+    let layout = SemanticPolicyLayout::from_components(components)?;
+    let parameters =
+        u64::try_from(layout.parameter_cells).map_err(|_| native_work_ceiling_overflow())?;
+    let text = ceiling_product(32, TEXT_CARDINALITY as u64)?;
+    let recurrent = ceiling_product(ceiling_product(2, 37)?, 128)?;
+    let component_count = COMPONENT_COUNT as u64;
+    let cells = ceiling_sum(
+        components
+            .iter()
+            .map(|component| u64::from(component.cardinality)),
+    )?;
+    let mut edit_cells = 0;
+    let mut edit_components = 0;
+    for component in components.iter().filter(|component| !component.is_text()) {
+        edit_cells = ceiling_sum([edit_cells, u64::from(component.cardinality)])?;
+        edit_components = ceiling_sum([edit_components, 1])?;
+    }
+    let targets = *source
+        .codebooks
+        .words
+        .get(1)
+        .ok_or(SemanticTransitionError::ObservationMismatch)?;
+    let origin_words =
+        u64::try_from(size_of::<SemanticTrainingViewOriginRecord>() / size_of::<u64>())
+            .map_err(|_| native_work_ceiling_overflow())?;
+    let outputs = ceiling_sum([parameters, text, recurrent])?;
+    let roots = ceiling_sum([parameters, text, component_count])?;
+    // Both original-origin comparisons; fixed coefficients and eight groups;
+    // each reached group can scan its bounded member range before refusal.
+    let preparation = ceiling_sum([
+        ceiling_product(4, origin_words)?,
+        9,
+        7,
+        8,
+        ceiling_product(8, group_member_bound)?,
+        16,                                   // Goal witness roots.
+        2,                                    // Candidate lanes.
+        component_count,                      // External coefficient validation.
+        component_count,                      // Original importance-weight receipt scan.
+        ceiling_product(2, component_count)?, // Critic receipts and baselines.
+        1,                                    // Critic term, including reached-refusal clearing.
+    ])?;
+    // Reached refusal clears four component coordinates; the normal actor path
+    // visits at most eleven. Neither path can exceed this one output clear.
+    let clear = ceiling_sum([
+        ceiling_product(2, outputs)?,
+        ceiling_product(11, component_count)?,
+    ])?;
+    let traversal = ceiling_sum([
+        ceiling_product(4, targets)?,
+        ceiling_product(4, 3)?,
+        ceiling_product(2, component_count)?, // Component and receipt.
+        ceiling_product(8, cells)?,
+        ceiling_product(2, component_count)?, // Selected support/score.
+        ceiling_product(18, edit_components)?, // Retained prefix choices.
+    ])?;
+    // Hidden/score recomputation and the supplied producer's scalar tally:
+    // readout_vjp visits 128*(1+cardinality), plus optional cardinality biases;
+    // advance_vjp visits 128*(1+optional selected embedding+128 recurrence).
+    let numerical = ceiling_sum([
+        ceiling_product(128, edit_components)?,
+        ceiling_product(130, edit_cells)?,
+        ceiling_product(128, edit_components)?,
+        ceiling_product(129, edit_cells)?,
+        ceiling_product(ceiling_product(128, 130)?, edit_components)?,
+    ])?;
+    let legality_calls = ceiling_sum([ceiling_product(2, cells)?, component_count])?;
+    let mut ceiling = [
+        0,
+        ceiling_sum([
+            preparation,
+            clear,
+            traversal,
+            numerical,
+            ceiling_product(5, roots)?, // Final actor/full-domain/error packing.
+        ])?,
+        0,
+        ceiling_sum([
+            1,
+            policy_viability_category_ceiling(source)?,
+            ceiling_product(2, legality_calls)?,
+        ])?,
+        0,
+        0,
+        0,
+        0,
+        snapshot_bytes,
+    ];
+    if source
+        .task
+        .as_ref()
+        .is_some_and(|task| task.0.spec.program.editable_program().is_some())
+    {
+        // A reached prefix requires predicate_count < books[1]. Four action
+        // checks and both scans plus the selected check can enter that owner.
+        let prefix_calls = ceiling_sum([4, ceiling_product(2, edit_cells)?, edit_components])?;
+        repeat_native_ceiling(
+            &mut ceiling,
+            rule_prefix_native_work_ceiling(targets)?,
+            prefix_calls,
+        )?;
+    }
+    native_work_ceiling_units(ceiling)?;
+    Ok(ceiling)
+}
+
+/// Enclose the original one-thread ordered critic reduction.
+pub(super) fn group_critic_native_work_ceiling(
+    member_count: usize,
+) -> Result<[u64; 9], SemanticTransitionError> {
+    let members = u64::try_from(member_count).map_err(|_| native_work_ceiling_overflow())?;
+    // Coefficient, evaluator ABI, group count, up to four identity words,
+    // every member term and the one scalar output.
+    let ceiling = [0, ceiling_sum([members, 8])?, 0, 0, 0, 0, 0, 0, 0];
+    native_work_ceiling_units(ceiling)?;
+    Ok(ceiling)
+}
+
 /// Enclose the reached event counters of the original embedded transitions.
 /// These are capacity bounds, not observed work or structural selection cost.
 /// The initializer has its own separate finite occurrence and is not included.
@@ -665,30 +881,14 @@ pub(super) fn actor_refresh_transition_native_work_ceilings(
         .words
         .get(1)
         .ok_or(SemanticTransitionError::ObservationMismatch)?;
-    let operands = *child
-        .codebooks
-        .words
-        .get(3)
-        .ok_or(SemanticTransitionError::ObservationMismatch)?;
-    let qualifier = components
-        .get(32 + 11)
-        .ok_or(SemanticTransitionError::ObservationMismatch)?
-        .cardinality as u64;
-    let leaf = components
-        .get(32 + 17)
-        .ok_or(SemanticTransitionError::ObservationMismatch)?
-        .cardinality as u64;
     // An acquisition refusal can reach viability even for Recompute before
     // its successful non-Proposal early return. Enclose both actual branches.
-    let viability = ceiling_product(
-        4,
-        ceiling_sum([
-            ceiling_product(targets, ceiling_sum([1, ceiling_product(8, operands)?])?)?,
-            18,
-            ceiling_sum([20, qualifier, leaf, targets])?,
-            2,
-        ])?,
-    )?;
+    let viability = policy_viability_category_ceiling(child)?;
+    let prefix = if editable {
+        Some(rule_prefix_native_work_ceiling(targets)?)
+    } else {
+        None
+    };
     let arena = child.graph.transition_arena();
     let roots = arena[2];
     let statements = arena[3];
@@ -831,6 +1031,9 @@ pub(super) fn actor_refresh_transition_native_work_ceilings(
                 return Err(SemanticTransitionError::ObservationMismatch);
             }
             add_native_work_ceiling(ceiling, [0, 0, 0, viability, 0, 0, 0, 0, 0])?;
+            if let Some(prefix) = prefix {
+                repeat_native_ceiling(ceiling, prefix, 4)?;
+            }
             native_work_ceiling_units(*ceiling)?;
             continue;
         }
@@ -851,7 +1054,59 @@ pub(super) fn actor_refresh_transition_native_work_ceilings(
                 .filter(|component| component.is_text())
                 .map(|component| u64::from(component.cardinality)),
         )?;
+        let edit_components = u64::try_from(
+            components
+                .iter()
+                .filter(|component| !component.is_text())
+                .count(),
+        )
+        .map_err(|_| native_work_ceiling_overflow())?;
         let policy = io.policy.ok_or(SemanticTransitionError::NotBound)?;
+        // The original forward readout is now metered by the same owner as
+        // backward recomputation. Each reached structural component visits its
+        // 128 hidden coordinates and at most 130 coordinates per score row.
+        add_native_work_ceiling(
+            ceiling,
+            [
+                0,
+                ceiling_sum([
+                    ceiling_product(128, edit_components)?,
+                    ceiling_product(130, edit_cells)?,
+                ])?,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+        )?;
+        if let Some(prefix) = prefix {
+            repeat_native_ceiling(
+                ceiling,
+                prefix,
+                ceiling_sum([4, ceiling_product(2, edit_cells)?])?,
+            )?;
+            // Each of the four final edit fields can decode one original rule:
+            // seven null choices, one ten-slot head predicate, two body and
+            // six variable operands, one output, and the valid_rule check.
+            repeat_native_ceiling(
+                ceiling,
+                [
+                    0,
+                    ceiling_sum([7, 10, ceiling_product(8, 6)?, 1])?,
+                    0,
+                    ceiling_sum([1, 7, 3, 6, 1])?,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+                4,
+            )?;
+        }
         let parameter_cells = policy.buffers.parameters.len() as u64;
         // The same uniform-domain producer contributes its retained Category
         // tally: parameter initialization/export, recurrent initialization,
