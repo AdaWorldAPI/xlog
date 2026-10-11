@@ -197,9 +197,14 @@ class SemanticPreparedStep:
     def requested_transition(self) -> Literal["proposal", "recompute", "update"]: ...
 
     def prepare_cold_model_work(
-        self, prepare_callback: Callable[[], Any], *, consumer_streams: Sequence[int]
+        self, prepare_callback: Callable[[], Any], *,
+        initialize_callback: Callable[[], None], consumer_streams: Sequence[int]
     ) -> Any:
-        """Prepare once under this original Update's native cold-work owner."""
+        """Prepare metadata once and retain the mandatory original initializer."""
+        ...
+
+    def initialize_cold_model_work(self) -> None:
+        """Run only that retained initializer, once after the complete plan freeze."""
         ...
 
     @property

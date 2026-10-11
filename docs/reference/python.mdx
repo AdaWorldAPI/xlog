@@ -224,7 +224,12 @@ source parameter allocations and target gradient destinations; it grants no
 current-policy result. The single `build_segment` call takes
 `execute_prepared_imports=`. After all outer and CURRENT resources and successors
 exist in the original allocation scope, it freezes the complete import roster
-and invokes this callback once. Call
+and invokes this callback once. Freeze the single complete numerical plan there,
+then call `step.initialize_cold_model_work()` for every original Update in its
+issued order before executing any SOURCE import. These calls use only the
+initializer retained during that Update's preparation and the same open Prefix
+registrar. Native rejects a missing initializer, an unfrozen plan, reordered
+entry, or SOURCE execution before every initializer genuinely completes. Call
 `source_controller.execute_task_import(prepared_import)` there in original
 Update/replay order. Each call performs its retained restore, pack and finalize
 once and returns `(same_task_use, genuine_retained_member)`; successful repeats
@@ -1035,7 +1040,9 @@ the complete frozen import roster. Only genuine import completion allows it to
 join the original cold consumers and hand off that same native reader once while
 retaining model allocations, witnesses, continuation and autograd owners. The
 original tally includes that reader release; its report finishes after handoff
-and before the original numerical initializers and capture. Build consumes the
+and before native graph initialization and capture. The retained model
+initializers described below execute earlier, inside that same open Prefix.
+Build consumes the
 already admitted instruction, not a second admission. Do not move application-level
 model/export cleanup before the last cold use. Private graph submission does not
 decrement the handed-off reader again.
@@ -1053,14 +1060,23 @@ to this cold receipt. Private preparation remains in its existing phase report;
 do not charge its prefix or model-preparation reports again. A missing result
 never denotes zero work.
 
-An issued Update may prepare its actual model resources with
-`step.prepare_cold_model_work(original_callback, consumer_streams=...)` before
-capture. The same prepared segment retains the exact Update, callback, report and
-result; ordinary callbacks receive their actual native registrar without a fake
-private phase. Structural callbacks share the original instruction Prefix
-registrar until all imports and the reader handoff genuinely complete; they do
-not create per-Update receipts for that same work. This preparation grants no current-policy numerical result or
-permission to replay an unknown callback.
+Every issued Update registers its original pair with
+`step.prepare_cold_model_work(prepare_callback, initialize_callback=original_initializer, consumer_streams=...)`.
+Preparation runs once and retains real allocation, layout, pending-model and
+delivery owners; it must not perform numerical initialization or admit a dummy
+empty operation plan. The cached preparation result is never cleared to replay
+that callback. After the complete outer and CURRENT structural roster freezes,
+the original `execute_prepared_imports` callback freezes one common numerical
+plan and calls `step.initialize_cold_model_work()` in the issued Update order,
+then executes SOURCE. The initializer must return `None`; native marks entry
+before calling it and retains an unknown or failed attempt without resubmission.
+A successful repeated call returns the cached completion without running it
+again. Initialization authenticates the same ordinary or private-phase Prefix,
+actual admitted plan and native allowance, retaining the original consumer
+streams. It does not issue
+another report or numerical recorder. Prefix completion and SOURCE execution
+both require the whole initialization roster to finish. This preparation grants
+no current-policy numerical result or permission to replay an unknown callback.
 
 If the original structural construction is genuinely cancelled before producer
 entry, native closes its same preparation Prefix as known refusal under the
@@ -2245,8 +2261,10 @@ successor and its retained learning inputs inside that same private allocation
 scope; preparing them before the scope would put their backing outside the
 required slab. The builder prepares the CURRENT child successors in that scope
 too, freezes future historical bindings, and calls `execute_prepared_imports`
-before reader handoff and numerical recording. The same scope spans preparation,
-ordered original imports and graph instantiation; there is no second builder or
+for the common numerical plan freeze, retained Update initialization and ordered
+SOURCE execution before reader handoff and graph recording. The same scope spans
+preparation, initialization, ordered original imports and graph instantiation;
+there is no second builder or
 pool re-entry. A callback failure exits the scope through the original cleanup
 path while native unknown work and its owners remain retained; the builder never
 retries the callback.

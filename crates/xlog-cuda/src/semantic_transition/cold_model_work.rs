@@ -661,6 +661,21 @@ impl SemanticTransitionSession {
         work: &SemanticColdModelWork,
     ) -> Result<(), SemanticTransitionError> {
         self.require_admitted_cold_model_work(admission, parent, work)?;
+        self.require_admitted_structural_cold_model_work_owner(
+            admission,
+            parent,
+            step,
+            self.original_cold_model_work(work)?,
+        )
+    }
+
+    fn require_admitted_structural_cold_model_work_owner(
+        &self,
+        admission: &SemanticSegmentInstructionAdmission,
+        parent: &SemanticPublishedLease,
+        step: &SemanticPreparedStep,
+        original: &ColdModelWorkStorage,
+    ) -> Result<(), SemanticTransitionError> {
         self.require_original_prepared_structure()?;
         let build = self
             .prepared_segment
@@ -677,14 +692,84 @@ impl SemanticTransitionSession {
         {
             return Err(publication_input_error("structural cold callback requires its exact admitted Update and original active source"));
         }
-        let original = self.original_cold_model_work(work)?;
         if original.purpose != SemanticColdModelWorkPurpose::PrivatePrefix
-            || original.state != RecordingState::Recording
+            || !matches!(
+                original.state,
+                RecordingState::Waiting | RecordingState::Recording
+            )
             || original.result.is_some()
             || original.prepared_scope.is_some()
         {
             return Err(publication_input_error(
                 "structural callback must borrow its same still-open original prefix recorder",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Enter numerical initialization only after the same complete structural
+    /// roster and original Prefix operation plan are frozen.
+    pub fn require_admitted_prepared_cold_initialization(
+        &self,
+        admission: &SemanticSegmentInstructionAdmission,
+        parent: &SemanticPublishedLease,
+        step: &SemanticPreparedStep,
+        work: &SemanticColdModelWork,
+    ) -> Result<(), SemanticTransitionError> {
+        self.require_admitted_structural_cold_model_work(admission, parent, step, work)?;
+        self.require_frozen_prepared_cold_initialization(self.original_cold_model_work(work)?)
+    }
+
+    /// Authenticate initialization against the already bound original shared
+    /// Prefix owner; the target does not create or replace its report.
+    pub fn require_shared_admitted_prepared_cold_initialization(
+        &self,
+        admission: &SemanticSegmentInstructionAdmission,
+        parent: &SemanticPublishedLease,
+        step: &SemanticPreparedStep,
+        source: &Self,
+        work: &SemanticColdModelWork,
+    ) -> Result<(), SemanticTransitionError> {
+        self.require_segment_instruction_admission(admission, parent)?;
+        self.ensure_quiescent()?;
+        self.checked_original_consumer_step(parent)?;
+        let original = self.instruction_admission(admission)?;
+        let storage = source.cold_model_work(work)?;
+        let allowance = self.graph.cold_work_allowance().ok_or_else(|| {
+            publication_input_error("cold initialization lost its original shared tally")
+        })?;
+        if original.state != actor_refresh_program::InstructionState::Admitted
+            || original
+                .cold_work
+                .as_ref()
+                .is_none_or(|retained| !retained.same_invocation(work))
+            || !Arc::ptr_eq(&allowance, &storage.allowance)
+        {
+            return Err(publication_input_error(
+                "shared cold initialization changed its original instruction invocation or allowance",
+            ));
+        }
+        self.require_admitted_structural_cold_model_work_owner(admission, parent, step, storage)?;
+        self.require_frozen_prepared_cold_initialization(storage)
+    }
+
+    fn require_frozen_prepared_cold_initialization(
+        &self,
+        original: &ColdModelWorkStorage,
+    ) -> Result<(), SemanticTransitionError> {
+        let build = self
+            .prepared_segment
+            .as_ref()
+            .expect("original structural scope");
+        if !build.structural_frozen || original.state != RecordingState::Recording {
+            return Err(publication_input_error(
+                "cold initialization requires its original active recorder and complete frozen structural roster",
+            ));
+        }
+        original.plan()?;
+        if original.pending_operation.is_some() || original.stopped_before_entry {
+            return Err(publication_input_error(
+                "cold initialization requires its original active prefix without an unresolved attempt",
             ));
         }
         Ok(())

@@ -3464,6 +3464,9 @@ struct SegmentInstructionPreparation {
     imports_execution_order: Vec<Arc<learning_phase::PrivateReplayChildCustody>>,
     imports_completed: usize,
     imports_active: Option<usize>,
+    initialization_order: Vec<Arc<Mutex<PreparedColdCallback>>>,
+    initializations_completed: usize,
+    initialization_active: Option<usize>,
     retirement_entered: bool,
     retirement_work: Option<Py<learning_phase::cold_model_work::PySemanticColdModelWork>>,
     retirement_report: Option<xlog_cuda::SemanticColdModelWorkResult>,
@@ -3509,6 +3512,74 @@ impl SegmentInstructionCustody {
             }
             original.replay_children.clone()
         };
+        let callbacks = {
+            let session = self.session.borrow(py);
+            let stored = session
+                .prepared_segment
+                .lock()
+                .map_err(|_| invalid("prepared segment mutex is poisoned"))?;
+            let stored = stored
+                .as_ref()
+                .ok_or_else(|| invalid("initialization roster lost its original segment"))?;
+            if stored
+                .instruction
+                .as_ref()
+                .is_none_or(|original| !std::ptr::eq(self, original.as_ref()))
+            {
+                return Err(invalid(
+                    "initialization roster changed its original instruction",
+                ));
+            }
+            stored.cold_callbacks.clone()
+        };
+        let mut initializers = Vec::with_capacity(callbacks.len());
+        for callback in callbacks {
+            let original = callback
+                .lock()
+                .map_err(|_| invalid("prepared cold callback custody is poisoned"))?;
+            if original.failed
+                || !original.callback_entered
+                || original.result.is_none()
+                || original.work.is_none()
+                || !original.shared_instruction_work
+                || original.initialization != PreparedColdInitialization::Pending
+            {
+                return Err(invalid(
+                    "initialization roster requires its complete original preparation",
+                ));
+            }
+            let step = original.step.borrow(py);
+            let preparation = self.preparation()?;
+            let position = preparation
+                .native_steps
+                .iter()
+                .position(|issued| issued.same_handle(&step.inner))
+                .ok_or_else(|| invalid("initialization lost its native-issued Update"))?;
+            if self.transitions.get(position) != Some(&SemanticTransitionKind::Update)
+                || preparation
+                    .scope
+                    .as_ref()
+                    .is_none_or(|scope| !Arc::ptr_eq(scope, &step.scope))
+            {
+                return Err(invalid("initialization changed its original Update scope"));
+            }
+            drop(preparation);
+            drop(step);
+            drop(original);
+            initializers.push((position, callback));
+        }
+        initializers.sort_by_key(|(position, _)| *position);
+        if initializers.len()
+            != self
+                .transitions
+                .iter()
+                .filter(|kind| **kind == SemanticTransitionKind::Update)
+                .count()
+        {
+            return Err(invalid(
+                "every original Update requires its retained preparation and initialization pair",
+            ));
+        }
         let mut pending = Vec::new();
         for child in children {
             if child.require_prepared_import_ready(py)? {
@@ -3516,13 +3587,17 @@ impl SegmentInstructionCustody {
             }
         }
         pending.sort_by_key(|child| child.execution_order());
-        if !pending.is_empty() && !has_callback {
+        if (!pending.is_empty() || !initializers.is_empty()) && !has_callback {
             return Err(invalid(
                 "the complete prepared import roster requires its original execution callback",
             ));
         }
         let mut original = self.preparation()?;
         original.imports_execution_order = pending;
+        original.initialization_order = initializers
+            .into_iter()
+            .map(|(_, callback)| callback)
+            .collect();
         original.imports_roster_frozen = true;
         Ok(())
     }
@@ -3575,6 +3650,8 @@ impl SegmentInstructionCustody {
         let mut original = self.preparation()?;
         if !original.imports_roster_frozen
             || original.imports_active.is_some()
+            || original.initialization_active.is_some()
+            || original.initializations_completed != original.initialization_order.len()
             || original.handoff_entered
             || original.callback_failed
             || original
@@ -3620,6 +3697,9 @@ impl SegmentInstructionCustody {
             if !original.imports_roster_frozen
                 || original.imports_active.is_some()
                 || original.imports_completed != original.imports_execution_order.len()
+                || original.initialization_active.is_some()
+                || original.initializations_completed != original.initialization_order.len()
+                || original.callback_failed
             {
                 return Err(invalid(
                     "recording requires genuine completion of the whole frozen import roster",
@@ -3630,6 +3710,33 @@ impl SegmentInstructionCustody {
         for child in children {
             child.require_prepared_import_executed(py)?;
         }
+        Ok(())
+    }
+
+    fn release_retired_initialization_roster(&self, known_non_submission: bool) -> PyResult<()> {
+        let mut original = self.preparation()?;
+        if original.initialization_active.is_some()
+            || (!known_non_submission
+                && original.initializations_completed != original.initialization_order.len())
+        {
+            return Ok(());
+        }
+        for callback in &original.initialization_order {
+            let initialization = callback
+                .lock()
+                .map_err(|_| invalid("prepared cold callback custody is poisoned"))?
+                .initialization;
+            if initialization != PreparedColdInitialization::Completed
+                && !(known_non_submission && initialization == PreparedColdInitialization::Pending)
+            {
+                return Ok(());
+            }
+        }
+        // Called only after genuine final-use joins, while the prepared
+        // segment still holds every callback. No final Python decref occurs
+        // under the instruction mutex. Known non-submission can also release
+        // callbacks that never entered; unknown attempts remain retained.
+        original.initialization_order.clear();
         Ok(())
     }
 
@@ -4209,6 +4316,8 @@ struct PreparedPythonSegment {
 struct PreparedColdCallback {
     step: Py<PySemanticPreparedStep>,
     callback: Py<PyAny>,
+    initialize_callback: Py<PyAny>,
+    initialization: PreparedColdInitialization,
     work: Option<Py<learning_phase::cold_model_work::PySemanticColdModelWork>>,
     result: Option<Py<PyAny>>,
     report: Option<xlog_cuda::SemanticColdModelWorkResult>,
@@ -4219,6 +4328,15 @@ struct PreparedColdCallback {
     callback_entered: bool,
     streams: Vec<u64>,
     private_phase: Option<Py<learning_phase::PySemanticLearningPhaseTransition>>,
+}
+
+#[cfg(feature = "semantic-policy")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PreparedColdInitialization {
+    Pending,
+    Entered,
+    Completed,
+    Unknown,
 }
 
 #[cfg(feature = "semantic-policy")]
@@ -12846,17 +12964,21 @@ impl PySemanticPreparedStep {
 #[pymethods]
 impl PySemanticPreparedStep {
     #[cfg(feature = "semantic-policy")]
-    #[pyo3(signature = (prepare_callback, *, consumer_streams))]
+    #[pyo3(signature = (prepare_callback, *, initialize_callback, consumer_streams))]
     fn prepare_cold_model_work(
         slf: Py<Self>,
         py: Python<'_>,
         prepare_callback: Py<PyAny>,
+        initialize_callback: Py<PyAny>,
         consumer_streams: &Bound<'_, PyAny>,
     ) -> PyResult<Py<PyAny>> {
         let step = slf.borrow(py);
         let session = step.session.borrow(py);
         session.require_creator()?;
-        if !prepare_callback.bind(py).is_callable() || !session.recording.load(Ordering::Acquire) {
+        if !prepare_callback.bind(py).is_callable()
+            || !initialize_callback.bind(py).is_callable()
+            || !session.recording.load(Ordering::Acquire)
+        {
             return Err(invalid(
                 "prepared cold work requires its original recording callback",
             ));
@@ -12915,6 +13037,8 @@ impl PySemanticPreparedStep {
                 let callback = Arc::new(Mutex::new(PreparedColdCallback {
                     step: slf.clone_ref(py),
                     callback: prepare_callback.clone_ref(py),
+                    initialize_callback: initialize_callback.clone_ref(py),
+                    initialization: PreparedColdInitialization::Pending,
                     work: None,
                     result: None,
                     report: None,
@@ -12937,6 +13061,7 @@ impl PySemanticPreparedStep {
         if !fresh {
             let original = retained()?;
             if original.callback.as_ptr() != prepare_callback.as_ptr()
+                || original.initialize_callback.as_ptr() != initialize_callback.as_ptr()
                 || original.streams != streams
                 || original.failed
                 || (original.result.is_none() && original.callback_entered)
@@ -13047,6 +13172,197 @@ impl PySemanticPreparedStep {
             .map(|result| result.clone_ref(py))
             .ok_or_else(|| invalid("prepared cold callback has no known original result"));
         result
+    }
+
+    /// Execute only the retained initializer after the whole structural roster
+    /// and original numerical plan freeze. A lost return never repeats it.
+    #[cfg(feature = "semantic-policy")]
+    fn initialize_cold_model_work(slf: Py<Self>, py: Python<'_>) -> PyResult<()> {
+        let step = slf.borrow(py);
+        let session = step.session.borrow(py);
+        session.require_creator()?;
+        let private = private_execution_owner(py, &session)?;
+        let (instruction, callback) = {
+            let stored = session
+                .prepared_segment
+                .lock()
+                .map_err(|_| invalid("prepared segment mutex is poisoned"))?;
+            let stored = stored
+                .as_ref()
+                .ok_or_else(|| invalid("initialization lost its original prepared segment"))?;
+            if !Arc::ptr_eq(&stored.scope, &step.scope)
+                || !stored
+                    .steps
+                    .iter()
+                    .any(|issued| issued.as_ptr() == slf.as_ptr())
+            {
+                return Err(invalid("initialization changed its original issued Update"));
+            }
+            let instruction =
+                stored.instruction.as_ref().map(Arc::clone).ok_or_else(|| {
+                    invalid("initialization lost its original instruction admission")
+                })?;
+            let mut original_callback = None;
+            for callback in &stored.cold_callbacks {
+                if callback
+                    .lock()
+                    .map_err(|_| invalid("prepared cold callback custody is poisoned"))?
+                    .step
+                    .as_ptr()
+                    == slf.as_ptr()
+                {
+                    original_callback = Some(Arc::clone(callback));
+                    break;
+                }
+            }
+            (
+                instruction,
+                original_callback
+                    .ok_or_else(|| invalid("initialize the original retained preparation pair"))?,
+            )
+        };
+        instruction.require_owner(py)?;
+        let retained = || {
+            callback
+                .lock()
+                .map_err(|_| invalid("prepared cold callback custody is poisoned"))
+        };
+        let (work, initialize_callback) = {
+            let original = retained()?;
+            if original.failed
+                || original.result.is_none()
+                || !original.callback_entered
+                || !original.shared_instruction_work
+                || original.private_phase.as_ref().map(Py::as_ptr)
+                    != private.as_ref().map(Py::as_ptr)
+            {
+                return Err(invalid(
+                    "initialization requires its same known original preparation",
+                ));
+            }
+            match original.initialization {
+                PreparedColdInitialization::Completed => return Ok(()),
+                PreparedColdInitialization::Entered | PreparedColdInitialization::Unknown => {
+                    return Err(invalid(
+                        "resolve the original unknown initialization without repeating it",
+                    ));
+                }
+                PreparedColdInitialization::Pending => {}
+            }
+            (
+                original
+                    .work
+                    .as_ref()
+                    .map(|work| work.clone_ref(py))
+                    .ok_or_else(|| invalid("initialization lost its original Prefix recorder"))?,
+                original.initialize_callback.clone_ref(py),
+            )
+        };
+        {
+            let original = instruction.preparation()?;
+            if !original.imports_roster_frozen
+                || original.initialization_active.is_some()
+                || original.imports_active.is_some()
+                || original.imports_completed != 0
+                || original.handoff_entered
+                || original.callback_failed
+                || original
+                    .initialization_order
+                    .get(original.initializations_completed)
+                    .is_none_or(|next| !Arc::ptr_eq(next, &callback))
+            {
+                return Err(invalid(
+                    "initialization must precede SOURCE in its frozen original Update order",
+                ));
+            }
+        }
+        if !session.recording.load(Ordering::Acquire)
+            || session
+                .active_cold_model_work
+                .lock()
+                .map_err(|_| invalid("active cold callback custody mutex is poisoned"))?
+                .as_ref()
+                .is_none_or(|active| active.as_ptr() != work.as_ptr())
+        {
+            return Err(invalid(
+                "initialization changed its original active Prefix scope",
+            ));
+        }
+        let require_frozen_work = || -> PyResult<()> {
+            let work_ref = work.borrow(py);
+            work_ref.check(py)?;
+            if let Some(private) = &private {
+                private
+                    .borrow(py)
+                    .require_private_actor_cold_callback(py, &session, &step, &work_ref)?;
+                let reader = work_ref.reader.borrow(py);
+                let source = reader.session.borrow(py);
+                let owner = session.owner()?;
+                if std::ptr::eq(&*source, &*session) {
+                    owner
+                        .require_shared_admitted_prepared_cold_initialization(
+                            &instruction.inner,
+                            &*instruction.parent.borrow(py).lease()?,
+                            &step.inner,
+                            &owner,
+                            &work_ref.inner,
+                        )
+                        .map_err(xlog_err)?;
+                } else {
+                    owner
+                        .require_shared_admitted_prepared_cold_initialization(
+                            &instruction.inner,
+                            &*instruction.parent.borrow(py).lease()?,
+                            &step.inner,
+                            &*source.owner()?,
+                            &work_ref.inner,
+                        )
+                        .map_err(xlog_err)?;
+                }
+            } else {
+                session
+                    .owner()?
+                    .require_admitted_prepared_cold_initialization(
+                        &instruction.inner,
+                        &*instruction.parent.borrow(py).lease()?,
+                        &step.inner,
+                        &work_ref.inner,
+                    )
+                    .map_err(xlog_err)?;
+            }
+            Ok(())
+        };
+        require_frozen_work()?;
+        {
+            let mut original = instruction.preparation()?;
+            let mut callback = retained()?;
+            original.initialization_active = Some(original.initializations_completed);
+            callback.initialization = PreparedColdInitialization::Entered;
+        }
+        let result = initialize_callback.bind(py).call0().and_then(|value| {
+            if !value.is_none() {
+                return Err(invalid(
+                    "retained initialization must return None, not a host result",
+                ));
+            }
+            require_frozen_work()
+        });
+        let mut original = instruction.preparation()?;
+        let mut callback = retained()?;
+        match result {
+            Ok(()) => {
+                callback.initialization = PreparedColdInitialization::Completed;
+                original.initializations_completed += 1;
+                original.initialization_active = None;
+                Ok(())
+            }
+            Err(error) => {
+                callback.initialization = PreparedColdInitialization::Unknown;
+                callback.failed = true;
+                original.callback_failed = true;
+                Err(error)
+            }
+        }
     }
 
     /// The Session's immutable nominal mode, readable during cold preparation
@@ -19558,6 +19874,15 @@ impl PySemanticTransitionController {
         }
         .map_err(xlog_err)?;
         drop(native_resources);
+        let retired_instruction = session
+            .prepared_segment
+            .lock()
+            .map_err(|_| invalid("prepared segment mutex is poisoned"))?
+            .as_ref()
+            .and_then(|segment| segment.instruction.as_ref().map(Arc::clone));
+        if let Some(instruction) = retired_instruction {
+            instruction.release_retired_initialization_roster(cancellation.is_some())?;
+        }
         let retained = session
             .prepared_segment
             .lock()

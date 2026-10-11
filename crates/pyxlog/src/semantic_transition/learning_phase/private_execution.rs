@@ -2041,6 +2041,15 @@ impl PySemanticLearningPhaseTransition {
         drain_export_owners();
         // Unknown retirement retains the original Python custody slot. Remove
         // it only after all native storage and consumer joins are known closed.
+        let instruction = session
+            .prepared_segment
+            .lock()
+            .map_err(|_| invalid("cancelled Python segment custody is poisoned"))?
+            .as_ref()
+            .and_then(|segment| segment.instruction.as_ref().map(Arc::clone));
+        if let Some(instruction) = instruction {
+            instruction.release_retired_initialization_roster(true)?;
+        }
         let python_segment = session
             .prepared_segment
             .lock()
