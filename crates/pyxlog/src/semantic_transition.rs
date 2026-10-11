@@ -11116,6 +11116,57 @@ impl PyNativeTensorAllocation {
 }
 
 #[cfg(feature = "semantic-policy")]
+fn policy_output_layout_row(
+    py: Python<'_>,
+    original: xlog_cuda::SemanticPolicyNumericalDomainLayout,
+) -> PyResult<Py<PyTuple>> {
+    let layout = original.layout;
+    let rank =
+        usize::try_from(layout.rank).map_err(|_| invalid("policy output rank exceeds usize"))?;
+    if rank > layout.dimensions.len()
+        || !matches!((layout.scalar_type, layout.element_bytes), (6, 4) | (9, 8))
+    {
+        return Err(invalid(
+            "native policy output is not an original floating-point view",
+        ));
+    }
+    let shape = PyTuple::new(py, layout.dimensions[..rank].iter().copied())?;
+    let strides = PyTuple::new(
+        py,
+        layout.strides_bytes[..rank]
+            .iter()
+            .map(|stride| stride / layout.element_bytes),
+    )?;
+    let allocation = Py::new(
+        py,
+        PyNativeTensorAllocation {
+            provenance: original.allocation,
+            policy_layout: Some(layout),
+        },
+    )?;
+    Ok((
+        allocation,
+        shape,
+        strides,
+        (2u8, (layout.element_bytes * 8) as u8),
+    )
+        .into_pyobject(py)?
+        .unbind())
+}
+
+#[cfg(feature = "semantic-policy")]
+fn policy_output_layout_rows(
+    py: Python<'_>,
+    originals: [xlog_cuda::SemanticPolicyNumericalDomainLayout; 9],
+) -> PyResult<Py<PyTuple>> {
+    let rows = originals
+        .into_iter()
+        .map(|original| policy_output_layout_row(py, original))
+        .collect::<PyResult<Vec<_>>>()?;
+    Ok(PyTuple::new(py, rows)?.unbind())
+}
+
+#[cfg(feature = "semantic-policy")]
 fn policy_domain_expected_layouts(
     expected: &Bound<'_, PyAny>,
 ) -> PyResult<[xlog_cuda::SemanticPolicyNumericalDomainLayout; 3]> {
@@ -14252,6 +14303,28 @@ impl PySemanticPreparedStep {
         Ok(PyTuple::new(py, capsules)?.unbind())
     }
 
+    /// Project the original critic destination without recording its reduction.
+    #[cfg(feature = "semantic-policy")]
+    #[pyo3(signature = (bank, *, consumer_stream))]
+    fn group_critic_scalar_layout(
+        &self,
+        py: Python<'_>,
+        bank: &Bound<'_, PyAny>,
+        consumer_stream: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyTuple>> {
+        let session = self.session.borrow(py);
+        session.require_creator()?;
+        self.require_task(py, &self.task_use.borrow(py))?;
+        let bank = usize::try_from(ColdValue::read(bank, &mut 128, 0)?.unsigned()?)
+            .map_err(|_| invalid("group critic bank exceeds native address space"))?;
+        let stream = parse_witness_consumer_stream(consumer_stream, &mut 128)?;
+        let layout = session
+            .owner()?
+            .prepared_group_critic_scalar_layout(&self.inner, bank, stream)
+            .map_err(xlog_err)?;
+        policy_output_layout_row(py, layout)
+    }
+
     /// Record the native group reduction after all frozen actor and edit rows
     /// have contributed once in this Update bank. Returns one FP32[1] DLPack
     /// scalar: raw episode sums are normalized, summed in the admitted order,
@@ -15569,6 +15642,82 @@ impl Drop for PySemanticRetainedReplayMember {
 #[cfg(feature = "semantic-policy")]
 #[pymethods]
 impl PySemanticRetainedReplayMember {
+    /// Project this original retained contribution's outputs before recording.
+    #[pyo3(signature = (update_step, bank, *, consumer_stream, edit_only=false))]
+    fn group_update_vjp_layouts(
+        &self,
+        py: Python<'_>,
+        update_step: Py<PySemanticPreparedStep>,
+        bank: &Bound<'_, PyAny>,
+        consumer_stream: &Bound<'_, PyAny>,
+        edit_only: bool,
+    ) -> PyResult<Py<PyTuple>> {
+        let bank = usize::try_from(ColdValue::read(bank, &mut 128, 0)?.unsigned()?)
+            .map_err(|_| invalid("group Update bank exceeds native address space"))?;
+        if bank > 1 || self.completed.load(Ordering::Acquire) {
+            return Err(invalid("retained replay has no open group Update bank"));
+        }
+        let stream = parse_witness_consumer_stream(consumer_stream, &mut 128)?;
+        let source_session = self.session.borrow(py);
+        source_session.require_creator()?;
+        if !source_session.importing.load(Ordering::Acquire) {
+            return Err(invalid(
+                "original replay is no longer retained for group backward",
+            ));
+        }
+        let update = update_step.borrow(py);
+        if self.session.as_ptr() == update.session.as_ptr() {
+            return Err(invalid(
+                "historical group member requires a distinct target Session",
+            ));
+        }
+        let target_session = update.session.borrow(py);
+        target_session.require_creator()?;
+        update.require_task(py, &update.task_use.borrow(py))?;
+        if let Some(child) = source_session.private_replay_custody()? {
+            child.require_target(py, &update)?;
+        }
+        {
+            let state = self
+                .group_use
+                .lock()
+                .map_err(|_| PyRuntimeError::new_err("retained group use is poisoned"))?;
+            if !state.gradient_banks[bank]
+                || state.deliveries[bank].is_none()
+                || state.edit_only != Some(edit_only)
+                || state.banks[bank]
+                || state
+                    .target
+                    .as_ref()
+                    .is_none_or(|target| !target.same_handle(&update.inner))
+            {
+                return Err(invalid(
+                    "retained output geometry changed its original Update contribution",
+                ));
+            }
+        }
+        let target = target_session.owner()?;
+        let source = source_session.owner()?;
+        let parent = self.parent.borrow(py);
+        let lease = parent.lease()?;
+        let layouts = target
+            .imported_policy_vjp_layouts(
+                &update.inner,
+                bank,
+                &source,
+                &lease,
+                self.invocation.borrow(py).rng,
+                self.replay_ordinal,
+                &self.replay_row,
+                edit_only,
+                stream,
+            )
+            .map_err(xlog_err)?;
+        drop(source);
+        drop(target);
+        policy_output_layout_rows(py, layouts)
+    }
+
     /// Record this original replay's single actor or edit contribution to the
     /// target Update graph. The original model output, published reader and
     /// tape stay owned by this handle through both mutually exclusive banks.
@@ -17953,31 +18102,12 @@ impl PySemanticTransitionTaskUse {
         drop(owner);
         let mut rows = Vec::with_capacity(3);
         for original in layouts {
-            let layout = original.layout;
-            let rank = usize::try_from(layout.rank)
-                .map_err(|_| invalid("policy domain rank exceeds usize"))?;
-            if rank > layout.dimensions.len() || layout.element_bytes != 8 {
+            if original.layout.element_bytes != 8 {
                 return Err(invalid(
                     "native policy domain layout is not an original FP64 view",
                 ));
             }
-            let shape = PyTuple::new(py, layout.dimensions[..rank].iter().copied())?;
-            let strides = PyTuple::new(
-                py,
-                layout.strides_bytes[..rank].iter().map(|stride| stride / 8),
-            )?;
-            let allocation = Py::new(
-                py,
-                PyNativeTensorAllocation {
-                    provenance: original.allocation,
-                    policy_layout: Some(layout),
-                },
-            )?;
-            rows.push(
-                (allocation, shape, strides, (2u8, 64u8))
-                    .into_pyobject(py)?
-                    .unbind(),
-            );
+            rows.push(policy_output_layout_row(py, original)?);
         }
         Ok(PyTuple::new(py, rows)?.unbind())
     }

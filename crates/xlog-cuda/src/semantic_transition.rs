@@ -15289,11 +15289,12 @@ pub struct SemanticPreparedGroupCritic {
 #[cfg(feature = "semantic-policy")]
 impl SemanticPreparedGroupCritic {
     pub fn into_dlpack(self) -> Result<DlpackManagedTensor, SemanticTransitionError> {
+        let layout = group_critic_output_layout()?;
         Ok(export_owned_allocation(
             unsafe { self.value.cast::<u8>() }.expect("FP32 group critic byte view"),
-            vec![1],
-            vec![1],
-            (2, 32),
+            vec![layout.dimensions[0] as i64],
+            vec![(layout.strides_bytes[0] / layout.element_bytes) as i64],
+            (2, (layout.element_bytes * 8) as u8),
             self.provider.device().ordinal() as i32,
             self.step_aliases,
             Some(self.publication),
@@ -15366,24 +15367,7 @@ fn export_policy_gradients(
     continuation: Arc<TextBindingStorage>,
     owner: Arc<dyn Send + Sync>,
 ) -> Result<[DlpackManagedTensor; 9], SemanticTransitionError> {
-    let original = policy_numerical_producer_layouts(support_cells, parameter_cells)?;
-    let mut text_error = original[7];
-    text_error.dimensions[2] = 2;
-    text_error.strides_bytes = [0; 4];
-    let text_error = canonical_tensor_layout(text_error)?;
-    // Native labels are interleaved per coordinate. The kernel explicitly
-    // packs actor then full into these contiguous region-major exports.
-    let layouts = [
-        original[2],
-        original[0],
-        original[3],
-        original[4],
-        text_error,
-        original[5],
-        paired_cotangent_domain(original[6])?,
-        paired_cotangent_domain(original[7])?,
-        paired_cotangent_domain(original[8])?,
-    ];
+    let layouts = policy_gradient_output_layouts(support_cells, parameter_cells)?;
     let numerical_views = numerical.roots.iter().map(|buffer| {
         // SAFETY: numerical roots are retained aligned FP64 storage.
         unsafe { buffer.view().cast::<u8>() }.expect("FP64 policy numerical byte view")
@@ -15416,6 +15400,84 @@ fn export_policy_gradients(
     Ok(tensors
         .try_into()
         .unwrap_or_else(|_| unreachable!("nine original policy gradient exports")))
+}
+
+#[cfg(feature = "semantic-policy")]
+fn policy_gradient_output_layouts(
+    support_cells: usize,
+    parameter_cells: usize,
+) -> Result<[SemanticTensorLayout; 9], SemanticTransitionError> {
+    let original = policy_numerical_producer_layouts(support_cells, parameter_cells)?;
+    let mut text_error = original[7];
+    text_error.dimensions[2] = 2;
+    text_error.strides_bytes = [0; 4];
+    let text_error = canonical_tensor_layout(text_error)?;
+    // Native labels are interleaved per coordinate. The kernel explicitly
+    // packs actor then full into these contiguous region-major exports.
+    Ok([
+        original[2],
+        original[0],
+        original[3],
+        original[4],
+        text_error,
+        original[5],
+        paired_cotangent_domain(original[6])?,
+        paired_cotangent_domain(original[7])?,
+        paired_cotangent_domain(original[8])?,
+    ])
+}
+
+#[cfg(feature = "semantic-policy")]
+fn policy_gradient_output_geometry(
+    buffers: &PolicyBuffers,
+    support_cells: usize,
+) -> Result<[SemanticPolicyNumericalDomainLayout; 9], SemanticTransitionError> {
+    let owner = &buffers.temporal_adjoints;
+    let values = [
+        owner.parameters.view().allocation_provenance(),
+        owner.text_logits.view().allocation_provenance(),
+        owner.component_baselines.view().allocation_provenance(),
+    ];
+    values
+        .into_iter()
+        .chain(
+            owner
+                .numerical
+                .roots
+                .iter()
+                .map(|buffer| buffer.view().allocation_provenance()),
+        )
+        .zip(policy_gradient_output_layouts(
+            support_cells,
+            buffers.layout.parameter_cells,
+        )?)
+        .map(|(allocation, layout)| {
+            Ok(SemanticPolicyNumericalDomainLayout {
+                allocation: allocation.ok_or_else(|| {
+                    publication_input_error(
+                        "original policy adjoint has no native allocation origin",
+                    )
+                })?,
+                layout,
+            })
+        })
+        .collect::<Result<Vec<_>, SemanticTransitionError>>()?
+        .try_into()
+        .map_err(|_| publication_input_error("original policy adjoint geometry lost an output"))
+}
+
+#[cfg(feature = "semantic-policy")]
+fn group_critic_output_layout() -> Result<SemanticTensorLayout, SemanticTransitionError> {
+    canonical_tensor_layout(SemanticTensorLayout {
+        role: 0,
+        index: 0,
+        scalar_type: 6,
+        element_bytes: 4,
+        rank: 1,
+        dimensions: [1, 0, 0, 0],
+        logical_axis: u64::MAX,
+        strides_bytes: [0; 4],
+    })
 }
 
 #[cfg(feature = "semantic-policy")]
@@ -38129,6 +38191,345 @@ impl SemanticTransitionSession {
         consumer_stream: u64,
     ) -> Result<SemanticPreparedPolicyGradients, SemanticTransitionError> {
         self.record_prepared_policy_vjp(step, bank, update_step, None, false, consumer_stream)
+    }
+
+    #[cfg(feature = "semantic-policy")]
+    fn group_output_geometry_target(
+        &self,
+        update: &SemanticPreparedStep,
+        bank: usize,
+        consumer_stream: u64,
+    ) -> Result<&PreparedStepStorage, SemanticTransitionError> {
+        self.check_prepared_cold(update)?;
+        let build = self
+            .prepared_segment
+            .as_ref()
+            .expect("checked original build");
+        if bank > 1
+            || dlpack_consumer_stream(consumer_stream)? != self.stream.cu_stream()
+            || self.captured.is_some()
+            || build.submitted
+            || build.completed
+            || build.cancelled.load(Ordering::Acquire)
+            || build.requested_kind(update, &self.publication_issuer)?
+                != SemanticTransitionKind::Update
+        {
+            return Err(publication_input_error(
+                "group output geometry requires its original cold Update bank and stream",
+            ));
+        }
+        let prepared = self.steps[&update.token]
+            .prepared
+            .as_ref()
+            .expect("checked Update");
+        if prepared.group_critic_recorded & (1 << bank) != 0
+            || !prepared.group_imported_vjp_members[bank].is_empty()
+            || !prepared.group_vjp_members[bank].is_empty()
+            || !prepared.group_edit_members[bank].is_empty()
+        {
+            return Err(publication_input_error(
+                "group output geometry must precede its original bank's contributions",
+            ));
+        }
+        Ok(prepared)
+    }
+
+    #[cfg(feature = "semantic-policy")]
+    fn require_group_output_source(
+        &self,
+        source: &Self,
+        actor: bool,
+    ) -> Result<(), SemanticTransitionError> {
+        source.ensure_quiescent()?;
+        let target_task = &self
+            .task
+            .as_ref()
+            .ok_or(SemanticTransitionError::NotBound)?
+            .0;
+        let source_task = &source
+            .task
+            .as_ref()
+            .ok_or(SemanticTransitionError::NotBound)?
+            .0;
+        if Arc::ptr_eq(&self.publication_issuer, &source.publication_issuer)
+            || self.provider.device().ordinal() != source.provider.device().ordinal()
+            || target_task.spec.scoring != source_task.spec.scoring
+            || target_task.objective_law != source_task.objective_law
+            || target_task.spec.training_domain.is_none()
+            || target_task.spec.training_domain != source_task.spec.training_domain
+            || (actor && !source_task.spec.actor_eligible)
+        {
+            return Err(publication_input_error(
+                "group output geometry requires its original source task and common objective",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Project the original future Edit's allocations without executing its SOURCE.
+    #[cfg(feature = "semantic-policy")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "original source, row and target custody remain distinct"
+    )]
+    pub fn prepared_imported_edit_policy_vjp_layouts(
+        &self,
+        update: &SemanticPreparedStep,
+        bank: usize,
+        source: &Self,
+        source_lease: &SemanticPublishedLease,
+        material: &SemanticReplayMaterial,
+        member_ordinal: u64,
+        member_row: &SemanticTrainingViewRow,
+        consumer_stream: u64,
+    ) -> Result<[SemanticPolicyNumericalDomainLayout; 9], SemanticTransitionError> {
+        let prepared = self.group_output_geometry_target(update, bank, consumer_stream)?;
+        self.require_group_output_source(source, false)?;
+        let invocation = source.admitted_policy_rng(source_lease)?;
+        let training = prepared
+            .training_view
+            .as_ref()
+            .ok_or(SemanticTransitionError::NotBound)?;
+        let origin = crate::semantic_training_view::origin_record(material.training_view_origin()?);
+        let (digest, _) = source
+            .verify_checkpoint_source_material(source_lease, &material.predecessor.encode()?)?;
+        let delivery = prepared.group_gradient_members[bank]
+            .get(&(
+                member_ordinal,
+                ImportedPolicyContributionKind::HistoricalEdit,
+            ))
+            .ok_or(SemanticTransitionError::ObservationMismatch)?;
+        let original = delivery
+            .preparation
+            .as_ref()
+            .ok_or(SemanticTransitionError::ObservationMismatch)?;
+        if material.transition_kind() != SemanticTransitionKind::Proposal
+            || !delivery.matches(&source.publication_issuer, source_lease.token, None)
+            || !Arc::ptr_eq(&original.issuer, &update.issuer)
+            || !Arc::ptr_eq(&original.scope, &update.scope)
+            || original.step != update.token
+            || original.bank != bank
+            || !Arc::ptr_eq(&original.source_issuer, &source.publication_issuer)
+            || original.source_token != source_lease.token
+            || original.source_identity != source_lease.identity
+            || original.material != digest
+            || original.member_ordinal != member_ordinal
+            || original.origin != origin
+            || member_row
+                .origin
+                .map(crate::semantic_training_view::origin_record)
+                != Some(origin)
+            || training
+                .edit_group_member_index(member_ordinal, member_row)?
+                .is_none()
+        {
+            return Err(publication_input_error(
+                "future Edit output geometry changed its original source or contribution",
+            ));
+        }
+        if training
+            .actor_group_member_index(member_ordinal, member_row)
+            .is_ok()
+        {
+            self.require_current_actor_overlap(update, bank, member_ordinal, member_row, false)?;
+        }
+        let policy = source
+            .prepared_policy
+            .as_ref()
+            .ok_or(SemanticTransitionError::NotBound)?;
+        if source.captured.is_some()
+            || !policy.parent.matches(source_lease)
+            || policy.binding != source.binding()
+            || policy.invocation != invocation
+        {
+            return Err(publication_input_error(
+                "future Edit output geometry lost its original prepared policy",
+            ));
+        }
+        policy_gradient_output_geometry(&policy.buffers, source.codebooks.input_cells)
+    }
+
+    /// Project the genuine retained tape's allocations, without recording backward.
+    #[cfg(feature = "semantic-policy")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "original invocation and target contribution remain explicit"
+    )]
+    pub fn imported_policy_vjp_layouts(
+        &self,
+        update: &SemanticPreparedStep,
+        bank: usize,
+        source: &Self,
+        source_lease: &SemanticPublishedLease,
+        invocation: SemanticRngBinding,
+        member_ordinal: u64,
+        member_row: &SemanticTrainingViewRow,
+        edit_only: bool,
+        consumer_stream: u64,
+    ) -> Result<[SemanticPolicyNumericalDomainLayout; 9], SemanticTransitionError> {
+        let prepared = self.group_output_geometry_target(update, bank, consumer_stream)?;
+        let training = prepared
+            .training_view
+            .as_ref()
+            .ok_or(SemanticTransitionError::NotBound)?;
+        let actor = training
+            .actor_group_member_index(member_ordinal, member_row)
+            .is_ok();
+        let edit_only = edit_only || !actor;
+        self.require_group_output_source(source, !edit_only)?;
+        source.checked_reader(source_lease)?;
+        let edit = training
+            .edit_group_member_index(member_ordinal, member_row)?
+            .is_some();
+        if (edit_only && !edit) || (!edit_only && !actor) {
+            return Err(SemanticTransitionError::ObservationMismatch);
+        }
+        if edit_only && actor {
+            self.require_current_actor_overlap(update, bank, member_ordinal, member_row, false)?;
+        }
+        let contribution = (
+            member_ordinal,
+            if edit_only {
+                ImportedPolicyContributionKind::HistoricalEdit
+            } else {
+                ImportedPolicyContributionKind::HistoricalCombined
+            },
+        );
+        if prepared.group_gradient_members[bank]
+            .get(&contribution)
+            .is_none_or(|delivery| {
+                !delivery.matches(
+                    &source.publication_issuer,
+                    source_lease.token,
+                    Some(invocation),
+                )
+            })
+        {
+            return Err(publication_input_error(
+                "retained output geometry changed its original physical delivery",
+            ));
+        }
+        let tape = source
+            .policy_tapes
+            .iter()
+            .find(|tape| {
+                tape.invocation == invocation
+                    && tape.refusal.is_none()
+                    && tape.prepared_bank.is_none()
+                    && tape.origin_state.is_some()
+                    && tape.policy.text_binding._witness.reader_token == source_lease.token
+            })
+            .ok_or(SemanticTransitionError::ObservationMismatch)?;
+        let origin = member_row
+            .origin
+            .as_ref()
+            .ok_or(SemanticTransitionError::ObservationMismatch)?;
+        if origin.invocation != invocation
+            || origin.transition != SemanticTransitionKind::Proposal
+            || origin.model_geometry_digest != source_lease.header.model_geometry_digest
+            || origin.model_numerical_digest != source_lease.header.model_numerical_digest
+        {
+            return Err(publication_input_error(
+                "retained output geometry changed its original policy lineage",
+            ));
+        }
+        source.checked_content_witness(source_lease, &tape.policy.text_binding._witness)?;
+        source.check_continuation_content(&tape.policy.text_binding)?;
+        policy_gradient_output_geometry(&tape.policy.buffers, tape.support.len())
+    }
+
+    /// Project the staged child's exact Proposal bank-one adjoint allocations.
+    #[cfg(feature = "semantic-policy")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "original actor proof and child owners remain explicit"
+    )]
+    pub fn prepared_actor_policy_vjp_layouts(
+        &self,
+        update: &SemanticPreparedStep,
+        bank: usize,
+        source: &Self,
+        proposal: &SemanticPreparedStep,
+        proof: &SemanticPreparedActorRefresh,
+        member_row: &SemanticTrainingViewRow,
+        consumer_stream: u64,
+    ) -> Result<[SemanticPolicyNumericalDomainLayout; 9], SemanticTransitionError> {
+        let prepared = self.group_output_geometry_target(update, bank, consumer_stream)?;
+        self.require_group_output_source(source, true)?;
+        source.check_prepared_cold(proposal)?;
+        self.require_prepared_actor_refresh_basis(update, bank, source, proposal, proof)?;
+        let build = source
+            .prepared_segment
+            .as_ref()
+            .expect("checked actor build");
+        let staged = source
+            .actor_refresh
+            .as_ref()
+            .ok_or(SemanticTransitionError::NotBound)?;
+        let training = prepared
+            .training_view
+            .as_ref()
+            .ok_or(SemanticTransitionError::NotBound)?;
+        training.actor_group_member_index(proof.inner.member.ordinal, member_row)?;
+        if source.stream.cu_stream() != self.stream.cu_stream()
+            || source.captured.is_some()
+            || build.submitted
+            || build.completed
+            || build.tokens.get(1) != Some(&proposal.token)
+            || staged.state != actor_refresh::ActorRefreshCaptureState::Staged
+            || prepared.group_gradient_members[bank]
+                .get(&(
+                    proof.inner.member.ordinal,
+                    ImportedPolicyContributionKind::CurrentActor,
+                ))
+                .is_none_or(|delivery| {
+                    !delivery.matches(&source.publication_issuer, proposal.token, None)
+                })
+        {
+            return Err(publication_input_error(
+                "actor output geometry requires its original staged Proposal and delivery",
+            ));
+        }
+        let proposal = source.steps[&proposal.token]
+            .prepared
+            .as_ref()
+            .expect("checked actor Proposal");
+        if proposal.transition_recorded != 0 {
+            return Err(publication_input_error(
+                "actor output geometry must precede original child recording",
+            ));
+        }
+        let buffers = proposal.branches[1]
+            .policy_buffers
+            .as_ref()
+            .ok_or(SemanticTransitionError::NotBound)?;
+        policy_gradient_output_geometry(buffers, source.codebooks.input_cells)
+    }
+
+    /// Project the existing critic destination; no member reduction is recorded.
+    #[cfg(feature = "semantic-policy")]
+    pub fn prepared_group_critic_scalar_layout(
+        &self,
+        update: &SemanticPreparedStep,
+        bank: usize,
+        consumer_stream: u64,
+    ) -> Result<SemanticPolicyNumericalDomainLayout, SemanticTransitionError> {
+        let prepared = self.group_output_geometry_target(update, bank, consumer_stream)?;
+        let training = prepared
+            .training_view
+            .as_ref()
+            .ok_or(SemanticTransitionError::NotBound)?;
+        Ok(SemanticPolicyNumericalDomainLayout {
+            allocation: training
+                .critic_total()
+                .allocation_provenance()
+                .ok_or_else(|| {
+                    publication_input_error(
+                        "original critic scalar has no native allocation origin",
+                    )
+                })?,
+            layout: group_critic_output_layout()?,
+        })
     }
 
     /// Record the original prepared Proposal named by one exact frozen actor

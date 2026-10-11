@@ -174,6 +174,11 @@ class SemanticPreparedActorRefresh:
         """
         ...
     def group_update_vjp(self, update_step: SemanticPreparedStep, bank: int, *, consumer_stream: int) -> tuple[Any, ...]: ...
+    def group_update_vjp_layouts(
+        self, update_step: SemanticPreparedStep, bank: int, *, consumer_stream: int,
+    ) -> tuple[_PolicyOutputLayout, ...]:
+        """Nine original adjoint allocation layouts, without recording or capsules."""
+        ...
 
 class SemanticPreparedStep:
     def prepare_actor_refresh(self, member_ordinal: int, *, refresh_snapshot: Any) -> SemanticPreparedActorRefresh: ...
@@ -205,6 +210,12 @@ class SemanticPreparedStep:
 
     def initialize_cold_model_work(self) -> None:
         """Run only that retained initializer, once after the complete plan freeze."""
+        ...
+
+    def group_critic_scalar_layout(
+        self, bank: int, *, consumer_stream: int,
+    ) -> _PolicyOutputLayout:
+        """The original FP32[1] critic destination, without reduction."""
         ...
 
     @property
@@ -254,6 +265,10 @@ class SemanticRetainedReplayMember:
         self, update_step: SemanticPreparedStep, bank: int, *,
         consumer_stream: int, edit_only: bool = False,
     ) -> tuple[Any, ...]: ...
+    def group_update_vjp_layouts(
+        self, update_step: SemanticPreparedStep, bank: int, *,
+        consumer_stream: int, edit_only: bool = False,
+    ) -> tuple[_PolicyOutputLayout, ...]: ...
     def confirm_published_target(self) -> None: ...
     def confirm_unpublished_target(self, update_step: SemanticPreparedStep) -> None: ...
     def finish(self) -> None: ...
@@ -282,6 +297,12 @@ class SemanticPreparedTaskImport:
     def parent(self) -> SemanticPublishedParent: ...
     def source_model_contract_metadata(self) -> _SourceModelContractMetadata: ...
     def source_model_memory_geometry(self) -> _SourceModelMemoryGeometry: ...
+    def group_update_vjp_layouts(
+        self, update_step: SemanticPreparedStep, bank: int, *,
+        consumer_stream: int, edit_only: bool = False,
+    ) -> tuple[_PolicyOutputLayout, ...]:
+        """Future SOURCE requires its original registered edit_only=True delivery."""
+        ...
     def group_update_vjp(
         self, update_step: SemanticPreparedStep, bank: int, *,
         consumer_stream: int, edit_only: bool = False,
@@ -486,6 +507,10 @@ _PolicyNumericalDomainLayout = tuple[
 _PolicyNumericalDomainLayouts = tuple[
     _PolicyNumericalDomainLayout, _PolicyNumericalDomainLayout,
     _PolicyNumericalDomainLayout,
+]
+_PolicyOutputLayout = tuple[
+    NativeTensorAllocation, tuple[int, ...], tuple[int, ...],
+    tuple[Literal[2], Literal[32, 64]],
 ]
 
 class SemanticTransitionTaskUse:

@@ -238,7 +238,10 @@ Completion authenticates every original physical Parameter and restored SOURCE
 gradient slot against that same completed model witness, preserving its slot as
 the deferred delivery's restoration intent. It does not replace leaves or edges.
 The prepared owner's `group_update_vjp` delegates only to that genuine completed
-member. Retain the same owner, model, aliases and graph through actual final use.
+member. Its `group_update_vjp_layouts(update_step, bank, consumer_stream=...,
+edit_only=True)` is available earlier, after that same future physical delivery
+is registered. It does not execute or complete the SOURCE import. Retain the
+same owner, model, aliases and graph through actual final use.
 If the target is genuinely cancelled before this import executes, native retires
 the same prepared source and invokes its original cleanup once. The prepared
 owner's `finish_cancelled_private_segment()` only acknowledges that cached
@@ -337,6 +340,30 @@ other critic and supervised roots, belong to the same single backward. Each
 contribution retains its original group denominator, model realization and
 demonstration prefix. Without a fresh actor overlap, the default
 `edit_only=False` preserves the existing native actor/Edit membership dispatch.
+
+Before numerical recording, query
+`refresh.group_update_vjp_layouts(update_step, bank, consumer_stream=...)` for
+the original CURRENT child, or
+`member.group_update_vjp_layouts(update_step, bank, consumer_stream=...,
+edit_only=...)` for the original historical owner. Each returns nine ordered
+`(NativeTensorAllocation, shape, element_strides, dlpack_dtype)` rows from the
+same temporal adjoints subsequently exported by `group_update_vjp`: FP32
+parameter `[P]`, text `[32,V]`, baseline `[1,C]`; FP64 envelopes `[P,2]`,
+`[32,V,2]`, `[1,C,2]`; and FP64 paired bounds `[2,P,4]`, `[2,32,V,4]`,
+`[2,1,C,4]`. Parameter count belongs to the original source, while vocabulary
+and component counts belong to its native catalogue. These are selected
+backward output layouts, not the three pre-draw uniform domains.
+
+`step.group_critic_scalar_layout(bank, consumer_stream=...)` returns the same
+four-field row for the original target training view's FP32 `[1]` allocation,
+with element stride `[1]`. Neither getter creates a tensor or DLPack capsule,
+initializes storage, activates hooks, records a VJP/reduction, consumes a
+contribution, or replaces the original numerical work plan. Rows retain only
+actual allocation lifetime, not reader rights or numerical content. Both
+getters authenticate the original cold target bank and stream; contribution
+queries also require their original registered physical delivery. Keep those
+rows for the compiler's check against the genuine later capsules. Numerical
+exports still require the original recording, hook and completion boundaries.
 
 After genuine whole-target cancellation and confirmed original graph destruction,
 the same prepared producer may call

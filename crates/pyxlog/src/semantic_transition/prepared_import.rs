@@ -1006,6 +1006,93 @@ impl PySemanticPreparedTaskImport {
         self.require_cancelled_ack(py)
     }
 
+    /// Project the same original outputs without completing or executing SOURCE.
+    #[pyo3(signature = (update_step, bank, *, consumer_stream, edit_only=false))]
+    fn group_update_vjp_layouts(
+        &self,
+        py: Python<'_>,
+        update_step: Py<PySemanticPreparedStep>,
+        bank: &Bound<'_, PyAny>,
+        consumer_stream: &Bound<'_, PyAny>,
+        edit_only: bool,
+    ) -> PyResult<Py<PyTuple>> {
+        let completed = *self
+            .stage
+            .lock()
+            .map_err(|_| invalid("prepared import stage is poisoned"))?
+            == ImportPreparationStage::Complete;
+        if completed {
+            let member = self
+                .member
+                .lock()
+                .map_err(|_| invalid("prepared import member is poisoned"))?
+                .as_ref()
+                .map(|member| member.clone_ref(py))
+                .ok_or_else(|| invalid("prepared import lost its genuine completed member"))?;
+            let result = member.borrow(py).group_update_vjp_layouts(
+                py,
+                update_step,
+                bank,
+                consumer_stream,
+                edit_only,
+            );
+            return result;
+        }
+        let update = update_step.borrow(py);
+        self.require_future_consumer(py, &update)?;
+        if !edit_only {
+            return Err(invalid(
+                "future SOURCE output geometry requires its original Edit-only contribution",
+            ));
+        }
+        let bank = usize::try_from(ColdValue::read(bank, &mut 128, 0)?.unsigned()?)
+            .map_err(|_| invalid("group Update bank exceeds native address space"))?;
+        let stream = parse_witness_consumer_stream(consumer_stream, &mut 128)?;
+        let source_session = self.session.borrow(py);
+        let target_session = update.session.borrow(py);
+        target_session.require_creator()?;
+        update.require_task(py, &update.task_use.borrow(py))?;
+        {
+            let state = self
+                .group_use
+                .lock()
+                .map_err(|_| invalid("prepared import group use is poisoned"))?;
+            if bank > 1
+                || !state.gradient_banks[bank]
+                || state.deliveries[bank].is_none()
+                || state.edit_only != Some(true)
+                || state.banks[bank]
+                || state
+                    .target
+                    .as_ref()
+                    .is_none_or(|target| !target.same_handle(&update.inner))
+            {
+                return Err(invalid(
+                    "future output geometry changed its original Update contribution",
+                ));
+            }
+        }
+        let target = target_session.owner()?;
+        let source = source_session.owner()?;
+        let parent = self.parent.borrow(py);
+        let lease = parent.lease()?;
+        let layouts = target
+            .prepared_imported_edit_policy_vjp_layouts(
+                &update.inner,
+                bank,
+                &source,
+                &lease,
+                &self.material,
+                self.ordinal as u64,
+                &self.replay_row,
+                stream,
+            )
+            .map_err(xlog_err)?;
+        drop(source);
+        drop(target);
+        policy_output_layout_rows(py, layouts)
+    }
+
     #[pyo3(signature = (update_step, bank, *, consumer_stream, edit_only=false))]
     fn group_update_vjp(
         &self,

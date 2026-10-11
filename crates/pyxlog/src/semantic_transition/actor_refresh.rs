@@ -2168,6 +2168,65 @@ impl PySemanticPreparedActorRefresh {
         result
     }
 
+    /// Project this staged child's original adjoint buffers before any recording.
+    #[pyo3(signature = (update_step, bank, *, consumer_stream))]
+    fn group_update_vjp_layouts(
+        &self,
+        py: Python<'_>,
+        update_step: Py<PySemanticPreparedStep>,
+        bank: usize,
+        consumer_stream: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyTuple>> {
+        let stream = parse_witness_consumer_stream(consumer_stream, &mut 128)?;
+        let update = update_step.borrow(py);
+        self.inner.require_update(py, &update, bank)?;
+        let (session, proposal) = {
+            let children = self.inner.children()?;
+            let child = &children[bank];
+            if !child.context_ready
+                || child.recording_entered
+                || child.vjp_entered
+                || child.delivery.is_none()
+                || child.retired
+            {
+                return Err(invalid(
+                    "actor output geometry requires its original prepared child and delivery",
+                ));
+            }
+            (
+                child
+                    .session
+                    .as_ref()
+                    .ok_or_else(|| invalid("actor output geometry lost its original Session"))?
+                    .clone_ref(py),
+                child
+                    .steps
+                    .get(1)
+                    .ok_or_else(|| invalid("actor output geometry lost its original Proposal"))?
+                    .clone_ref(py),
+            )
+        };
+        let target = update.session.borrow(py);
+        let source = session.borrow(py);
+        source.require_creator()?;
+        let target_owner = target.owner()?;
+        let source_owner = source.owner()?;
+        let layouts = target_owner
+            .prepared_actor_policy_vjp_layouts(
+                &update.inner,
+                bank,
+                &source_owner,
+                &proposal.borrow(py).inner,
+                &self.inner.proof,
+                &self.inner.row,
+                stream,
+            )
+            .map_err(xlog_err)?;
+        drop(source_owner);
+        drop(target_owner);
+        policy_output_layout_rows(py, layouts)
+    }
+
     #[pyo3(signature = (update_step, bank, *, consumer_stream))]
     fn group_update_vjp(
         &self,
