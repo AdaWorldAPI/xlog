@@ -8,7 +8,7 @@ type ColdWorkAllowance = Arc<Mutex<crate::semantic_transition::ColdNativeAllowan
 type ColdWorkAllowance = ();
 
 use sha2::{Digest, Sha256};
-use xlog_core::{symbol, RelId, ScalarType, Schema, XlogError};
+use xlog_core::{symbol, RelId, ScalarType, Schema};
 
 use crate::cuda_compat::{IntoKernelParamStorage, KernelParamStorage};
 use crate::launch::LaunchEnqueueError;
