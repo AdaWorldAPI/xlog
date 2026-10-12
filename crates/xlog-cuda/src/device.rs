@@ -85,7 +85,6 @@ impl HostTransferCompletion {
 /// One page-locked host allocation, shared by synchronous staging and terminal
 /// receipt owners. An uncertain copy retains these bytes through cold retirement.
 /// No caller-owned host address is ever placed in that retirement queue.
-#[derive(Debug)]
 pub(crate) struct PinnedHostBuffer {
     ptr: usize,
     bytes: usize,
@@ -93,10 +92,31 @@ pub(crate) struct PinnedHostBuffer {
     event: Option<CudaEvent>,
     completion: HostTransferCompletion,
     retirement_proven: bool,
+    retained_owner: Option<Arc<dyn Send + Sync>>,
+}
+
+impl std::fmt::Debug for PinnedHostBuffer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PinnedHostBuffer")
+            .field("ptr", &self.ptr)
+            .field("bytes", &self.bytes)
+            .field("completion", &self.completion)
+            .field("retirement_proven", &self.retirement_proven)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PinnedHostBuffer {
     pub(crate) fn new(stream: &CudaStream, bytes: usize) -> std::result::Result<Self, DriverError> {
+        Self::new_with_owner(stream, bytes, None)
+    }
+
+    fn new_with_owner(
+        stream: &CudaStream,
+        bytes: usize,
+        retained_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> std::result::Result<Self, DriverError> {
         let _ordinary = crate::cuda_graph::reserve_uncaptured_stream(stream)?;
         let context = Arc::clone(stream.context());
         let event = context.new_event(None)?;
@@ -112,6 +132,7 @@ impl PinnedHostBuffer {
             event: Some(event),
             completion: HostTransferCompletion::Complete,
             retirement_proven: false,
+            retained_owner,
         })
     }
 
@@ -476,6 +497,15 @@ impl<T: DeviceRepr> RetainedDeviceWrite<T> {
         source: &[T],
         destination: DeviceMemoryView<T>,
     ) -> std::result::Result<Self, DriverError> {
+        Self::new_with_owner(stream, source, destination, None)
+    }
+
+    pub(crate) fn new_with_owner(
+        stream: &CudaStream,
+        source: &[T],
+        destination: DeviceMemoryView<T>,
+        retained_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> std::result::Result<Self, DriverError> {
         if source.len() != destination.len() {
             return Err(DriverError(sys::CUresult::CUDA_ERROR_INVALID_VALUE));
         }
@@ -483,7 +513,7 @@ impl<T: DeviceRepr> RetainedDeviceWrite<T> {
             .checked_mul(source.len())
             .ok_or(DriverError(sys::CUresult::CUDA_ERROR_INVALID_VALUE))?;
         let original_stream_id = crate::cuda_graph::stream_execution_id(stream)?;
-        let mut buffer = PinnedHostBuffer::new(stream, bytes)?;
+        let mut buffer = PinnedHostBuffer::new_with_owner(stream, bytes, retained_owner)?;
         buffer.write(source)?;
         Ok(Self {
             destination,
@@ -594,9 +624,21 @@ pub(crate) struct RetainedDeviceRead<T: DeviceRepr + Copy> {
 }
 
 impl<T: DeviceRepr + Copy> RetainedDeviceRead<T> {
+    pub(crate) fn submitted(&self) -> bool {
+        self.submitted
+    }
+
     pub(crate) fn new(
         stream: &CudaStream,
         source: DeviceMemoryView<T>,
+    ) -> std::result::Result<Self, DriverError> {
+        Self::new_with_owner(stream, source, None)
+    }
+
+    pub(crate) fn new_with_owner(
+        stream: &CudaStream,
+        source: DeviceMemoryView<T>,
+        retained_owner: Option<Arc<dyn Send + Sync>>,
     ) -> std::result::Result<Self, DriverError> {
         let bytes = source
             .len()
@@ -604,7 +646,11 @@ impl<T: DeviceRepr + Copy> RetainedDeviceRead<T> {
             .ok_or(DriverError(sys::CUresult::CUDA_ERROR_INVALID_VALUE))?;
         Ok(Self {
             source,
-            buffer: Some(PinnedHostBuffer::new(stream, bytes)?),
+            buffer: Some(PinnedHostBuffer::new_with_owner(
+                stream,
+                bytes,
+                retained_owner,
+            )?),
             entered: false,
             submitted: false,
             retired: false,
@@ -682,8 +728,8 @@ impl<T: DeviceRepr + Copy> RetainedDeviceRead<T> {
                 .expect("original read staging")
                 .read_vec::<T>(self.source.len())
         }?;
-        self.values = Some(values.clone());
         self.buffer = None;
+        self.values = Some(values.clone());
         Ok(values)
     }
 
@@ -729,10 +775,11 @@ impl Drop for PinnedHostBuffer {
             self.event.take().expect("pinned owner event present"),
             self.completion,
             self.retirement_proven,
+            self.retained_owner.take(),
         );
         crate::cuda_graph::retire_resources_after_completion(
             resources,
-            |(_, context, event, completion, retirement_proven)| {
+            |(_, context, event, completion, retirement_proven, _)| {
                 context.bind_to_thread()?;
                 if *retirement_proven {
                     return Ok(());
@@ -743,7 +790,7 @@ impl Drop for PinnedHostBuffer {
                     || Err(DriverError(sys::CUresult::CUDA_ERROR_UNKNOWN)),
                 )
             },
-            |(ptr, _, _, _, _)| {
+            |(ptr, _, _, _, _, _)| {
                 // SAFETY: the entire copy batch is complete. The canonical
                 // retirement helper never resubmits an unknown free outcome.
                 unsafe { sys::cuMemFreeHost(*ptr as *mut c_void).result() }

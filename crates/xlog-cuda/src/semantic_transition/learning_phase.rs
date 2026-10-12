@@ -121,9 +121,9 @@ impl SemanticLearningPhaseTransition {
         Identity256::from_bytes(digest.finalize().into())
     }
 
-    pub(super) fn apply(
+    pub(super) fn apply<B: PublicationByteStorage>(
         &self,
-        material: &mut PublicationMaterial,
+        material: &mut PublicationMaterialStorage<B>,
     ) -> Result<(SemanticLearningPhaseRecord, Option<LearningFoldPlan>), SemanticTransitionError>
     {
         if !matches!(
@@ -202,7 +202,10 @@ impl SemanticLearningPhaseTransition {
         // particular, its masters must not be reset from pre-absorption values.
         if fold.is_none() {
             let original = &material.model_allocations;
-            let mut allocations = original.clone();
+            let mut allocations = original
+                .iter()
+                .map(PublicationByteStorage::copy_owned)
+                .collect::<Result<Vec<_>, _>>()?;
             for operation in &self.recipe {
                 if matches!(operation, SemanticLearningCopyReset::Preserve { .. }) {
                     continue;
@@ -213,7 +216,7 @@ impl SemanticLearningPhaseTransition {
                     self.target,
                     self.phase_index,
                     |allocation, offset, value| {
-                        allocations[allocation][offset..offset + value.len()]
+                        allocations[allocation].writable_bytes()?[offset..offset + value.len()]
                             .copy_from_slice(value);
                         Ok(())
                     },
@@ -242,8 +245,7 @@ impl SemanticLearningPhaseTransition {
                         .model_memory
                         .location(range.range.role, range.range.index)?;
                     range.bytes = material.model_allocations[allocation]
-                        [offset..offset + range.bytes.len()]
-                        .to_vec();
+                        .slice_bytes(offset..offset + range.bytes.len())?;
                 }
             }
         }
@@ -271,8 +273,8 @@ impl SemanticLearningPhaseTransition {
     }
 }
 
-fn scalar_i64(
-    material: &PublicationMaterial,
+fn scalar_i64<B: PublicationByteStorage>(
+    material: &PublicationMaterialStorage<B>,
     key: (u64, u64),
 ) -> Result<i64, SemanticTransitionError> {
     let layout = material
@@ -293,8 +295,8 @@ fn scalar_i64(
     })?))
 }
 
-fn element_offsets<'a>(
-    material: &'a PublicationMaterial,
+fn element_offsets<'a, B: PublicationByteStorage>(
+    material: &'a PublicationMaterialStorage<B>,
     key: (u64, u64),
 ) -> Result<
     (
@@ -340,8 +342,8 @@ fn element_offsets<'a>(
     Ok((allocation, offsets))
 }
 
-fn visit_expected_values(
-    material: &PublicationMaterial,
+fn visit_expected_values<B: PublicationByteStorage>(
+    material: &PublicationMaterialStorage<B>,
     operation: &SemanticLearningCopyReset,
     target: SemanticLearningPhase,
     phase_index: u64,
@@ -489,9 +491,9 @@ fn original_float(value: &serde_json::Value) -> Result<f32, SemanticTransitionEr
     Ok(value)
 }
 
-fn view_key(
+fn view_key<B: PublicationByteStorage>(
     value: &serde_json::Value,
-    material: &PublicationMaterial,
+    material: &PublicationMaterialStorage<B>,
 ) -> Result<(u64, u64), SemanticTransitionError> {
     let fields = schema_array(&value["layout"])?;
     if fields.len() != 8 {
@@ -527,8 +529,8 @@ fn view_key(
 }
 
 impl LearningFoldPlan {
-    fn prepare(
-        material: &PublicationMaterial,
+    fn prepare<B: PublicationByteStorage>(
+        material: &PublicationMaterialStorage<B>,
         transition: &SemanticLearningPhaseTransition,
     ) -> Result<Self, SemanticTransitionError> {
         let record = material
@@ -1426,8 +1428,8 @@ pub(super) fn decode_history(
     Ok(history)
 }
 
-pub(super) fn validate_history(
-    material: &PublicationMaterial,
+pub(super) fn validate_history<B: PublicationByteStorage>(
+    material: &PublicationMaterialStorage<B>,
 ) -> Result<(), SemanticTransitionError> {
     let mut previous: Option<&SemanticLearningPhaseRecord> = None;
     for record in &material.learning_phases {

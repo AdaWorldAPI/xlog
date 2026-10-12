@@ -46,6 +46,8 @@ pub(super) struct PreparedActorRefreshOwner {
     pub(super) cancelled: Arc<AtomicBool>,
     pub(super) recording_ready: Arc<AtomicBool>,
     pub(super) target: Arc<PublicationStorage>,
+    pub(super) content_geometry: [SemanticPreparedSourceContentGeometry; 2],
+    _material_reservation: SemanticReplayMaterialReservation,
     work: Arc<ActorRefreshWork>,
     children: Mutex<[Option<Arc<()>>; 2]>,
     construction_pending: [Arc<AtomicBool>; 2],
@@ -123,10 +125,14 @@ pub(super) struct StagedActorRefresh {
 }
 
 struct ActorRefreshContextPreparation {
-    material: Vec<u8>,
+    material: Option<OwnedPublicationMaterial>,
+    material_digest: Identity256,
+    material_owner: Arc<()>,
     zero: crate::device::RetainedDeviceWrite<u64>,
     marker: Option<crate::device::RetainedDeviceWrite<PreparedActorRefreshDevice>>,
     admitted: [bool; 2],
+    dma_recorded: [bool; 2],
+    dma_allowance: Option<std::sync::Weak<Mutex<ColdNativeAllowance>>>,
     zero_done: bool,
     restore_done: bool,
     ready: bool,
@@ -170,52 +176,54 @@ pub(super) struct ActorRefreshWork {
     entries: [TrackedCudaSlice<ActorRefreshWorkEntry>; 2],
     components: Mutex<[Vec<Option<ActorRefreshObservedComponent>>; 2]>,
     frozen: Mutex<[Vec<bool>; 2]>,
+    initialization: Mutex<[ActorRefreshMetadataUploads; 2]>,
     uploads: Mutex<[Option<ActorRefreshMetadataUploads>; 2]>,
+    material_reservation: Arc<SemanticReplayMaterialReservation>,
 }
 
 struct ActorRefreshMetadataUploads {
-    entries: crate::device::RetainedDeviceWrite<ActorRefreshWorkEntry>,
-    header: crate::device::RetainedDeviceWrite<ActorRefreshWorkInput>,
-    admitted: [bool; 2],
+    entries: state_restoration::OriginalDeviceWrite,
+    header: state_restoration::OriginalDeviceWrite,
+    poisoned: bool,
     cursor: usize,
 }
 
 impl ActorRefreshMetadataUploads {
     fn complete(
         &mut self,
+        domain: &ResidentExecutionDomain,
         provider: &CudaKernelProvider,
         stream: &Arc<CudaStream>,
-        entry_bytes: usize,
+        may_submit: bool,
+        allowance: Option<&Arc<Mutex<ColdNativeAllowance>>>,
     ) -> Result<(), SemanticTransitionError> {
         while self.cursor < 2 {
-            let bytes = if self.cursor == 0 {
-                entry_bytes
-            } else {
-                size_of::<ActorRefreshWorkInput>()
-            };
-            if !self.admitted[self.cursor] {
-                provider.admit_launch_metadata_htod(bytes);
-                self.admitted[self.cursor] = true;
-            }
             let write = if self.cursor == 0 {
-                if !self.entries.entered() {
-                    self.entries
-                        .enqueue(stream)
-                        .map_err(|error| runtime_error("original actor metadata upload", error))?;
-                }
-                self.entries.resolve()
+                &mut self.entries
             } else {
-                if !self.header.entered() {
-                    self.header.enqueue(stream).map_err(|error| {
-                        runtime_error("original actor metadata publication", error)
-                    })?;
-                }
-                self.header.resolve()
+                &mut self.header
             };
-            write.map_err(|error| runtime_error("original actor metadata completion", error))?;
+            let may_submit = may_submit && !self.poisoned;
+            write.resolve_with_dma(
+                domain,
+                stream,
+                provider,
+                &mut self.poisoned,
+                may_submit,
+                allowance,
+            )?;
             self.cursor += 1;
         }
         Ok(())
+    }
+
+    fn retire(&mut self, stream: &Arc<CudaStream>) -> Result<(), SemanticTransitionError> {
+        self.entries.retire_without_result(stream)?;
+        self.header.retire_without_result(stream)
+    }
+
+    fn unresolved(&self) -> bool {
+        self.poisoned || self.entries.pending() || self.header.pending()
     }
 }
 
@@ -268,8 +276,34 @@ impl ActorRefreshObservedComponent {
 impl ActorRefreshWork {
     fn allocate(
         provider: &CudaKernelProvider,
+        stream: &Arc<CudaStream>,
         members: Vec<u64>,
+        budget: &SemanticReplayMaterialBudget,
     ) -> Result<Self, SemanticTransitionError> {
+        let rows = members.len();
+        let write_metadata = state_restoration::OriginalDeviceWrite::metadata_allocation_bytes::<
+            ActorRefreshWorkEntry,
+        >()
+        .checked_add(
+            state_restoration::OriginalDeviceWrite::metadata_allocation_bytes::<
+                ActorRefreshWorkInput,
+            >(),
+        )
+        .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        let bytes = rows
+            .checked_mul(
+                size_of::<u64>()
+                    + 2 * size_of::<Option<ActorRefreshObservedComponent>>()
+                    + 2 * size_of::<bool>()
+                    + 4 * size_of::<ActorRefreshWorkEntry>(),
+            )
+            .and_then(|bytes| bytes.checked_add(4 * size_of::<ActorRefreshWorkInput>()))
+            .and_then(|bytes| bytes.checked_add(4 * write_metadata))
+            .and_then(|bytes| bytes.checked_add(size_of::<Self>() + 4 * size_of::<usize>()))
+            .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        let material_reservation = Arc::new(budget.reserve_auxiliary(
+            u64::try_from(bytes).map_err(|_| SemanticTransitionError::GenerationExhausted)?,
+        )?);
         let inputs = [
             allocate_publication(provider, 1)?,
             allocate_publication(provider, 1)?,
@@ -279,18 +313,31 @@ impl ActorRefreshWork {
             allocate_publication(provider, members.len())?,
         ];
         let empty = vec![ActorRefreshWorkEntry::default(); members.len()];
-        for bank in 0..2 {
-            upload_publication(provider, &empty, &entries[bank])?;
-            upload_publication(
-                provider,
-                &[ActorRefreshWorkInput {
-                    abi: 0,
-                    entries: entries[bank].device_ptr_value(),
-                    count: members.len() as u64,
-                }],
-                &inputs[bank],
-            )?;
-        }
+        let stage = |bank| {
+            Ok::<_, SemanticTransitionError>(ActorRefreshMetadataUploads {
+                entries: state_restoration::OriginalDeviceWrite::new_with_owner(
+                    stream,
+                    &empty,
+                    entries[bank].view(),
+                    false,
+                    Some(Arc::clone(&material_reservation)),
+                )?,
+                header: state_restoration::OriginalDeviceWrite::new_with_owner(
+                    stream,
+                    &[ActorRefreshWorkInput {
+                        abi: 0,
+                        entries: entries[bank].device_ptr_value(),
+                        count: members.len() as u64,
+                    }],
+                    inputs[bank].view(),
+                    false,
+                    Some(Arc::clone(&material_reservation)),
+                )?,
+                poisoned: false,
+                cursor: 0,
+            })
+        };
+        let initialization = [stage(0)?, stage(1)?];
         let components = [vec![None; members.len()], vec![None; members.len()]];
         let frozen = [vec![false; members.len()], vec![false; members.len()]];
         Ok(Self {
@@ -299,8 +346,41 @@ impl ActorRefreshWork {
             entries,
             components: Mutex::new(components),
             frozen: Mutex::new(frozen),
+            initialization: Mutex::new(initialization),
             uploads: Mutex::new([None, None]),
+            material_reservation,
         })
+    }
+
+    fn initialize(
+        &self,
+        domain: &ResidentExecutionDomain,
+        provider: &CudaKernelProvider,
+        stream: &Arc<CudaStream>,
+        may_submit: bool,
+        allowance: Option<&Arc<Mutex<ColdNativeAllowance>>>,
+    ) -> Result<(), SemanticTransitionError> {
+        let mut original = self.initialization.lock().map_err(|_| {
+            publication_input_error("original actor initialization custody is poisoned")
+        })?;
+        for bank in &mut *original {
+            bank.complete(domain, provider, stream, may_submit, allowance)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn metadata_dma_native_work_ceiling(
+        members: usize,
+    ) -> Result<[u64; 9], SemanticTransitionError> {
+        let members =
+            u64::try_from(members).map_err(|_| SemanticTransitionError::GenerationExhausted)?;
+        let bytes = actor_work_add(
+            actor_work_mul(members, size_of::<ActorRefreshWorkEntry>() as u64)?,
+            size_of::<ActorRefreshWorkInput>() as u64,
+        )?;
+        let ceiling = [8, 0, 0, 0, 0, 0, 0, 0, actor_work_mul(4, bytes)?];
+        native_work_bound::native_work_ceiling_units(ceiling)?;
+        Ok(ceiling)
     }
 
     fn record(
@@ -651,10 +731,10 @@ impl SemanticTransitionSession {
     /// Bind every original sealed episode in original index order. The trusted
     /// typed importer verifies complete index coverage before this call; native
     /// batch receipts, not row count or host flags, determine qualified actors.
-    pub fn bind_actor_refresh_initial_episodes(
+    pub fn bind_actor_refresh_initial_episodes<B: AsRef<[u8]>>(
         &mut self,
         index_identity: Identity256,
-        initial_episodes: &[(SemanticReplayMaterial, Identity256, Vec<u8>)],
+        initial_episodes: &[(SemanticReplayMaterial, Identity256, B)],
     ) -> Result<u64, SemanticTransitionError> {
         self.ensure_quiescent()?;
         if index_identity == Identity256::default() || self.prepared_segment.is_some() {
@@ -665,7 +745,8 @@ impl SemanticTransitionSession {
         let mut episodes = Vec::with_capacity(initial_episodes.len());
         let mut actors = Vec::new();
         for (material, batch_identity, batch_bytes) in initial_episodes {
-            let (origin, actor) = initial_episode_actor(material, *batch_identity, batch_bytes)?;
+            let (origin, actor) =
+                initial_episode_actor(material, *batch_identity, batch_bytes.as_ref())?;
             if episodes.iter().any(|(previous, _)| previous == &origin) {
                 return Err(publication_input_error(
                     "initial episode roster repeats an original action",
@@ -709,6 +790,7 @@ impl SemanticTransitionSession {
         material: &SemanticReplayMaterial,
         batch_identity: Identity256,
         batch_bytes: &[u8],
+        content_geometry: [SemanticPreparedSourceContentGeometry; 2],
     ) -> Result<SemanticPreparedActorRefresh, SemanticTransitionError> {
         self.require_prepared_replay_parent(step, released_parent)?;
         self.require_prepared_structure_mutable()?;
@@ -753,6 +835,35 @@ impl SemanticTransitionSession {
             .ok_or_else(|| {
                 publication_input_error("actor refresh row is outside the frozen actor group")
             })?;
+        for (bank, geometry) in content_geometry.iter().enumerate() {
+            geometry.require_original_actor_refresh(self, step, bank, &member, material)?;
+        }
+        let inputs = Arc::clone(
+            owner
+                .inputs
+                .as_ref()
+                .ok_or(SemanticTransitionError::NotBound)?,
+        );
+        let metadata_bytes = training
+            .actor_group_members()
+            .len()
+            .checked_mul(size_of::<u64>())
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    inputs
+                        .model_slots
+                        .len()
+                        .checked_mul(size_of::<Arc<ModelGenerationOwner>>())?,
+                )
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(size_of::<PreparedActorRefreshOwner>() + 8 * size_of::<usize>())
+            })
+            .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        let material_reservation = content_geometry[0].material_budget().reserve_auxiliary(
+            u64::try_from(metadata_bytes)
+                .map_err(|_| SemanticTransitionError::GenerationExhausted)?,
+        )?;
         let actor_members = training
             .actor_group_members()
             .iter()
@@ -762,12 +873,6 @@ impl SemanticTransitionSession {
         if !actor || actual_origin != member.origin {
             return Err(SemanticTransitionError::ObservationMismatch);
         }
-        let inputs = Arc::clone(
-            owner
-                .inputs
-                .as_ref()
-                .ok_or(SemanticTransitionError::NotBound)?,
-        );
         let models = inputs
             .model_slots
             .iter()
@@ -857,11 +962,25 @@ impl SemanticTransitionSession {
             }
             Arc::clone(original)
         } else {
-            let work = Arc::new(ActorRefreshWork::allocate(&self.provider, actor_members)?);
+            let work = Arc::new(ActorRefreshWork::allocate(
+                &self.provider,
+                &self.stream,
+                actor_members,
+                &content_geometry[0].material_budget(),
+            )?);
             self.actor_refresh_work
                 .insert(step.token, Arc::clone(&work));
             work
         };
+        // The Session owns every exact staging command before any upload can
+        // enter. An uncertain command remains on this same original Update.
+        work.initialize(
+            &self.domain,
+            &self.provider,
+            &self.stream,
+            self.original_session_completion_may_submit(),
+            self.graph.cold_work_allowance().as_ref(),
+        )?;
         let proof = SemanticPreparedActorRefresh {
             inner: Arc::new(PreparedActorRefreshOwner {
                 issuer: Arc::clone(&self.publication_issuer),
@@ -893,11 +1012,16 @@ impl SemanticTransitionSession {
                         .recording_ready,
                 ),
                 target: Arc::clone(self.prepared_publication()?),
+                content_geometry,
+                _material_reservation: material_reservation,
                 work,
                 children: Mutex::new([None, None]),
                 construction_pending: std::array::from_fn(|_| Arc::new(AtomicBool::new(false))),
             }),
         };
+        for geometry in &proof.inner.content_geometry {
+            geometry.bind_original_actor_refresh(&proof.inner)?;
+        }
         if let Some(assignment) = self.actor_refresh_program.as_mut().and_then(|program| {
             program
                 .main_origins
@@ -958,6 +1082,7 @@ impl SemanticTransitionSession {
                 records,
                 limits,
                 work,
+                self.replay_material_budget.clone(),
             )
             .map_err(SemanticTransitionError::Semantic)?;
         let binding = Arc::new(ActorRefreshConstructionBinding {
@@ -985,6 +1110,7 @@ impl SemanticTransitionSession {
             session: None,
             completed: None,
             binding,
+            replay_material_budget: self.replay_material_budget.clone(),
             retired: false,
         })
     }
@@ -1162,6 +1288,7 @@ impl SemanticTransitionSession {
     pub fn restore_actor_refresh_context(
         &mut self,
         material: &SemanticReplayMaterial,
+        resolved: SemanticResolvedReplayMaterial,
         proof: &SemanticPreparedActorRefresh,
         target_bank: usize,
     ) -> Result<(), SemanticTransitionError> {
@@ -1175,21 +1302,22 @@ impl SemanticTransitionSession {
                 "actor context requires its exact original row and current model owner",
             ));
         }
-        let material_bytes = material.predecessor.encode()?;
+        let (decoded, material_digest) = resolved.into_original(material)?;
         if let Some(original) = &self.actor_refresh {
+            let context = original
+                .context
+                .lock()
+                .map_err(|_| publication_input_error("actor context custody is poisoned"))?;
             if !Arc::ptr_eq(&original.proof.inner, &proof.inner)
                 || original.target_bank != target_bank
-                || original
-                    .context
-                    .lock()
-                    .map_err(|_| publication_input_error("actor context custody is poisoned"))?
-                    .material
-                    != material_bytes
+                || context.material_digest != material_digest
+                || !Arc::ptr_eq(&context.material_owner, &material.proof_owner)
             {
                 return Err(publication_input_error(
                     "actor context changed its original restoration",
                 ));
             }
+            drop(context);
             return self.resolve_actor_refresh_context(proof, target_bank);
         }
         if proof.inner.cancelled.load(Ordering::Acquire)
@@ -1216,10 +1344,18 @@ impl SemanticTransitionSession {
             crate::device::RetainedDeviceWrite::new(&stream, &[0u64; 11], native_work.view())
                 .map_err(|error| runtime_error("original actor work staging", error))?;
         let context = Arc::new(Mutex::new(ActorRefreshContextPreparation {
-            material: material_bytes,
+            material: Some(decoded),
+            material_digest,
+            material_owner: Arc::clone(&material.proof_owner),
             zero,
             marker: None,
             admitted: [false; 2],
+            dma_recorded: [false; 2],
+            dma_allowance: self
+                .graph
+                .cold_work_allowance()
+                .as_ref()
+                .map(Arc::downgrade),
             zero_done: false,
             restore_done: false,
             ready: false,
@@ -1294,6 +1430,17 @@ impl SemanticTransitionSession {
         if retained.ready {
             return Ok(());
         }
+        let allowance = self.graph.cold_work_allowance();
+        if retained.dma_allowance.as_ref().is_some_and(|issued| {
+            allowance
+                .as_ref()
+                .is_none_or(|actual| !issued.ptr_eq(&Arc::downgrade(actual)))
+        }) || retained.dma_allowance.is_none() && allowance.is_some()
+        {
+            return Err(publication_input_error(
+                "original actor context changed its native tally owner",
+            ));
+        }
         if !retained.zero_done {
             if !retained.admitted[0] {
                 self.provider
@@ -1302,9 +1449,31 @@ impl SemanticTransitionSession {
             }
             if !retained.zero.entered() {
                 self.ensure_quiescent_except_actor_context(&issuance)?;
-                retained
-                    .zero
-                    .enqueue(&self.stream)
+                if let Some(allowance) = &allowance {
+                    allowance
+                        .lock()
+                        .map_err(|_| {
+                            publication_input_error("original cold allowance is poisoned")
+                        })?
+                        .require_submitted_dma(11 * size_of::<u64>(), retained.dma_recorded[0])?;
+                }
+                let ActorRefreshContextPreparation {
+                    zero, dma_recorded, ..
+                } = &mut *retained;
+                let submission = zero.enqueue(&self.stream);
+                if zero.submitted() {
+                    if let Some(allowance) = &allowance {
+                        allowance
+                            .lock()
+                            .map_err(|_| {
+                                publication_input_error("original cold allowance is poisoned")
+                            })?
+                            .record_submitted_dma(11 * size_of::<u64>(), &mut dma_recorded[0])?;
+                    } else {
+                        dma_recorded[0] = true;
+                    }
+                }
+                submission
                     .map_err(|error| runtime_error("original actor work initialization", error))?;
             }
             retained
@@ -1318,8 +1487,12 @@ impl SemanticTransitionSession {
                 self.resolve_state_material_restore()?
             } else {
                 self.ensure_quiescent_except_actor_context(&issuance)?;
-                self.restore_state_material_inner(
-                    &retained.material,
+                let material = retained.material.take().ok_or_else(|| {
+                    publication_input_error("actor context lost its original resolved material")
+                })?;
+                self.restore_decoded_state_material(
+                    material,
+                    retained.material_digest,
                     None,
                     Some(RestoredModelOwners::Current {
                         owners: &proof.inner.models,
@@ -1373,11 +1546,40 @@ impl SemanticTransitionSession {
                 .admit_launch_metadata_htod(size_of::<PreparedActorRefreshDevice>());
             retained.admitted[1] = true;
         }
-        let marker = retained.marker.as_mut().expect("original actor marker");
+        let ActorRefreshContextPreparation {
+            marker,
+            dma_recorded,
+            ..
+        } = &mut *retained;
+        let marker = marker.as_mut().expect("original actor marker");
         if !marker.entered() {
             self.ensure_quiescent_except_actor_context(&issuance)?;
-            marker
-                .enqueue(&self.stream)
+            if let Some(allowance) = &allowance {
+                allowance
+                    .lock()
+                    .map_err(|_| publication_input_error("original cold allowance is poisoned"))?
+                    .require_submitted_dma(
+                        size_of::<PreparedActorRefreshDevice>(),
+                        dma_recorded[1],
+                    )?;
+            }
+            let submission = marker.enqueue(&self.stream);
+            if marker.submitted() {
+                if let Some(allowance) = &allowance {
+                    allowance
+                        .lock()
+                        .map_err(|_| {
+                            publication_input_error("original cold allowance is poisoned")
+                        })?
+                        .record_submitted_dma(
+                            size_of::<PreparedActorRefreshDevice>(),
+                            &mut dma_recorded[1],
+                        )?;
+                } else {
+                    dma_recorded[1] = true;
+                }
+            }
+            submission
                 .map_err(|error| runtime_error("original actor marker initialization", error))?;
         }
         marker
@@ -1629,13 +1831,14 @@ impl SemanticTransitionSession {
                         })
                     })
                     .collect::<Result<Vec<_>, SemanticTransitionError>>()?;
-                let entry_write = crate::device::RetainedDeviceWrite::new(
+                let entry_write = state_restoration::OriginalDeviceWrite::new_with_owner(
                     &self.stream,
                     &entries,
                     work.entries[bank].view(),
-                )
-                .map_err(|error| runtime_error("original actor metadata staging", error))?;
-                let header_write = crate::device::RetainedDeviceWrite::new(
+                    false,
+                    Some(Arc::clone(&work.material_reservation)),
+                )?;
+                let header_write = state_restoration::OriginalDeviceWrite::new_with_owner(
                     &self.stream,
                     &[ActorRefreshWorkInput {
                         abi: 1,
@@ -1643,24 +1846,26 @@ impl SemanticTransitionSession {
                         count: work.members.len() as u64,
                     }],
                     work.inputs[bank].view(),
-                )
-                .map_err(|error| runtime_error("original actor metadata staging", error))?;
+                    false,
+                    Some(Arc::clone(&work.material_reservation)),
+                )?;
                 uploads[bank] = Some(ActorRefreshMetadataUploads {
                     entries: entry_write,
                     header: header_write,
-                    admitted: [false; 2],
+                    poisoned: false,
                     cursor: 0,
                 });
             }
-            let bytes = work
-                .members
-                .len()
-                .checked_mul(size_of::<ActorRefreshWorkEntry>())
-                .ok_or(SemanticTransitionError::GenerationExhausted)?;
             uploads[bank]
                 .as_mut()
                 .expect("retained original actor metadata")
-                .complete(&self.provider, &self.stream, bytes)?;
+                .complete(
+                    &self.domain,
+                    &self.provider,
+                    &self.stream,
+                    self.original_session_completion_may_submit(),
+                    self.graph.cold_work_allowance().as_ref(),
+                )?;
         }
         Ok(())
     }
@@ -2047,6 +2252,19 @@ impl SemanticTransitionSession {
         &self,
     ) -> Result<(), SemanticTransitionError> {
         for (&token, work) in &self.actor_refresh_work {
+            if work
+                .initialization
+                .lock()
+                .map_err(|_| {
+                    publication_input_error("original actor initialization custody is poisoned")
+                })?
+                .iter()
+                .any(|original| original.cursor != 2 || original.unresolved())
+            {
+                return Err(publication_input_error(
+                    "original actor metadata initialization is still unresolved",
+                ));
+            }
             let build = self
                 .prepared_segment
                 .as_ref()
@@ -2123,6 +2341,35 @@ impl SemanticTransitionSession {
                         "original Update allowance cannot admit its retained actor model and initialization producers",
                     ));
                 }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn has_unresolved_actor_refresh_metadata(&self) -> bool {
+        self.actor_refresh_work.values().any(|work| {
+            work.initialization
+                .lock()
+                .map_or(true, |original| original.iter().any(|write| write.unresolved()))
+                || work.uploads.lock().map_or(true, |original| {
+                    original.iter().flatten().any(|write| write.unresolved())
+                })
+        })
+    }
+
+    pub(super) fn retire_actor_refresh_work_metadata(&self) -> Result<(), SemanticTransitionError> {
+        for work in self.actor_refresh_work.values() {
+            let mut initialization = work.initialization.lock().map_err(|_| {
+                publication_input_error("original actor initialization custody is poisoned")
+            })?;
+            for original in &mut *initialization {
+                original.retire(&self.stream)?;
+            }
+            let mut uploads = work.uploads.lock().map_err(|_| {
+                publication_input_error("original actor metadata custody is poisoned")
+            })?;
+            for original in uploads.iter_mut().flatten() {
+                original.retire(&self.stream)?;
             }
         }
         Ok(())

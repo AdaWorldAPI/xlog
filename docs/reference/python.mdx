@@ -218,11 +218,207 @@ prepared SOURCE import and returns its full original
 `(allocation_bytes, storages, views)`; each storage is
 `(allocation, byte_offset, span_bytes)` and each view is
 `(role, index, storage, byte_offset, layout)` with the existing tensor layout.
-Use `parent.resident_model_memory(consumer_stream=...)` for the actual resident
-allocation aliases of an acquired parent, not metadata as a replacement for
-physical ownership. Actual numerical record reads, full material comparison,
+Before any source factory or tensor export, call
+`controller.prepare_source_content_geometry(task_use,
+instruction_admission=original_instruction)`. It returns the original complete
+SOURCE roster, with immutable `kind()`, `step_index()`, `member_ordinal()` and
+`bank()` selectors. Each handle exposes the cached `source_task()` pair,
+guarded `model_contract_material()`, opaque original allocation identities in
+`model_memory_layouts()`, and input, feedback and policy tensor layouts. Opaque
+allocation identities are not physical device pointers or execution rights.
+Historical handles expose their independent `model_restore_context()`.
+CURRENT handles carry structural proof only: numerical identity and generation
+come from the genuine Actor/bank, not a historical checkpoint restore.
+
+Retain each geometry owner with its projected metadata. Its
+`task_training_domain()` returns the original native domain identity and cold
+projection; `task_objective_law()` uses the original verified scoring identity
+and the same canonical law serializer as the eventual task use.
+`policy_layout()`, `policy_support_layout()`, `feedback_schema()`,
+`prefix_capacity()`, `feedback_capacity()`, `schema_generation()`,
+`structural_capacities()` and `position_table_identity()` project that same
+original source, never the outer task. The fresh child factories have no pending
+learning phase: `learning_feedback_intervention()` returns their authenticated
+`None` baseline, which original late SOURCE/CURRENT binding checks again. This
+does not define the intervention of an ordinary restored phase owner.
+`policy_numerical_domain_layouts()` projects the three genuine FP64 uniform
+allocations separately from the nine policy-logit snapshots; it does not export
+tensors or read values.
+
+The four tensor geometry getters (`input_tensor_layouts`,
+`feedback_tensor_layouts`, `policy_tensor_layouts` and
+`policy_numerical_domain_layouts`) omit section keywords for historical SOURCE.
+CURRENT must pass `prepared_kind="recompute" | "proposal"` and
+`prepared_bank=0 | 1`; uniform domains belong only to Proposal. This selects the
+actual original allocation partition, not a blanket new owner per section.
+Within one child, with R denoting Recompute and P denoting Proposal:
+
+| Original backing | Sharing between sections |
+| --- | --- |
+| Prefix, role 1 | R0 = R1 = P0 = P1 |
+| Cache, roles 4/5 | R0 = P0; R1 = P1; banks differ |
+| Private input, roles 3 and 6–13 | R0 = R1; P0 = P1; steps differ |
+| Header and separately Source | Same step partition; Header fields share their Header |
+| Each of six feedback buffers | Same step partition; the six buffers differ |
+| Three uniform buffers | P0 and P1 differ |
+
+This table does not identify backings across distinct children. The model
+input-generation port remains shared as described below. External policy
+outputs retain their original producer/witness and alias proof; equal typed
+layouts do not establish native storage sharing.
+`policy_tensor_layouts` returns only the nine canonical typed layouts, without
+native allocation or version leaves. Those outputs remain external producers;
+their real capture supplies storage, offset and alias proof. The three uniform
+inputs are distinct genuine native allocations, not these external outputs.
+
+After issuing the original source roster, obtain each target Update's input
+generation with `controller.model_input_generation_port(task_use,
+instruction_admission=original_instruction, step_index=...)`. A CURRENT geometry
+returns the same native declaration from `model_input_generation_port()`.
+`same_port()` tests original declaration identity; `model_memory_layouts()` uses
+the existing opaque allocation/storage/view projection. The native allocator
+binds this declaration once to the exact admitted parent for the first Update,
+and to the preceding Update's original output generation thereafter.
+`allocation_matches(declared_allocation, actual_native_allocation)` validates
+the late physical owner; an unbound future is an error and a valid foreign
+backing compares unequal. Equal shape, byte span or ancestor is never that join.
+Retain this port and each distinct tensor/storage/version owner through its last
+use. These metadata ports are not replacement task uses or numerical grants.
+
+Freeze each early handle's complete expression roster with
+`content_family(phase, kind)` and `freeze_content_occurrences(events=...)`
+before its original factory effects. During the corresponding historical
+preparation, call
+`prepared.prepare_source_content(consumer_stream=...,
+resident_memory=prepared_model_restore.resident_memory,
+content_geometry=original_geometry)`. The resulting
+`SemanticPreparedSourceContent` reuses that original resident carrier and
+allocates the original model-context, prefix, terminal-state, feedback and cache
+outputs without numerical preparation. Its `model_context()`, `prefix()`,
+`terminal_state()`, `feedback()`, `tensor(role, index)` and
+`tensor_allocation(role, index)` methods return the original cached structural
+ports, not content witnesses or permission to read uninitialized values.
+No second resident carrier or re-exported capsule is created. The same original
+prepared import retains the recipe and both authenticated target deliveries;
+actual model-content witnesses remain mandatory after admitted execution.
+Retain the recipe while any returned structural tuple, provenance or capsule
+metadata remains held, including a consumed `used_dltensor` capsule. Known
+physical port retirement releases its physical aliases, but the recipe keeps
+the original projection receipt until those borrowed metadata owners leave the
+caller's lifetime. This retention does not extend numerical or reader rights.
+
+The late recipe binds the same early frozen owner; its
+`freeze_content_occurrences(events=...)` accepts only the original event tuple
+and returns the same cached handles, without compiling a second roster.
+For CURRENT, `update.prepare_actor_refresh(member_ordinal,
+refresh_snapshot=original_source,
+content_geometry=(original_bank0_geometry, original_bank1_geometry))` binds
+the two handles to the original Actor preparation. It does not execute the
+historical restore, checkpoint comparison or gradient-presence copy.
+Phases are `"model"`,
+`"pack-policy"` and `"finalize-continuation"`; kinds are `"bind-model"`,
+`"capture"` and `"verify"`. For historical SOURCE, the first event binds the original published model
+through `controller.bind_model_content(...)`, using its original parent receiver
+and authentic output witness. Each immutable event contains the original family,
+receiver slot, optional bind/capture-output slot, tensor descriptors and allocation descriptors.
+Tensor descriptors contain the existing tensor layout, logical begin/end,
+storage slot, optional version slot, allocation slot and byte offset. Allocation
+descriptors contain the original slot, full owned allocation/storage byte extent
+and existing native provenance when present. The extent is not a caching
+allocator's containing CUDA block. A missing version slot makes no counter claim;
+known storage/counter object partitions still require the canonical caller's
+authentic producer bindings. Native content identity and byte guards remain
+mandatory, as do the strict model/learning restoration partitions.
+
+Each early CURRENT geometry belongs to one original outer Actor bank. Freeze its
+four independent sections in the same original roster: Recompute banks zero and
+one use model then finalize-continuation; Proposal banks zero and one use model,
+pack-policy then finalize-continuation. Create these families with
+`geometry.content_family(phase, kind, prepared_kind="recompute" | "proposal",
+prepared_bank=0 | 1)`. Both keywords are mandatory for CURRENT and absent for
+historical SOURCE. The event tuple remains the same five fields.
+Family and occurrence `prepared_kind()` and `prepared_bank()` project that
+original section; occurrence `phase()` identifies its existing phase.
+CURRENT starts with verification of the already-recorded original prepared bank
+model witness, not another BindModel. The actual prepared child selects its one
+section and advances only that section's cursor after the same recorder succeeds.
+Other sections are neither replayed nor marked complete. Unknown retains the
+original physical custody; known joined child retirement releases its physical
+aliases without changing the immutable frozen proof.
+
+Pass the original Historical geometry tuple retained by the plan, in its original
+order, as `source_content` to the same `original_work.admit_plan(...)` that admits
+model work. Native resolves each geometry through its existing once-only recipe
+binding to the same live source-content owner. It checks the original instruction,
+report and Historical kind, rejects missing or expired bindings and CURRENT
+geometry, and preserves the existing roster/order, allowance, unentered-state and
+sealed-destination checks. This creates no recipe or freezer and does not reorder
+or deduplicate the tuple. An original source-content recipe is also accepted.
+Native derives preparation
+and full ordered content-event costs from the original geometry and authenticated
+delivery roster; no count, price or remaining budget is supplied by the caller.
+The original `controller.bind_model_content(...)`, `controller.capture_tensor_content(...)`
+and witness `verify(...)`
+consume `occurrence=original_handle`, including every inner model-body guard.
+`pack_policy_occurrences()` and `finalize_continuation_occurrences()` project the
+same already-issued handles, without a second freeze or replacement wrappers.
+Unknown completion retains that exact handle, native command and input custody;
+continuation does not re-run producer callbacks. Structural projections do not
+establish numerical completion or GPU acceptance.
+
+At the original admitted SOURCE preparation, call
+`recipe.activate(consumer_stream=...)` under its already-issued recorder, before
+dependent reads. The original fresh recording permit authenticates its native
+preparation; an Unknown operation resumes its same retained owner and cursor.
+`terminal_state_allocation()` returns the cached native provenance of the same
+eight-byte terminal view, without exporting or exposing its full private header.
+It is not a replacement for the model's required full-allocation export.
+
+Use `parent.prepare_resident_model_memory(consumer_stream=...)` when the whole
+original numerical plan must freeze before content access. It returns an
+original `SemanticPreparedResidentModelMemory` carrier. `carrier.memory` caches
+the same six-field resident envelope with genuine full-allocation capsules,
+issued once; `carrier.model_contract_metadata` caches the original record bytes
+and layout. Structural preparation performs no content guard, private-step
+copy, stream ordering or event creation and grants no numerical rights.
+Call `carrier.activate(consumer_stream=...)` at **each** admitted numerical
+occurrence, before its first read. It checks the original typed seals and full
+backing seals, without a one-time Python success flag. Unknown activation keeps
+the same native Session owner, reader, immutable envelope, commands and streams;
+retry that carrier only, without re-export, restaging or numerical replay.
+Retain the carrier in the original cold lifetime and drop it at that lifetime's
+export teardown before parent release. Surviving physical model aliases retain
+the original numerical generation independently, not that publication reader.
+The ordinary `parent.resident_model_memory(consumer_stream=...)` API uses the
+same canonical structural preparation followed by immediate content activation.
+Metadata does not replace physical ownership. Actual numerical record reads, full material comparison,
 gradient-presence values and live-state guards remain in the original charged
 execution callback.
+
+Before the original report is admitted, `carrier.prepare_resident_read(work)`
+issues an opaque `SemanticResidentModelRead` for that exact original region.
+Pass each actual occurrence as `resident_reads=((region_ordinal, read), ...)`
+to the report's existing `admit_plan`. Native checks the original report and
+ordered region roster, then claims the same carrier's typed and full-backing
+guard before its numerical read. Distinct occurrences cannot be collapsed into
+one success flag; a skipped region requires the original native no-entry proof.
+
+Inside the original snapshot region of an intermediate restore,
+`work.prepare_resident_model_restoration(carrier)` returns the same retained
+`SemanticPreparedResidentModelRestoration`, with opaque `restore_read` and
+`snapshot_read` occurrences for that original four-region report. This is
+structural metadata, not a restored allocation or permission to run a factory.
+Its `training_domain` and `objective_law` use the original verified task
+projection; `feedback_intervention` uses the original pending restore branch,
+not inherited source feedback rights. These immutable planning projections are
+checked against the actual child before its model callback. New gradient leaves
+still belong to that actual restored model, never to the source carrier.
+The original Snapshot0 binds its authentic native proof before source retirement;
+the same issuer then travels through the canonical native restore. Later reads
+must match that actual completed restore, original source proof, typed geometry
+and stream. Failed Python projection retains the same original issuer, while
+unknown restoration retains its original pending native owner. A digest, shape,
+different factory result or independently reconstructed carrier cannot substitute.
 
 `task_use.learning_feedback_intervention(parent)` projects the same original
 feedback metadata later exposed by the authentic model-content witness. The
@@ -348,6 +544,14 @@ available only after native graph retirement and final-use quiescence; it
 returns no R/P outcomes and starts no numerical work.
 The callback window closes on every return or error. An uncertain callback
 retains the original owners and cannot be repeated as another cleanup attempt.
+Inside that same genuine final callback, each original
+`step.retirement_consumer_streams()` returns its native joined final-use roster.
+It authenticates the retained step, task and segment and requires known original
+completion or cancellation plus actual graph retirement. It acquires no bank
+reader, performs no numerical work and releases no storage. An earlier cleanup,
+Python retirement flag or unknown completion cannot expose this receipt. Release
+the compiler's corresponding counter alias before the native producer storage is
+retired; a surviving imported alias still retains its original allocation.
 Register the fresh actor's delivery with `actor_refresh=refresh`. Register the
 historical demonstration with `group_member=member, edit_only=True`, and pass
 the same `edit_only=True` to `member.group_update_vjp(...)`. The native owner
@@ -435,7 +639,8 @@ or repeating retirement. If only terminal encoding failed after retirement,
 `retire_segment` continues that original metadata suffix with the same task and
 consumer streams, without repeating producer callbacks or device retirement.
 
-`restore_cancelled_checkpoint(checkpoint, *, program_bytes, ...)` authenticates
+`restore_cancelled_checkpoint(checkpoint, *, program_bytes, material_source,
+max_resolved_material_bytes, ...)` authenticates
 the exact original Program and complete signed state, including its native task
 binding, against the independently pinned `learning_phase_checkpoint_issuer`.
 No caller-derived task identity is accepted. Phase-marked capsules additionally
@@ -443,7 +648,10 @@ require the complete existing lifecycle proof and current snapshot. A valid
 terminal raises `SemanticTransitionCheckpointCancelled`, carrying `checkpoint`,
 `task_identity`, `first_program_ordinal`, `end_program_ordinal`, `proposal_spent`
 and the full `parent_identity`. Invalid or nonterminal input is rejected. This
-metadata-only entry creates no CUDA provider, task, model or Runtime. Normal
+metadata-only entry creates no CUDA provider, task, model or Runtime.
+Bind the same durable material store and exact saved resolved-memory cap before
+decoding; this entry uses the original shared payload and metadata pool, not an
+unbounded inspection decoder. Normal
 `restore_checkpoint` makes the same authenticated terminal decision before
 memory admission or any device/model entry. Cancelled is terminal; an unknown
 execution cannot acquire this disposition or admit a replacement instruction.
@@ -510,7 +718,27 @@ including values larger than 64 bits. No additional native identity projection o
 rewritten record is required.
 
 The transported material pairs retain the original ordered references and exact
-bytes (or an explicitly declared reconstruction). The training-view material
+bytes (or an explicitly declared reconstruction). A stored payload is
+`("stored", (st_dev, st_ino), digest_hex, positive_size)` from the originally
+opened material directory. `material_source` is the exact immutable tuple
+`((st_dev, st_ino), tuple(sorted((digest_hex, positive_size), ...)), resolve_material)`.
+Retain one original resolver callable; it receives `(digest_hex, limit)` and
+returns exact `bytes`. Registry binding validates the sealed roster without
+loading its payloads. Its identity and resolver cannot change; additional
+entries form a monotone union, and contradictory sizes are rejected.
+
+`import_task`, `task_observation_roots` and `restore_checkpoint` also require
+the original positive `max_resolved_material_bytes`. This is one shared pool
+for live payloads, copies, decoder scratch and native readbacks, not the
+cumulative store size or whole-process RSS. The original pool reserves both
+resolver-result and retained-copy extents before invoking the resolver.
+Children and Pending operations retain that same pool. Training-arena admission
+and replay-delivery acknowledgement pass the same `material_source` and inherit
+its cap; they cannot resize it. Fresh restore checks the saved store and cap
+before native decoding or model factory invocation. These checks do not prove
+that the complete model, verifier and operation fit their separate memory limit.
+
+The training-view material
 uses the producer's `training-view/v2` bytes; the older v1 layout is not
 accepted or converted. Its 264-byte header binds identity, source, dimensions,
 answer boundary and three declared branch spans (all zero without branches).
@@ -670,7 +898,7 @@ FINAL output and its acknowledgement-only operation remain unchanged.
 
 After durable checkpoint and actual external execution,
 `controller.acknowledge_replay_delivery(task_use, parent=..., snapshot=...,
-delivery_receipt=..., result_receipt=..., replay_row=...)` accepts one complete
+delivery_receipt=..., result_receipt=..., replay_row=..., material_source=...)` accepts one complete
 original episode transport row, including every original material and native
 publication evidence. It rejects actor rows and checkpoint-only referents.
 The result receipt is HMAC-SHA256 under the bound receiver key over
@@ -714,14 +942,31 @@ The secret key is never put in the checkpoint. Failed authentication or reader
 cleanup does not install a receiver binding or enable those rows.
 
 `SemanticTransitionController.save_checkpoint(task_use, *, parent,
-consumer_streams, snapshot, snapshot_model_state)` returns one sealed `bytes`
+consumer_streams, snapshot, snapshot_model_state, model_material_capacity,
+model_material_working_bytes, original_writer=None)` returns one sealed
+`SemanticMaterialBytes`
 value containing the selected native publication, the task capsule, the session
 allocation contract, and the application's exact model-state bytes. The controller
 joins every listed consumer stream before the cold native export. It then calls
-`snapshot_model_state()` exactly once on the creator thread without holding the
+`snapshot_model_state(original_writer)` exactly once on the creator thread without holding the
 native owner or task-state lock, and revalidates the task binding and acquired
-publication before sealing the result. The callback must return exact builtin
-`bytes`; failure or concurrent mutation returns no checkpoint.
+publication before sealing the result. The callback writes into this original
+native writer and returns its sealed `SemanticMaterialBytes`; no complete
+model-state `bytes` copy or second checkpoint backing is created. Unknown
+completion retains the original export, callback, writer, bounds and cursor;
+continuation does not invoke a replacement producer.
+
+For a compiled cold report, obtain each original region's metadata-only writer
+before freeze with `work.prepare_checkpoint_writer(region_ordinal=...,
+model_material_capacity=..., model_material_working_bytes=...)`. Derive both
+bounds from that same actual or projected prepared snapshot. The original
+region strongly retains this exact `SemanticMaterialWriter`, including when
+its future parent does not yet exist. Compose the snapshot with it, pass it as
+`original_writer` to the same save core, and consume that same object in the
+later callback. Distinct regions, including a future restored snapshot, never
+share or replace writers. Pure `region_ordinal`, `model_material_capacity` and
+`model_material_working_bytes` getters grant no execution rights; physical
+activation still requires the original live report and fresh recording permit.
 The serializer runs inside native's temporary controlled-reader scope for that
 actual parent. It can bind and verify the selected model against the original
 publication even when the stable task is `Imported`. Native does not invent an
@@ -1022,7 +1267,7 @@ labels, accumulate all required loss groups into the actual physical parameters,
 and supply both independent physical-block checks.
 
 `SemanticTransitionController.admit_training_arena(task_use, *, parent,
-consumer_streams, snapshot, replay_rows, training_objective, training_domain,
+consumer_streams, snapshot, replay_rows, material_source, training_objective, training_domain,
 refresh_snapshot, resolve_checkpoint=None, max_checkpoint_bytes=None,
 max_total_checkpoint_bytes=None)` materializes that genuine original roster
 once from the current nonterminal inference or training publication. It uses
@@ -1204,7 +1449,7 @@ release_cancelled_phase_execution, resource_observer, feedback_interventions, le
 checkpoint_destination, snapshot_model_state, restore_model,
 snapshot_restored_model, retire_restored_model, cancelled_retirement_context, retire_source_model,
 refresh_snapshot, phase_record_owner, phase_record_limits,
-frozen_program_bytes, cold_model_work_capacity)` takes the exact builtin full
+frozen_program_bytes)` takes the exact builtin full
 `source_checkpoint` bytes already used by the original scientific owner. It
 quiesces the successful recompute parent and verifies the supplied native state,
 task capsule, original Proposal expense, Session configuration, initial prefill
@@ -1928,12 +2173,11 @@ The supported scientific acceptance callback takes exactly eleven arguments.
 Checking its complete scientific prefix does not implement the private executor
 or establish full GPU execution or cold recovery.
 
-Preparation also requires `cold_model_work_capacity`, an exact positive integer
-from the original preparation instruction. Its bounded allocation arithmetic is
-checked, and both the capacity and unchanged program bytes enter the signed
-Admission. The original decoder returns the preparation tuple
-`("prepare", None, None, cold_model_work_capacity)`; native code compares the
-capacity without introducing another instruction decoder.
+Preparation retains the unchanged signed program and its original unmaterialized
+report owner. The event extent is derived only from the complete original
+pre-effect plan. It is not an early preparation-capacity field, a rewritten
+instruction or a caller-supplied native price. The original decoder remains the
+sole authority for the preparation instruction.
 
 Inside the original source serializer, before preparation returns,
 `task_use.active_cold_model_work()` or
@@ -2043,20 +2287,28 @@ Model-invocation markers and native saved-content witnesses retain their existin
 specialized producers; a generic operation cannot fabricate either receipt.
 
 Before plan admission, obtain its `consumer_stream` and
-`model_work_buffer_layout(consumer_stream=...)`. The metadata-only result is
-`(NativeTensorAllocation, shape, element_strides, dlpack_dtype)` from the same
-original CUDA UInt64 `[capacity, 3]` allocation, with element strides `[3, 1]`
-and DLPack dtype `(1, 64)`. It retains the actual allocation lifetime, not a
-tensor, reader right or numerical content. The original reader, region order
-and Session stream are authenticated without exporting a capsule, admitting a
-plan or charging work. Bind this future port into the complete original
-compiler plan, then freeze and admit that plan once.
+`model_work_buffer_port(consumer_stream=...)`. The native-issued
+`SemanticModelWorkBufferPort` retains its `original_owner`, `device_ordinal`,
+`consumer_stream`, `dtype=(1,64)` and `row_width=3`, but no event extent, address,
+allocation provenance or capsule. `same_counter(other)` compares the original
+native counter owner. Regions of one report share that counter; they do not
+create independent scratch allocations. Bind this port into the complete
+original compiler plan, then freeze and admit that plan once.
 
-Only after admission, obtain the single real
-`model_work_buffer(consumer_stream=...)` export and match its import against
-that retained allocation and exact layout before calling `begin()`.
-The actual exporter still requires the admitted original plan and retains the
-same scratch and reader aliases; metadata cannot bypass that boundary.
+After admission and known initialization, `port.finalized_extent` returns the
+original exact event extent without allocating, exporting or resuming preparation.
+For an admitted empty cold report it is zero: import no tensor or capsule, while
+retaining the original native report, tally and terminal validation. An unknown
+initializer is not an empty report and cannot issue this extent. For a nonempty
+extent, call the original port's `export()`. Its cached tuple is
+`(NativeTensorAllocation, shape, element_strides, dlpack_dtype, device_ordinal,
+consumer_stream, capsule)` from the genuine native UInt64 `[E,3]` allocation,
+with element strides `[3,1]` and `view_bytes=24*E`. Native pairs the allocation
+and layout with the same capsule; matching an arbitrary tensor's shape is not
+allocation provenance. Import this counter once and retain that same tensor
+across the original report's regions. A consumed capsule is not reissued.
+The physical `model_work_buffer_layout` getter remains late metadata only;
+it cannot materialize scratch before the admitted plan or grant reader rights.
 The existing model-work recorder
 uses `record_model_work`, `record_model_device_work` and
 `record_model_invocation`, then calls `end()` on normal exit or `fail()` on an
@@ -2084,11 +2336,34 @@ its scratch aliases are gone. Its Admission and original event capacity cannot
 change, and completed recording is never reopened. Outstanding scratch aliases
 also prevent state-changing work and release.
 
-The connected Python path still issues this scope only for the first source
-preparation serializer. Mandatory later source/candidate serializers require
-their own original checkpoint or delivery operation, registrar and continuous
-whole-operation backing interval; Session-scoped lookup alone does not implement
-that executor or attest its expense.
+The phase constructor requires
+`prepare_checkpoint_writer(selected_model, work) -> original_writer` before
+writer lookup for source/private snapshots, checkpoints and model comparisons.
+This callback performs the existing metadata-only report preparation and retains
+every original regional writer before the sole freeze/admission. It must return
+the identical writer cached for the selected region, report and original pool.
+The existing `work.prepare_checkpoint_writer(...)` also takes
+`resident_read=original_read` and
+`codec_staging_bytes=original_encoder_chunk_bytes`. The read is the same opaque
+occurrence already retained in the report's resident-read roster, including its
+original future restore snapshot. Native derives the full backing extents from
+that Selected/Restored origin, and declares checked read commands and bytes before
+admission; Python supplies no spans or work counters. A repeated metadata handoff
+must match the original read object and extent and reuse its retained scratch
+loan even after a failed Python allocation.
+Later serialization is separate: `snapshot_model_state(original_writer)` or
+`snapshot_restored_model(selected_model, original_writer)` consumes that same
+writer without repeating metadata preparation or admission. Unknown retains the
+original callback, model, writer and entered cursor.
+
+Model comparison uses that writer against the original guarded saved-model
+range. It declares the complete spans, compares monotone writes in place and
+seals only after all original spans are complete; it does not allocate another
+whole model snapshot. The phase source checkpoint and restore/evaluation handoffs
+are the original `SemanticMaterialBytes`, not newly copied Python `bytes`.
+Mandatory later source/candidate serializers still require their own original
+checkpoint or delivery operation, registrar and continuous whole-operation
+backing interval; Session-scoped lookup alone does not attest their expense.
 
 The same original owner also retains one private native tally. Actually reached
 snapshot commands, the original serializer's tensor-content and retained
@@ -2120,8 +2395,9 @@ The original Session blocks further import, execution and abort until resolution
 object if the application loses its reference.
 
 Call `pending.commit_checkpoint(durable_owner)` exactly once. That original
-owner implements `commit(destination, complete_checkpoint, sha256) -> bytes`
-and `resolve(destination, sha256) -> bytes | None | False`. `commit` must
+owner implements
+`commit(destination, complete_checkpoint, sha256) -> SemanticMaterialBytes`
+and `resolve(destination, sha256) -> SemanticMaterialBytes | None | False`. `commit` must
 atomically persist the full checkpoint in the accepted destination and return
 its exact durable readback. Only after readback and fresh revalidation does
 native code revoke the source task use and return the single runnable
@@ -2164,9 +2440,12 @@ accepted by this contract.
 Initial and recovered starts keep their original `initial_prefill` child and
 `initial-prefill-bound` referent (phase 2). For a completed late Proposal whose
 `completed_action_projection(consumer_streams=...).initial_prefill` is `None`,
-call `step.save_checkpoint(consumer_streams=..., snapshot_model_state=callback)`.
+call `step.save_checkpoint(consumer_streams=..., snapshot_model_state=callback,
+model_material_capacity=..., model_material_working_bytes=...,
+original_writer=original_region_writer)`.
 The callback is the original model owner's historical serializer for that same
-retained step; it returns exact builtin `bytes`, not a snapshot of the current
+retained step; it consumes the exact original writer and returns its sealed
+`SemanticMaterialBytes`, not a snapshot of the current
 model or a new forward. The native checkpoint contains that step's complete
 pre-action publication, model allocations, random state, semantic arena and task
 capsule. The full task capsule retains its original segment operation; its compact
@@ -2355,10 +2634,9 @@ require their connected runtime implementation and full GPU evidence.
 
 ### Original model work recording
 
-`controller.build_segment` requires the frozen `tensor_content_capacity`,
-`model_work_capacity`, `segment_capacity_bytes`, and
+`controller.build_segment` requires the immutable `segment_capacity_bytes` and
 `other_external_cuda_bytes` alongside the transition schedule and producer.
-The last two values bound the producer's CUDA slab and all later external
+These values bound the producer's CUDA slab and all later external
 CUDA allocation classes, respectively. Native compares their combined declared
 claim with free CUDA memory before the first segment allocation, then retains
 the logical reservation through segment retirement. The snapshot is a necessary
@@ -2385,12 +2663,24 @@ there is no second builder or
 pool re-entry. A callback failure exits the scope through the original cleanup
 path while native unknown work and its owners remain retained; the builder never
 retries the callback.
-Call `step.reserve_tensor_content(tensor_content_capacity)` and
-`step.reserve_model_work(model_work_capacity)` during `prepare_segment`, before
-capture. Each positive capacity must exactly match its frozen segment value.
-Native allocates both buffers from the retained segment claim, not separate
-late reservations. The work capacity bounds event occurrences, including every
-saved tensor; native does not run the model to discover a capacity.
+The sole complete pre-effect plan derives all original capture-row counts and
+the maximum event count across the two banks of each step. Its original producer
+calls `controller.finalize_segment_layout(task_use, layouts=...)` with the exact
+ordered tuple `(original_step, capture_rows, bank_event_capacity)` for every step.
+Native seals these counts as a child of the same admission, without rewriting
+program bytes, and reserves the whole late native allocation claim before
+allocating digest/event buffers. The original initialization engine retains the
+reset commands; finalization itself does not submit them. A failed physical or
+logical allocation admission preserves the sealed child and permits neither a
+new plan nor an increased count. Cold/evaluation report finalization and the
+complete retained-allocation union remain separate required native consumers of
+the same plan; this segment interface alone does not establish whole-peak fit.
+
+Before that freeze, use `step.model_work_buffer_port(consumer_stream=...)` to
+bind the original counter owner without importing unmaterialized scratch.
+After finalization, use its genuine paired `export()` tuple described above.
+Both original banks retain one counter tensor/capsule for their shared step,
+not two equivalent-looking imports.
 
 During the original `enqueue_step`, call
 `step.record_model_work(kind, dimensions)` for each executed operator occurrence.
@@ -4697,7 +4987,7 @@ for batch in data_loader:
 
 The `semantic-policy` native build provides
 `SemanticTransitionController.prepare_model_evaluation(task_use, parent,
-model_work_capacity=..., cohort=None)` for an already admitted training operation
+model_work_capacity=None, cohort=None)` for an already admitted training operation
 and its genuine acquired parent. It does not construct an Update, run backward,
 draw randomness, update an optimizer, or publish a successor.
 
@@ -4715,24 +5005,23 @@ quarantine or grant new numerical submissions after a fatal CUDA failure.
 
 Before the cold report is admitted, use
 `evaluation.training_view_layouts(consumer_stream=...)` and
-`evaluation.model_work_buffer_layout(consumer_stream=...)`. Training metadata
+`evaluation.model_work_buffer_port(consumer_stream=...)`. Training metadata
 accepts the same consumer stream as the original training-view export; numerical
-work metadata requires that evaluation's own `consumer_stream`.
-The former returns all seventeen original cohort rows;
-the latter returns its actual numerical U64 `[capacity,3]` scratch row with
-strides `[3,1]`. Each row contains
-`(NativeTensorAllocation, shape, element_strides, dlpack_dtype)` and retains the
-real original allocation. These getters neither resume preparation nor export
-capsules, order streams, initialize storage or enqueue work. They authenticate
-the same prepared invocation, live parent, cohort and valid consumer stream, and grant
-no numerical content rights. Numerical scratch is a separate allocation from
-the cold report's work buffer; its stream is not inferred from that report.
-Keep the rows to bind the compiler's future ports and verify the genuine later
-exports against the same native allocation provenance.
+work ownership requires that evaluation's own `consumer_stream`.
+The former returns all seventeen original cohort rows; the latter returns the
+same original unmaterialized counter port type, without an event extent or an
+allocation. These getters neither resume preparation nor export capsules,
+initialize storage or enqueue work. The evaluation counter is separate from
+the cold report counter, and its extent is not inferred from that report.
+Freeze the complete original capture plan before effects, then call
+`evaluation.admit_plan(operations)` with that distinct immutable roster. Native
+allocates its exact `E` once and subsequent capture consumes that same plan.
+An ordinary explicitly supplied `model_work_capacity` is only a fixed upper
+limit, not early allocation authority.
 
-The returned evaluation owns one recording. Export its
-`training_view(consumer_stream=...)` and `model_work_buffer(consumer_stream=...)`
-while the invocation is still prepared. Bind the output tensors and their native
+The returned evaluation owns one recording. After its own plan admission, export
+the counter port's genuine paired `export()` tuple and the original
+`training_view(consumer_stream=...)`. Bind the output tensors and their native
 content witness before capture. Then call
 `capture(enqueue, memory_scope=..., output_witness=..., consumer_streams=...)`.
 The callback uses the existing model content scope on the same parent and the
@@ -4823,7 +5112,16 @@ authority snapshot. Before numerical launch, `cancel(consumer_streams=...)` does
 so only after proving no captured submission entered, joining actual consumers,
 revalidating the original full publication and retiring the original graph.
 Cancellation is forbidden once numerical submission entered, even before output
-report submission. Unknown
+report submission. After known cancellation, `evaluation.cancellation_proof()`
+returns an opaque `SemanticCancelledModelEvaluation`; `belongs_to(evaluation)`
+authenticates that original native invocation. Its `capture_disposition` is
+`not-entered`, `entered-aborted` or `recorded-and-cancelled`, derived from the
+original native recorder entry and return. These values do not certify Python
+compiler-region completion, authorize another numerical capture or clear a failed
+execution. The caller must combine this proof with its actual original compiler
+state and the enclosing native report's authenticated skipped span before using
+an existing cleanup tail. Pending or unknown cancellation issues no such proof.
+Unknown
 completion keeps native buffers retained and blocks mutation/release. Dropping an unfinished owner
 quarantines its Session; it is not cancellation or proof of completion. Keep all
 Python producers and aliases alive until known completion and creator-thread cleanup.

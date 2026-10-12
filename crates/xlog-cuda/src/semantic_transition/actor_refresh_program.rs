@@ -262,8 +262,6 @@ fn validate_segment(value: &Value) -> Result<(), SemanticTransitionError> {
             "operation",
             "transitions",
             "capacity_bytes",
-            "tensor_content_capacity",
-            "model_work_capacity",
             "other_external_cuda_bytes",
             "entropy_threshold",
             "distance_weight",
@@ -294,11 +292,7 @@ fn validate_segment(value: &Value) -> Result<(), SemanticTransitionError> {
     if integer(&segment["capacity_bytes"])? <= 512 {
         return Err(invalid_program());
     }
-    for field in [
-        "tensor_content_capacity",
-        "model_work_capacity",
-        "other_external_cuda_bytes",
-    ] {
+    for field in ["other_external_cuda_bytes"] {
         if integer(&segment[field])? == 0 {
             return Err(invalid_program());
         }
@@ -803,17 +797,7 @@ impl ActorRefreshProgram {
                             }
                         }
                         "prepare" | "checkpoint" | "retire" | "delivery" => {
-                            if operation_name == "prepare" {
-                                let prepare = object(
-                                    &instruction,
-                                    &["operation", "cold_model_work_capacity"],
-                                )?;
-                                if integer(&prepare["cold_model_work_capacity"])? == 0 {
-                                    return Err(invalid_program());
-                                }
-                            } else {
-                                object(&instruction, &["operation"])?;
-                            }
+                            object(&instruction, &["operation"])?;
                             if operation(
                                 instruction_object
                                     .get("operation")
@@ -1046,6 +1030,63 @@ fn assignment_material(
         bytes.extend_from_slice(&assignment.batch_bytes);
     }
     bytes
+}
+
+fn assignment_material_allocation_bound(
+    program: &ActorRefreshProgram,
+) -> Result<u64, SemanticTransitionError> {
+    let mut bytes = b"XLOG-ACTOR-REFRESH-ASSIGNMENTS\0".len() as u64 + 8 + 64 + 8 + 8 + 8;
+    let mut add = |amount: u64| -> Result<(), SemanticTransitionError> {
+        bytes = bytes
+            .checked_add(amount)
+            .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        Ok(())
+    };
+    let cold_result =
+        |result: Option<SemanticColdModelWorkResult>| -> Result<u64, SemanticTransitionError> {
+            Ok(8 + if let Some(result) = result {
+                (size_of::<[u64; 5]>() + std::mem::size_of_val(&result.native_events)) as u64
+            } else {
+                0
+            })
+        };
+    if program.original_rng.is_some() {
+        add(3 * 8)?;
+    }
+    for claim in &program.admissions {
+        add(7 * 8 + 4 * 32 + 8 + 32 + 8 + 8 + 8)?;
+        add(u64::try_from(claim.instruction.len())
+            .map_err(|_| SemanticTransitionError::GenerationExhausted)?)?;
+        if claim.checkpoint_source.is_some() {
+            add(2 * 32 + 8)?;
+        }
+        add(cold_result(claim.cold_result)?)?;
+        add(cold_result(claim.retirement_result)?)?;
+        for (_, result) in &claim.prepared_cold_results {
+            add(8 + cold_result(*result)?)?;
+        }
+    }
+    for assignment in &program.main_origins {
+        add(8 + size_of::<SemanticTrainingViewOriginRecord>() as u64 + 32)?;
+        add(u64::try_from(assignment.batch_bytes.len())
+            .map_err(|_| SemanticTransitionError::GenerationExhausted)?)?;
+    }
+    let pointer_bytes = program
+        .main_origins
+        .len()
+        .checked_mul(3 * size_of::<&MainActorAssignment>())
+        .ok_or(SemanticTransitionError::GenerationExhausted)?;
+    bytes
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(pointer_bytes as u64))
+        .and_then(|bytes| {
+            bytes.checked_add(
+                (size_of::<SemanticTrainingViewOriginRecord>()
+                    + size_of::<PublicationMaterialBytesOwner>()
+                    + 2 * size_of::<usize>()) as u64,
+            )
+        })
+        .ok_or(SemanticTransitionError::GenerationExhausted)
 }
 
 fn require_cancelled_assignment_prefix(
@@ -1476,9 +1517,8 @@ impl SemanticTransitionSession {
         }
         // Freeze the actual source prefix before the first admission installs
         // its RNG binding or any admission changes the canonical assignment map.
-        let assignment_prefix = Identity256::from_bytes(
-            Sha256::digest(self.actor_refresh_assignment_material()?).into(),
-        );
+        let (assignment_bytes, _assignment_reservation) = self.actor_refresh_assignment_bytes()?;
+        let assignment_prefix = Identity256::from_bytes(Sha256::digest(assignment_bytes).into());
         let assignment_prefix_has_rng = program.original_rng.is_some();
         let issuance = Arc::new(());
         let admission = SemanticSegmentInstructionAdmission {
@@ -1579,6 +1619,44 @@ impl SemanticTransitionSession {
     ) -> Result<(), SemanticTransitionError> {
         self.require_segment_instruction_admission(admission, parent)?;
         let (digest, _) = self.verify_checkpoint_source_material(parent, source_material)?;
+        self.bind_segment_checkpoint_source_digest(
+            admission,
+            digest,
+            source_checkpoint,
+            source_proposal_spent,
+            source_assignments,
+        )
+    }
+
+    /// Bind an authenticated source from the original material pool, without a copy.
+    pub fn bind_segment_loaded_checkpoint_source(
+        &mut self,
+        admission: &SemanticSegmentInstructionAdmission,
+        parent: &SemanticPublishedLease,
+        source_material: &mut SemanticReplayLoadedMaterial,
+        source_checkpoint: Identity256,
+        source_proposal_spent: u64,
+        source_assignments: &[u8],
+    ) -> Result<(), SemanticTransitionError> {
+        self.require_segment_instruction_admission(admission, parent)?;
+        let (digest, _) = self.verify_checkpoint_loaded_source_material(parent, source_material)?;
+        self.bind_segment_checkpoint_source_digest(
+            admission,
+            digest,
+            source_checkpoint,
+            source_proposal_spent,
+            source_assignments,
+        )
+    }
+
+    fn bind_segment_checkpoint_source_digest(
+        &mut self,
+        admission: &SemanticSegmentInstructionAdmission,
+        digest: Identity256,
+        source_checkpoint: Identity256,
+        source_proposal_spent: u64,
+        source_assignments: &[u8],
+    ) -> Result<(), SemanticTransitionError> {
         let program = self
             .actor_refresh_program
             .as_ref()
@@ -1659,14 +1737,25 @@ impl SemanticTransitionSession {
         &self,
         admission: &SemanticSegmentInstructionAdmission,
     ) -> Result<Vec<SemanticTransitionKind>, SemanticTransitionError> {
-        let claim = self.instruction_admission(admission)?;
-        self.actor_refresh_program
-            .as_ref()
-            .expect("original program")
-            .steps[claim.first as usize..claim.end as usize]
+        self.admitted_segment_steps(admission)?
             .iter()
             .map(|step| step.kind.ok_or_else(invalid_program))
             .collect()
+    }
+
+    pub(super) fn admitted_segment_steps(
+        &self,
+        admission: &SemanticSegmentInstructionAdmission,
+    ) -> Result<&[ProgramStep], SemanticTransitionError> {
+        let claim = self.instruction_admission(admission)?;
+        let first = usize::try_from(claim.first).map_err(|_| invalid_program())?;
+        let end = usize::try_from(claim.end).map_err(|_| invalid_program())?;
+        self.actor_refresh_program
+            .as_ref()
+            .ok_or_else(invalid_program)?
+            .steps
+            .get(first..end)
+            .ok_or_else(invalid_program)
     }
 
     pub fn admitted_segment_cold_capacity(
@@ -1675,12 +1764,6 @@ impl SemanticTransitionSession {
     ) -> Result<SemanticSegmentColdCapacity, SemanticTransitionError> {
         let instruction = json_value(&self.instruction_admission(admission)?.instruction)?;
         Ok(SemanticSegmentColdCapacity {
-            tensor_content_capacity: usize::try_from(integer(
-                &instruction["tensor_content_capacity"],
-            )?)
-            .map_err(|_| invalid_program())?,
-            model_work_capacity: usize::try_from(integer(&instruction["model_work_capacity"])?)
-                .map_err(|_| invalid_program())?,
             segment_capacity_bytes: integer(&instruction["capacity_bytes"])?,
             other_external_cuda_bytes: integer(&instruction["other_external_cuda_bytes"])?,
         })
@@ -1965,6 +2048,32 @@ impl SemanticTransitionSession {
     /// Native-issued assignments retained by the original authenticated task
     /// checkpoint. Complete replay materials remain in their existing custody.
     pub fn actor_refresh_assignment_material(&self) -> Result<Vec<u8>, SemanticTransitionError> {
+        if self.replay_material_budget.is_some() {
+            return Err(publication_input_error(
+                "bounded actor assignment export requires its original loaded owner",
+            ));
+        }
+        Ok(self.actor_refresh_assignment_bytes()?.0)
+    }
+
+    pub fn actor_refresh_loaded_assignment_material(
+        &self,
+    ) -> Result<SemanticReplayLoadedMaterial, SemanticTransitionError> {
+        if self.replay_material_budget.is_none() {
+            return Err(publication_input_error(
+                "loaded actor assignments require their original capacity pool",
+            ));
+        }
+        let (bytes, reservation) = self.actor_refresh_assignment_bytes()?;
+        Ok(SemanticReplayLoadedMaterial {
+            bytes: PublicationMaterialBytes::retained(bytes, reservation),
+            decoded: None,
+        })
+    }
+
+    fn actor_refresh_assignment_bytes(
+        &self,
+    ) -> Result<(Vec<u8>, Option<SemanticReplayMaterialReservation>), SemanticTransitionError> {
         let program = self
             .actor_refresh_program
             .as_ref()
@@ -1973,13 +2082,21 @@ impl SemanticTransitionSession {
             .actor_refresh_initial
             .as_ref()
             .ok_or_else(invalid_program)?;
+        let reservation = self
+            .replay_material_budget
+            .as_ref()
+            .map(|budget| budget.reserve_auxiliary(assignment_material_allocation_bound(program)?))
+            .transpose()?;
         let assignments: Vec<_> = program.main_origins.iter().collect();
-        Ok(assignment_material(
-            program.identity,
-            initial.index,
-            program.original_rng,
-            &program.admissions,
-            &assignments,
+        Ok((
+            assignment_material(
+                program.identity,
+                initial.index,
+                program.original_rng,
+                &program.admissions,
+                &assignments,
+            ),
+            reservation,
         ))
     }
 
@@ -1990,6 +2107,32 @@ impl SemanticTransitionSession {
         &mut self,
         admission: &SemanticSegmentInstructionAdmission,
     ) -> Result<Vec<u8>, SemanticTransitionError> {
+        if self.replay_material_budget.is_some() {
+            return Err(publication_input_error(
+                "bounded cancelled assignments require their original loaded owner",
+            ));
+        }
+        self.complete_cancelled_assignment_material(admission)?;
+        self.actor_refresh_assignment_material()
+    }
+
+    pub fn cancelled_segment_loaded_assignment_material(
+        &mut self,
+        admission: &SemanticSegmentInstructionAdmission,
+    ) -> Result<SemanticReplayLoadedMaterial, SemanticTransitionError> {
+        if self.replay_material_budget.is_none() {
+            return Err(publication_input_error(
+                "loaded cancelled assignments require their original capacity pool",
+            ));
+        }
+        self.complete_cancelled_assignment_material(admission)?;
+        self.actor_refresh_loaded_assignment_material()
+    }
+
+    fn complete_cancelled_assignment_material(
+        &mut self,
+        admission: &SemanticSegmentInstructionAdmission,
+    ) -> Result<(), SemanticTransitionError> {
         if self.prepared_segment.is_some() || self.captured.is_some() {
             return Err(publication_input_error(
                 "cancelled instruction still owns prepared execution",
@@ -2029,7 +2172,7 @@ impl SemanticTransitionSession {
             require_retired_instruction_expense(previous)?;
         }
         self.instruction_admission_mut(admission)?.state = InstructionState::Cancelled;
-        self.actor_refresh_assignment_material()
+        Ok(())
     }
 
     /// Verify terminal instruction custody before allocating a Session or
@@ -2080,10 +2223,10 @@ impl SemanticTransitionSession {
     /// Restore every native-issued assignment from the authenticated checkpoint.
     /// An unavailable episode remains unresolved, not dropped or authenticated.
     /// Actor preparation joins its complete original replay before any draw.
-    pub fn restore_actor_refresh_assignments(
+    pub fn restore_actor_refresh_assignments<B: AsRef<[u8]>>(
         &mut self,
         bytes: &[u8],
-        episodes: &[(SemanticReplayMaterial, Identity256, Vec<u8>)],
+        episodes: &[(SemanticReplayMaterial, Identity256, B)],
     ) -> Result<(), SemanticTransitionError> {
         self.ensure_quiescent()?;
         let program = self
@@ -2117,7 +2260,7 @@ impl SemanticTransitionSession {
                     continue;
                 }
                 let (actual, actor) =
-                    actor_refresh::initial_episode_actor(material, *identity, bytes)?;
+                    actor_refresh::initial_episode_actor(material, *identity, bytes.as_ref())?;
                 if actual == assignment.origin && actor {
                     matches += 1;
                 }

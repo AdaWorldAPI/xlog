@@ -9,6 +9,7 @@ const EFFECT_DOMAIN: &[u8] = b"dlm-new.local-tool.v1\0";
 pub(super) struct AuthenticatedTaskResults {
     pub observations: Vec<[u64; 18]>,
     pub disposition: u64,
+    pub allocation_owner: Option<Arc<SemanticReplayMaterialReservation>>,
 }
 
 fn invalid_receipt() -> SemanticTransitionError {
@@ -105,6 +106,48 @@ fn object<'a>(
     Ok(value)
 }
 
+fn value_clone_allocation_bound(value: &Value) -> Result<u64, SemanticTransitionError> {
+    let add = |left: u64, right: u64| {
+        left.checked_add(right)
+            .ok_or(SemanticTransitionError::GenerationExhausted)
+    };
+    match value {
+        Value::String(value) => {
+            u64::try_from(value.len()).map_err(|_| SemanticTransitionError::GenerationExhausted)
+        }
+        Value::Number(value) if value.is_i64() || value.is_u64() => Ok(20),
+        Value::Number(_) => Err(invalid_receipt()),
+        Value::Array(values) => {
+            let bytes = values
+                .len()
+                .checked_mul(size_of::<Value>())
+                .ok_or(SemanticTransitionError::GenerationExhausted)?;
+            values.iter().try_fold(
+                u64::try_from(bytes).map_err(|_| SemanticTransitionError::GenerationExhausted)?,
+                |sum, value| add(sum, value_clone_allocation_bound(value)?),
+            )
+        }
+        Value::Object(values) => {
+            let node = u64::try_from(OwnedPublicationMaterial::tree_node_bound(
+                size_of::<String>(),
+                size_of::<Value>(),
+            )?)
+            .map_err(|_| SemanticTransitionError::GenerationExhausted)?;
+            values.iter().try_fold(0u64, |sum, (key, value)| {
+                add(
+                    add(
+                        add(sum, node)?,
+                        u64::try_from(key.len())
+                            .map_err(|_| SemanticTransitionError::GenerationExhausted)?,
+                    )?,
+                    value_clone_allocation_bound(value)?,
+                )
+            })
+        }
+        _ => Ok(0),
+    }
+}
+
 fn string(value: &Value) -> Result<&str, SemanticTransitionError> {
     value.as_str().ok_or_else(invalid_receipt)
 }
@@ -182,7 +225,15 @@ fn verify_receipt_metadata(
     receipt_identity: Identity256,
     binding: &SemanticTaskVerificationBinding,
     outcome: &Value,
+    budget: Option<&SemanticReplayMaterialBudget>,
 ) -> Result<(), SemanticTransitionError> {
+    let _scratch = budget
+        .map(|budget| {
+            budget.reserve_auxiliary(
+                SemanticReplayMaterialBudget::json_allocation_bound_with_field_copies(bytes, 2)?,
+            )
+        })
+        .transpose()?;
     let value: Value = serde_json::from_slice(bytes).map_err(|_| invalid_receipt())?;
     if json_bytes(&value)? != bytes {
         return Err(invalid_receipt());
@@ -252,7 +303,10 @@ fn verify_receipt_metadata(
     Ok(())
 }
 
-fn require_retired(record: &Map<String, Value>) -> Result<i64, SemanticTransitionError> {
+fn require_retired(
+    record: &Map<String, Value>,
+    budget: Option<&SemanticReplayMaterialBudget>,
+) -> Result<i64, SemanticTransitionError> {
     let exit = record["exit_code"].as_i64().ok_or_else(invalid_receipt)?;
     let retirement = object(
         &record["retirement"],
@@ -283,6 +337,19 @@ fn require_retired(record: &Map<String, Value>) -> Result<i64, SemanticTransitio
     if !(1..=3).contains(&integer(&init[0])?) || integer(&init[1])? > 255 {
         return Err(invalid_receipt());
     }
+    let launch_bytes = string(&record["launch_status_hex"])?.len() / 2;
+    let scratch_bytes = launch_bytes
+        .checked_mul(1 + size_of::<i64>() + size_of::<u64>())
+        .and_then(|bytes| bytes.checked_add(4 * (size_of::<i64>() + size_of::<u64>())))
+        .ok_or(SemanticTransitionError::GenerationExhausted)?;
+    let _scratch = budget
+        .map(|budget| {
+            budget.reserve_auxiliary(
+                u64::try_from(scratch_bytes)
+                    .map_err(|_| SemanticTransitionError::GenerationExhausted)?,
+            )
+        })
+        .transpose()?;
     let launch_status = hex_bytes(&record["launch_status_hex"])?;
     let mut exits = Vec::new();
     let mut children = Vec::new();
@@ -290,6 +357,9 @@ fn require_retired(record: &Map<String, Value>) -> Result<i64, SemanticTransitio
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
     {
+        let _line_scratch = budget
+            .map(|budget| budget.reserve_json_parse(line))
+            .transpose()?;
         let value: Value = serde_json::from_slice(line).map_err(|_| invalid_receipt())?;
         let value = value.as_object().ok_or_else(invalid_receipt)?;
         if let Some(value) = value.get("exit-code") {
@@ -310,8 +380,20 @@ fn verify_outcome(
     command: &Map<String, Value>,
     acceptance: &Value,
     binding: &SemanticTaskVerificationBinding,
+    budget: Option<&SemanticReplayMaterialBudget>,
 ) -> Result<(u64, bool), SemanticTransitionError> {
-    let exit = require_retired(record)?;
+    let exit = require_retired(record, budget)?;
+    let output_bytes = (string(&record["stdout_hex"])?.len() / 2)
+        .checked_add(string(&record["stderr_hex"])?.len() / 2)
+        .ok_or(SemanticTransitionError::GenerationExhausted)?;
+    let _output_scratch = budget
+        .map(|budget| {
+            budget.reserve_auxiliary(
+                u64::try_from(output_bytes)
+                    .map_err(|_| SemanticTransitionError::GenerationExhausted)?,
+            )
+        })
+        .transpose()?;
     let stdout = hex_bytes(&record["stdout_hex"])?;
     let stderr = hex_bytes(&record["stderr_hex"])?;
     let capacity = integer(&command["output_bytes"])?;
@@ -337,6 +419,35 @@ fn verify_outcome(
             return Err(invalid_receipt());
         }
         let laws = roster(&record["measurement_laws"], 3)?;
+        let fixed_strings = [
+            "kind",
+            "kind",
+            "metric",
+            "kind",
+            "value",
+            "absolute-integer-difference-at-most/1",
+            "stdout-signed-i64/1",
+            "integer-tolerance/1",
+        ]
+        .iter()
+        .try_fold(0u64, |sum, value| {
+            sum.checked_add(value.len() as u64)
+                .ok_or(SemanticTransitionError::GenerationExhausted)
+        })?;
+        let node = u64::try_from(OwnedPublicationMaterial::tree_node_bound(
+            size_of::<String>(),
+            size_of::<Value>(),
+        )?)
+        .map_err(|_| SemanticTransitionError::GenerationExhausted)?;
+        let metric_bytes = value_clone_allocation_bound(&metric["metric"])?;
+        let law_bytes = fixed_strings
+            .checked_add(20)
+            .and_then(|n| node.checked_mul(5).and_then(|nodes| n.checked_add(nodes)))
+            .and_then(|n| n.checked_add(metric_bytes))
+            .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        let _law_scratch = budget
+            .map(|budget| budget.reserve_auxiliary(law_bytes))
+            .transpose()?;
         if laws[0] != serde_json::json!({"kind": "absolute-integer-difference-at-most/1"})
             || laws[1]
                 != serde_json::json!({"kind": "stdout-signed-i64/1", "metric": metric["metric"]})
@@ -388,14 +499,15 @@ fn verify_outcome(
     Ok((truth, rejected))
 }
 
-pub(super) fn verify_acquired_receipts(
+pub(super) fn verify_acquired_receipts<B: AsRef<[u8]>>(
     ground: &SemanticTaskGround,
-    materials: &[(Identity256, Vec<u8>, Vec<u8>)],
+    materials: &[(Identity256, B, B)],
     stable_intent: Identity256,
     original_effect: &[u8],
     original_native_payload: &[u8],
     original_action_identity: Identity256,
     key: &[u8; 32],
+    budget: Option<&SemanticReplayMaterialBudget>,
 ) -> Result<AuthenticatedTaskResults, SemanticTransitionError> {
     let SemanticTaskGround::Coding(bindings) = ground else {
         return Err(invalid_receipt());
@@ -409,6 +521,35 @@ pub(super) fn verify_acquired_receipts(
     {
         return Err(invalid_receipt());
     }
+    let mut owned_bytes = (2 * size_of::<Value>() + "coding".len()) as u64;
+    for binding in bindings {
+        let binding_bytes =
+            (size_of::<Value>() * 8 + 2 * 20 + 4 * 64 + binding.receipt_family.name().len())
+                .checked_add(if binding.measurement.is_some() {
+                    4 * size_of::<Value>() + 4 * 64
+                } else {
+                    0
+                })
+                .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        owned_bytes = owned_bytes
+            .checked_add(
+                u64::try_from(binding_bytes)
+                    .map_err(|_| SemanticTransitionError::GenerationExhausted)?
+                    .checked_mul(2)
+                    .ok_or(SemanticTransitionError::GenerationExhausted)?,
+            )
+            .and_then(|n| n.checked_add((size_of::<Value>() + size_of::<[u64; 18]>()) as u64))
+            .and_then(|n| {
+                n.checked_add(
+                    OwnedPublicationMaterial::tree_node_bound(size_of::<[u8; 32]>(), 0).ok()?
+                        as u64,
+                )
+            })
+            .ok_or(SemanticTransitionError::GenerationExhausted)?;
+    }
+    let allocation_owner = budget
+        .map(|budget| budget.reserve_auxiliary(owned_bytes).map(Arc::new))
+        .transpose()?;
     let plan_digest = Identity256::from_bytes(
         original_native_payload[..32]
             .try_into()
@@ -424,12 +565,14 @@ pub(super) fn verify_acquired_receipts(
     let mut candidate_identity = None;
     let mut disposition = 1;
     let total_material_bytes = materials.iter().try_fold(0_u64, |sum, (_, material, _)| {
-        sum.checked_add(material.len() as u64)
+        sum.checked_add(material.as_ref().len() as u64)
             .ok_or_else(invalid_receipt)
     })?;
     for (ordinal, (binding, (receipt_identity, material, receipt_metadata))) in
         bindings.iter().zip(materials).enumerate()
     {
+        let material = material.as_ref();
+        let receipt_metadata = receipt_metadata.as_ref();
         if !receipt_identities.insert(*receipt_identity.as_bytes())
             || Identity256::from_bytes(Sha256::digest(material).into()) != *receipt_identity
             || material.len() <= RECEIPT_DOMAIN.len() + 32
@@ -446,6 +589,13 @@ pub(super) fn verify_acquired_receipts(
             return Err(invalid_receipt());
         }
         let raw = &material[RECEIPT_DOMAIN.len()..mac_offset];
+        let _receipt_scratch = budget
+            .map(|budget| {
+                budget.reserve_auxiliary(
+                    SemanticReplayMaterialBudget::json_allocation_bound_with_field_copies(raw, 2)?,
+                )
+            })
+            .transpose()?;
         let value: Value = serde_json::from_slice(raw).map_err(|_| invalid_receipt())?;
         if json_bytes(&value)? != raw {
             return Err(invalid_receipt());
@@ -631,6 +781,19 @@ pub(super) fn verify_acquired_receipts(
             .filter(|argv| !argv.is_empty())
             .ok_or_else(invalid_receipt)?;
         let executable = string(&argv[0])?;
+        let executable_bytes = "environment:"
+            .len()
+            .checked_add(executable.len())
+            .and_then(|n| n.checked_mul(2))
+            .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        let _executable_scratch = budget
+            .map(|budget| {
+                budget.reserve_auxiliary(
+                    u64::try_from(executable_bytes)
+                        .map_err(|_| SemanticTransitionError::GenerationExhausted)?,
+                )
+            })
+            .transpose()?;
         let executables = plan
             .get("executables")
             .and_then(Value::as_object)
@@ -654,12 +817,14 @@ pub(super) fn verify_acquired_receipts(
         }
         identity(&verifier["executable_sha256"])?;
         identity(&verifier["environment_sha256"])?;
-        let (truth, rejected) = verify_outcome(record, command, &acceptances[ordinal], binding)?;
+        let (truth, rejected) =
+            verify_outcome(record, command, &acceptances[ordinal], binding, budget)?;
         verify_receipt_metadata(
             receipt_metadata,
             *receipt_identity,
             binding,
             &record["outcome"],
+            budget,
         )?;
         if rejected {
             disposition = 2;
@@ -693,5 +858,6 @@ pub(super) fn verify_acquired_receipts(
     Ok(AuthenticatedTaskResults {
         observations,
         disposition,
+        allocation_owner,
     })
 }

@@ -1,4 +1,4 @@
-//! Original device-produced policy derivative and critic work of one Update.
+//! Original device-produced model scratch, policy derivative and critic work.
 //! Allocation and metadata are cold; only actual retained producers charge.
 
 use super::*;
@@ -35,6 +35,7 @@ pub(super) enum PolicyWorkKey {
     Local(u64, usize),
     Imported(ImportedPolicyContributionKey),
     Critic,
+    ModelScratch,
 }
 
 #[derive(Clone)]

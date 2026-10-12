@@ -62,7 +62,7 @@ impl RetainedMaterialRange {
     }
 }
 
-struct OriginalPublicationGuard {
+pub(super) struct OriginalPublicationGuard {
     storage: Arc<PublicationStorage>,
     inputs: Option<Arc<PreparedStepInputs>>,
     input_command: Option<OriginalNativeCommand>,
@@ -76,18 +76,23 @@ struct OriginalPublicationGuard {
 }
 
 impl OriginalPublicationGuard {
-    fn complete(
+    #[cfg(feature = "semantic-policy")]
+    pub(super) fn use_cold_work(&mut self, work: &DeviceMemoryView<u64>) {
+        self.cold_work = Some(work.clone());
+    }
+
+    pub(super) fn complete(
         &mut self,
         session: &mut SemanticTransitionSession,
         lease: &SemanticPublishedLease,
     ) -> Result<(), SemanticTransitionError> {
         let _ordinary = crate::cuda_graph::reserve_uncaptured_stream(&session.stream)
-            .map_err(|error| runtime_error("original replay guard stream admission", error))?;
+            .map_err(|error| runtime_error("original publication guard stream admission", error))?;
         let end = self
             .ranges
             .len()
             .checked_add(4)
-            .ok_or_else(|| publication_input_error("replay guard cursor overflow"))?;
+            .ok_or_else(|| publication_input_error("publication guard cursor overflow"))?;
         while self.cursor < end {
             let result = match self.cursor {
                 0 | 1 => self.edges[self.cursor].join(),
@@ -98,7 +103,7 @@ impl OriginalPublicationGuard {
                             &mut self.poisoned,
                             None,
                             false,
-                            None,
+                            self.cold_work.as_ref(),
                             self.input_command.as_mut(),
                         )
                     } else {
@@ -160,7 +165,7 @@ impl ReplayEvidenceObservation {
     fn resolve(
         &mut self,
         session: &mut SemanticTransitionSession,
-        predecessor: &PublicationMaterial,
+        predecessor: &OwnedPublicationMaterial,
         successor: &SemanticPublishedLease,
         poisoned: &mut bool,
     ) -> Result<PublicationReplayEvidence, SemanticTransitionError> {
@@ -206,11 +211,12 @@ pub(super) struct OriginalReplayPublicationVerification {
     consumers: Option<[OriginalStepConsumers; 2]>,
     guards: Option<[OriginalPublicationGuard; 2]>,
     predecessor_observation: Option<SemanticPublishedStateObservation>,
-    predecessor_material: Option<PublicationMaterial>,
+    predecessor_material: Option<Arc<OwnedPublicationMaterial>>,
     successor_observation: Option<ReplayEvidenceObservation>,
     cursor: usize,
     poisoned: bool,
     completed: bool,
+    allocation_reservation: Option<SemanticReplayMaterialReservation>,
 }
 
 impl SemanticTransitionSession {
@@ -232,6 +238,86 @@ impl SemanticTransitionSession {
                 "replay comparison requires two original distinct held readers",
             ));
         }
+        // Acquire the original shared byte allowance before constructing any
+        // pinned destination. This is a capacity reservation, not executed work.
+        let budget = match (
+            self.replay_material_budget.as_ref(),
+            material.budget.as_ref(),
+        ) {
+            (Some(original), Some(material)) if original.same_pool(material) => Some(original),
+            (None, None) => None,
+            _ => {
+                return Err(publication_input_error(
+                    "replay comparison changes its original capacity pool",
+                ))
+            }
+        };
+        let allocation_reservation = budget
+            .map(|budget| {
+                let storage = self
+                    .publication
+                    .as_ref()
+                    .ok_or(SemanticTransitionError::NotBound)?;
+                if predecessor.header.model_geometry_digest
+                    != material.predecessor.bank.header.model_geometry_digest
+                    || !storage.layouts.values().copied().eq(material
+                        .predecessor
+                        .layouts
+                        .iter()
+                        .copied())
+                    || storage.model_memory.allocation_bytes
+                        != material.predecessor.model_memory.allocation_bytes
+                {
+                    return Err(SemanticTransitionError::ObservationMismatch);
+                }
+                // The predecessor's sole observation reserves its own readback
+                // and validation scratch before that original roster exists.
+                // This owner reserves only its consumers, guards and successor.
+                let mut requested = 0u64;
+                let mut add = |count: u64, width: u64| -> Result<(), SemanticTransitionError> {
+                    requested = requested
+                        .checked_add(
+                            count
+                                .checked_mul(width)
+                                .ok_or(SemanticTransitionError::GenerationExhausted)?,
+                        )
+                        .ok_or(SemanticTransitionError::GenerationExhausted)?;
+                    Ok(())
+                };
+                add(1, size_of::<OriginalReplayPublicationVerification>() as u64)?;
+                add(1, 2 * size_of::<PublicationBank>() as u64)?;
+                for range in &successor.directory {
+                    if REPLAY_EVIDENCE_ROLES.contains(&range.role) || matches!(range.role, 14 | 48)
+                    {
+                        add(range.length_bytes, 3)?;
+                    }
+                }
+                for lease in [predecessor, successor] {
+                    add(
+                        lease.directory.len() as u64,
+                        (3 * size_of::<PublicationRange>()
+                            + size_of::<(u64, u64, SemanticTensorLayout)>()
+                            + size_of::<OriginalNativeCommand>()
+                            + size_of::<RetainedMaterialRange>()) as u64,
+                    )?;
+                    let streams = self.readers[&lease.token]
+                        .consumer_streams
+                        .len()
+                        .checked_add(self.steps[&lease.token].consumer_streams.len())
+                        .ok_or(SemanticTransitionError::GenerationExhausted)?;
+                    add(
+                        streams as u64,
+                        (3 * OwnedPublicationMaterial::tree_node_bound(size_of::<u64>(), 0)?
+                            + 2 * size_of::<OriginalConsumerEdge>()) as u64,
+                    )?;
+                }
+                add(
+                    REPLAY_EVIDENCE_ROLES.len() as u64,
+                    size_of::<Identity256>() as u64,
+                )?;
+                budget.reserve_owned(requested, requested)
+            })
+            .transpose()?;
         let consumers = [
             self.stage_replay_consumers(predecessor)?,
             self.stage_replay_consumers(successor)?,
@@ -275,6 +361,7 @@ impl SemanticTransitionSession {
             cursor: 0,
             poisoned: false,
             completed: false,
+            allocation_reservation,
         }));
         // The Session retains the owner independently of the Python handoff
         // and moves it into its existing quarantine on an unresolved drop.
@@ -311,7 +398,16 @@ impl SemanticTransitionSession {
         lease: &SemanticPublishedLease,
     ) -> Result<OriginalPublicationGuard, SemanticTransitionError> {
         let keys = self.published_range_keys(lease)?;
-        let ranges = self.publication_content_guard_ranges(lease, &keys)?;
+        self.stage_publication_content_guard(lease, &keys, 1)
+    }
+
+    pub(super) fn stage_publication_content_guard(
+        &self,
+        lease: &SemanticPublishedLease,
+        keys: &[(SemanticStateRole, u64)],
+        consumer_stream: u64,
+    ) -> Result<OriginalPublicationGuard, SemanticTransitionError> {
+        let ranges = self.publication_content_guard_ranges(lease, keys)?;
         let storage = Arc::clone(
             self.publication
                 .as_ref()
@@ -338,7 +434,7 @@ impl SemanticTransitionSession {
         #[cfg(not(feature = "semantic-policy"))]
         let cold_work = None;
         let native = self.stream.cu_stream();
-        let consumer = dlpack_consumer_stream(1)?;
+        let consumer = dlpack_consumer_stream(consumer_stream)?;
         Ok(OriginalPublicationGuard {
             storage,
             inputs,
@@ -392,6 +488,7 @@ impl SemanticTransitionSession {
             ));
         }
         if self.has_unresolved_session_native_effect_except_replay_verification()
+            || self.resident_model_activation.is_some()
             || self.has_pending_state_restoration_except(None, None)
             || {
                 #[cfg(feature = "semantic-policy")]
@@ -488,14 +585,13 @@ impl SemanticTransitionSession {
                             poisoned,
                             ..
                         } = &mut *original;
-                        let bytes = self.resolve_published_state_observation_with_poison(
+                        let material = self.resolve_published_state_observation_with_poison(
                             predecessor,
                             predecessor_observation
                                 .as_mut()
                                 .expect("original predecessor observation"),
                             poisoned,
                         )?;
-                        let material = PublicationMaterial::decode(&bytes)?;
                         let header = material.bank.header;
                         let expected = original.expected_predecessor;
                         if header.instance == expected.instance
@@ -504,7 +600,9 @@ impl SemanticTransitionSession {
                             || header.logical_digest != expected.logical_digest
                             || header.state_digest != expected.state_digest
                         {
-                            return Err(publication_input_error("replay comparison requires the freshly restored complete predecessor"));
+                            return Err(publication_input_error(
+                                "replay comparison requires the freshly restored complete predecessor",
+                            ));
                         }
                         original.predecessor_material = Some(material);
                         original.poisoned = false;
@@ -532,7 +630,9 @@ impl SemanticTransitionSession {
                             || actual.successor.state_digest
                                 != original.expected_successor.state_digest
                         {
-                            return Err(publication_input_error("genuine replay successor differs from the expected complete native state"));
+                            return Err(publication_input_error(
+                                "genuine replay successor differs from the expected complete native state",
+                            ));
                         }
                         if actual.ranges.len() != original.expected_ranges.len() {
                             return Err(SemanticTransitionError::ObservationMismatch);
@@ -541,7 +641,9 @@ impl SemanticTransitionSession {
                             actual.ranges.iter().zip(&original.expected_ranges)
                         {
                             if actual.logical_record_digest()? != *expected {
-                                return Err(publication_input_error("genuine replay differs from the expected normalized publication records"));
+                                return Err(publication_input_error(
+                                    "genuine replay differs from the expected normalized publication records",
+                                ));
                             }
                         }
                         original.poisoned = false;
@@ -570,6 +672,7 @@ impl SemanticTransitionSession {
         original.predecessor_observation = None;
         original.predecessor_material = None;
         original.successor_observation = None;
+        original.allocation_reservation = None;
         original.completed = true;
         self.replay_verification_pending
             .store(false, Ordering::Release);

@@ -168,19 +168,16 @@ __device__ void semantic_content_integrity_trap();
 static_assert(sizeof(ModelWorkEvent)==104 && sizeof(ModelWorkInput)==24 && sizeof(ExecutionWork)==152,
     "original execution work ABI");
 
-// Native owns this scratch bank and records a reset before each actual producer
-// occurrence. The immutable descriptor and its upper geometry are never exported.
-extern "C" __global__ void semantic_model_work_reset(uint64_t actual,uint64_t words) {
-    auto* values=reinterpret_cast<uint64_t*>(actual);
-    for(uint64_t i=threadIdx.x;i<words;i+=blockDim.x)values[i]=0;
-}
-
 // Recorded at the original model-call site. CUDA graph recording alone never
 // writes a call: only execution of the selected branch reaches this node.
-extern "C" __global__ void semantic_model_invocation(uint64_t actual) {
+extern "C" __global__ void semantic_model_invocation(uint64_t actual,uint64_t native_work) {
     if(blockIdx.x || threadIdx.x)return;
+    auto* work=reinterpret_cast<semantic_graph::NativeWorkTally*>(native_work);
+    semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::Command,1);
     auto* values=reinterpret_cast<uint64_t*>(actual);
-    values[0]=1;values[1]=0;values[2]=1;
+    values[0]=semantic_graph::written_word(1,work);
+    values[1]=semantic_graph::written_word(0,work);
+    values[2]=semantic_graph::written_word(1,work);
 }
 
 // One owning thread appends actual logical work. Failure never wraps either
@@ -241,6 +238,26 @@ __device__ void execution_work_merge_parallel(ExecutionWork& work,semantic_graph
         else execution_work_merge_native(work,actual);
     }
     __syncthreads();
+}
+
+// This is the original NativeWorkTally, never an ExecutionWork reinterpretation.
+// Parallel writers reduce only their reached stores; capacity is not a charge.
+extern "C" __global__ void semantic_model_work_reset(uint64_t actual,uint64_t words,
+        uint64_t native_work) {
+    if(blockIdx.x)return;
+    auto* values=reinterpret_cast<uint64_t*>(actual);
+    semantic_graph::NativeWorkTally local{};
+    if(threadIdx.x==0)
+        semantic_graph::charge_native(&local,semantic_graph::NativeWorkEvent::Command,1);
+    for(uint64_t i=threadIdx.x;i<words;i+=blockDim.x)
+        values[i]=semantic_graph::written_word(0,&local);
+    const auto reached=native_work_reduce_parallel(local);
+    if(threadIdx.x==0 && native_work) {
+        auto* target=reinterpret_cast<semantic_graph::NativeWorkTally*>(native_work);
+        for(uint32_t i=0;i<9;++i)
+            semantic_graph::charge_native(target,static_cast<semantic_graph::NativeWorkEvent>(i),reached.events[i]);
+        if(reached.overflow)target->overflow=1;
+    }
 }
 
 __device__ void consume_model_work(const ModelWorkInput& input,ExecutionWork& work,
@@ -4309,7 +4326,8 @@ __device__ bool before(uint32_t a,uint32_t b,const float* logits) {
 __device__ void semantic_call(const Descriptor& d, uint64_t admission,
         const semantic_graph::ResidentHandle* handle, const semantic_graph::Receipt* source,
         semantic_graph::Receipt* output, const semantic_graph::DecodedStatement* statement=nullptr,
-        const semantic_graph::DecodedSupport* support=nullptr,ExecutionWork* work=nullptr) {
+        const semantic_graph::DecodedSupport* support=nullptr,ExecutionWork* work=nullptr,
+        semantic_graph::NativeWorkTally* native_work=nullptr) {
     semantic_graph::LaunchDescriptor launch={};
     launch.expected_owner=d.arena[1];launch.root_capacity=d.arena[2];
     launch.statement_capacity=d.arena[3];launch.support_capacity=d.arena[4];
@@ -4321,7 +4339,9 @@ __device__ void semantic_call(const Descriptor& d, uint64_t admission,
     launch.decoded_support_ptr=reinterpret_cast<uint64_t>(support);
     launch.admission=admission;launch.abi_generation=semantic_graph::kAbiGeneration;
     semantic_graph::NativeWorkTally actual{};
-    semantic_graph::execute(reinterpret_cast<uint64_t*>(d.arena[0]),launch,work ? &actual : nullptr);
+    // An operation has one meter owner. ExecutionWork already merges its native
+    // tally; the explicit original cold tally is used only without that owner.
+    semantic_graph::execute(reinterpret_cast<uint64_t*>(d.arena[0]),launch,work ? &actual : native_work);
     if(work)execution_work_merge_native(*work,actual);
 }
 
@@ -4605,7 +4625,7 @@ __device__ semantic_program::Result task_program_closure(const Descriptor& descr
         const TaskProgramBank& bank,const semantic_task_ground::Plane& plane,uint32_t slot,
         const semantic_program::Rule* inserted,uint32_t inserted_count,
         semantic_program::DualSupport* support,semantic_program::Fact** output,
-        ExecutionWork* work=nullptr) {
+        ExecutionWork* work=nullptr,semantic_graph::NativeWorkTally* native_work=nullptr) {
     const uint64_t lineage_words=(uint64_t(bank.task.bindings)+63)/64;
     if(slot>2 || !descriptor.task_support_truths ||
        descriptor.task_support_lineage_words!=3*PROGRAM_FACT_CAPACITY*2*lineage_words ||
@@ -4626,7 +4646,7 @@ __device__ semantic_program::Result task_program_closure(const Descriptor& descr
         semantic_graph::NativeWorkTally native{};
         semantic_graph::charge_native(&native,semantic_graph::NativeWorkEvent::TableSlot,closure.charged_pairs);
         execution_work_merge_native(*work,native);
-    }
+    } else semantic_graph::charge_native(native_work,semantic_graph::NativeWorkEvent::TableSlot,closure.charged_pairs);
     return closure;
 }
 
@@ -7057,9 +7077,11 @@ __device__ uint64_t publication_publish(const Descriptor& descriptor,Publication
 struct FeedbackSupportCollector {
     uint64_t* rows;
     uint64_t capacity, count, refusal, begin=0, channels=3;
+    semantic_graph::NativeWorkTally* work=nullptr;
     __device__ bool operator()(uint64_t slot,const uint64_t* version,const uint64_t* support) {
         if(!(channels&support[5]))return true;
         for(uint64_t index=begin;index<count;++index) {
+            semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::TableSlot,1);
             const auto* prior=rows+12*index;
             if(prior[2]==version[5] && prior[3]==support[1] && prior[4]==slot && prior[5]==version[1])return true;
         }
@@ -7069,6 +7091,7 @@ struct FeedbackSupportCollector {
         row[0]=support[10];row[1]=support[11];row[2]=version[5];row[3]=support[1];
         row[4]=slot;row[5]=version[1];row[6]=version[13];row[7]=support[5];
         semantic_graph::copy_identity(row+8,support+6);
+        semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::CanonicalByte,12*sizeof(uint64_t));
         return true;
     }
 };
@@ -7084,7 +7107,8 @@ struct PublicationFeedbackInputs {
 // Resolve every source through the actual acquired reader. The publication
 // word may advance while this reader retains its original bank and seals.
 __device__ uint64_t publication_feedback_inputs(uint64_t control_ptr,
-        const PublicationLease* lease,uint64_t slots,PublicationFeedbackInputs* inputs) {
+        const PublicationLease* lease,uint64_t slots,PublicationFeedbackInputs* inputs,
+        semantic_graph::NativeWorkTally* work=nullptr) {
     const uint64_t lease_ptr=reinterpret_cast<uint64_t>(lease);
     if(!control_ptr || control_ptr%alignof(PublicationControl) || control_ptr>UINT64_MAX-sizeof(PublicationControl) ||
        !lease_ptr || lease_ptr%alignof(PublicationLease) || lease_ptr>UINT64_MAX-sizeof(PublicationLease) ||
@@ -7097,20 +7121,20 @@ __device__ uint64_t publication_feedback_inputs(uint64_t control_ptr,
        !control.directories[lease->bank] || control.directories[lease->bank]%alignof(PublicationRange) ||
        !control.storage || control.storage%alignof(PublicationStorageEntry) || !control.storage_count ||
        control.storage_count>(UINT64_MAX-control.storage)/sizeof(PublicationStorageEntry))return 1;
-    const auto* bank=publication_acquired_bank(control,*lease);
+    const auto* bank=publication_acquired_bank(control,*lease,work);
     const auto& contract=*reinterpret_cast<const PublicationContract*>(control.contract);
     if(!bank || contract.abi!=1 || contract.feedback_capacity!=slots ||
        bank->header.range_count>contract.range_capacity ||
        bank->header.range_count>(UINT64_MAX-control.directories[lease->bank])/sizeof(PublicationRange))return 1;
     const auto* ranges=reinterpret_cast<const PublicationRange*>(control.directories[lease->bank]);
-    const auto* records=publication_find_range(ranges,bank->header.range_count,15);
+    const auto* records=publication_find_range(ranges,bank->header.range_count,15,0,work);
     if(!records || records->length_bytes!=slots*sizeof(RawFeedbackRecord) ||
        records->logical_begin || records->logical_end>slots)return 1;
     const auto* bytes=publication_range_bytes(control,*records);
     uint64_t digest[4];
     if(!bytes || reinterpret_cast<uint64_t>(bytes)%alignof(RawFeedbackRecord) ||
-       publication_range_digest(control,*records,nullptr,digest) ||
-       !publication_identity_equal(digest,records->digest))return 1;
+       publication_range_digest(control,*records,nullptr,digest,work) ||
+       !publication_identity_equal(digest,records->digest,work))return 1;
     inputs->bank=bank;
     inputs->records=reinterpret_cast<const RawFeedbackRecord*>(bytes);
     inputs->control=&control;inputs->ranges=ranges;
@@ -7120,11 +7144,11 @@ __device__ uint64_t publication_feedback_inputs(uint64_t control_ptr,
     inputs->statement_count=roles[15].count;
     inputs->statement_capacity=0;
     for(uint64_t index=0;index<inputs->statement_count;++index) {
-        const auto* statement=publication_find_range(ranges,bank->header.range_count,16,index);
+        const auto* statement=publication_find_range(ranges,bank->header.range_count,16,index,work);
         if(!statement || !statement->length_bytes)return 1;
         const auto* data=publication_range_bytes(control,*statement);
-        if(!data || publication_range_digest(control,*statement,nullptr,digest) ||
-           !publication_identity_equal(digest,statement->digest))return 1;
+        if(!data || publication_range_digest(control,*statement,nullptr,digest,work) ||
+           !publication_identity_equal(digest,statement->digest,work))return 1;
         if(statement->length_bytes>inputs->statement_capacity)inputs->statement_capacity=statement->length_bytes;
     }
     return 0;
@@ -7133,14 +7157,20 @@ __device__ uint64_t publication_feedback_inputs(uint64_t control_ptr,
 __device__ uint64_t publication_feedback_lineage(const Descriptor& descriptor,
         const PublicationLease* lease,uint64_t slots,
         semantic_graph::Receipt* queries,uint64_t* original_statements,uint64_t* offsets,
-        uint64_t* supports,uint64_t support_capacity) {
+        uint64_t* supports,uint64_t support_capacity,semantic_graph::NativeWorkTally* work=nullptr) {
     for(uint64_t slot=0;slot<slots;++slot) {
         queries[slot]=semantic_graph::Receipt{};original_statements[slot]=UINT64_MAX;offsets[slot]=0;
+        semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::CanonicalByte,
+            sizeof(semantic_graph::Receipt)+2*sizeof(uint64_t));
     }
     offsets[slots]=0;
-    for(uint64_t i=0;i<support_capacity*12;++i)supports[i]=0;
+    semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::CanonicalByte,sizeof(uint64_t));
+    for(uint64_t i=0;i<support_capacity*12;++i) {
+        supports[i]=0;
+        semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::CanonicalByte,sizeof(uint64_t));
+    }
     PublicationFeedbackInputs inputs{};
-    if(publication_feedback_inputs(descriptor.publication.control,lease,slots,&inputs) || !descriptor.task)return 1;
+    if(publication_feedback_inputs(descriptor.publication.control,lease,slots,&inputs,work) || !descriptor.task)return 1;
     const auto* task=reinterpret_cast<const uint64_t*>(descriptor.task);
     TaskProgramBank program{};
     if(!task_program_bank(task,descriptor.task_words,&program) || task[1]!=descriptor.arena[1])return 1;
@@ -7151,6 +7181,7 @@ __device__ uint64_t publication_feedback_lineage(const Descriptor& descriptor,
         descriptor.arena[2],descriptor.arena[3],descriptor.arena[4],descriptor.arena[5],
         descriptor.arena[6],&layout) || (slots && layout.support_capacity>UINT64_MAX/slots) ||
         support_capacity!=slots*layout.support_capacity)return 1;
+    layout.work=work;
     const semantic_graph::ResidentHandle root{bank.header.semantic_owner,semantic_graph::kRootKind,
         bank.header.semantic_slot,bank.header.semantic_generation};
     semantic_task_ground::Plane plane{};
@@ -7158,17 +7189,24 @@ __device__ uint64_t publication_feedback_lineage(const Descriptor& descriptor,
     semantic_program::Fact* facts=nullptr;
     semantic_program::Result closure{};
     if(program.editable) {
-        const auto* ground=publication_find_range(inputs.ranges,bank.header.range_count,semantic_task_ground::kPublicationRole);
+        const auto* ground=publication_find_range(inputs.ranges,bank.header.range_count,semantic_task_ground::kPublicationRole,0,work);
         if(!ground || !semantic_task_ground::decode_plane(
             reinterpret_cast<uint64_t>(publication_range_bytes(*inputs.control,*ground)),ground->length_bytes,view,&plane))return 1;
-        closure=task_program_closure(descriptor,program,plane,0,nullptr,0,&lineage,&facts);
+        closure=task_program_closure(descriptor,program,plane,0,nullptr,0,&lineage,&facts,nullptr,work);
         if(closure.status!=semantic_program::Status::Ok)return 1;
     }
     FeedbackSupportCollector collector{supports,support_capacity,0,0};
+    collector.work=work;
     for(uint64_t slot=0;slot<slots;++slot) {
         offsets[slot]=collector.count;
+        semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::CanonicalByte,sizeof(uint64_t));
         const auto& saved=inputs.records[slot];
-        if(saved.valid==0) { offsets[slot+1]=collector.count;continue; }
+        semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::TableSlot,1);
+        if(saved.valid==0) {
+            offsets[slot+1]=collector.count;
+            semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::CanonicalByte,sizeof(uint64_t));
+            continue;
+        }
         if(saved.valid!=1 || saved.statement_index>=view.queries || saved.pro>1 || saved.contra>1)return 1;
         collector.begin=collector.count;
         semantic_graph::DecodedStatement statement{};
@@ -7184,6 +7222,8 @@ __device__ uint64_t publication_feedback_lineage(const Descriptor& descriptor,
                saved.query_receipt.words[2]!=truth || saved.query_receipt.words[4]!=saved.statement_index)return 1;
             query=saved.query_receipt;
             original_statements[slot]=statement.record;
+            semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::CanonicalByte,
+                sizeof(semantic_graph::Receipt)+sizeof(uint64_t));
             for(uint32_t binding=0;binding<view.bindings && fact_index<closure.fact_count;++binding) {
                 uint64_t channels=0;
                 for(uint32_t channel=0;channel<2;++channel) {
@@ -7197,11 +7237,11 @@ __device__ uint64_t publication_feedback_lineage(const Descriptor& descriptor,
                 for(uint32_t word=0;word<8;++word)
                     protected_statement.identity_words[word]=uint32_t(view.observation(binding)[word/2]>>(32*(word%2)));
                 semantic_graph::Receipt actual{};
-                semantic_call(descriptor,semantic_graph::kResidentRootTruthAdmission,&root,nullptr,&actual,&protected_statement);
+                semantic_call(descriptor,semantic_graph::kResidentRootTruthAdmission,&root,nullptr,&actual,&protected_statement,nullptr,nullptr,work);
                 if(actual.words[0]!=semantic_graph::kOk || (actual.words[2]&channels)!=channels ||
                    actual.words[39]!=bank.header.semantic_owner || actual.words[33]!=semantic_graph::kRootKind ||
                    actual.words[34]!=bank.header.semantic_slot || actual.words[35]!=bank.header.semantic_generation ||
-                   !publication_identity_equal(actual.words+16,bank.header.semantic_digest))return 1;
+                   !publication_identity_equal(actual.words+16,bank.header.semantic_digest,work))return 1;
                 for(uint32_t word=0;word<3;++word)if(actual.words[13+word]!=bank.header.semantic_extents[word])return 1;
                 collector.channels=channels;
                 semantic_graph::Receipt checked{};
@@ -7209,14 +7249,15 @@ __device__ uint64_t publication_feedback_lineage(const Descriptor& descriptor,
                     false,collector,&checked))return collector.refusal ? collector.refusal : 1;
             }
             offsets[slot+1]=collector.count;
+            semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::CanonicalByte,sizeof(uint64_t));
             continue;
         }
         collector.channels=3;
-        semantic_call(descriptor,semantic_graph::kResidentRootTruthAdmission,&root,nullptr,&query,&statement);
+        semantic_call(descriptor,semantic_graph::kResidentRootTruthAdmission,&root,nullptr,&query,&statement,nullptr,nullptr,work);
         if(query.words[0]!=semantic_graph::kOk || query.words[2]!=(saved.pro|(saved.contra<<1)) ||
            query.words[39]!=bank.header.semantic_owner || query.words[33]!=semantic_graph::kRootKind ||
            query.words[34]!=bank.header.semantic_slot || query.words[35]!=bank.header.semantic_generation ||
-           !publication_identity_equal(query.words+16,bank.header.semantic_digest))return 1;
+           !publication_identity_equal(query.words+16,bank.header.semantic_digest,work))return 1;
         for(uint32_t i=0;i<3;++i)if(query.words[13+i]!=bank.header.semantic_extents[i])return 1;
         // Cold restoration deliberately preserves archived runtime handles.
         // Stable semantic fields still have to agree with the fresh query.
@@ -7225,12 +7266,14 @@ __device__ uint64_t publication_feedback_lineage(const Descriptor& descriptor,
         if((query.words[8]!=0)!=(query.words[12]!=0) ||
            (query.words[2]!=0)!=(query.words[8]!=0))return 1;
         original_statements[slot]=statement.record;
+        semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::CanonicalByte,sizeof(uint64_t));
         if(query.words[12]) {
             semantic_graph::Receipt checked{};
             if(!semantic_graph::visit_support_chain(layout,query.words[7],query.words[11]+1,
                     false,collector,&checked))return collector.refusal ? collector.refusal : 1;
         }
         offsets[slot+1]=collector.count;
+        semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::CanonicalByte,sizeof(uint64_t));
     }
     return 0;
 }
@@ -7240,18 +7283,27 @@ extern "C" __global__ void semantic_feedback_project(Descriptor descriptor,
         semantic_graph::Receipt* queries,uint64_t* original_statements,uint64_t* offsets,
         uint64_t* supports,uint64_t support_capacity,uint64_t* status) {
     if(blockIdx.x || threadIdx.x)return;
+    const uint64_t cold_work_ptr=descriptor.native_work;
+    if(cold_work_ptr && !publication_pointer_span(cold_work_ptr,sizeof(semantic_graph::NativeWorkTally),
+            alignof(semantic_graph::NativeWorkTally))) { semantic_content_integrity_trap();return; }
+    auto* work=reinterpret_cast<semantic_graph::NativeWorkTally*>(cold_work_ptr);
+    semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::Command,1);
     // The preceding encoder initializes every status on this same stream.
     // Consumers follow the projection's event; rejected input must never
     // become usable merely because no host reads its private status buffer.
-    for(uint64_t slot=0;slot<slots;++slot)if(status[slot]) {
-        semantic_content_integrity_trap();return;
+    for(uint64_t slot=0;slot<slots;++slot) {
+        semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::TableSlot,1);
+        if(status[slot]) { semantic_content_integrity_trap();return; }
     }
     const uint64_t error=publication_feedback_lineage(descriptor,lease,slots,queries,
-        original_statements,offsets,supports,support_capacity);
+        original_statements,offsets,supports,support_capacity,work);
     // Keep the original private diagnostic while stopping every dependent
     // consumer, including when an actual contributor has no original target.
     if(error) {
-        for(uint64_t slot=0;slot<slots;++slot)status[slot]=(uint64_t(1)<<32)|error;
+        for(uint64_t slot=0;slot<slots;++slot) {
+            status[slot]=(uint64_t(1)<<32)|error;
+            semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::CanonicalByte,sizeof(uint64_t));
+        }
         semantic_content_integrity_trap();
     }
 }
@@ -7260,7 +7312,12 @@ extern "C" __global__ void semantic_feedback_project(Descriptor descriptor,
 // Retained output capacity preserves every physical slot, including invalid gaps.
 extern "C" __global__ void semantic_feedback_encode(uint64_t control_ptr,
         const PublicationLease* lease,uint64_t capacity,
-        uint64_t slots, float* features, uint8_t* validity, uint64_t* status) {
+        uint64_t slots, float* features, uint8_t* validity, uint64_t* status,uint64_t cold_work_ptr=0) {
+    if(cold_work_ptr && !publication_pointer_span(cold_work_ptr,sizeof(semantic_graph::NativeWorkTally),
+            alignof(semantic_graph::NativeWorkTally))) { semantic_content_integrity_trap();return; }
+    auto* work=reinterpret_cast<semantic_graph::NativeWorkTally*>(cold_work_ptr);
+    if(blockIdx.x==0 && threadIdx.x==0)
+        semantic_graph::charge_native_parallel(work,semantic_graph::NativeWorkEvent::Command,1);
     if(!capacity || capacity>(UINT64_MAX-4)/9 || !slots ||
        slots>UINT64_MAX/(9*capacity+4)/sizeof(float)) { semantic_content_integrity_trap();return; }
     const uint64_t width = 9 * capacity + 4;
@@ -7269,20 +7326,30 @@ extern "C" __global__ void semantic_feedback_encode(uint64_t control_ptr,
     __shared__ semantic_feedback::Statement statement;
     __shared__ uint64_t statement_error;
     if(threadIdx.x==0) {
-        input_error=publication_feedback_inputs(control_ptr,lease,slots,&inputs);
+        // Every block genuinely revalidates the input hashes. Its serial local
+        // meter is merged atomically; repeated reached work is not deduplicated.
+        semantic_graph::NativeWorkTally local{};
+        input_error=publication_feedback_inputs(control_ptr,lease,slots,&inputs,work ? &local : nullptr);
         if(!input_error && inputs.statement_capacity!=capacity)input_error=1;
+        for(unsigned event=0;event<9;++event)
+            semantic_graph::charge_native_parallel(work,semantic_graph::NativeWorkEvent(event),local.events[event]);
+        if(work && local.overflow)atomicExch(reinterpret_cast<unsigned long long*>(&work->overflow),1ULL);
     }
     __syncthreads();
     for (uint64_t slot = blockIdx.x; slot < slots; slot += gridDim.x) {
         if(threadIdx.x==0) {
+            semantic_graph::NativeWorkTally local{};
             statement={};statement_error=0;
             if(!input_error && inputs.records[slot].valid) {
                 const auto index=inputs.records[slot].statement_index;
                 const auto* range=index<inputs.statement_count ? publication_find_range(inputs.ranges,
-                    inputs.bank->header.range_count,16,index) : nullptr;
+                    inputs.bank->header.range_count,16,index,work ? &local : nullptr) : nullptr;
                 if(!range)statement_error=1;
                 else statement={publication_range_bytes(*inputs.control,*range),range->length_bytes};
             }
+            for(unsigned event=0;event<9;++event)
+                semantic_graph::charge_native_parallel(work,semantic_graph::NativeWorkEvent(event),local.events[event]);
+            if(work && local.overflow)atomicExch(reinterpret_cast<unsigned long long*>(&work->overflow),1ULL);
         }
         __syncthreads();
         const uint64_t error = input_error ? (uint64_t(1)<<32)|input_error : statement_error ? statement_error :
@@ -7290,10 +7357,14 @@ extern "C" __global__ void semantic_feedback_encode(uint64_t control_ptr,
         if (threadIdx.x == 0) {
             status[slot] = error;
             validity[slot] = error ? 0 : uint8_t(inputs.records[slot].valid);
+            semantic_graph::charge_native_parallel(work,semantic_graph::NativeWorkEvent::CanonicalByte,
+                sizeof(uint64_t)+sizeof(uint8_t));
         }
-        for (uint64_t column = threadIdx.x; column < width; column += blockDim.x)
+        for (uint64_t column = threadIdx.x; column < width; column += blockDim.x) {
             features[slot * width + column] = error ? 0.0f :
                 semantic_feedback::coordinate(inputs.records[slot], statement, capacity, column);
+            semantic_graph::charge_native_parallel(work,semantic_graph::NativeWorkEvent::CanonicalByte,sizeof(float));
+        }
         __syncthreads();
     }
 }
@@ -7456,10 +7527,14 @@ extern "C" __global__ void semantic_transition_execute(Descriptor descriptor) {
             }
             if(transition_kind==4) {
                 numerical &= publication_merge_actor_refresh_work(descriptor,state->execution_work);
-                numerical &= publication_merge_policy_work(descriptor,state->execution_work);
-            } else if(descriptor.publication.native_work || descriptor.policy_work) {
+            } else if(descriptor.publication.native_work) {
                 semantic_content_integrity_trap();return;
             }
+            // Every non-Drain model branch owns its scratch producer component;
+            // Update additionally owns derivative, critic and actor components.
+            if(transition_kind!=3)
+                numerical &= publication_merge_policy_work(descriptor,state->execution_work);
+            else if(descriptor.policy_work) { semantic_content_integrity_trap();return; }
             uint64_t training_status=0;
             uint8_t original_numerical=numerical;
             if(transition_kind==1)numerical &= critic_admissible && uniform_admissible;

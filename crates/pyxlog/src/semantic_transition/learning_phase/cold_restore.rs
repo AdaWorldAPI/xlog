@@ -34,19 +34,113 @@ pub(super) fn cancelled_evaluation_reason(
 pub(in crate::semantic_transition) struct VerifiedClosure {
     pub(in crate::semantic_transition) phase_id: [u8; 32],
     pub(in crate::semantic_transition) completion_digest: [u8; 32],
-    pub(in crate::semantic_transition) admission: Arc<[u8]>,
+    pub(in crate::semantic_transition) admission: xlog_cuda::SemanticReplayLoadedMaterial,
     pub(in crate::semantic_transition) program: Arc<[u8]>,
     pub(in crate::semantic_transition) history: Arc<[u8]>,
     pub(in crate::semantic_transition) acceptance: Arc<[u8]>,
     pub(in crate::semantic_transition) snapshot: AuthoritySnapshot,
     pub(in crate::semantic_transition) refusal: Option<RefusalClosure>,
+    material_sources: Arc<material_source::MaterialSourceRegistry>,
+    _metadata_reservation: xlog_cuda::SemanticReplayMaterialReservation,
 }
 
 pub(in crate::semantic_transition) struct RefusalClosure {
     pub(in crate::semantic_transition) cause: Arc<str>,
-    pub(in crate::semantic_transition) record: Arc<[u8]>,
+    pub(in crate::semantic_transition) record: xlog_cuda::SemanticReplayLoadedMaterial,
     pub(in crate::semantic_transition) expense: ProposalExpense,
-    pub(super) source_native: Arc<[u8]>,
+    pub(super) source_proof: xlog_cuda::SemanticReplayStateMaterialProof,
+}
+
+struct BoundCheckpointContext<'a> {
+    source: &'a Arc<material_source::MaterialSourceRegistry>,
+    original: xlog_cuda::SemanticReplayLoadedMaterial,
+    records: [Option<xlog_cuda::SemanticReplayLoadedMaterial>; 3],
+    proof: xlog_cuda::SemanticReplayStateMaterialProof,
+}
+
+struct BoundPhaseLineage {
+    proof: xlog_cuda::SemanticReplayStateMaterialProof,
+    start: usize,
+}
+
+impl std::ops::Deref for BoundPhaseLineage {
+    type Target = [xlog_cuda::SemanticLearningPhaseRecord];
+
+    fn deref(&self) -> &Self::Target {
+        &self.proof.learning_phase_history()[self.start..]
+    }
+}
+
+impl<'a> BoundCheckpointContext<'a> {
+    fn new(
+        source: &'a Arc<material_source::MaterialSourceRegistry>,
+        native: &mut xlog_cuda::SemanticReplayLoadedMaterial,
+        records: &[Option<xlog_cuda::SemanticReplayLoadedMaterial>; 3],
+    ) -> PyResult<Self> {
+        native
+            .require_budget(&source.native_budget()?)
+            .map_err(xlog_err)?;
+        let proof = native.checkpoint_proof().map_err(xlog_err)?;
+        Ok(Self {
+            source,
+            original: native.clone(),
+            records: records.clone(),
+            proof,
+        })
+    }
+
+    fn original_material(&self, bytes: &[u8]) -> PyResult<xlog_cuda::SemanticReplayLoadedMaterial> {
+        let begin = bytes.as_ptr() as usize;
+        let end = begin
+            .checked_add(bytes.len())
+            .ok_or_else(|| invalid("cold closure original slice extent overflow"))?;
+        for owner in std::iter::once(&self.original).chain(self.records.iter().flatten()) {
+            let original = owner.as_bytes();
+            let original_begin = original.as_ptr() as usize;
+            let original_end = original_begin
+                .checked_add(original.len())
+                .ok_or_else(|| invalid("cold closure retained material extent overflow"))?;
+            if begin >= original_begin && end <= original_end {
+                return owner
+                    .slice_payload(begin - original_begin..end - original_begin)
+                    .map_err(xlog_err);
+            }
+        }
+        Err(invalid(
+            "cold closure slice is not retained by its original loaded materials",
+        ))
+    }
+
+    fn native_proof(&self, native: &[u8]) -> PyResult<xlog_cuda::SemanticReplayStateMaterialProof> {
+        if native == self.original.as_bytes() {
+            return Ok(self.proof.clone());
+        }
+        let mut loaded = self.original_material(native)?;
+        loaded.checkpoint_proof().map_err(xlog_err)
+    }
+
+    fn lineage(
+        &self,
+        source: &[u8],
+        target: &[u8],
+        admission: &[u8],
+        recipe: &[u8],
+        final_phase: Option<SemanticLearningPhase>,
+    ) -> PyResult<BoundPhaseLineage> {
+        let source = self.native_proof(source)?;
+        let target = self.native_proof(target)?;
+        require_executed_lineage_records(
+            source.learning_phase_history(),
+            target.learning_phase_history(),
+            admission,
+            recipe,
+            final_phase,
+        )?;
+        Ok(BoundPhaseLineage {
+            proof: target,
+            start: source.learning_phase_history().len(),
+        })
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -179,6 +273,17 @@ fn host(value: &ColdValue) -> PyResult<Value> {
             fields.insert("bytes_hex".to_owned(), Value::String(hex(bytes)));
             Value::Object(fields)
         }
+        ColdValue::ReplayBytes(payload) => {
+            let mut fields = Map::new();
+            fields.insert("bytes_hex".to_owned(), Value::String(hex(payload.bytes())));
+            Value::Object(fields)
+        }
+        ColdValue::Stored(stored) => Value::Array(vec![
+            Value::String("stored".to_owned()),
+            Value::Array(stored.store.0.into_iter().map(Value::from).collect()),
+            Value::String(stored.digest.clone()),
+            Value::from(stored.size),
+        ]),
     })
 }
 
@@ -610,22 +715,35 @@ fn recipe_material(record: &xlog_cuda::SemanticLearningPhaseRecord) -> Vec<u8> {
 /// Live and cold custody prove the original executed native prefix. Complete
 /// delivery additionally requires a transition reaching its declared final phase;
 /// cancelled evaluation preserves genuine absence or partial phase progress.
-pub(super) fn require_executed_lineage(
-    source_native: &[u8],
-    final_native: &[u8],
+pub(super) fn require_executed_lineage_bound(
+    source: &xlog_cuda::SemanticReplayStateMaterialProof,
+    target: &xlog_cuda::SemanticReplayStateMaterialProof,
     admission: &[u8],
     recipe_bytes: &[u8],
     final_phase: Option<SemanticLearningPhase>,
-) -> PyResult<Vec<xlog_cuda::SemanticLearningPhaseRecord>> {
+) -> PyResult<()> {
+    require_executed_lineage_records(
+        source.learning_phase_history(),
+        target.learning_phase_history(),
+        admission,
+        recipe_bytes,
+        final_phase,
+    )?;
+    Ok(())
+}
+
+fn require_executed_lineage_records<'a>(
+    original: &[xlog_cuda::SemanticLearningPhaseRecord],
+    final_phases: &'a [xlog_cuda::SemanticLearningPhaseRecord],
+    admission: &[u8],
+    recipe_bytes: &[u8],
+    final_phase: Option<SemanticLearningPhase>,
+) -> PyResult<&'a [xlog_cuda::SemanticLearningPhaseRecord]> {
     let recipe = ColdValue::from_canonical_bytes(recipe_bytes)?;
     let recipe = recipe.fields(5)?;
     let source_phase = phase(recipe[0].text()?)?;
-    let original = SemanticTransitionSession::checkpoint_learning_phase_history(source_native)
-        .map_err(xlog_err)?;
-    let final_phases = SemanticTransitionSession::checkpoint_learning_phase_history(final_native)
-        .map_err(xlog_err)?;
     let added = final_phases
-        .strip_prefix(original.as_slice())
+        .strip_prefix(original)
         .ok_or_else(|| invalid("phase checkpoint lacks its original executed native transition"))?;
     if added
         .iter()
@@ -640,15 +758,19 @@ pub(super) fn require_executed_lineage(
             "phase checkpoint differs from its original executed recipe or signed admission",
         ));
     }
-    Ok(added.to_vec())
+    Ok(added)
 }
 
 fn require_private_expense(
-    source: &SemanticCheckpointManifest,
-    private: &SemanticCheckpointManifest,
+    source: &impl CheckpointManifestReader,
+    private: &impl CheckpointManifestReader,
+    material_sources: &Arc<material_source::MaterialSourceRegistry>,
 ) -> PyResult<ProposalExpense> {
-    let (source_seed, _, _, _) = TaskCheckpointSeed::decode(&source.task)?;
-    let (private_seed, _, _, _) = TaskCheckpointSeed::decode(&private.task)?;
+    let source = source.borrowed();
+    let private = private.borrowed();
+    let (source_seed, _, _, _) = TaskCheckpointSeed::decode_bound(&source.task, material_sources)?;
+    let (private_seed, _, _, _) =
+        TaskCheckpointSeed::decode_bound(&private.task, material_sources)?;
     let expense = private_seed.proposal_expense()?;
     if source.session != private.session
         || source_seed.training_domain != private_seed.training_domain
@@ -668,7 +790,322 @@ fn require_private_expense(
     Ok(expense)
 }
 
+fn closure_metadata_bound(lifecycle: &phase_record::LifecyclePayloads<'_>) -> PyResult<u64> {
+    fn add(total: &mut u64, bytes: u64) -> PyResult<()> {
+        *total = total
+            .checked_add(bytes)
+            .ok_or_else(|| invalid("cold closure metadata extent overflow"))?;
+        Ok(())
+    }
+    fn canonical(total: &mut u64, bytes: &[u8]) -> PyResult<()> {
+        let (_, owned, nodes) = ColdValue::checked_canonical_bytes(bytes, false)?;
+        // Original cold decoding, authority projection, Python recipe fields,
+        // JSON host projection, and their canonical comparison coexist here.
+        let extent = (owned as u64)
+            .checked_add(bytes.len() as u64)
+            .and_then(|extent| {
+                extent.checked_add((nodes as u64).checked_mul(
+                    (std::mem::size_of::<ColdValue>() + std::mem::size_of::<Value>()) as u64,
+                )?)
+            })
+            .and_then(|extent| extent.checked_mul(6))
+            .ok_or_else(|| invalid("cold closure canonical metadata extent overflow"))?;
+        add(total, extent)
+    }
+    fn json_material(total: &mut u64, bytes: &[u8]) -> PyResult<()> {
+        if !bytes.is_empty() {
+            // The signed-program check and terminal-target readers use the
+            // same JSON core while the original program remains retained.
+            let extent = xlog_cuda::SemanticReplayMaterialBudget::json_allocation_bound(bytes)
+                .map_err(xlog_err)?
+                .checked_mul(3)
+                .ok_or_else(|| invalid("cold closure JSON metadata extent overflow"))?;
+            add(total, extent)?;
+            add(
+                total,
+                (bytes.len() as u64)
+                    .checked_add((2 * std::mem::size_of::<usize>()) as u64)
+                    .ok_or_else(|| invalid("cold closure retained JSON extent overflow"))?,
+            )?;
+        }
+        Ok(())
+    }
+    let mut total =
+        (std::mem::size_of::<VerifiedClosure>() + 2 * std::mem::size_of::<usize>()) as u64;
+    let mut inputs = RecordReader(
+        lifecycle
+            .admission
+            .strip_prefix(b"xlog.learning-phase.inputs.v2\0")
+            .ok_or_else(|| invalid("cold phase admission has another domain"))?,
+    );
+    inputs.field()?;
+    json_material(&mut total, inputs.field()?)?;
+    canonical(&mut total, inputs.field()?)?;
+    canonical(&mut total, inputs.field()?)?;
+    add(
+        &mut total,
+        (inputs.field()?.len() as u64)
+            .checked_mul(2)
+            .ok_or_else(|| invalid("cold closure destination extent overflow"))?,
+    )?;
+    for _ in 0..2 {
+        add(
+            &mut total,
+            (inputs.field()?.len() as u64)
+                .checked_mul(4)
+                .ok_or_else(|| invalid("cold closure feedback projection extent overflow"))?,
+        )?;
+    }
+    canonical(&mut total, inputs.field()?)?;
+    inputs.field()?;
+    inputs.finish()?;
+    if let Some(preparation) = lifecycle.preparation {
+        let mut reader = RecordReader(preparation);
+        reader.field()?;
+        json_material(&mut total, reader.field()?)?;
+        json_material(&mut total, reader.field()?)?;
+        reader.finish()?;
+    }
+    if lifecycle.refused {
+        let mut reader = RecordReader(
+            lifecycle
+                .completion
+                .strip_prefix(b"xlog.learning-phase.refusal.v1\0")
+                .ok_or_else(|| invalid("terminal phase record has another original domain"))?,
+        );
+        add(
+            &mut total,
+            (reader.field()?.len() as u64)
+                .checked_add((2 * std::mem::size_of::<usize>()) as u64)
+                .ok_or_else(|| invalid("cold closure refusal cause extent overflow"))?,
+        )?;
+        for _ in 0..2 {
+            reader.field()?;
+        }
+        for _ in 0..3 {
+            json_material(&mut total, reader.field()?)?;
+        }
+        for _ in 0..3 {
+            canonical(&mut total, reader.field()?)?;
+        }
+        reader.field()?;
+        reader.finish()?;
+    } else {
+        let mut reader = RecordReader(
+            lifecycle
+                .completion
+                .strip_prefix(b"xlog.learning-phase.delivery.v1\0")
+                .ok_or_else(|| invalid("cold phase delivery has another domain"))?,
+        );
+        reader.field()?;
+        json_material(&mut total, reader.field()?)?;
+        canonical(&mut total, reader.field()?)?;
+        reader.field()?;
+        canonical(&mut total, reader.field()?)?;
+        reader.field()?;
+        reader.finish()?;
+    }
+    // Fixed issuer/digest/fence byte copies and exact three-record stack roster.
+    add(&mut total, 8 * 32)?;
+    Ok(total)
+}
+
 impl VerifiedClosure {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the original live phase retains its signed chain and independent checkpoint issuer"
+    )]
+    pub(super) fn read_retained(
+        py: Python<'_>,
+        checkpoint: &[u8],
+        checkpoint_issuer: &[u8; 32],
+        original_records: &[Option<xlog_cuda::SemanticReplayLoadedMaterial>; 3],
+        record_count: usize,
+        issuer: [u8; 32],
+        phase_id: [u8; 32],
+        limits: RecordLimits,
+        source_checkpoint: &[u8],
+        target: Option<[u8; 32]>,
+        destination: &str,
+        source_phase: SemanticLearningPhase,
+        target_phase: SemanticLearningPhase,
+        material_sources: &Arc<material_source::MaterialSourceRegistry>,
+    ) -> PyResult<Self> {
+        if !matches!(record_count, 2 | 3) {
+            return Err(invalid(
+                "live phase closure lost its complete original signed chain",
+            ));
+        }
+        let mut raw = [&[][..]; 3];
+        for (index, material) in original_records.iter().take(record_count).enumerate() {
+            raw[index] = material
+                .as_ref()
+                .ok_or_else(|| invalid("live phase closure lost an original signed record"))?
+                .as_bytes();
+        }
+        let lifecycle = lifecycle_payloads(&raw[..record_count], issuer, phase_id, limits)?;
+        fn nested_native(
+            owner: &xlog_cuda::SemanticReplayLoadedMaterial,
+            original: &[u8],
+            checkpoint: &[u8],
+        ) -> PyResult<Option<xlog_cuda::SemanticReplayLoadedMaterial>> {
+            if original != checkpoint {
+                return Ok(None);
+            }
+            let manifest = SemanticCheckpointManifest::decode_borrowed(original)?;
+            let begin = (manifest.native.as_ptr() as usize)
+                .checked_sub(owner.as_bytes().as_ptr() as usize)
+                .ok_or_else(|| {
+                    invalid("live phase checkpoint is outside its original signed owner")
+                })?;
+            let end = begin
+                .checked_add(manifest.native.len())
+                .filter(|end| *end <= owner.as_bytes().len())
+                .ok_or_else(|| {
+                    invalid("live phase native slice exceeds its original signed owner")
+                })?;
+            owner.slice_payload(begin..end).map(Some).map_err(xlog_err)
+        }
+        let mut admission = RecordReader(
+            lifecycle
+                .admission
+                .strip_prefix(b"xlog.learning-phase.inputs.v2\0")
+                .ok_or_else(|| invalid("live phase admission has another original domain"))?,
+        );
+        let source = admission.field()?;
+        let mut native = nested_native(original_records[0].as_ref().unwrap(), source, checkpoint)?;
+        if native.is_none() {
+            if let Some(preparation) = lifecycle.preparation {
+                let prepared = RecordReader(preparation).field()?;
+                native =
+                    nested_native(original_records[1].as_ref().unwrap(), prepared, checkpoint)?;
+            }
+        }
+        if native.is_none() {
+            let domain = if lifecycle.refused {
+                &b"xlog.learning-phase.refusal.v1\0"[..]
+            } else {
+                &b"xlog.learning-phase.delivery.v1\0"[..]
+            };
+            let mut completion = RecordReader(
+                lifecycle
+                    .completion
+                    .strip_prefix(domain)
+                    .ok_or_else(|| invalid("live phase completion has another original domain"))?,
+            );
+            if lifecycle.refused {
+                completion.field()?;
+                completion.field()?;
+            }
+            let completed = completion.field()?;
+            native = nested_native(
+                original_records[record_count - 1].as_ref().unwrap(),
+                completed,
+                checkpoint,
+            )?;
+        }
+        let mut native = native.ok_or_else(|| {
+            invalid("live phase checkpoint is not retained by its original signed lifecycle")
+        })?;
+        let budget = material_sources.native_budget()?;
+        let fixed_bytes_count = if target.is_some() { 5 } else { 4 };
+        let mut metadata = material_bytes::python_instance_extent::<PyBytes>(py)?
+            .checked_add(33)
+            .and_then(|bytes| bytes.checked_mul(fixed_bytes_count))
+            .ok_or_else(|| invalid("live phase fixed-byte metadata extent overflow"))?;
+        metadata = metadata
+            .checked_add(
+                material_bytes::python_instance_extent::<PyTuple>(py)?
+                    .checked_mul(3)
+                    .and_then(|bytes| {
+                        bytes.checked_add((record_count + 9) * std::mem::size_of::<usize>())
+                    })
+                    .ok_or_else(|| invalid("live phase tuple metadata extent overflow"))?,
+            )
+            .ok_or_else(|| invalid("live phase metadata extent overflow"))?;
+        let integer_type = <pyo3::types::PyInt as pyo3::PyTypeInfo>::type_object_raw(py);
+        // Every limb stores at least one bit. This derives a finite u64
+        // instance bound from the actual interpreter's integer item extent.
+        let integer_item = usize::try_from(unsafe { (*integer_type).tp_itemsize })
+            .map_err(|_| invalid("live phase integer type has an invalid item extent"))?;
+        metadata =
+            metadata
+                .checked_add(
+                    material_bytes::python_instance_extent::<pyo3::types::PyInt>(py)?
+                        .checked_add((u64::BITS as usize).checked_mul(integer_item).ok_or_else(
+                            || invalid("live phase integer metadata extent overflow"),
+                        )?)
+                        .and_then(|bytes| bytes.checked_mul(3))
+                        .ok_or_else(|| invalid("live phase limit metadata extent overflow"))?,
+                )
+                .ok_or_else(|| invalid("live phase metadata extent overflow"))?;
+        for text in [
+            destination,
+            phase_name(source_phase),
+            phase_name(target_phase),
+        ] {
+            metadata = metadata
+                .checked_add(
+                    material_bytes::python_instance_extent::<PyString>(py)?
+                        .checked_add(
+                            text.len()
+                                .checked_mul(4)
+                                .and_then(|bytes| bytes.checked_add(4))
+                                .ok_or_else(|| {
+                                    invalid("live phase text metadata extent overflow")
+                                })?,
+                        )
+                        .ok_or_else(|| invalid("live phase text instance extent overflow"))?,
+                )
+                .ok_or_else(|| invalid("live phase metadata extent overflow"))?;
+        }
+        let _metadata = material_bytes::reserve_material_metadata(&budget, metadata)?;
+        let mut wrappers: [Option<Py<material_bytes::PySemanticMaterialBytes>>; 3] =
+            std::array::from_fn(|_| None);
+        for (index, original) in original_records.iter().take(record_count).enumerate() {
+            wrappers[index] = Some(Py::new(
+                py,
+                material_bytes::PySemanticMaterialBytes::from_native(
+                    py,
+                    original.as_ref().unwrap().clone(),
+                    &budget,
+                )?,
+            )?);
+        }
+        let records = PyTuple::new(
+            py,
+            wrappers
+                .iter()
+                .take(record_count)
+                .map(|value| value.as_ref().unwrap().clone_ref(py)),
+        )?;
+        let issuer = PyBytes::new(py, &issuer);
+        let checkpoint_issuer = PyBytes::new(py, checkpoint_issuer);
+        let limits = (limits.record_bytes, limits.total_bytes, limits.records).into_pyobject(py)?;
+        let target = target
+            .map(|digest| PyBytes::new(py, &digest).into_any().unbind())
+            .unwrap_or_else(|| py.None());
+        let fence = (
+            PyBytes::new(py, &phase_id),
+            PyBytes::new(py, &Sha256::digest(source_checkpoint)),
+            target,
+            destination,
+            phase_name(source_phase),
+            phase_name(target_phase),
+        )
+            .into_pyobject(py)?;
+        Self::read(
+            checkpoint,
+            issuer.as_any(),
+            records.as_any(),
+            limits.as_any(),
+            fence.as_any(),
+            Some(checkpoint_issuer.as_any()),
+            material_sources,
+            &mut native,
+        )
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "terminal verification retains the already decoded original signed inputs and fence"
@@ -688,6 +1125,8 @@ impl VerifiedClosure {
         target_phase: SemanticLearningPhase,
         pending_target: Option<[u8; 32]>,
         py: Python<'_>,
+        context: &BoundCheckpointContext<'_>,
+        metadata_reservation: xlog_cuda::SemanticReplayMaterialReservation,
     ) -> PyResult<Self> {
         let mut reader = RecordReader(
             lifecycle
@@ -732,13 +1171,12 @@ impl VerifiedClosure {
             {
                 return Err(invalid("Source evaluation cancellation contradicts absent private restoration or scientific acceptance"));
             }
-            let manifest = SemanticCheckpointManifest::decode(source)?;
-            let (seed, saved_snapshot, _, _) = TaskCheckpointSeed::decode(&manifest.task)?;
+            let manifest = SemanticCheckpointManifest::decode_borrowed(source)?;
+            let (seed, saved_snapshot, _, _) =
+                TaskCheckpointSeed::decode_bound(&manifest.task, context.source)?;
             let mut expense = seed.proposal_expense()?;
-            let source_parent =
-                SemanticTransitionSession::state_material_projection(&manifest.native)
-                    .map_err(xlog_err)?
-                    .publication;
+            let source_proof = context.native_proof(manifest.native)?;
+            let source_parent = source_proof.original_identity();
             let recipe = ColdValue::from_canonical_bytes(recipe_bytes)?;
             let fields = recipe.fields(5)?;
             let values = fields
@@ -796,15 +1234,15 @@ impl VerifiedClosure {
                         "private cancellation requires its actual original private branch",
                     ));
                 }
-                let private_manifest = SemanticCheckpointManifest::decode(private)?;
+                let private_manifest = SemanticCheckpointManifest::decode_borrowed(private)?;
                 let (_, private_snapshot, _, _) =
-                    TaskCheckpointSeed::decode(&private_manifest.task)?;
-                expense = require_private_expense(&manifest, &private_manifest)?;
+                    TaskCheckpointSeed::decode_bound(&private_manifest.task, context.source)?;
+                expense = require_private_expense(&manifest, &private_manifest, context.source)?;
                 snapshot.newer_than(&private_snapshot)?;
                 // Initial trajectory construction is an exact Source restore.
                 // Only executed cold restores may add a phase. No transition
                 // yet is genuine absence, never a fabricated first recipe.
-                let added = require_executed_lineage(
+                let added = context.lineage(
                     &manifest.native,
                     &private_manifest.native,
                     admission,
@@ -825,9 +1263,9 @@ impl VerifiedClosure {
                         "cancelled private checkpoint extends beyond its actual original prefix",
                     ));
                 }
-                SemanticTransitionSession::state_material_projection(&private_manifest.native)
-                    .map_err(xlog_err)?
-                    .publication
+                context
+                    .native_proof(private_manifest.native)?
+                    .original_identity()
             };
             let entry_fields = ColdValue::from_canonical_bytes(entry_material)?;
             let entry_fields = entry_fields.fields(6)?;
@@ -992,17 +1430,19 @@ impl VerifiedClosure {
             return Ok(Self {
                 phase_id,
                 completion_digest: Sha256::digest(terminal_record).into(),
-                admission: Arc::from(admission),
+                admission: context.original_material(admission)?,
                 program: Arc::from(program_bytes),
                 history: Arc::from(history_bytes),
                 acceptance: Arc::from(&[][..]),
                 snapshot,
                 refusal: Some(RefusalClosure {
                     cause: Arc::from(cause),
-                    record: Arc::from(terminal_record),
+                    record: context.original_material(terminal_record)?,
                     expense,
-                    source_native: Arc::from(manifest.native.as_slice()),
+                    source_proof,
                 }),
+                material_sources: context.source.clone(),
+                _metadata_reservation: metadata_reservation,
             });
         }
         if pending_target.is_some_and(|target| {
@@ -1039,31 +1479,30 @@ impl VerifiedClosure {
                 ))
             }
         }
-        let source_manifest = SemanticCheckpointManifest::decode(source)?;
-        let private_manifest = SemanticCheckpointManifest::decode(private)?;
-        let (_, source_snapshot, _, _) = TaskCheckpointSeed::decode(&source_manifest.task)?;
-        let (_, private_snapshot, _, _) = TaskCheckpointSeed::decode(&private_manifest.task)?;
-        let expense = require_private_expense(&source_manifest, &private_manifest)?;
+        let source_manifest = SemanticCheckpointManifest::decode_borrowed(source)?;
+        let private_manifest = SemanticCheckpointManifest::decode_borrowed(private)?;
+        let (_, source_snapshot, _, _) =
+            TaskCheckpointSeed::decode_bound(&source_manifest.task, context.source)?;
+        let (_, private_snapshot, _, _) =
+            TaskCheckpointSeed::decode_bound(&private_manifest.task, context.source)?;
+        let expense = require_private_expense(&source_manifest, &private_manifest, context.source)?;
         let program = json(program_bytes)?;
         let declared_phase =
             phase(program["final_phase"].as_str().ok_or_else(|| {
                 invalid("terminal phase lost its original declared final phase")
             })?)?;
-        let phases = require_executed_lineage(
+        let phases = context.lineage(
             &source_manifest.native,
             &private_manifest.native,
             admission,
             recipe_bytes,
             Some(declared_phase),
         )?;
-        let source_parent =
-            SemanticTransitionSession::state_material_projection(&source_manifest.native)
-                .map_err(xlog_err)?
-                .publication;
-        let private_parent =
-            SemanticTransitionSession::state_material_projection(&private_manifest.native)
-                .map_err(xlog_err)?
-                .publication;
+        let source_proof = context.native_proof(source_manifest.native)?;
+        let source_parent = source_proof.original_identity();
+        let private_parent = context
+            .native_proof(private_manifest.native)?
+            .original_identity();
         let prefix = json(prefix_bytes)?;
         let history = json(history_bytes)?;
         let result = json(result_bytes)?;
@@ -1177,17 +1616,19 @@ impl VerifiedClosure {
         Ok(Self {
             phase_id,
             completion_digest: Sha256::digest(terminal_record).into(),
-            admission: Arc::from(admission),
+            admission: context.original_material(admission)?,
             program: Arc::from(program_bytes),
             history: Arc::from(history_bytes),
             acceptance: Arc::from(result_bytes),
             snapshot,
             refusal: Some(RefusalClosure {
                 cause: Arc::from(cause),
-                record: Arc::from(terminal_record),
+                record: context.original_material(terminal_record)?,
                 expense,
-                source_native: Arc::from(source_manifest.native.as_slice()),
+                source_proof,
             }),
+            material_sources: context.source.clone(),
+            _metadata_reservation: metadata_reservation,
         })
     }
 
@@ -1198,9 +1639,26 @@ impl VerifiedClosure {
         limits: &Bound<'_, PyAny>,
         fence: &Bound<'_, PyAny>,
         checkpoint_issuer: Option<&Bound<'_, PyAny>>,
+        material_sources: &Arc<material_source::MaterialSourceRegistry>,
+        native: &mut xlog_cuda::SemanticReplayLoadedMaterial,
     ) -> PyResult<Self> {
         let py = issuer.py();
-        let issuer: [u8; 32] = original_bytes(issuer, 32)?.try_into().unwrap();
+        let manifest = SemanticCheckpointManifest::decode_borrowed(checkpoint)?;
+        if native.as_bytes() != manifest.native {
+            return Err(invalid(
+                "cold closure requires this original loaded checkpoint material",
+            ));
+        }
+        if !issuer.is_exact_instance_of::<PyBytes>() {
+            return Err(invalid(
+                "cold phase issuer requires its exact original bytes",
+            ));
+        }
+        let issuer: [u8; 32] = issuer
+            .cast::<PyBytes>()?
+            .as_bytes()
+            .try_into()
+            .map_err(|_| invalid("cold phase issuer requires its original 32-byte extent"))?;
         if !records.is_exact_instance_of::<PyTuple>() || !fence.is_exact_instance_of::<PyTuple>() {
             return Err(invalid(
                 "cold phase recovery requires the original ordered tuple and fence",
@@ -1217,25 +1675,61 @@ impl VerifiedClosure {
             ));
         }
         let limits = RecordLimits::read(limits)?;
-        let phase_id: [u8; 32] = original_bytes(&fence.get_item(0)?, 32)?.try_into().unwrap();
-        let source_digest = original_bytes(&fence.get_item(1)?, 32)?;
-        let target = fence.get_item(2)?;
-        let destination = ColdValue::read(&fence.get_item(3)?, &mut (16 * 1024 * 1024), 0)?;
-        let source_phase = ColdValue::read(&fence.get_item(4)?, &mut 128, 0)?;
-        let target_phase = ColdValue::read(&fence.get_item(5)?, &mut 128, 0)?;
-        let source_phase = phase(source_phase.text()?)?;
-        let target_phase = phase(target_phase.text()?)?;
-        let retained: Vec<_> = records.iter().collect();
-        let mut raw = Vec::with_capacity(retained.len());
-        for value in &retained {
-            if !value.is_exact_instance_of::<PyBytes>() {
+        let phase = fence.get_item(0)?;
+        if !phase.is_exact_instance_of::<PyBytes>() {
+            return Err(invalid(
+                "cold phase identifier requires its exact original bytes",
+            ));
+        }
+        let phase_id: [u8; 32] = phase
+            .cast::<PyBytes>()?
+            .as_bytes()
+            .try_into()
+            .map_err(|_| invalid("cold phase identifier requires its original 32-byte extent"))?;
+        let budget = material_sources.native_budget()?;
+        let mut retained: [Option<xlog_cuda::SemanticReplayLoadedMaterial>; 3] =
+            std::array::from_fn(|_| None);
+        for (index, value) in records.iter().enumerate() {
+            if !value.is_exact_instance_of::<material_bytes::PySemanticMaterialBytes>() {
                 return Err(invalid(
-                    "cold phase records require exact original byte materials",
+                    "cold phase records require their original guarded byte materials",
                 ));
             }
-            raw.push(value.cast::<PyBytes>()?.as_bytes());
+            retained[index] = Some(
+                value
+                    .cast::<material_bytes::PySemanticMaterialBytes>()?
+                    .borrow()
+                    .original_loaded(&budget)?,
+            );
         }
-        let lifecycle = lifecycle_payloads(&raw, issuer, phase_id, limits)?;
+        let mut raw = [&[][..]; 3];
+        for (index, value) in retained.iter().take(records.len()).enumerate() {
+            let value = value.as_ref().expect("original record tuple extent");
+            raw[index] = value.as_bytes();
+        }
+        let raw = &raw[..records.len()];
+        let context = BoundCheckpointContext::new(material_sources, native, &retained)?;
+        let lifecycle = lifecycle_payloads(raw, issuer, phase_id, limits)?;
+        let metadata_reservation = material_sources
+            .native_budget()?
+            .reserve_auxiliary(closure_metadata_bound(&lifecycle)?)
+            .map_err(xlog_err)?;
+        let source_digest = original_bytes(&fence.get_item(1)?, 32)?;
+        let target = fence.get_item(2)?;
+        let destination = fence.get_item(3)?;
+        let source_phase = fence.get_item(4)?;
+        let target_phase = fence.get_item(5)?;
+        if [&destination, &source_phase, &target_phase]
+            .iter()
+            .any(|value| !value.is_exact_instance_of::<PyString>())
+        {
+            return Err(invalid(
+                "cold phase fence requires its exact original text fields",
+            ));
+        }
+        let destination = destination.cast::<PyString>()?.to_str()?;
+        let source_phase = phase(source_phase.cast::<PyString>()?.to_str()?)?;
+        let target_phase = phase(target_phase.cast::<PyString>()?.to_str()?)?;
         let admission = lifecycle.admission;
         let mut reader = RecordReader(
             admission
@@ -1246,7 +1740,7 @@ impl VerifiedClosure {
         let program_bytes = reader.field()?;
         let recipe_bytes = reader.field()?;
         let grant = ColdValue::from_canonical_bytes(reader.field()?)?;
-        if reader.field()? != destination.text()?.as_bytes() {
+        if reader.field()? != destination.as_bytes() {
             return Err(invalid("cold phase chain changed its original destination"));
         }
         let feedback = [reader.field()?, reader.field()?];
@@ -1279,13 +1773,15 @@ impl VerifiedClosure {
                 recipe_bytes,
                 &grant,
                 feedback,
-                destination.text()?,
+                destination,
                 source_phase,
                 target_phase,
                 pending_target,
                 py,
+                &context,
+                metadata_reservation,
             )?;
-            closure.require_checkpoint(checkpoint, source, checkpoint_issuer)?;
+            closure.require_checkpoint_bound(checkpoint, source, checkpoint_issuer, &context)?;
             return Ok(closure);
         }
         let target_digest = original_bytes(&target, 32)?;
@@ -1320,10 +1816,12 @@ impl VerifiedClosure {
         let mut reader = RecordReader(usage_bytes);
         let usage = [reader.word()?, reader.word()?, reader.word()?];
         reader.finish()?;
-        let source_manifest = SemanticCheckpointManifest::decode(source)?;
-        let final_manifest = SemanticCheckpointManifest::decode(delivered_checkpoint)?;
-        let (source_seed, _, _, _) = TaskCheckpointSeed::decode(&source_manifest.task)?;
-        let (final_seed, final_snapshot, _, _) = TaskCheckpointSeed::decode(&final_manifest.task)?;
+        let source_manifest = SemanticCheckpointManifest::decode_borrowed(source)?;
+        let final_manifest = SemanticCheckpointManifest::decode_borrowed(delivered_checkpoint)?;
+        let (source_seed, _, _, _) =
+            TaskCheckpointSeed::decode_bound(&source_manifest.task, material_sources)?;
+        let (final_seed, final_snapshot, _, _) =
+            TaskCheckpointSeed::decode_bound(&final_manifest.task, material_sources)?;
         if source_seed.training_domain != final_seed.training_domain
             || source_seed.replay_capacity != final_seed.replay_capacity
             || source_seed.training_objective != final_seed.training_objective
@@ -1339,14 +1837,12 @@ impl VerifiedClosure {
             ));
         }
         require_retained_arena_authority(&source_seed.authority, &final_seed.authority)?;
-        let source_parent =
-            SemanticTransitionSession::state_material_projection(&source_manifest.native)
-                .map_err(xlog_err)?
-                .publication;
-        let final_parent =
-            SemanticTransitionSession::state_material_projection(&final_manifest.native)
-                .map_err(xlog_err)?
-                .publication;
+        let source_parent = context
+            .native_proof(source_manifest.native)?
+            .original_identity();
+        let final_parent = context
+            .native_proof(final_manifest.native)?
+            .original_identity();
         if parent_material != identity_material(final_parent) {
             return Err(invalid(
                 "cold phase delivery changed its actual native publication identity",
@@ -1357,7 +1853,7 @@ impl VerifiedClosure {
             phase(program["final_phase"].as_str().ok_or_else(|| {
                 invalid("signed program lost its original declared final phase")
             })?)?;
-        let added = require_executed_lineage(
+        let added = context.lineage(
             &source_manifest.native,
             &final_manifest.native,
             raw[0],
@@ -1406,7 +1902,7 @@ impl VerifiedClosure {
                 .is_none_or(Vec::is_empty)
             || program["source_checkpoint_sha256"] != digest(source)
             || program["source_parent"] != identity_value(source_parent)
-            || program["destination"] != destination.text()?
+            || program["destination"] != destination
             || program["grant"] != host(&grant)?
             || program["recipe_digest"]
                 != host(&ColdValue::Bytes(Arc::from(
@@ -1484,21 +1980,28 @@ impl VerifiedClosure {
         let closure = Self {
             phase_id,
             completion_digest: Sha256::digest(raw[2]).into(),
-            admission: Arc::from(raw[0]),
+            admission: context.original_material(raw[0])?,
             program: Arc::from(program_bytes),
             history: Arc::from(history_bytes),
             acceptance: Arc::from(acceptance_bytes),
             snapshot,
             refusal: None,
+            material_sources: material_sources.clone(),
+            _metadata_reservation: metadata_reservation,
         };
-        closure.require_checkpoint(checkpoint, delivered_checkpoint, checkpoint_issuer)?;
+        closure.require_checkpoint_bound(
+            checkpoint,
+            delivered_checkpoint,
+            checkpoint_issuer,
+            &context,
+        )?;
         Ok(closure)
     }
 }
 
 /// Reuse the canonical restore trust boundary without allocating a native Session.
 /// An absent closure still requires the Session signature, not phase completion.
-pub(in crate::semantic_transition) fn read_checkpoint_restore_closure(
+pub(in crate::semantic_transition) fn read_checkpoint_restore_closure_bound(
     checkpoint: &[u8],
     snapshot: Option<&Bound<'_, PyAny>>,
     issuer: Option<&Bound<'_, PyAny>>,
@@ -1506,16 +2009,29 @@ pub(in crate::semantic_transition) fn read_checkpoint_restore_closure(
     limits: Option<&Bound<'_, PyAny>>,
     fence: Option<&Bound<'_, PyAny>>,
     checkpoint_issuer: Option<&Bound<'_, PyAny>>,
+    material_sources: &Arc<material_source::MaterialSourceRegistry>,
+    native: &mut xlog_cuda::SemanticReplayLoadedMaterial,
 ) -> PyResult<Option<Arc<VerifiedClosure>>> {
+    let manifest = SemanticCheckpointManifest::decode_borrowed(checkpoint)?;
+    native
+        .require_budget(&material_sources.native_budget()?)
+        .map_err(xlog_err)?;
+    if native.as_bytes() != manifest.native {
+        return Err(invalid(
+            "cold closure requires this original loaded checkpoint material",
+        ));
+    }
     let closure = match (issuer, records, limits, fence) {
         (None, None, None, None) => {
-            let manifest = SemanticCheckpointManifest::decode(checkpoint)?;
+            let manifest = SemanticCheckpointManifest::decode_borrowed(checkpoint)?;
             let checkpoint_issuer = checkpoint_issuer.ok_or_else(|| {
                 invalid("checkpoint restoration requires its independently pinned Session issuer")
             })?;
             if verify_checkpoint_signature(&manifest, checkpoint_issuer)?
-                || !SemanticTransitionSession::checkpoint_learning_phase_history(&manifest.native)
+                || !native
+                    .checkpoint_proof()
                     .map_err(xlog_err)?
+                    .learning_phase_history()
                     .is_empty()
             {
                 return Err(invalid(
@@ -1532,10 +2048,27 @@ pub(in crate::semantic_transition) fn read_checkpoint_restore_closure(
                 limits,
                 fence,
                 checkpoint_issuer,
+                material_sources,
+                native,
             )?;
             let snapshot = snapshot.ok_or_else(|| {
                 invalid("cold phase restoration requires its current authority snapshot")
             })?;
+            let budget = material_sources.native_budget()?;
+            let _preflight_reservation = budget
+                .reserve_auxiliary(
+                    (std::mem::size_of::<pyo3::ffi::PyVarObject>()
+                        + 2 * std::mem::size_of::<usize>()
+                        + std::mem::size_of::<Bound<'_, PyAny>>()) as u64,
+                )
+                .map_err(xlog_err)?;
+            let extent = ColdValue::read_allocation_bound(snapshot, &mut (16 * 1024 * 1024), 0)?;
+            let _snapshot_reservation =
+                budget
+                    .reserve_auxiliary(extent.checked_mul(3).ok_or_else(|| {
+                        invalid("cold authority snapshot metadata extent overflow")
+                    })?)
+                    .map_err(xlog_err)?;
             let current =
                 AuthoritySnapshot::parse(&ColdValue::read(snapshot, &mut (16 * 1024 * 1024), 0)?)?;
             current.newer_than(&verified.snapshot)?;
@@ -1588,6 +2121,8 @@ pub(in crate::semantic_transition) struct CheckpointCustody {
     pub(in crate::semantic_transition) closure: Option<Arc<VerifiedClosure>>,
     pub(in crate::semantic_transition) origin: Option<[u8; 32]>,
     key: SigningKey,
+    pub(in crate::semantic_transition) pending_export:
+        Option<Arc<Mutex<material_bytes::OriginalCheckpointExport>>>,
 }
 
 impl CheckpointCustody {
@@ -1596,6 +2131,7 @@ impl CheckpointCustody {
             closure: None,
             origin: None,
             key: SigningKey::generate(&mut OsRng),
+            pending_export: None,
         }
     }
 
@@ -1603,24 +2139,29 @@ impl CheckpointCustody {
         self.key.verifying_key().to_bytes()
     }
 
+    pub(in crate::semantic_transition) fn seal_extent(&self) -> usize {
+        SEAL_DOMAIN.len() + 2 * 32 + 8 + if self.closure.is_some() { 3 * 32 } else { 0 } + 64
+    }
+
     pub(in crate::semantic_transition) fn seal(
         &self,
-        manifest: &SemanticCheckpointManifest,
+        manifest: &impl CheckpointManifestReader,
+        phases: &[xlog_cuda::SemanticLearningPhaseRecord],
     ) -> PyResult<Vec<u8>> {
-        let mut bytes = SEAL_DOMAIN.to_vec();
+        let manifest = manifest.borrowed();
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(self.seal_extent())
+            .map_err(|_| invalid("checkpoint signing buffer allocation failed"))?;
+        bytes.extend_from_slice(SEAL_DOMAIN);
         for field in [self.issuer(), manifest.unsigned_phase_root()] {
             bytes.extend_from_slice(&field);
         }
         if let Some(closure) = &self.closure {
-            let phases =
-                SemanticTransitionSession::checkpoint_learning_phase_history(&manifest.native)
-                    .map_err(xlog_err)?;
             let valid = if let Some(refusal) = &closure.refusal {
-                let original = SemanticTransitionSession::checkpoint_learning_phase_history(
-                    &refusal.source_native,
-                )
-                .map_err(xlog_err)?;
-                let (seed, _, _, _) = TaskCheckpointSeed::decode(&manifest.task)?;
+                let original = refusal.source_proof.learning_phase_history();
+                let (seed, _, _, _) =
+                    TaskCheckpointSeed::decode_bound(manifest.task, &closure.material_sources)?;
                 let expense = seed.proposal_expense()?;
                 phases == original
                     && expense.capacity == refusal.expense.capacity
@@ -1657,8 +2198,9 @@ impl CheckpointCustody {
 /// The selector is untrusted metadata. It locates an independent create-only
 /// pin; it never supplies that pin's authority or verifies a checkpoint.
 pub(in crate::semantic_transition) fn checkpoint_issuer_selector(
-    manifest: &SemanticCheckpointManifest,
+    manifest: &impl CheckpointManifestReader,
 ) -> PyResult<Option<[u8; 32]>> {
+    let manifest = manifest.borrowed();
     if manifest.phase_seal.is_empty() {
         return Ok(None);
     }
@@ -1699,9 +2241,10 @@ fn checkpoint_seal(bytes: &[u8]) -> PyResult<CheckpointSeal> {
 }
 
 fn authenticated_checkpoint_seal(
-    manifest: &SemanticCheckpointManifest,
+    manifest: &impl CheckpointManifestReader,
     checkpoint_issuer: &Bound<'_, PyAny>,
 ) -> PyResult<CheckpointSeal> {
+    let manifest = manifest.borrowed();
     let issuer: [u8; 32] = original_bytes(checkpoint_issuer, 32)?.try_into().unwrap();
     let seal = checkpoint_seal(&manifest.phase_seal)?;
     if seal.issuer != issuer || seal.root != manifest.unsigned_phase_root() {
@@ -1722,7 +2265,7 @@ fn authenticated_checkpoint_seal(
 /// Verify the one canonical Session signature against an independently supplied pin.
 /// The returned phase tag is metadata, not proof of lifecycle completion.
 pub(in crate::semantic_transition) fn verify_checkpoint_signature(
-    manifest: &SemanticCheckpointManifest,
+    manifest: &impl CheckpointManifestReader,
     checkpoint_issuer: &Bound<'_, PyAny>,
 ) -> PyResult<bool> {
     Ok(authenticated_checkpoint_seal(manifest, checkpoint_issuer)?
@@ -1731,13 +2274,14 @@ pub(in crate::semantic_transition) fn verify_checkpoint_signature(
 }
 
 impl VerifiedClosure {
-    pub(super) fn require_checkpoint(
+    fn require_checkpoint_bound(
         &self,
         checkpoint: &[u8],
         delivered_checkpoint: &[u8],
         checkpoint_issuer: Option<&Bound<'_, PyAny>>,
+        context: &BoundCheckpointContext<'_>,
     ) -> PyResult<()> {
-        let manifest = SemanticCheckpointManifest::decode(checkpoint)?;
+        let manifest = SemanticCheckpointManifest::decode_borrowed(checkpoint)?;
         let seal = authenticated_checkpoint_seal(
             &manifest,
             checkpoint_issuer.ok_or_else(|| {
@@ -1747,7 +2291,7 @@ impl VerifiedClosure {
         if checkpoint == delivered_checkpoint {
             return Ok(());
         }
-        let original = SemanticCheckpointManifest::decode(delivered_checkpoint)?;
+        let original = SemanticCheckpointManifest::decode_borrowed(delivered_checkpoint)?;
         let phase = seal.phase.ok_or_else(|| {
             invalid("descendant checkpoint lacks its original known phase completion")
         })?;
@@ -1756,18 +2300,14 @@ impl VerifiedClosure {
                 "descendant checkpoint belongs to another known phase completion",
             ));
         }
-        let original_phases =
-            SemanticTransitionSession::checkpoint_learning_phase_history(&original.native)
-                .map_err(xlog_err)?;
-        let actual_phases =
-            SemanticTransitionSession::checkpoint_learning_phase_history(&manifest.native)
-                .map_err(xlog_err)?;
-        let (saved, _, _, _) = TaskCheckpointSeed::decode(&original.task)?;
-        let (current, _, _, _) = TaskCheckpointSeed::decode(&manifest.task)?;
-        let saved_parent = SemanticTransitionSession::state_material_projection(&original.native)
-            .map_err(xlog_err)?;
-        let current_parent = SemanticTransitionSession::state_material_projection(&manifest.native)
-            .map_err(xlog_err)?;
+        let saved_parent = context.native_proof(original.native)?;
+        let current_parent = context.native_proof(manifest.native)?;
+        let original_phases = saved_parent.learning_phase_history();
+        let actual_phases = current_parent.learning_phase_history();
+        let (saved, _, _, _) =
+            TaskCheckpointSeed::decode_bound(&original.task, &self.material_sources)?;
+        let (current, _, _, _) =
+            TaskCheckpointSeed::decode_bound(&manifest.task, &self.material_sources)?;
         let current_expense = current.proposal_expense()?;
         if original_phases != actual_phases
             || saved.training_domain != current.training_domain
@@ -1776,7 +2316,7 @@ impl VerifiedClosure {
             || saved.proposal_expense()?.capacity != current_expense.capacity
             || saved.proposal_expense()?.original_admission != current_expense.original_admission
             || saved.proposal_expense()?.spent > current_expense.spent
-            || saved_parent.model_generation > current_parent.model_generation
+            || saved_parent.model_generation() > current_parent.model_generation()
             || self.refusal.as_ref().is_some_and(|refusal| {
                 current_expense.capacity != refusal.expense.capacity
                     || current_expense.original_admission != refusal.expense.original_admission
@@ -1826,7 +2366,11 @@ impl VerifiedClosure {
                         PyBytes::new(py, &self.acceptance).into_any().unbind()
                     },
                     PyBytes::new(py, &self.history),
-                    PyBytes::new(py, &refusal.record),
+                    material_bytes::PySemanticMaterialBytes::from_native(
+                        py,
+                        refusal.record.clone(),
+                        &self.material_sources.native_budget()?,
+                    )?,
                 )
                     .into_pyobject(py)?
                     .unbind())
@@ -1841,8 +2385,9 @@ impl VerifiedClosure {
         let Some(refusal) = &self.refusal else {
             return Ok(None);
         };
-        let manifest = SemanticCheckpointManifest::decode(checkpoint)?;
-        let (seed, _, _, _) = TaskCheckpointSeed::decode(&manifest.task)?;
+        let manifest = SemanticCheckpointManifest::decode_borrowed(checkpoint)?;
+        let (seed, _, _, _) =
+            TaskCheckpointSeed::decode_bound(&manifest.task, &self.material_sources)?;
         let mut expense = seed.proposal_expense()?;
         if expense.capacity != refusal.expense.capacity
             || expense.original_admission != refusal.expense.original_admission

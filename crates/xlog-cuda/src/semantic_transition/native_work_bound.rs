@@ -10,6 +10,14 @@ impl OriginalNativeCommand {
         bytes: usize,
         operation: impl FnOnce(&CudaEnqueue<'_>, &mut bool, &mut bool) -> Result<(), XlogError>,
     ) -> Result<(), SemanticTransitionError> {
+        if !self.entered {
+            if let Some(allowance) = allowance {
+                allowance
+                    .lock()
+                    .map_err(|_| publication_input_error("original cold allowance is poisoned"))?
+                    .require_submitted_dma(bytes, self.dma_recorded)?;
+            }
+        }
         let result = self.run(domain, poisoned, recorder, operation);
         // A successful driver submission remains expenditure when the original
         // commit or completion fence subsequently fails. A preflight refusal
@@ -19,7 +27,7 @@ impl OriginalNativeCommand {
                 allowance
                     .lock()
                     .map_err(|_| publication_input_error("original cold allowance is poisoned"))?
-                    .record_submitted_dma(bytes)?;
+                    .record_submitted_dma(bytes, &mut self.dma_recorded)?;
             }
             self.dma_recorded = true;
         }
@@ -30,6 +38,7 @@ impl OriginalNativeCommand {
         &mut self,
         allowance: &Arc<Mutex<ColdNativeAllowance>>,
         ceiling: [u64; 9],
+        source: Option<&Arc<prepared_source_content::PreparedSourceContentOwner>>,
     ) -> Result<(), SemanticTransitionError> {
         if let Some(original) = &self.allowance_claim {
             if !original.ptr_eq(&Arc::downgrade(allowance)) {
@@ -42,7 +51,7 @@ impl OriginalNativeCommand {
         if allowance
             .lock()
             .map_err(|_| publication_input_error("original model guard allowance is poisoned"))?
-            .claim_model_contract_guard(ceiling)?
+            .claim_model_contract_guard(ceiling, source)?
         {
             self.allowance_claim = Some(Arc::downgrade(allowance));
         }
@@ -58,6 +67,9 @@ pub(super) struct OriginalContentBatch {
     // The original report and child graph retain the strong owner. Keeping
     // only its issued identity here avoids a cohort -> batch -> cohort cycle.
     pub(super) allowance: Option<std::sync::Weak<Mutex<ColdNativeAllowance>>>,
+    pub(super) source_occurrence: Option<super::source_content_occurrences::SourceContentClaim>,
+    pub(super) source_native_guard:
+        Option<super::source_content_occurrences::SourceNativeContentClaim>,
 }
 
 impl OriginalContentBatch {
@@ -75,17 +87,593 @@ impl OriginalContentBatch {
             cursor: 0,
             commands,
             allowance: None,
+            source_occurrence: None,
+            source_native_guard: None,
         })
+    }
+}
+
+impl TensorContentBuffers {
+    pub(super) fn retain_source_native_guard_batch(
+        &self,
+        domain: &ResidentExecutionDomain,
+        claim: &super::source_content_occurrences::SourceNativeContentClaim,
+        allowance: &Arc<Mutex<ColdNativeAllowance>>,
+    ) -> Result<(), SemanticTransitionError> {
+        if self
+            .native_work_ceiling(true)?
+            .iter()
+            .zip(claim.native_work_ceiling())
+            .any(|(actual, upper)| *actual > upper)
+        {
+            return Err(publication_input_error(
+                "SOURCE native consumer exceeded its frozen original producer geometry",
+            ));
+        }
+        let mut original = self.original_cold.lock().map_err(|_| {
+            publication_input_error("original SOURCE native guard custody is poisoned")
+        })?;
+        if let Some(batch) = original.as_ref() {
+            if !batch.verify
+                || batch.source_occurrence.is_some()
+                || batch
+                    .source_native_guard
+                    .as_ref()
+                    .is_none_or(|issued| !claim.same_claim(issued))
+            {
+                return Err(publication_input_error(
+                    "SOURCE native consumer changed its original retained commands",
+                ));
+            }
+            return Ok(());
+        }
+        let count = self
+            .tensors
+            .len()
+            .checked_add(usize::from(matches!(
+                self.seals,
+                TensorContentSeals::Model(_)
+            )))
+            .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        let mut batch = OriginalContentBatch::new(domain, true, count)?;
+        batch.retirement = claim.is_retirement();
+        batch.source_native_guard = Some(claim.clone());
+        batch.allowance = Some(Arc::downgrade(allowance));
+        *original = Some(batch);
+        Ok(())
+    }
+    pub(super) fn retain_source_feedback_batch(
+        &self,
+        domain: &ResidentExecutionDomain,
+        owner: &Arc<prepared_source_content::PreparedSourceContentOwner>,
+    ) -> Result<(), SemanticTransitionError> {
+        owner.require_feedback_content(self)?;
+        owner
+            .allowance
+            .lock()
+            .map_err(|_| publication_input_error("original SOURCE allowance is poisoned"))?
+            .require_source_content_admitted(owner)?;
+        let mut original = self.original_cold.lock().map_err(|_| {
+            publication_input_error("original SOURCE feedback command custody is poisoned")
+        })?;
+        if original.is_none() {
+            let mut batch = OriginalContentBatch::new(domain, false, self.tensors.len())?;
+            batch.allowance = Some(Arc::downgrade(&owner.allowance));
+            *original = Some(batch);
+        } else if original.as_ref().is_some_and(|batch| {
+            batch.verify
+                || batch.source_occurrence.is_some()
+                || batch
+                    .allowance
+                    .as_ref()
+                    .is_none_or(|allowance| !allowance.ptr_eq(&Arc::downgrade(&owner.allowance)))
+        }) {
+            return Err(publication_input_error(
+                "SOURCE feedback changed its original retained seal commands",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn retain_source_occurrence_batch(
+        &self,
+        domain: &ResidentExecutionDomain,
+        claim: &super::source_content_occurrences::SourceContentClaim,
+        allowance: &Arc<Mutex<ColdNativeAllowance>>,
+        verify: bool,
+    ) -> Result<(), SemanticTransitionError> {
+        if self
+            .native_work_ceiling(verify)?
+            .iter()
+            .zip(claim.native_work_ceiling())
+            .any(|(actual, upper)| *actual > upper)
+        {
+            return Err(publication_input_error(
+                "SOURCE content exceeded its frozen original native geometry ceiling",
+            ));
+        }
+        let mut original = self
+            .original_cold
+            .lock()
+            .map_err(|_| publication_input_error("original SOURCE content custody is poisoned"))?;
+        if let Some(batch) = original.as_ref() {
+            if batch.verify != verify
+                || batch
+                    .source_occurrence
+                    .as_ref()
+                    .is_none_or(|issued| !claim.same_claim(issued))
+            {
+                return Err(publication_input_error(
+                    "SOURCE content changed its retained original command claim",
+                ));
+            }
+            return Ok(());
+        }
+        let count = self
+            .tensors
+            .len()
+            .checked_add(usize::from(matches!(
+                self.seals,
+                TensorContentSeals::Model(_)
+            )))
+            .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        let mut batch = OriginalContentBatch::new(domain, verify, count)?;
+        batch.source_occurrence = Some(claim.clone());
+        batch.allowance = Some(Arc::downgrade(allowance));
+        *original = Some(batch);
+        Ok(())
     }
 }
 
 /// Original finite content occurrences. Other canonical native producers have
 /// separate schedules; this subtotal must never stand in for their ceiling.
+fn native_tally_initialization_ceiling() -> [u64; 9] {
+    [1, 0, 0, 0, 0, 0, 0, 0, 11 * size_of::<u64>() as u64]
+}
+
+/// Each admitted row can be reset once and can contain one invocation marker.
+/// Initialization also clears all three words of the authentic original rows.
+/// These are finite entitlements, not reached-work charges.
+pub(super) fn model_scratch_native_work_ceiling(
+    capacity: usize,
+    initialize: bool,
+) -> Result<[u64; 9], SemanticTransitionError> {
+    let capacity = u64::try_from(capacity).map_err(|_| native_work_ceiling_overflow())?;
+    Ok([
+        ceiling_sum([
+            ceiling_product(2, capacity)?,
+            u64::from(initialize && capacity != 0),
+        ])?,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        ceiling_product(
+            ceiling_product(if initialize { 9 } else { 6 }, capacity)?,
+            size_of::<u64>() as u64,
+        )?,
+    ])
+}
+
+pub(super) fn model_scratch_initialization_ceiling(
+    capacity: usize,
+) -> Result<[u64; 9], SemanticTransitionError> {
+    let capacity = u64::try_from(capacity).map_err(|_| native_work_ceiling_overflow())?;
+    Ok([
+        u64::from(capacity != 0),
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        ceiling_product(ceiling_product(3, capacity)?, size_of::<u64>() as u64)?,
+    ])
+}
+
+/// Finite geometry of the original fresh graph and its canonical codebooks.
+/// These terms are upper bounds, never reached counters or content permission.
+pub(super) fn child_constructor_native_work_ceiling(
+    capacities: crate::SemanticHypergraphCapacities,
+    records: &crate::SemanticAdmissionRecords,
+    limits: crate::SemanticAdmissionLimits,
+    program: Option<&crate::SemanticProgramAdmission>,
+) -> Result<([u64; 9], [u64; 9]), SemanticTransitionError> {
+    let (counts, arena_words) = capacities
+        .native_work_geometry()
+        .map_err(SemanticTransitionError::Semantic)?;
+    let [roots, statements, supports, versions] = counts;
+    let count = |count: usize| u64::try_from(count).map_err(|_| native_work_ceiling_overflow());
+    let predicate_count = count(records.predicates.len())?;
+    let record_count = count(records.records.len())?;
+    let support_count = count(records.supports.len())?;
+    let arguments = records.records.iter().try_fold(0, |total, record| {
+        ceiling_sum([total, count(record.arguments.len())?])
+    })?;
+    let qualifiers = records.records.iter().try_fold(0, |total, record| {
+        ceiling_sum([total, count(record.qualifiers.len())?])
+    })?;
+    let additional = program.map_or(0, |program| u64::from(program.predicate_count));
+    // The original derive owner deduplicates these entries; before dedup each
+    // argument, statement qualifier bundle and support can contribute once.
+    // Every table also contains its genuine NULL row. The empty qualifier
+    // bundle is present even when the original admission has no statement.
+    let targets = ceiling_sum([predicate_count, additional, 1])?;
+    let operands = ceiling_sum([
+        arguments,
+        additional,
+        if program.is_some() { 4 } else { 0 },
+        1,
+    ])?;
+    let qualifier_rows = ceiling_sum([record_count, 2])?;
+    let leaves = ceiling_sum([support_count, 1])?;
+    // Canonical typed operand encodings fit in sixteen fixed bytes plus their
+    // original UTF-8 symbols. The admission's checked UTF-8 limit includes all
+    // copied occurrences, so dedup cannot increase this payload extent.
+    let payload = ceiling_sum([
+        ceiling_product(16, arguments)?,
+        count(limits.max_utf8_bytes)?,
+        ceiling_product(4, ceiling_sum([record_count, 1])?)?,
+        ceiling_product(32, qualifiers)?,
+    ])?;
+    let words = ceiling_sum([
+        25,
+        ceiling_product(10, targets)?,
+        ceiling_product(6, operands)?,
+        ceiling_product(3, qualifier_rows)?,
+        ceiling_product(18, leaves)?,
+        ceiling_sum([payload, 7])? / 8,
+    ])?;
+    let catalogue_bytes = ceiling_sum([
+        ceiling_product(words, size_of::<u64>() as u64)?,
+        ceiling_product(
+            COMPONENT_COUNT as u64,
+            size_of::<SemanticComponent>() as u64,
+        )?,
+    ])?;
+    let command_bytes = size_of::<crate::semantic_hypergraph::DeviceCommand>() as u64;
+    let receipt_bytes =
+        size_of::<crate::semantic_hypergraph::SemanticResidentReceiptRecord>() as u64;
+    let dma = [
+        6,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        ceiling_sum([
+            ceiling_product(2, ceiling_sum([command_bytes, receipt_bytes])?)?,
+            catalogue_bytes,
+        ])?,
+    ];
+    // Initialize clears the actual arena and fixed receipt/root words, scans
+    // every table (including rejected occupied slots), and seals the empty
+    // root. The paired admission Snapshot is the existing two-visit projection.
+    let mut ceiling = [
+        2,
+        ceiling_sum([
+            ceiling_product(2, roots)?,
+            ceiling_product(2, statements)?,
+            supports,
+            versions,
+            3,
+        ])?,
+        0,
+        0,
+        0,
+        0,
+        0,
+        2,
+        ceiling_sum([
+            ceiling_product(arena_words, size_of::<u64>() as u64)?,
+            874,
+            448,
+        ])?,
+    ];
+    add_native_work_ceiling(&mut ceiling, dma)?;
+    native_work_ceiling_units(ceiling)?;
+    Ok((ceiling, dma))
+}
+
 pub(crate) struct ColdNativeAllowance {
     purpose: SemanticColdModelWorkPurpose,
     content: Option<FrozenColdEvaluationContent>,
+    source: Option<FrozenColdSourceContent>,
+    resident_reads: Option<FrozenColdResidentReads>,
     submitted_dma: [u64; 9],
     submitted_dma_ceiling: [u64; 9],
+    native_initialization_claimed: bool,
+    model_input_generations: Option<std::sync::Weak<prepared_source_content::OriginalModelInputGenerations>>,
+    model_scratch_ceiling: Option<[u64; 9]>,
+    prepared_scratch_initialization: [u64; 9],
+}
+
+/// Exact original read occurrences, ordered by their enclosing report regions.
+/// Geometry remains metadata; only the actual issued producer can claim it.
+pub(super) struct FrozenColdResidentReads {
+    reads: Vec<(usize, SemanticResidentModelRead, [u64; 9], bool)>,
+    readbacks: Vec<Option<(SemanticPublicationReadbackLoan, bool)>>,
+    restorations: Vec<(
+        SemanticPreparedResidentModelRestoration,
+        [u64; 9],
+        bool,
+        bool,
+    )>,
+    cursor: usize,
+    ceiling: [u64; 9],
+    _reservation: Option<SemanticReplayMaterialReservation>,
+}
+
+impl FrozenColdResidentReads {
+    pub(super) fn new(
+        work: &SemanticColdModelWork,
+        reads: &[(usize, SemanticResidentModelRead)],
+    ) -> Result<Self, SemanticTransitionError> {
+        let reservation = if let Some((_, first)) = reads.first() {
+            let budget = first.material_budget();
+            for (region, read) in reads {
+                read.require_report(work, *region)?;
+                if !budget.same_pool(&read.material_budget()) {
+                    return Err(publication_input_error(
+                        "resident read declaration changed its original material pool",
+                    ));
+                }
+            }
+            let read_bytes = reads
+                .len()
+                .checked_mul(size_of::<(usize, SemanticResidentModelRead, [u64; 9], bool)>()
+                    + size_of::<Option<(SemanticPublicationReadbackLoan, bool)>>())
+                .ok_or(SemanticTransitionError::GenerationExhausted)?;
+            let restoration_bytes = reads
+                .len()
+                .checked_mul(size_of::<(
+                    SemanticPreparedResidentModelRestoration,
+                    [u64; 9],
+                    bool,
+                    bool,
+                )>())
+                .ok_or(SemanticTransitionError::GenerationExhausted)?;
+            let bytes = read_bytes
+                .checked_add(restoration_bytes)
+                .and_then(|bytes| bytes.checked_add(size_of::<Self>()))
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .ok_or(SemanticTransitionError::GenerationExhausted)?;
+            Some(budget.reserve_auxiliary(bytes)?)
+        } else {
+            None
+        };
+        let mut original = Vec::new();
+        original
+            .try_reserve_exact(reads.len())
+            .map_err(|error| runtime_error("resident read declaration reservation", error))?;
+        let mut total = [0; 9];
+        let mut readbacks = Vec::new();
+        readbacks.try_reserve_exact(reads.len())
+            .map_err(|error| runtime_error("native readback declaration reservation", error))?;
+        let mut restorations = Vec::new();
+        restorations
+            .try_reserve_exact(reads.len())
+            .map_err(|error| runtime_error("native restoration declaration reservation", error))?;
+        for (index, (region, read)) in reads.iter().enumerate() {
+            read.require_report(work, *region)?;
+            if index > 0 && reads[index - 1].0 > *region
+                || reads[..index]
+                    .iter()
+                    .any(|(_, earlier)| read.same_occurrence(earlier))
+            {
+                return Err(publication_input_error(
+                    "resident read declaration changed its original order or repeated an occurrence",
+                ));
+            }
+            let ceiling = read.native_work_ceiling()?;
+            add_native_work_ceiling(&mut total, ceiling)?;
+            add_native_work_ceiling(&mut total, read.checkpoint_readback_ceiling())?;
+            readbacks.push(read.checkpoint_readback_loan().map(|loan| (loan.clone(), false)));
+            if let Some(issuer) = read.restoration_issuer()? {
+                issuer.require_report(work, *region)?;
+                if restorations.iter().any(
+                    |(original, _, _, _): &(
+                        SemanticPreparedResidentModelRestoration,
+                        [u64; 9],
+                        bool,
+                        bool,
+                    )| issuer.same_issuer(original),
+                ) {
+                    return Err(publication_input_error(
+                        "native restoration repeated its original issuer",
+                    ));
+                }
+                let dma = issuer.dma_native_work_ceiling()?;
+                add_native_work_ceiling(&mut total, dma)?;
+                restorations.push((issuer, dma, false, false));
+            }
+            original.push((*region, read.clone(), ceiling, false));
+        }
+        native_work_ceiling_units(total)?;
+        Ok(Self {
+            reads: original,
+            readbacks,
+            restorations,
+            cursor: 0,
+            ceiling: total,
+            _reservation: reservation,
+        })
+    }
+
+    fn skip_unentered_region(&mut self, region: usize) -> Result<(), SemanticTransitionError> {
+        if region == 2 && self.restorations.iter().any(|(_, _, claimed, _)| *claimed) {
+            return Err(publication_input_error(
+                "native restoration skip cannot replace an entered original occurrence",
+            ));
+        }
+        if self.reads[..self.cursor]
+            .iter()
+            .any(|(original, _, _, _)| *original == region)
+        {
+            return Err(publication_input_error(
+                "resident read skip cannot replace an entered original occurrence",
+            ));
+        }
+        for (original, _, _, skipped) in &mut self.reads[self.cursor..] {
+            if *original == region {
+                *skipped = true;
+            }
+        }
+        if region == 2 {
+            for (_, _, _, skipped) in &mut self.restorations {
+                *skipped = true;
+            }
+        }
+        self.advance_skipped_prefix();
+        Ok(())
+    }
+
+    fn advance_skipped_prefix(&mut self) {
+        while self
+            .reads
+            .get(self.cursor)
+            .is_some_and(|(_, _, _, skipped)| *skipped)
+        {
+            self.cursor += 1;
+        }
+    }
+
+    fn require_complete(&self) -> Result<(), SemanticTransitionError> {
+        if self.cursor != self.reads.len()
+            || self
+                .restorations
+                .iter()
+                .any(|(_, _, claimed, skipped)| !claimed && !skipped)
+        {
+            return Err(publication_input_error(
+                "successful cold completion requires every non-skipped original resident read",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Enclose original restore copies before their actual input exists. The
+/// immutable pool cap bounds payload bytes and the worst legal one-byte chunk;
+/// it is never an executed-work charge or a permission to access contents.
+pub(super) fn restoration_dma_native_work_ceiling(
+    source: &SemanticTransitionSession,
+    lease: &SemanticPublishedLease,
+    budget: &SemanticReplayMaterialBudget,
+) -> Result<[u64; 9], SemanticTransitionError> {
+    source.checked_reader(lease)?;
+    if source
+        .replay_material_budget
+        .as_ref()
+        .is_none_or(|original| !original.same_pool(budget))
+    {
+        return Err(SemanticTransitionError::ObservationMismatch);
+    }
+    let storage = source
+        .publication
+        .as_ref()
+        .ok_or(SemanticTransitionError::NotBound)?;
+    let (_, task) = source
+        .task
+        .as_ref()
+        .ok_or(SemanticTransitionError::NotBound)?;
+    let count = |n: usize| u64::try_from(n).map_err(|_| native_work_ceiling_overflow());
+    let bytes = |n: usize, width: usize| ceiling_product(count(n)?, count(width)?);
+    let payload = budget.owner.capacity;
+    let catalogue = ceiling_sum([
+        bytes(task.len(), size_of::<u64>())?,
+        bytes(source.device_codebooks.len(), size_of::<u64>())?,
+        bytes(
+            source.device_components.len(),
+            size_of::<SemanticComponent>(),
+        )?,
+    ])?;
+    let queue = lease
+        .directory
+        .iter()
+        .find(|range| range.role == 56 && range.index == 0);
+    let append_capacity = queue
+        .map(|range| {
+            range
+                    .length_bytes
+                    .checked_sub(size_of::<
+                        crate::semantic_training_view::SemanticTrainingReplayAppendHeader,
+                    >() as u64)
+                    .ok_or(SemanticTransitionError::ObservationMismatch)
+                    .map(|bytes| {
+                        bytes
+                            / size_of::<
+                                crate::semantic_training_view::SemanticTrainingReplayAppendEntry,
+                            >() as u64
+                    })
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let mut control_bytes = ceiling_sum([
+        2 * size_of::<PublicationBank>() as u64,
+        bytes(
+            storage.allocations.len(),
+            size_of::<PublicationStorageEntry>(),
+        )?,
+        size_of::<PublicationContract>() as u64,
+        bytes(storage.terminals.len(), size_of::<u64>())?,
+        bytes(storage.role_counts.len(), size_of::<PublicationRoleCount>())?,
+        size_of::<PendingContinuation>() as u64,
+        bytes(
+            storage.continuation_templates.len(),
+            size_of::<PublicationRange>(),
+        )?,
+        size_of::<PublicationControl>() as u64,
+        size_of::<DeviceState>() as u64,
+    ])?;
+    let mut control_count = 8u64;
+    for directory in &storage.bank_templates {
+        control_bytes = ceiling_sum([
+            control_bytes,
+            bytes(directory.len(), size_of::<PublicationRange>())?,
+        ])?;
+        control_count = ceiling_sum([control_count, u64::from(!directory.is_empty())])?;
+    }
+    control_count = ceiling_sum([
+        control_count,
+        u64::from(!storage.terminals.is_empty()),
+        u64::from(!storage.continuation_templates.is_empty()),
+    ])?;
+    let ceiling = [
+        ceiling_sum([
+            payload,
+            3,
+            control_count,
+            ceiling_product(2, append_capacity)?,
+            2,
+        ])?,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        ceiling_sum([
+            ceiling_product(2, payload)?,
+            catalogue,
+            control_bytes,
+            ceiling_product(
+                append_capacity,
+                size_of::<crate::semantic_training_view::TrainingViewRowDescriptor>() as u64,
+            )?,
+            size_of::<PublicationControl>() as u64,
+            size_of::<PublicationHeader>() as u64,
+        ])?,
+    ];
+    native_work_ceiling_units(ceiling)?;
+    Ok(ceiling)
 }
 
 pub(super) struct FrozenColdEvaluationContent {
@@ -107,8 +695,14 @@ impl ColdNativeAllowance {
         Self {
             purpose,
             content: None,
+            source: None,
+            resident_reads: None,
             submitted_dma: [0; 9],
             submitted_dma_ceiling: [0; 9],
+            native_initialization_claimed: false,
+            model_input_generations: None,
+            model_scratch_ceiling: None,
+            prepared_scratch_initialization: [0; 9],
         }
     }
 
@@ -118,6 +712,295 @@ impl ColdNativeAllowance {
             SemanticColdModelWorkPurpose::SourceEvaluation
                 | SemanticColdModelWorkPurpose::PrivateEvaluation
         )
+    }
+
+    pub(super) fn register_model_input_generations(
+        &mut self,
+        original: &Arc<prepared_source_content::OriginalModelInputGenerations>,
+    ) -> Result<(), SemanticTransitionError> {
+        if self.model_input_generations.is_some() {
+            return Err(publication_input_error("original model input generation roster is registered once"));
+        }
+        self.model_input_generations = Some(Arc::downgrade(original));
+        Ok(())
+    }
+
+    pub(super) fn model_input_generations(
+        &self,
+        instruction: &Arc<[u8]>,
+    ) -> Result<Option<Arc<prepared_source_content::OriginalModelInputGenerations>>, SemanticTransitionError> {
+        let Some(original) = &self.model_input_generations else { return Ok(None); };
+        let original = original.upgrade().ok_or_else(|| {
+            publication_input_error("original model input generation roster has retired")
+        })?;
+        original.require_instruction(instruction)?;
+        Ok(Some(original))
+    }
+
+    pub(super) fn freeze_model_scratch(
+        &mut self,
+        ceiling: [u64; 9],
+    ) -> Result<(), SemanticTransitionError> {
+        if self.model_scratch_ceiling.is_some() {
+            return Err(publication_input_error(
+                "model scratch requires its sole original complete cold admission",
+            ));
+        }
+        native_work_ceiling_units(ceiling)?;
+        self.model_scratch_ceiling = Some(ceiling);
+        Ok(())
+    }
+
+    pub(super) fn require_unfrozen_prepared_scratch(&self) -> Result<(), SemanticTransitionError> {
+        if self.model_scratch_ceiling.is_some() {
+            return Err(publication_input_error(
+                "prepared scratch allocation must precede its original complete cold admission",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The sole native allocator calls this once for its original installed
+    /// work bank, including children sharing this authentic Prefix allowance.
+    pub(super) fn register_prepared_scratch_initialization(
+        &mut self,
+        capacity: usize,
+    ) -> Result<(), SemanticTransitionError> {
+        self.require_unfrozen_prepared_scratch()?;
+        add_native_work_ceiling(
+            &mut self.prepared_scratch_initialization,
+            model_scratch_initialization_ceiling(capacity)?,
+        )
+    }
+
+    pub(super) fn is_source_prefix(&self) -> bool {
+        self.purpose == SemanticColdModelWorkPurpose::PrivatePrefix
+    }
+
+    pub(super) fn require_source_preparation(&self) -> Result<(), SemanticTransitionError> {
+        if self.purpose != SemanticColdModelWorkPurpose::PrivatePrefix || self.source.is_some() {
+            return Err(publication_input_error(
+                "SOURCE structural preparation requires its original Prefix allowance",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn freeze_source_content(
+        &mut self,
+        source: FrozenColdSourceContent,
+    ) -> Result<(), SemanticTransitionError> {
+        self.require_source_preparation()?;
+        self.source = Some(source);
+        Ok(())
+    }
+
+    pub(super) fn freeze_resident_reads(
+        &mut self,
+        reads: FrozenColdResidentReads,
+    ) -> Result<(), SemanticTransitionError> {
+        if self.resident_reads.is_some() {
+            return Err(publication_input_error(
+                "resident reads belong to the sole original complete cold admission",
+            ));
+        }
+        self.resident_reads = Some(reads);
+        Ok(())
+    }
+
+    pub(super) fn has_resident_reads(&self) -> bool {
+        self.resident_reads
+            .as_ref()
+            .is_some_and(|reads| !reads.reads.is_empty())
+    }
+
+    /// Called only when the native enclosing report proves this whole region
+    /// never entered. Closed cleanup and partial refusal do not satisfy it.
+    pub(super) fn skip_unentered_resident_reads(
+        &mut self,
+        region: usize,
+    ) -> Result<(), SemanticTransitionError> {
+        if let Some(reads) = &mut self.resident_reads {
+            reads.skip_unentered_region(region)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn claim_resident_read(
+        &mut self,
+        owner: &Arc<super::resident_model_memory::ResidentModelMemoryOwner>,
+        region: usize,
+        ceiling: [u64; 9],
+    ) -> Result<(), SemanticTransitionError> {
+        let reads = self.resident_reads.as_mut().ok_or_else(|| {
+            publication_input_error("resident read precedes its original finite cold admission")
+        })?;
+        let (original_region, read, original_ceiling, _) =
+            reads.reads.get(reads.cursor).ok_or_else(|| {
+                publication_input_error("resident read exceeded its original ordered roster")
+            })?;
+        if *original_region != region || *original_ceiling != ceiling {
+            return Err(publication_input_error(
+                "resident read changed its original region, order or native geometry ceiling",
+            ));
+        }
+        read.claim_actual(owner, ceiling)?;
+        reads.cursor += 1;
+        reads.advance_skipped_prefix();
+        Ok(())
+    }
+
+    /// Transfer this exact original read's already frozen DMA entitlement to
+    /// its sole retained observation. This is not a second total-work charge.
+    pub(super) fn claim_checkpoint_readback(
+        &mut self,
+        loan: &SemanticPublicationReadbackLoan,
+    ) -> Result<(), SemanticTransitionError> {
+        let reads = self.resident_reads.as_mut().ok_or_else(||
+            publication_input_error("checkpoint readback precedes its original finite admission"))?;
+        let index = reads.readbacks.iter().position(|entry|
+            entry.as_ref().is_some_and(|(original, _)| original.same_loan(loan)))
+            .ok_or_else(|| publication_input_error("checkpoint readback is outside its original resident roster"))?;
+        if index >= reads.cursor || reads.reads[index].3 {
+            return Err(publication_input_error("checkpoint readback has not entered its original resident occurrence"));
+        }
+        let (original, claimed) = reads.readbacks[index].as_mut().expect("original admitted readback loan");
+        if *claimed || original.native_work_ceiling() != loan.native_work_ceiling() {
+            return Err(publication_input_error("checkpoint readback repeated or changed its original DMA entitlement"));
+        }
+        add_native_work_ceiling(&mut self.submitted_dma_ceiling, original.submitted_dma_ceiling())?;
+        *claimed = true;
+        Ok(())
+    }
+
+    /// A caller must first prove the original live report and waiting native
+    /// restore prelude. This consumes the occurrence frozen from its real read.
+    pub(super) fn claim_resident_restoration(
+        &mut self,
+        issuer: &SemanticPreparedResidentModelRestoration,
+    ) -> Result<(), SemanticTransitionError> {
+        let reads = self.resident_reads.as_mut().ok_or_else(|| {
+            publication_input_error(
+                "native restoration precedes its original finite cold admission",
+            )
+        })?;
+        let (_, region_read, _, _) = reads.reads.get(reads.cursor).ok_or_else(|| {
+            publication_input_error("native restoration exceeded its original read order")
+        })?;
+        let expected = region_read.restoration_issuer()?.ok_or_else(|| {
+            publication_input_error(
+                "native restoration precedes a different original read occurrence",
+            )
+        })?;
+        if !issuer.same_issuer(&expected) {
+            return Err(publication_input_error(
+                "native restoration replaced its original issuer",
+            ));
+        }
+        let (original, ceiling, claimed, skipped) = reads
+            .restorations
+            .iter_mut()
+            .find(|(original, _, _, _)| issuer.same_issuer(original))
+            .ok_or_else(|| {
+                publication_input_error("native restoration is outside its original finite roster")
+            })?;
+        if *claimed || *skipped || original.dma_native_work_ceiling()? != *ceiling {
+            return Err(publication_input_error(
+                "native restoration repeated or changed its original finite occurrence",
+            ));
+        }
+        add_native_work_ceiling(&mut self.submitted_dma_ceiling, *ceiling)?;
+        *claimed = true;
+        Ok(())
+    }
+
+    pub(super) fn require_resident_reads_complete(&self) -> Result<(), SemanticTransitionError> {
+        self.resident_reads
+            .as_ref()
+            .ok_or_else(|| {
+                publication_input_error(
+                    "cold completion lost its original frozen resident read roster",
+                )
+            })?
+            .require_complete()
+    }
+
+    pub(super) fn require_source_content_admitted(
+        &self,
+        owner: &Arc<prepared_source_content::PreparedSourceContentOwner>,
+    ) -> Result<(), SemanticTransitionError> {
+        let source = self.source.as_ref().ok_or_else(|| {
+            publication_input_error(
+                "SOURCE content requires its complete original finite admission",
+            )
+        })?;
+        if !source
+            .recipes
+            .iter()
+            .any(|recipe| recipe.owner.ptr_eq(&Arc::downgrade(owner)) && recipe.preparation_claimed)
+        {
+            return Err(publication_input_error(
+                "SOURCE content has not entered its sole admitted original preparation",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn claim_source_preparation(
+        &mut self,
+        owner: &Arc<prepared_source_content::PreparedSourceContentOwner>,
+    ) -> Result<(), SemanticTransitionError> {
+        let source = self.source.as_mut().ok_or_else(|| {
+            publication_input_error(
+                "SOURCE preparation precedes its complete original finite admission",
+            )
+        })?;
+        let recipe = source
+            .recipes
+            .iter_mut()
+            .find(|recipe| recipe.owner.ptr_eq(&Arc::downgrade(owner)))
+            .ok_or_else(|| {
+                publication_input_error(
+                    "SOURCE preparation is outside its original admitted roster",
+                )
+            })?;
+        if recipe.preparation_claimed {
+            return Err(publication_input_error(
+                "SOURCE preparation cannot replace its sole original occurrence",
+            ));
+        }
+        add_native_work_ceiling(&mut self.submitted_dma_ceiling, recipe.dma_ceiling)?;
+        recipe.preparation_claimed = true;
+        Ok(())
+    }
+
+    pub(super) fn claim_source_resident_guard(
+        &mut self,
+        owner: &Arc<super::resident_model_memory::ResidentModelMemoryOwner>,
+        ceiling: [u64; 9],
+    ) -> Result<(), SemanticTransitionError> {
+        let source = self.source.as_mut().ok_or_else(|| {
+            publication_input_error(
+                "resident SOURCE guard precedes its complete original finite admission",
+            )
+        })?;
+        let recipe = source
+            .recipes
+            .iter_mut()
+            .find(|recipe| recipe.resident.ptr_eq(&Arc::downgrade(owner)))
+            .ok_or_else(|| {
+                publication_input_error("resident guard is outside its original SOURCE roster")
+            })?;
+        if !recipe.preparation_claimed
+            || recipe.resident_claimed
+            || recipe.resident_ceiling != ceiling
+        {
+            return Err(publication_input_error(
+                "resident SOURCE guard changed or repeated its original finite producer",
+            ));
+        }
+        recipe.resident_claimed = true;
+        Ok(())
     }
 
     pub(super) fn freeze_content(
@@ -134,13 +1017,42 @@ impl ColdNativeAllowance {
     }
 
     pub(super) fn content_ceiling(&self) -> Result<[u64; 9], SemanticTransitionError> {
-        match &self.content {
-            Some(content) => Ok(content.ceiling),
-            None if !self.is_evaluation() => Ok([0; 9]),
-            None => Err(publication_input_error(
-                "evaluation content must be frozen before its original native producers",
-            )),
+        let mut ceiling = if self.purpose == SemanticColdModelWorkPurpose::PrivatePrefix {
+            self.source.as_ref().map(|source| source.ceiling)
+                .ok_or_else(|| publication_input_error("Prefix content must include its full original SOURCE roster before effects"))?
+        } else {
+            match &self.content {
+                Some(content) => Ok(content.ceiling),
+                None if !self.is_evaluation() => Ok([0; 9]),
+                None => Err(publication_input_error(
+                    "evaluation content must be frozen before its original native producers",
+                )),
+            }?
+        };
+        if let Some(reads) = &self.resident_reads {
+            add_native_work_ceiling(&mut ceiling, reads.ceiling)?;
         }
+        add_native_work_ceiling(&mut ceiling, native_tally_initialization_ceiling())?;
+        if let Some(scratch) = self.model_scratch_ceiling {
+            add_native_work_ceiling(&mut ceiling, scratch)?;
+        }
+        add_native_work_ceiling(&mut ceiling, self.prepared_scratch_initialization)?;
+        native_work_ceiling_units(ceiling)?;
+        Ok(ceiling)
+    }
+
+    pub(super) fn claim_native_tally_initialization(
+        &mut self,
+    ) -> Result<(), SemanticTransitionError> {
+        if self.native_initialization_claimed {
+            return Ok(());
+        }
+        add_native_work_ceiling(
+            &mut self.submitted_dma_ceiling,
+            native_tally_initialization_ceiling(),
+        )?;
+        self.native_initialization_claimed = true;
+        Ok(())
     }
 
     pub(super) fn claim_content(
@@ -148,6 +1060,11 @@ impl ColdNativeAllowance {
         tensors: &TensorContentBuffers,
         verify: bool,
     ) -> Result<(), SemanticTransitionError> {
+        if self.purpose == SemanticColdModelWorkPurpose::PrivatePrefix {
+            return Err(publication_input_error(
+                "Prefix native content requires its original finite producer claim before effects",
+            ));
+        }
         if !self.is_evaluation() {
             return Ok(());
         }
@@ -227,7 +1144,33 @@ impl ColdNativeAllowance {
         &mut self,
         rows: usize,
         contract_bytes: usize,
+        source: Option<&Arc<prepared_source_content::PreparedSourceContentOwner>>,
     ) -> Result<bool, SemanticTransitionError> {
+        if let Some(owner) = source {
+            self.require_source_content_admitted(owner)?;
+            let recipe = self
+                .source
+                .as_mut()
+                .expect("checked original SOURCE admission")
+                .recipes
+                .iter_mut()
+                .find(|recipe| recipe.owner.ptr_eq(&Arc::downgrade(owner)))
+                .expect("checked original SOURCE recipe");
+            if recipe.model_snapshot
+                != Some(model_snapshot_native_work_ceiling(rows, contract_bytes)?)
+            {
+                return Err(publication_input_error(
+                    "SOURCE model snapshot changed or repeated its original finite producer",
+                ));
+            }
+            recipe.model_snapshot = None;
+            return Ok(true);
+        }
+        if self.is_source_prefix() {
+            return Err(publication_input_error(
+                "Prefix model snapshot lacks its original finite SOURCE producer",
+            ));
+        }
         if !self.is_evaluation() {
             return Ok(false);
         }
@@ -250,7 +1193,31 @@ impl ColdNativeAllowance {
     fn claim_model_contract_guard(
         &mut self,
         ceiling: [u64; 9],
+        source: Option<&Arc<prepared_source_content::PreparedSourceContentOwner>>,
     ) -> Result<bool, SemanticTransitionError> {
+        if let Some(owner) = source {
+            self.require_source_content_admitted(owner)?;
+            let recipe = self
+                .source
+                .as_mut()
+                .expect("checked original SOURCE admission")
+                .recipes
+                .iter_mut()
+                .find(|recipe| recipe.owner.ptr_eq(&Arc::downgrade(owner)))
+                .expect("checked original SOURCE recipe");
+            if recipe.model_contract_guard != Some(ceiling) {
+                return Err(publication_input_error(
+                    "SOURCE model guard changed or repeated its original finite producer",
+                ));
+            }
+            recipe.model_contract_guard = None;
+            return Ok(true);
+        }
+        if self.is_source_prefix() {
+            return Err(publication_input_error(
+                "Prefix model contract guard lacks its original finite SOURCE producer",
+            ));
+        }
         if !self.is_evaluation() {
             return Ok(false);
         }
@@ -270,7 +1237,37 @@ impl ColdNativeAllowance {
         &mut self,
         ceiling: [u64; 9],
         dma: [u64; 9],
+        inputs: &PreparedStepInputs,
     ) -> Result<bool, SemanticTransitionError> {
+        if self.purpose == SemanticColdModelWorkPurpose::PrivatePrefix {
+            let source = self.source.as_mut().ok_or_else(|| {
+                publication_input_error(
+                    "SOURCE step input preparation precedes its complete native admission",
+                )
+            })?;
+            let recipe = source
+                .recipes
+                .iter_mut()
+                .find(|recipe| {
+                    recipe
+                        .owner
+                        .upgrade()
+                        .is_some_and(|owner| owner.matches_inputs(inputs))
+                })
+                .ok_or_else(|| {
+                    publication_input_error(
+                        "SOURCE step inputs are outside their original native union",
+                    )
+                })?;
+            if !recipe.preparation_claimed || recipe.step_input_preparation != Some((ceiling, dma))
+            {
+                return Err(publication_input_error(
+                    "SOURCE step inputs changed or repeated their original finite producer",
+                ));
+            }
+            recipe.step_input_preparation = None;
+            return Ok(true);
+        }
         if !self.is_evaluation() {
             return Ok(false);
         }
@@ -287,10 +1284,14 @@ impl ColdNativeAllowance {
         Ok(true)
     }
 
-    pub(super) fn record_submitted_dma(
-        &mut self,
+    pub(crate) fn require_submitted_dma(
+        &self,
         bytes: usize,
+        recorded: bool,
     ) -> Result<(), SemanticTransitionError> {
+        if recorded {
+            return Ok(());
+        }
         let mut reached = self.submitted_dma;
         add_native_work_ceiling(
             &mut reached,
@@ -312,10 +1313,48 @@ impl ColdNativeAllowance {
             .any(|(actual, upper)| *actual > upper)
         {
             return Err(publication_input_error(
+                "native DMA precedes its original finite entitlement",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_submitted_dma(
+        &mut self,
+        bytes: usize,
+        recorded: &mut bool,
+    ) -> Result<(), SemanticTransitionError> {
+        if *recorded {
+            return Ok(());
+        }
+        let mut reached = self.submitted_dma;
+        add_native_work_ceiling(
+            &mut reached,
+            [
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                u64::try_from(bytes).map_err(|_| native_work_ceiling_overflow())?,
+            ],
+        )?;
+        // A finite-entitlement failure cannot erase a command already submitted
+        // to the driver. Retain its reached evidence before refusing completion.
+        self.submitted_dma = reached;
+        *recorded = true;
+        if reached
+            .iter()
+            .zip(self.submitted_dma_ceiling)
+            .any(|(actual, upper)| *actual > upper)
+        {
+            return Err(publication_input_error(
                 "submitted native DMA exceeded its original finite entitlement",
             ));
         }
-        self.submitted_dma = reached;
         Ok(())
     }
 
@@ -348,6 +1387,189 @@ impl ColdNativeAllowance {
         result.native_work = units;
         Ok(())
     }
+}
+
+pub(super) struct FrozenColdSourceContent {
+    pub(super) recipes: Vec<FrozenSourceRecipe>,
+    pub(super) ceiling: [u64; 9],
+}
+
+/// Enclose the genuine feedback encoder, lineage projection and six seals.
+/// The CUDA launch repeats its acquired-input guard once per encoder block.
+pub(super) fn feedback_native_work_ceiling(
+    source: &SemanticTransitionSession,
+    lease: &SemanticPublishedLease,
+    feedback: &FeedbackBuffers,
+) -> Result<[u64; 9], SemanticTransitionError> {
+    let descriptor = source.descriptor();
+    let slots = u64::try_from(feedback.slots).map_err(|_| native_work_ceiling_overflow())?;
+    let capacity =
+        u64::try_from(feedback.support_capacity).map_err(|_| native_work_ceiling_overflow())?;
+    let task = &source
+        .task
+        .as_ref()
+        .ok_or(SemanticTransitionError::NotBound)?
+        .0;
+    feedback_geometry_native_work_ceiling(
+        &lease.directory,
+        slots,
+        capacity,
+        &feedback.schema,
+        descriptor.arena[2],
+        descriptor.arena[3],
+        &task.spec,
+        feedback.content.native_work_ceiling(false)?,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one canonical producer requires its original typed geometry"
+)]
+pub(super) fn feedback_geometry_native_work_ceiling(
+    directory: &[PublicationRange],
+    slots: u64,
+    capacity: u64,
+    schema: &SemanticFeedbackSchema,
+    statement_capacity: u64,
+    versions: u64,
+    task: &SemanticTaskEvaluationSpec,
+    output_ceiling: [u64; 9],
+) -> Result<[u64; 9], SemanticTransitionError> {
+    let ranges = u64::try_from(directory.len()).map_err(|_| native_work_ceiling_overflow())?;
+    let records = directory
+        .iter()
+        .filter(|range| range.role == 15 && range.index == 0);
+    let statements = directory.iter().filter(|range| range.role == 16);
+    let count =
+        u64::try_from(statements.clone().count()).map_err(|_| native_work_ceiling_overflow())?;
+    if records.clone().count() != 1 || count == 0 || count > slots {
+        return Err(SemanticTransitionError::ObservationMismatch);
+    }
+    let guards = ceiling_sum([count, 1])?;
+    let mut inputs = [
+        0,
+        ceiling_sum([
+            8,
+            ceiling_product(guards, ranges)?,
+            ceiling_product(4, guards)?,
+        ])?,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        ceiling_product(guards, 21 * 8 + 32)?,
+    ];
+    for range in records.chain(statements) {
+        inputs[7] = ceiling_sum([
+            inputs[7],
+            ceiling_sum([128, range.length_bytes, 9, 63])? / 64,
+        ])?;
+    }
+    let mut ceiling = [
+        2,
+        ceiling_product(slots, ranges)?,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        ceiling_product(
+            slots,
+            ceiling_sum([9, ceiling_product(4, schema.feature_width as u64)?])?,
+        )?,
+    ];
+    repeat_native_ceiling(&mut ceiling, inputs, ceiling_sum([slots.min(65535), 1])?)?;
+    let receipt = size_of::<crate::semantic_hypergraph::SemanticResidentReceiptRecord>() as u64;
+    add_native_work_ceiling(
+        &mut ceiling,
+        [
+            0,
+            ceiling_product(2, slots)?,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            ceiling_sum([
+                ceiling_product(slots, ceiling_sum([receipt, 16])?)?,
+                8,
+                ceiling_product(96, capacity)?,
+                ceiling_product(16, slots)?,
+                ceiling_product(slots, ceiling_sum([receipt, 8])?)?,
+                ceiling_product(8, slots)?,
+            ])?,
+        ],
+    )?;
+    let editable = task.program.editable_program().is_some();
+    let calls = ceiling_product(
+        slots,
+        if editable {
+            task.task_ground.bindings().len() as u64
+        } else {
+            1
+        },
+    )?;
+    let truth = [
+        1,
+        ceiling_sum([ceiling_product(4, statement_capacity)?, 8])?,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        ceiling_sum([ceiling_product(3, receipt)?, 32 * 8])?,
+    ];
+    repeat_native_ceiling(&mut ceiling, truth, calls)?;
+    repeat_native_ceiling(
+        &mut ceiling,
+        [
+            0,
+            ceiling_sum([
+                1,
+                ceiling_product(9, versions)?,
+                ceiling_product(versions, capacity)?,
+                4,
+            ])?,
+            versions,
+            0,
+            0,
+            0,
+            0,
+            ceiling_product(2, versions)?,
+            ceiling_sum([ceiling_product(265, versions)?, 7 * 8])?,
+        ],
+        calls,
+    )?;
+    if editable {
+        // Same fixed PROGRAM_FUEL used by task_program_closure. Every charged
+        // pair checks the fuel before increment, including failed prefixes.
+        add_native_work_ceiling(
+            &mut ceiling,
+            [0, ceiling_sum([ranges, 1_000_000])?, 0, 0, 0, 0, 0, 0, 0],
+        )?;
+    }
+    add_native_work_ceiling(&mut ceiling, output_ceiling)?;
+    native_work_ceiling_units(ceiling)?;
+    Ok(ceiling)
+}
+
+pub(super) struct FrozenSourceRecipe {
+    pub(super) owner: std::sync::Weak<prepared_source_content::PreparedSourceContentOwner>,
+    pub(super) resident: std::sync::Weak<super::resident_model_memory::ResidentModelMemoryOwner>,
+    pub(super) resident_ceiling: [u64; 9],
+    pub(super) preparation_claimed: bool,
+    pub(super) resident_claimed: bool,
+    pub(super) dma_ceiling: [u64; 9],
+    pub(super) model_snapshot: Option<[u64; 9]>,
+    pub(super) model_contract_guard: Option<[u64; 9]>,
+    pub(super) step_input_preparation: Option<([u64; 9], [u64; 9])>,
 }
 
 impl FrozenColdEvaluationContent {
@@ -533,6 +1755,13 @@ pub(super) fn model_contract_guard_native_work_ceiling(
     storage: &PublicationStorage,
     directory: &[PublicationRange],
 ) -> Result<[u64; 9], SemanticTransitionError> {
+    model_contract_guard_geometry_native_work_ceiling(&storage.contract_value, directory)
+}
+
+pub(super) fn model_contract_guard_geometry_native_work_ceiling(
+    contract: &PublicationContract,
+    directory: &[PublicationRange],
+) -> Result<[u64; 9], SemanticTransitionError> {
     let record = directory
         .iter()
         .find(|range| range.role == 44 && range.index == 0)
@@ -558,9 +1787,7 @@ pub(super) fn model_contract_guard_native_work_ceiling(
         .and_then(|value| value.checked_add(5))
         .ok_or_else(native_work_ceiling_overflow)?;
     ceiling[7] = ceiling[7]
-        .checked_add(blocks(
-            storage.contract_value.model_contract_layout.schema_bytes,
-        )?)
+        .checked_add(blocks(contract.model_contract_layout.schema_bytes)?)
         .ok_or_else(native_work_ceiling_overflow)?;
     let range_blocks = blocks(size_of::<PublicationRange>() as u64)?
         .checked_add(2)
@@ -570,6 +1797,78 @@ pub(super) fn model_contract_guard_native_work_ceiling(
         if matches!(range.role, 18..=25) {
             add_native_work_ceiling(&mut ceiling, [0, 0, 0, 0, 0, 0, 0, 4, 224])?;
         }
+    }
+    Ok(ceiling)
+}
+
+/// One genuine resident guard hashes every typed range and that range's full
+/// selected backing. Shared allocations are deliberately counted again for each
+/// view, exactly as semantic_publication_content_guard executes them.
+pub(super) fn resident_model_content_guard_native_work_ceiling(
+    storage: &PublicationStorage,
+    directory: &[PublicationRange],
+    keys: &[(SemanticStateRole, u64)],
+) -> Result<[u64; 9], SemanticTransitionError> {
+    resident_model_content_guard_geometry_native_work_ceiling(
+        &storage.model_memory,
+        &storage.layouts,
+        directory,
+        keys,
+        |slot| {
+            storage
+                .allocations
+                .get(slot)
+                .map(|allocation| allocation.entry().bytes)
+                .ok_or(SemanticTransitionError::ObservationMismatch)
+        },
+    )
+}
+
+pub(super) fn resident_model_content_guard_geometry_native_work_ceiling(
+    model_memory: &ModelMemoryGeometry,
+    layouts: &BTreeMap<(u64, u64), SemanticTensorLayout>,
+    directory: &[PublicationRange],
+    keys: &[(SemanticStateRole, u64)],
+    allocation_bytes: impl Fn(usize) -> Result<u64, SemanticTransitionError>,
+) -> Result<[u64; 9], SemanticTransitionError> {
+    if keys.len() != model_memory.views.len() {
+        return Err(SemanticTransitionError::ObservationMismatch);
+    }
+    let mut ceiling = [0; 9];
+    let mut seen = BTreeSet::new();
+    for &(role, index) in keys {
+        if !matches!(role as u64, 18..=25) || !seen.insert((role as u64, index)) {
+            return Err(SemanticTransitionError::ObservationMismatch);
+        }
+        let (position, range) = directory
+            .iter()
+            .enumerate()
+            .find(|(_, range)| range.role == role as u64 && range.index == index)
+            .ok_or(SemanticTransitionError::ObservationMismatch)?;
+        let layout = layouts
+            .get(&(role as u64, index))
+            .ok_or(SemanticTransitionError::ObservationMismatch)?;
+        add_native_work_ceiling(
+            &mut ceiling,
+            tensor_layout_native_work_ceiling(
+                layout,
+                range.logical_begin,
+                range.logical_end,
+                usize::try_from(range.length_bytes).map_err(|_| native_work_ceiling_overflow())?,
+                true,
+            )?,
+        )?;
+        let blocks = allocation_bytes(
+            usize::try_from(range.storage_slot).map_err(|_| native_work_ceiling_overflow())?,
+        )?
+        .checked_add(9 + 63)
+        .ok_or_else(native_work_ceiling_overflow)?
+            / 64;
+        let visits = u64::try_from(position)
+            .ok()
+            .and_then(|position| position.checked_add(1))
+            .ok_or_else(native_work_ceiling_overflow)?;
+        add_native_work_ceiling(&mut ceiling, [0, visits, 0, 0, 0, 0, 0, blocks, 32])?;
     }
     Ok(ceiling)
 }
@@ -1340,7 +2639,7 @@ pub(super) fn content_digest_ceiling(
 }
 
 impl PreparedStepInputs {
-    fn native_work_ceiling(&self) -> Result<[u64; 9], SemanticTransitionError> {
+    pub(super) fn native_work_ceiling(&self) -> Result<[u64; 9], SemanticTransitionError> {
         Self::basis_native_work_ceiling(&self.storage, &self.plans)
     }
 
@@ -1348,73 +2647,74 @@ impl PreparedStepInputs {
         storage: &PublicationStorage,
         plans: &[StepInputPlan],
     ) -> Result<[u64; 9], SemanticTransitionError> {
-        // One original guard, two metadata seals, and the fixed roster fold.
-        let mut ceiling = [1, 0, 0, 0, 0, 0, 0, 2, 112];
-        for (bytes, prefix_words) in [
-            (size_of::<PublicationHeader>() as u64, 26),
-            ((32 * size_of::<SemanticTextSlot>()) as u64, 27),
-        ] {
-            let mut digest = content_digest_ceiling(bytes, prefix_words, false)?;
-            digest[0] = 0;
-            add_native_work_ceiling(&mut ceiling, digest)?;
-        }
-        let count = u64::try_from(plans.len()).map_err(|_| native_work_ceiling_overflow())?;
-        let previous = count
-            .checked_sub(1)
-            .ok_or(SemanticTransitionError::ObservationMismatch)?;
-        ceiling[1] = count
-            .checked_mul(previous)
-            .map(|visits| visits / 2)
-            .and_then(|visits| visits.checked_add(count))
-            .ok_or_else(native_work_ceiling_overflow)?;
-        for plan in plans {
-            let mut digest = if matches!(plan.role, 4..=13 | 18..=25) {
-                let end = if plan.layout.logical_axis == u64::MAX {
-                    0
-                } else {
-                    plan.layout.dimensions[plan.layout.logical_axis as usize]
-                };
-                tensor_layout_native_work_ceiling(
-                    &plan.layout,
-                    0,
-                    end,
-                    plan.banks[0].span.len(),
-                    true,
-                )?
-            } else {
-                content_digest_ceiling(plan.banks[0].span.len() as u64, 21, false)?
-            };
-            digest[0] = 0;
-            add_native_work_ceiling(&mut ceiling, digest)?;
-        }
-        let mut backing_ceiling = [0; 9];
-        for bank in 0..2 {
-            let mut selected = [0; 9];
-            let mut seen = BTreeSet::new();
-            for plan in plans.iter().filter(|plan| matches!(plan.role, 18..=25)) {
-                let slot = plan.banks[bank].storage_slot;
-                if !seen.insert(slot) {
-                    continue;
-                }
-                let allocation = storage
-                    .allocations
-                    .get(slot)
-                    .ok_or(SemanticTransitionError::ObservationMismatch)?;
-                let blocks = allocation
-                    .entry()
-                    .bytes
-                    .checked_add(9 + 63)
-                    .ok_or_else(native_work_ceiling_overflow)?
-                    / 64;
-                add_native_work_ceiling(&mut selected, [0, 0, 0, 0, 0, 0, 0, blocks, 32])?;
-            }
-            for (upper, actual) in backing_ceiling.iter_mut().zip(selected) {
-                *upper = (*upper).max(actual);
-            }
-        }
-        add_native_work_ceiling(&mut ceiling, backing_ceiling)?;
-        Ok(ceiling)
+        step_input_basis_geometry_native_work_ceiling(plans, |slot| {
+            storage
+                .allocations
+                .get(slot)
+                .map(|allocation| allocation.entry().bytes)
+                .ok_or(SemanticTransitionError::ObservationMismatch)
+        })
     }
+}
+
+pub(super) fn step_input_basis_geometry_native_work_ceiling(
+    plans: &[StepInputPlan],
+    allocation_bytes: impl Fn(usize) -> Result<u64, SemanticTransitionError>,
+) -> Result<[u64; 9], SemanticTransitionError> {
+    // One original guard, two metadata seals, and the fixed roster fold.
+    let mut ceiling = [1, 0, 0, 0, 0, 0, 0, 2, 112];
+    for (bytes, prefix_words) in [
+        (size_of::<PublicationHeader>() as u64, 26),
+        ((32 * size_of::<SemanticTextSlot>()) as u64, 27),
+    ] {
+        let mut digest = content_digest_ceiling(bytes, prefix_words, false)?;
+        digest[0] = 0;
+        add_native_work_ceiling(&mut ceiling, digest)?;
+    }
+    let count = u64::try_from(plans.len()).map_err(|_| native_work_ceiling_overflow())?;
+    let previous = count
+        .checked_sub(1)
+        .ok_or(SemanticTransitionError::ObservationMismatch)?;
+    ceiling[1] = count
+        .checked_mul(previous)
+        .map(|visits| visits / 2)
+        .and_then(|visits| visits.checked_add(count))
+        .ok_or_else(native_work_ceiling_overflow)?;
+    for plan in plans {
+        let mut digest = if matches!(plan.role, 4..=13 | 18..=25) {
+            let end = if plan.layout.logical_axis == u64::MAX {
+                0
+            } else {
+                plan.layout.dimensions[plan.layout.logical_axis as usize]
+            };
+            tensor_layout_native_work_ceiling(&plan.layout, 0, end, plan.banks[0].span.len(), true)?
+        } else {
+            content_digest_ceiling(plan.banks[0].span.len() as u64, 21, false)?
+        };
+        digest[0] = 0;
+        add_native_work_ceiling(&mut ceiling, digest)?;
+    }
+    let mut backing_ceiling = [0; 9];
+    for bank in 0..2 {
+        let mut selected = [0; 9];
+        let mut seen = BTreeSet::new();
+        for plan in plans.iter().filter(|plan| matches!(plan.role, 18..=25)) {
+            let slot = plan.banks[bank].storage_slot;
+            if !seen.insert(slot) {
+                continue;
+            }
+            let blocks = allocation_bytes(slot)?
+                .checked_add(9 + 63)
+                .ok_or_else(native_work_ceiling_overflow)?
+                / 64;
+            add_native_work_ceiling(&mut selected, [0, 0, 0, 0, 0, 0, 0, blocks, 32])?;
+        }
+        for (upper, actual) in backing_ceiling.iter_mut().zip(selected) {
+            *upper = (*upper).max(actual);
+        }
+    }
+    add_native_work_ceiling(&mut ceiling, backing_ceiling)?;
+    Ok(ceiling)
 }
 
 pub(super) fn step_input_plans(
@@ -1457,12 +2757,38 @@ pub(super) fn step_input_producer_native_work_ceiling(
     plans: &[StepInputPlan],
     directory: &[PublicationRange],
 ) -> Result<[u64; 9], SemanticTransitionError> {
-    let mut ceiling = PreparedStepInputs::basis_native_work_ceiling(storage, plans)?;
+    step_input_producer_geometry_native_work_ceiling(
+        &storage.contract_value,
+        storage.layouts.len(),
+        storage.allocations.len(),
+        storage.role_counts.len(),
+        plans,
+        directory,
+        |slot| {
+            storage
+                .allocations
+                .get(slot)
+                .map(|allocation| allocation.entry().bytes)
+                .ok_or(SemanticTransitionError::ObservationMismatch)
+        },
+    )
+}
+
+pub(super) fn step_input_producer_geometry_native_work_ceiling(
+    contract: &PublicationContract,
+    layout_count: usize,
+    allocation_count: usize,
+    role_count: usize,
+    plans: &[StepInputPlan],
+    directory: &[PublicationRange],
+    allocation_bytes: impl Fn(usize) -> Result<u64, SemanticTransitionError>,
+) -> Result<[u64; 9], SemanticTransitionError> {
+    let mut ceiling = step_input_basis_geometry_native_work_ceiling(plans, allocation_bytes)?;
     // The selected-model check is a strict prefix of the full role44 guard.
     // Retaining that complete guard ceiling is a conservative native bound.
     add_native_work_ceiling(
         &mut ceiling,
-        model_contract_guard_native_work_ceiling(storage, directory)?,
+        model_contract_guard_geometry_native_work_ceiling(contract, directory)?,
     )?;
     let table = directory
         .iter()
@@ -1472,11 +2798,10 @@ pub(super) fn step_input_producer_native_work_ceiling(
     table_digest[0] = 0;
     add_native_work_ceiling(&mut ceiling, table_digest)?;
     let n = u64::try_from(directory.len()).map_err(|_| native_work_ceiling_overflow())?;
-    let t = u64::try_from(storage.layouts.len()).map_err(|_| native_work_ceiling_overflow())?;
+    let t = u64::try_from(layout_count).map_err(|_| native_work_ceiling_overflow())?;
     let k = u64::try_from(plans.len()).map_err(|_| native_work_ceiling_overflow())?;
-    let s = u64::try_from(storage.allocations.len()).map_err(|_| native_work_ceiling_overflow())?;
-    let d = storage
-        .contract_value
+    let s = u64::try_from(allocation_count).map_err(|_| native_work_ceiling_overflow())?;
+    let d = contract
         .window_capacity
         .checked_add(storage.contract_value.feedback_capacity)
         .ok_or_else(native_work_ceiling_overflow)?;
@@ -1489,7 +2814,7 @@ pub(super) fn step_input_producer_native_work_ceiling(
     let mut visits = sum(s, pairs(s)?)?;
     visits = sum(
         visits,
-        u64::try_from(storage.role_counts.len()).map_err(|_| native_work_ceiling_overflow())?,
+        u64::try_from(role_count).map_err(|_| native_work_ceiling_overflow())?,
     )?;
     visits = sum(visits, sum(6, d)?)?;
     visits = sum(visits, sum(n, product(t, sum(n, 1)?)?)?)?;

@@ -2,6 +2,9 @@
 
 use super::phase_evaluation::EvaluationOwners;
 use super::*;
+use crate::semantic_transition::resident_model_memory::{
+    PySemanticPreparedResidentModelMemory, PySemanticPreparedResidentModelRestoration,
+};
 use xlog_cuda::{
     SemanticColdModelWork, SemanticColdModelWorkRegion, SemanticColdModelWorkResult,
     SemanticColdNativeWork,
@@ -11,7 +14,9 @@ use xlog_cuda::{
 struct RestoreSnapshot {
     entered: bool,
     admitted: bool,
-    saved: Option<Py<PyBytes>>,
+    saved: Option<Py<material_bytes::PySemanticMaterialBytes>>,
+    serializer: Option<Py<PyAny>>,
+    native_snapshot_bound: bool,
     error: Option<PyErr>,
 }
 
@@ -36,6 +41,9 @@ pub(super) struct IntermediateRestore {
     custody: Option<SemanticColdNativeWork>,
     regions: Vec<SemanticColdModelWorkRegion>,
     callbacks: [Option<Py<PySemanticColdModelWork>>; 4],
+    resident_restoration_attempt: Option<xlog_cuda::SemanticPreparedResidentModelRestoration>,
+    resident_restoration: Option<Py<PySemanticPreparedResidentModelRestoration>>,
+    resident_prelude: Option<Arc<xlog_cuda::SemanticColdResidentRestorationPrelude>>,
     snapshots: [RestoreSnapshot; 2],
     retirement_entered: bool,
     retirement_completed: bool,
@@ -93,6 +101,148 @@ impl PySemanticLearningPhaseTransition {
         } else {
             "checkpoint-model"
         })
+    }
+
+    pub(super) fn prepare_intermediate_resident_model_restoration(
+        &self,
+        py: Python<'_>,
+        work: &PySemanticColdModelWork,
+        memory: &PySemanticPreparedResidentModelMemory,
+    ) -> PyResult<Py<PySemanticPreparedResidentModelRestoration>> {
+        self.intermediate_restore_material_mode(py, work)?;
+        let mut retained = self.intermediate()?;
+        let current = retained.as_mut().expect("original intermediate restore");
+        let original = current.work.as_ref().expect("original four-region report");
+        if current.regions.len() != 4
+            || current.callbacks[0]
+                .as_ref()
+                .is_none_or(|callback| !std::ptr::eq(&*callback.borrow(py), work))
+            || current
+                .owners
+                .as_ref()
+                .is_none_or(|owners| owners.parent.as_ptr() != memory.original_binding().0.as_ptr())
+            || current
+                .snapshots
+                .iter()
+                .any(|snapshot| snapshot.saved.is_some() || snapshot.error.is_some())
+            || current.snapshots[1].entered
+            || current.retirement_entered
+            || current.session_release_entered
+            || current.restore_entered
+        {
+            return Err(invalid(
+                "resident restoration requires its original current snapshot carrier before retirement",
+            ));
+        }
+        self.source
+            .borrow(py)
+            .owner()?
+            .require_cold_model_work_resident_read_preparation(original)
+            .map_err(xlog_err)?;
+        if current
+            .resident_restoration_attempt
+            .as_ref()
+            .is_some_and(|attempt| !attempt.same_source(memory.original_binding().1))
+        {
+            return Err(invalid(
+                "resident restoration changed its original snapshot carrier",
+            ));
+        }
+        if let Some(cached) = &current.resident_restoration {
+            return Ok(cached.clone_ref(py));
+        }
+        if current.resident_restoration_attempt.is_none() {
+            current.resident_restoration_attempt =
+                Some(memory.prepare_original_restoration(py, original)?);
+        }
+        let task = current
+            .owners
+            .as_ref()
+            .expect("original current-state owners")
+            .task
+            .borrow(py);
+        let projection_extent = task.future_model_metadata_allocation_bound(py)?;
+        let projected = PySemanticPreparedResidentModelRestoration::new(
+            py,
+            current
+                .resident_restoration_attempt
+                .as_ref()
+                .expect("original resident restoration issuer")
+                .clone(),
+            original,
+            projection_extent,
+            || {
+                Ok((
+                    task.task_training_domain(py)?,
+                    task.task_objective_law(py)?,
+                    self.private_branch_feedback_projection(py, current.branch)?,
+                ))
+            },
+        )?;
+        drop(task);
+        current.resident_restoration = Some(projected.clone_ref(py));
+        Ok(projected)
+    }
+
+    pub(super) fn require_intermediate_restored_model_metadata(
+        &self,
+        py: Python<'_>,
+        task: &PySemanticTransitionTaskUse,
+        parent: &Py<PySemanticPublishedParent>,
+    ) -> PyResult<()> {
+        let (planned, branch) = {
+            let retained = self.intermediate()?;
+            let Some(current) = retained.as_ref() else {
+                return Ok(());
+            };
+            let Some(planned) = &current.resident_restoration else {
+                return Ok(());
+            };
+            if !current.restore_entered
+                || current.restored.is_some()
+                || current
+                    .resident_restoration_attempt
+                    .as_ref()
+                    .is_none_or(|issuer| !issuer.same_issuer(&planned.borrow(py).inner))
+            {
+                return Err(invalid(
+                    "future model metadata lost its original pending restoration",
+                ));
+            }
+            (planned.clone_ref(py), current.branch)
+        };
+        {
+            let retained = self.private_restore()?;
+            let owners = retained.as_ref().ok_or_else(|| {
+                invalid("future model metadata lacks its original constructed child")
+            })?;
+            if owners
+                .task_use
+                .as_ref()
+                .is_none_or(|original| !std::ptr::eq(&*original.borrow(py), task))
+                || owners
+                    .parent
+                    .as_ref()
+                    .is_none_or(|original| original.as_ptr() != parent.as_ptr())
+            {
+                return Err(invalid(
+                    "future model metadata changed its actual child task or parent",
+                ));
+            }
+        }
+        let planned = planned.borrow(py);
+        let budget = planned.material_budget(py);
+        let _projection = budget
+            .reserve_auxiliary(task.future_model_metadata_allocation_bound(py)?)
+            .map_err(xlog_err)?;
+        let result = planned.require_metadata(
+            py,
+            task.task_training_domain(py)?.bind(py),
+            task.task_objective_law(py)?.bind(py),
+            self.private_branch_feedback_projection(py, branch)?
+                .bind(py),
+        );
+        result
     }
 
     pub(super) fn require_intermediate_cold_callback(
@@ -305,6 +455,9 @@ impl PySemanticLearningPhaseTransition {
             custody: None,
             regions: Vec::new(),
             callbacks: std::array::from_fn(|_| None),
+            resident_restoration_attempt: None,
+            resident_restoration: None,
+            resident_prelude: None,
             snapshots: std::array::from_fn(|_| RestoreSnapshot::default()),
             retirement_entered: false,
             retirement_completed: false,
@@ -457,7 +610,7 @@ impl PySemanticLearningPhaseTransition {
             || current.snapshots[0]
                 .saved
                 .as_ref()
-                .is_none_or(|saved| saved.bind(py).as_bytes() != checkpoint)
+                .is_none_or(|saved| saved.borrow(py).as_bytes() != checkpoint)
         {
             return Err(invalid(
                 "intermediate allocation changed its actual checkpoint, recipe or known retirement",
@@ -470,13 +623,22 @@ impl PySemanticLearningPhaseTransition {
         &self,
         py: Python<'_>,
     ) -> PyResult<SemanticColdNativeWork> {
-        let work = self
-            .intermediate()?
-            .as_ref()
-            .and_then(|current| current.work.clone())
-            .ok_or_else(|| {
+        let work = {
+            let retained = self.intermediate()?;
+            let current = retained.as_ref().ok_or_else(|| {
                 invalid("intermediate allocation lost its original pre-allocation report")
             })?;
+            if let Some(issuer) = &current.resident_restoration_attempt {
+                let prelude = current.resident_prelude.as_ref().ok_or_else(|| {
+                    invalid("intermediate allocation lost its original admitted native prelude")
+                })?;
+                prelude.require_restoration(issuer).map_err(xlog_err)?;
+                return Ok(prelude.shared_native_work().clone());
+            }
+            current.work.clone().ok_or_else(|| {
+                invalid("intermediate allocation lost its original pre-allocation report")
+            })?
+        };
         self.source
             .borrow(py)
             .owner()?
@@ -545,7 +707,15 @@ impl PySemanticLearningPhaseTransition {
         let Some(current) = retained.as_ref() else {
             return Ok(None);
         };
-        let Some(work) = current.callbacks[2].as_ref() else {
+        let ordinal = if current.snapshots[1].entered
+            && current.snapshots[1].saved.is_none()
+            && current.snapshots[1].error.is_none()
+        {
+            3
+        } else {
+            2
+        };
+        let Some(work) = current.callbacks[ordinal].as_ref() else {
             return Ok(None);
         };
         if work.borrow(py).custody(py)?.parent.is_none() {
@@ -601,17 +771,35 @@ impl PySemanticLearningPhaseTransition {
         Ok(())
     }
 
-    fn intermediate_snapshot(&self, py: Python<'_>, index: usize) -> PyResult<Py<PyBytes>> {
+    fn intermediate_snapshot(
+        &self,
+        py: Python<'_>,
+        index: usize,
+    ) -> PyResult<Py<material_bytes::PySemanticMaterialBytes>> {
         self.require_intermediate_entry(py)?;
+        let saved = {
+            let retained = self.intermediate()?;
+            let snapshot = &retained
+                .as_ref()
+                .expect("original intermediate restore")
+                .snapshots[index];
+            if let Some(error) = &snapshot.error {
+                return Err(error.clone_ref(py));
+            }
+            snapshot.saved.as_ref().map(|saved| saved.clone_ref(py))
+        };
+        if let Some(saved) = saved {
+            if index == 0 {
+                self.bind_intermediate_resident_snapshot(py)?;
+            }
+            return Ok(saved);
+        }
         let (entered, owners) = {
             let retained = self.intermediate()?;
             let current = retained.as_ref().expect("original intermediate restore");
             let snapshot = &current.snapshots[index];
             if let Some(error) = &snapshot.error {
                 return Err(error.clone_ref(py));
-            }
-            if let Some(saved) = &snapshot.saved {
-                return Ok(saved.clone_ref(py));
             }
             let owners = if index == 0 {
                 let original = current.owners.as_ref().expect("actual pre-restore owners");
@@ -643,25 +831,55 @@ impl PySemanticLearningPhaseTransition {
         }
         let work =
             self.intermediate_callback(py, if index == 0 { 0 } else { 3 }, &owners.parent)?;
-        let serializer = self.model_owner(py, PhaseModelOwner::SerializeCandidate)?;
-        let selected = owners.model.clone_ref(py);
-        let session = owners.parent.borrow(py).session.clone_ref(py);
-        let snapshot_model =
-            pyo3::types::PyCFunction::new_closure(py, None, None, move |args, kwargs| {
-                let py = args.py();
-                if !args.is_empty() || kwargs.is_some_and(|kwargs| !kwargs.is_empty()) {
-                    return Err(invalid(
-                        "intermediate serializer accepts its original zero-argument call",
-                    ));
-                }
-                let session = session.borrow(py);
-                let original = work.borrow(py);
-                let _scope = ColdCallbackScope::enter(py, &session, &original, work.clone_ref(py))?;
-                serializer
-                    .bind(py)
-                    .call1((selected.clone_ref(py),))
-                    .map(Bound::unbind)
-            })?;
+        let writer = self.prepare_model_checkpoint_writer(py, &owners.model, &work)?;
+        let (capacity, working_bytes) = writer.borrow(py).original_cold_bounds()?;
+        let cached = self
+            .intermediate()?
+            .as_ref()
+            .expect("original intermediate restore")
+            .snapshots[index]
+            .serializer
+            .as_ref()
+            .map(|serializer| serializer.clone_ref(py));
+        let snapshot_model = if let Some(cached) = cached {
+            cached
+        } else {
+            let serializer = self.model_owner(py, PhaseModelOwner::SerializeCandidate)?;
+            let selected = owners.model.clone_ref(py);
+            let session = owners.parent.borrow(py).session.clone_ref(py);
+            let original_writer = writer.clone_ref(py);
+            let callback =
+                pyo3::types::PyCFunction::new_closure(py, None, None, move |args, kwargs| {
+                    let py = args.py();
+                    if args.len() != 1
+                        || kwargs.is_some_and(|kwargs| !kwargs.is_empty())
+                        || !args.get_item(0)?.is(original_writer.bind(py).as_any())
+                    {
+                        return Err(invalid(
+                            "intermediate serializer requires its original writer object",
+                        ));
+                    }
+                    let session = session.borrow(py);
+                    let original = work.borrow(py);
+                    let _scope =
+                        ColdCallbackScope::enter(py, &session, &original, work.clone_ref(py))?;
+                    original_writer
+                        .borrow(py)
+                        .bind_original_cold_callback(py, &work)?;
+                    serializer
+                        .bind(py)
+                        .call1((selected.clone_ref(py), original_writer.clone_ref(py)))
+                        .map(Bound::unbind)
+                })?
+                .into_any()
+                .unbind();
+            self.intermediate()?
+                .as_mut()
+                .expect("original intermediate restore")
+                .snapshots[index]
+                .serializer = Some(callback.clone_ref(py));
+            callback
+        };
         let fresh = self.refresh_snapshot.bind(py).call0()?;
         let authority =
             AuthoritySnapshot::parse(&ColdValue::read(&fresh, &mut (16 * 1024 * 1024), 0)?)?;
@@ -681,10 +899,13 @@ impl PySemanticLearningPhaseTransition {
             owners.controller.borrow(py).save_checkpoint(
                 py,
                 &owners.task.borrow(py),
-                &owners.parent.borrow(py),
+                owners.parent.bind(py),
                 streams.bind(py),
                 &fresh,
-                snapshot_model.as_any(),
+                snapshot_model.bind(py),
+                capacity,
+                working_bytes,
+                Some(writer.clone_ref(py)),
             )
         };
         let mut retained = self.intermediate()?;
@@ -695,6 +916,10 @@ impl PySemanticLearningPhaseTransition {
         match result {
             Ok(saved) => {
                 snapshot.saved = Some(saved.clone_ref(py));
+                drop(retained);
+                if index == 0 {
+                    self.bind_intermediate_resident_snapshot(py)?;
+                }
                 Ok(saved)
             }
             Err(error) => {
@@ -702,6 +927,61 @@ impl PySemanticLearningPhaseTransition {
                 Err(error)
             }
         }
+    }
+
+    fn bind_intermediate_resident_snapshot(&self, py: Python<'_>) -> PyResult<()> {
+        let (issuer, saved, parent, task) = {
+            let retained = self.intermediate()?;
+            let current = retained.as_ref().expect("original intermediate restore");
+            if current.snapshots[0].native_snapshot_bound {
+                return Ok(());
+            }
+            let Some(issuer) = &current.resident_restoration_attempt else {
+                return Ok(());
+            };
+            let owners = current.owners.as_ref().ok_or_else(|| {
+                invalid("planned resident snapshot lost its original current-state owners")
+            })?;
+            (
+                issuer.clone(),
+                current.snapshots[0]
+                    .saved
+                    .as_ref()
+                    .ok_or_else(|| {
+                        invalid("planned resident restoration precedes its original saved snapshot")
+                    })?
+                    .clone_ref(py),
+                owners.parent.clone_ref(py),
+                owners.task.clone_ref(py),
+            )
+        };
+        let saved = saved.borrow(py);
+        let manifest = SemanticCheckpointManifest::decode_borrowed(saved.as_bytes())?;
+        let mut material = saved
+            .original_loaded(
+                &task
+                    .borrow(py)
+                    .checkpoint
+                    .material_sources
+                    .native_budget()?,
+            )?
+            .slice_payload(checkpoint_section_range(saved.as_bytes(), manifest.native)?)
+            .map_err(xlog_err)?;
+        let proof = material.checkpoint_proof().map_err(xlog_err)?;
+        let published = parent.borrow(py);
+        let session = published.session.borrow(py);
+        session.require_creator()?;
+        let owner = session.owner()?;
+        task.borrow(py).require_original_identity(&owner)?;
+        issuer
+            .bind_original_snapshot(&owner, &*published.lease()?, proof)
+            .map_err(xlog_err)?;
+        self.intermediate()?
+            .as_mut()
+            .expect("original intermediate restore")
+            .snapshots[0]
+            .native_snapshot_bound = true;
+        Ok(())
     }
 
     fn require_intermediate_region_closed(&self, py: Python<'_>, index: usize) -> PyResult<()> {
@@ -940,9 +1220,8 @@ impl PySemanticLearningPhaseTransition {
                 .source
                 .borrow(py)
                 .owner()?
-                .prepare_cold_model_work(
+                .prepare_cold_model_work_deferred(
                     &*self.parent.borrow(py).lease()?,
-                    self.preparation_inputs.cold_model_work_capacity,
                     ordinal,
                     self.records()?.confirmed_admission()?,
                     xlog_cuda::SemanticColdModelWorkPurpose::IntermediateRestore,
@@ -1024,13 +1303,40 @@ impl PySemanticLearningPhaseTransition {
         let checkpoint = self.intermediate_snapshot(py, 0)?;
         self.require_intermediate_region_closed(py, 0)?;
         self.retire_intermediate_source(py)?;
-        let (entered, restored, recipe) = {
+        {
+            let mut retained = self.intermediate()?;
+            let current = retained.as_mut().expect("original intermediate restore");
+            if let Some(issuer) = &current.resident_restoration_attempt {
+                if current.resident_prelude.is_none() {
+                    let prelude = self
+                        .source
+                        .borrow(py)
+                        .owner()?
+                        .prepare_cold_resident_restoration(
+                            current.work.as_ref().expect("original four-region report"),
+                            issuer,
+                        )
+                        .map_err(xlog_err)?;
+                    current.resident_prelude = Some(Arc::new(prelude));
+                }
+                issuer
+                    .bind_native_prelude(
+                        current
+                            .resident_prelude
+                            .as_ref()
+                            .expect("original native prelude"),
+                    )
+                    .map_err(xlog_err)?;
+            }
+        }
+        let (entered, restored, recipe, resident_restoration) = {
             let retained = self.intermediate()?;
             let current = retained.as_ref().expect("original intermediate restore");
             (
                 current.restore_entered,
                 current.restored.as_ref().map(|value| value.clone_ref(py)),
                 current.recipe.clone(),
+                current.resident_restoration_attempt.clone(),
             )
         };
         let restored = match restored {
@@ -1090,7 +1396,10 @@ impl PySemanticLearningPhaseTransition {
                     Some(self.refresh_snapshot.bind(py)),
                     Some(&task.checkpoint.proposal_expense),
                     Some(&task.checkpoint.checkpoint_sources),
+                    Some(&task.checkpoint.material_sources),
                     Some(pending),
+                    resident_restoration.as_ref(),
+                    None,
                 );
                 let mut retained = self.intermediate()?;
                 let current = retained.as_mut().expect("original intermediate restore");

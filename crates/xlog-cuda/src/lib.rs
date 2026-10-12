@@ -87,15 +87,24 @@ pub use semantic_transition::{
     SemanticLearningCopyReset, SemanticLearningPhase, SemanticLearningPhaseRecord,
     SemanticLearningPhaseTransition, SemanticModelContext, SemanticModelContractLayout,
     SemanticModelForwardWitness, SemanticModelMemory, SemanticModelStorage, SemanticModelView,
-    SemanticNonterminalIntentBinding, SemanticObservedSource, SemanticOutputIntent,
-    SemanticParentBinding, SemanticPolicyFieldLayout, SemanticPolicyLayout,
-    SemanticPreparedSegmentCapture, SemanticPreparedSegmentContinuation,
-    SemanticPreparedSegmentNonSubmission, SemanticPreparedSegmentTransfers, SemanticPreparedStep,
-    SemanticPreparedStepOutcome, SemanticPublicationInputProjection,
-    SemanticPublicationTensorProjection, SemanticPublishedAcquisition, SemanticPublishedIdentity,
-    SemanticPublishedLease, SemanticPublishedStateObservation, SemanticReplayAppendBinding,
-    SemanticReplayMaterial, SemanticReplayModelBackings, SemanticReplayPublicationVerification,
-    SemanticResidentModelMemory, SemanticRngBinding, SemanticSegmentColdCapacity,
+    SemanticModelWorkBufferExport, SemanticModelWorkBufferPort, SemanticNonterminalIntentBinding,
+    SemanticObservedSource, SemanticOutputIntent, SemanticParentBinding, SemanticPolicyFieldLayout,
+    SemanticPolicyLayout, SemanticPreparedResidentModelMemory, SemanticPreparedSegmentCapture,
+    SemanticPreparedSegmentContinuation, SemanticPreparedSegmentNonSubmission,
+    SemanticPreparedSegmentTransfers, SemanticPreparedStep, SemanticPreparedStepOutcome,
+    SemanticPublicationInputProjection, SemanticPublicationTensorProjection,
+    SemanticLoadedPublicationInputProjection,
+    SemanticPublishedAcquisition, SemanticPublishedIdentity, SemanticPublishedLease,
+    SemanticPublishedStateObservation, SemanticPublishedStateObservationBinding,
+    SemanticCheckpointInitialPrefillObservation,
+    SemanticReplayAppendBinding, SemanticReplayAppendRows,
+    SemanticReplayDecisionBytes, SemanticReplayLoadedMaterial, SemanticReplayMaterial,
+    SemanticReplayMaterialBudget, SemanticReplayMaterialOutput, SemanticReplayMaterialReservation,
+    SemanticPublicationReadbackLoan, SemanticReplayMaterialScratch,
+    SemanticReplayModelBackings,
+    SemanticReplayPublicationVerification, SemanticReplayStateMaterialAdmission,
+    SemanticReplayStateMaterialProof, SemanticReplayTrainingViewRow, SemanticResidentModelMemory,
+    SemanticResolvedReplayMaterial, SemanticRngBinding, SemanticSegmentColdCapacity,
     SemanticSegmentTerminalWait, SemanticSourceMapping, SemanticStateRecord, SemanticStateRole,
     SemanticStructuralCostDescriptor, SemanticTaskContentIdentity, SemanticTaskEvaluation,
     SemanticTaskEvaluationSpec, SemanticTaskFacts, SemanticTaskGoalWitness, SemanticTaskGround,
@@ -120,23 +129,36 @@ pub use semantic_transition::{
     SemanticCompletedStepWitnessMaterial, SemanticCompletedTaskGroundMaterial,
     SemanticCompletedTheoryDeltaMaterial, SemanticPolicyGradients,
     SemanticPolicyNumericalDomainLayout, SemanticPreparedActorRefresh,
+    SemanticPreparedResidentModelRestoration, SemanticResidentModelRead,
     SemanticSegmentInstructionAdmission, SemanticSelectedPolicyGradients,
     SemanticTransitionSessionConstruction, SemanticUpdateCanaryMeasurement,
     SemanticUpdateForwardReceipt, SemanticUpdateForwardReceiptMaterial, SemanticUpdateMeasurements,
 };
 #[cfg(feature = "semantic-policy")]
 pub use semantic_transition::{
-    SemanticCancelledModelEvaluation, SemanticColdEvaluationContent,
-    SemanticCompletedModelEvaluation, SemanticEvaluationCohort, SemanticModelEvaluation,
-    SemanticModelEvaluationResult,
+    SemanticCancelledEvaluationCapture, SemanticCancelledModelEvaluation,
+    SemanticColdEvaluationContent, SemanticCompletedModelEvaluation, SemanticEvaluationCohort,
+    SemanticModelEvaluation, SemanticModelEvaluationResult,
 };
 #[cfg(feature = "semantic-policy")]
 pub use semantic_transition::{
-    SemanticColdModelWork, SemanticColdModelWorkDisposition, SemanticColdModelWorkOperation,
+    SemanticColdModelWork, SemanticColdModelWorkAdmission, SemanticColdModelWorkDisposition, SemanticColdModelWorkOperation,
     SemanticColdModelWorkPurpose, SemanticColdModelWorkRegion, SemanticColdModelWorkReportCursor,
-    SemanticColdModelWorkResult, SemanticColdNativeWork,
+    SemanticColdModelWorkResult, SemanticColdNativeWork, SemanticColdNativeWorkActivationIdentity,
+    SemanticColdNativeWorkActivationPermit, SemanticColdResidentRestorationPrelude,
 };
 pub use semantic_work::ModelWorkKind;
+
+#[cfg(feature = "semantic-policy")]
+pub use semantic_transition::{
+    SemanticPreparedSourceCache, SemanticPreparedSourceContent, SemanticPreparedSourceContentPorts,
+    SemanticPreparedSourceContentGeometry, SemanticSourceContentGeometryKind,
+    SemanticSourceContentGeometrySeed, SemanticSourceGeometryAllocation, SemanticSourceGeometryTensor,
+    SemanticModelInputGenerationPort,
+    SemanticSourceAllocationDescriptor, SemanticSourceContentAllocation, SemanticSourceContentEvent, SemanticSourceContentFamily,
+    SemanticSourceContentKind, SemanticSourceContentOccurrence, SemanticSourceContentPhase,
+    SemanticSourceContentRetirement, SemanticSourceTensorDescriptor,
+};
 
 pub use wcoj_metadata::{
     HeatDist, LayoutSignature, RootMetadata, VertexId, WcojCycle4HgWorkPlanU32,

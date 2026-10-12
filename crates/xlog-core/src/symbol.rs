@@ -10,6 +10,10 @@ static REGISTRY: OnceLock<RwLock<SymbolRegistry>> = OnceLock::new();
 struct SymbolRegistry {
     to_id: HashMap<String, u32>,
     to_string: Vec<String>,
+    string_owners: Vec<Option<Arc<dyn Send + Sync>>>,
+    table_owner: Option<Arc<dyn Send + Sync>>,
+    strings_array_owner: Option<Arc<dyn Send + Sync>>,
+    owners_array_owner: Option<Arc<dyn Send + Sync>>,
 }
 
 impl SymbolRegistry {
@@ -17,6 +21,10 @@ impl SymbolRegistry {
         Self {
             to_id: HashMap::new(),
             to_string: Vec::new(),
+            string_owners: Vec::new(),
+            table_owner: None,
+            strings_array_owner: None,
+            owners_array_owner: None,
         }
     }
 }
@@ -28,24 +36,136 @@ fn registry() -> &'static RwLock<SymbolRegistry> {
 /// Intern a string, returning its unique ID.
 /// Thread-safe. Returns existing ID if already interned.
 pub fn intern(s: &str) -> u32 {
+    intern_owned(s, None).expect("symbol registry allocation")
+}
+
+/// Actual UTF-8 clone extent of an original symbol, without making a copy.
+pub fn resolved_allocation_bytes(id: u32) -> crate::Result<usize> {
+    let reg = registry().read().unwrap();
+    reg.to_string
+        .get(id as usize)
+        .map(String::len)
+        .ok_or_else(|| crate::XlogError::Compilation("unknown original symbol identity".into()))
+}
+
+/// Intern in the original registry, retaining native allocation custody.
+/// The callback reserves capacity only; it must not invoke a language runtime.
+pub fn intern_with_allocation_owner(
+    s: &str,
+    reserve: &mut dyn FnMut(usize) -> crate::Result<Arc<dyn Send + Sync>>,
+) -> crate::Result<u32> {
+    intern_owned(s, Some(reserve))
+}
+
+fn intern_owned(
+    s: &str,
+    mut reserve: Option<&mut dyn FnMut(usize) -> crate::Result<Arc<dyn Send + Sync>>>,
+) -> crate::Result<u32> {
     // Fast path: check if already interned (read lock)
     {
         let reg = registry().read().unwrap();
         if let Some(&id) = reg.to_id.get(s) {
-            return id;
+            return Ok(id);
         }
     }
     // Slow path: insert new (write lock)
     let mut reg = registry().write().unwrap();
     // Double-check after acquiring write lock
     if let Some(&id) = reg.to_id.get(s) {
-        return id;
+        return Ok(id);
     }
-    let id = reg.to_string.len() as u32;
+    let overflow =
+        || crate::XlogError::Compilation("symbol registry extent exceeds this host".into());
+    let id = u32::try_from(reg.to_string.len()).map_err(|_| overflow())?;
+    let next = reg.to_string.len().checked_add(1).ok_or_else(overflow)?;
+    let retain_string_owner = reserve.is_some() || !reg.string_owners.is_empty();
+    let mut retain = |bytes: usize| -> crate::Result<Option<Arc<dyn Send + Sync>>> {
+        reserve.as_mut().map(|reserve| reserve(bytes)).transpose()
+    };
+    let strings_owner = retain(s.len().checked_mul(2).ok_or_else(overflow)?)?;
+    if next > reg.to_id.capacity() {
+        // Swiss-table growth keeps one eighth of its power-of-two buckets
+        // empty. The control group is at most sixteen bytes on supported hosts.
+        let buckets = if next < 4 {
+            4
+        } else if next < 8 {
+            8
+        } else if next < 15 {
+            16
+        } else {
+            next.checked_mul(8)
+                .ok_or_else(overflow)?
+                .checked_div(7)
+                .and_then(usize::checked_next_power_of_two)
+                .ok_or_else(overflow)?
+        };
+        let entries = buckets
+            .checked_mul(std::mem::size_of::<(String, u32)>())
+            .ok_or_else(overflow)?;
+        let aligned = entries
+            .checked_add(15)
+            .map(|bytes| bytes & !15)
+            .ok_or_else(overflow)?;
+        let bytes = aligned
+            .checked_add(buckets)
+            .and_then(|bytes| bytes.checked_add(16))
+            .ok_or_else(overflow)?;
+        let owner = retain(bytes)?;
+        reg.to_id.try_reserve(1).map_err(|_| overflow())?;
+        reg.table_owner = owner;
+    }
+    if next > reg.to_string.capacity() {
+        let capacity = reg
+            .to_string
+            .capacity()
+            .checked_mul(2)
+            .ok_or_else(overflow)?
+            .max(next)
+            .max(4);
+        let bytes = capacity
+            .checked_mul(std::mem::size_of::<String>())
+            .ok_or_else(overflow)?;
+        let owner = retain(bytes)?;
+        let additional = capacity
+            .checked_sub(reg.to_string.len())
+            .ok_or_else(overflow)?;
+        reg.to_string
+            .try_reserve_exact(additional)
+            .map_err(|_| overflow())?;
+        reg.strings_array_owner = owner;
+    }
+    if retain_string_owner {
+        let owner_count = reg
+            .string_owners
+            .len()
+            .checked_add(1)
+            .ok_or_else(overflow)?;
+        if owner_count > reg.string_owners.capacity() {
+            let capacity = reg
+                .string_owners
+                .capacity()
+                .checked_mul(2)
+                .ok_or_else(overflow)?
+                .max(owner_count)
+                .max(4);
+            let bytes = capacity
+                .checked_mul(std::mem::size_of::<Option<Arc<dyn Send + Sync>>>())
+                .ok_or_else(overflow)?;
+            let owner = retain(bytes)?;
+            let additional = capacity
+                .checked_sub(reg.string_owners.len())
+                .ok_or_else(overflow)?;
+            reg.string_owners
+                .try_reserve_exact(additional)
+                .map_err(|_| overflow())?;
+            reg.owners_array_owner = owner;
+        }
+        reg.string_owners.push(strings_owner);
+    }
     let owned = s.to_string();
     reg.to_id.insert(owned.clone(), id);
     reg.to_string.push(owned);
-    id
+    Ok(id)
 }
 
 /// Resolve an ID to its string. Panics if ID is invalid.
@@ -55,8 +175,34 @@ pub fn resolve(id: u32) -> String {
 
 /// Resolve an ID to its string if present.
 pub fn resolve_checked(id: u32) -> Option<String> {
+    resolve_owned(id, None)
+        .expect("ordinary symbol read has no allocation callback")
+        .map(|(text, _)| text)
+}
+
+/// Copy the original symbol text only after its real UTF-8 extent is reserved
+/// under the same registry read lock. The returned owner follows that copy's
+/// actual consumer lifetime; it does not grant symbol or program admission.
+pub fn resolve_with_allocation_owner(
+    id: u32,
+    reserve: &mut dyn FnMut(usize) -> crate::Result<Arc<dyn Send + Sync>>,
+) -> crate::Result<(String, Arc<dyn Send + Sync>)> {
+    let (text, owner) = resolve_owned(id, Some(reserve))?.ok_or_else(|| {
+        crate::XlogError::Compilation("invalid symbol ID in original owned read".into())
+    })?;
+    Ok((text, owner.expect("original symbol allocation owner")))
+}
+
+fn resolve_owned(
+    id: u32,
+    reserve: Option<&mut dyn FnMut(usize) -> crate::Result<Arc<dyn Send + Sync>>>,
+) -> crate::Result<Option<(String, Option<Arc<dyn Send + Sync>>)>> {
     let reg = registry().read().unwrap();
-    reg.to_string.get(id as usize).cloned()
+    let Some(text) = reg.to_string.get(id as usize) else {
+        return Ok(None);
+    };
+    let owner = reserve.map(|reserve| reserve(text.len())).transpose()?;
+    Ok(Some((text.clone(), owner)))
 }
 
 /// Owned symbol meanings copied together from one registry state.
@@ -98,6 +244,11 @@ pub enum SymbolSnapshotError {
     },
     /// A writer previously panicked while holding the registry lock.
     RegistryPoisoned,
+    /// The original allocation owner refused snapshot storage.
+    AllocationRejected {
+        /// Original allocation diagnostic.
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for SymbolSnapshotError {
@@ -114,6 +265,7 @@ impl std::fmt::Display for SymbolSnapshotError {
                 write!(f, "symbol snapshot UTF-8 bytes exceed {limit}")
             }
             Self::RegistryPoisoned => write!(f, "symbol registry lock is poisoned"),
+            Self::AllocationRejected { detail } => f.write_str(detail),
         }
     }
 }
@@ -129,6 +281,29 @@ pub fn snapshot_checked(
     max_entries: usize,
     max_utf8_bytes: usize,
 ) -> Result<SymbolSnapshot, SymbolSnapshotError> {
+    snapshot_owned(ids, max_entries, max_utf8_bytes, None).map(|(snapshot, _)| snapshot)
+}
+
+/// Reserve actual snapshot storage under the same registry lock before copying.
+/// The returned owner must follow the snapshot's real consumer lifetime.
+pub fn snapshot_checked_with_allocation_owner(
+    ids: &[u32],
+    max_entries: usize,
+    max_utf8_bytes: usize,
+    reserve: &mut dyn FnMut(usize, usize) -> Result<Arc<dyn Send + Sync>, SymbolSnapshotError>,
+) -> Result<(SymbolSnapshot, Arc<dyn Send + Sync>), SymbolSnapshotError> {
+    let (snapshot, owner) = snapshot_owned(ids, max_entries, max_utf8_bytes, Some(reserve))?;
+    Ok((snapshot, owner.expect("original snapshot allocation owner")))
+}
+
+fn snapshot_owned(
+    ids: &[u32],
+    max_entries: usize,
+    max_utf8_bytes: usize,
+    reserve: Option<
+        &mut dyn FnMut(usize, usize) -> Result<Arc<dyn Send + Sync>, SymbolSnapshotError>,
+    >,
+) -> Result<(SymbolSnapshot, Option<Arc<dyn Send + Sync>>), SymbolSnapshotError> {
     if ids.len() > max_entries {
         return Err(SymbolSnapshotError::EntryLimit {
             requested: ids.len(),
@@ -150,11 +325,14 @@ pub fn snapshot_checked(
                 limit: max_utf8_bytes,
             })?;
     }
+    let owner = reserve
+        .map(|reserve| reserve(ids.len(), max_utf8_bytes - remaining))
+        .transpose()?;
     let entries = ids
         .iter()
         .map(|&id| (id, reg.to_string[id as usize].clone().into_boxed_str()))
         .collect();
-    Ok(SymbolSnapshot { entries })
+    Ok((SymbolSnapshot { entries }, owner))
 }
 
 /// Clear all symbols. For testing/REPL only.
@@ -163,6 +341,7 @@ pub fn clear() {
     let mut reg = registry().write().unwrap();
     reg.to_id.clear();
     reg.to_string.clear();
+    reg.string_owners.clear();
 }
 
 /// Number of interned symbols.

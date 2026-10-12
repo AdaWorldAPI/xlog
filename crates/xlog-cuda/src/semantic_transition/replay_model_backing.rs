@@ -34,8 +34,8 @@ fn live_model_generations() -> &'static Mutex<Vec<LiveModelGeneration>> {
     LIVE.get_or_init(Mutex::default)
 }
 
-fn backing_descriptor(
-    material: &PublicationMaterial,
+fn backing_descriptor<B: PublicationByteStorage>(
+    material: &PublicationMaterialStorage<B>,
     allocation: usize,
 ) -> Result<(ReplayBackingOrigin, Identity256, Vec<u8>), SemanticTransitionError> {
     let bytes = material.model_memory.allocation_bytes[allocation];
@@ -123,9 +123,9 @@ fn backing_descriptor(
 /// Register only after the complete original cold observation authenticated
 /// the actual acquired directory, every typed seal and the full backing bytes.
 #[cfg(feature = "semantic-policy")]
-pub(super) fn register_original_model_generations(
+pub(super) fn register_original_model_generations<B: PublicationByteStorage>(
     provider: &Arc<CudaKernelProvider>,
-    material: &PublicationMaterial,
+    material: &PublicationMaterialStorage<B>,
     originals: &[(u64, Arc<TrackedCudaSlice<u8>>)],
 ) -> Result<(), SemanticTransitionError> {
     if originals.len() != material.model_memory.allocation_bytes.len() {
@@ -194,10 +194,10 @@ pub struct SemanticReplayModelBackings {
 }
 
 impl SemanticReplayModelBackings {
-    pub(super) fn lease(
+    pub(super) fn lease<B: PublicationByteStorage>(
         &self,
         provider: &Arc<CudaKernelProvider>,
-        material: &PublicationMaterial,
+        material: &PublicationMaterialStorage<B>,
     ) -> Result<Vec<Arc<ReplayModelBacking>>, SemanticTransitionError> {
         let mut state = self.state.lock().map_err(|_| {
             publication_input_error("original replay model backing custody is poisoned")

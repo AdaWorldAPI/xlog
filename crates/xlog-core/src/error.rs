@@ -2,10 +2,20 @@
 
 use thiserror::Error;
 
+mod diagnostic_owner;
+
+pub use diagnostic_owner::OwnedDiagnostic;
+
 /// Primary error type for XLOG operations
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum XlogError {
+    /// An original diagnostic with inseparable allocation custody.
+    ///
+    /// Its displayed message and underlying classification are unchanged.
+    #[error(transparent)]
+    OwnedDiagnostic(std::sync::Arc<OwnedDiagnostic>),
+
     /// Parse error from the Datalog frontend.
     #[error("Parse error: {0}")]
     Parse(String),
@@ -137,6 +147,29 @@ pub enum XlogError {
 }
 
 impl XlogError {
+    /// Return the original classified error without discarding its owner.
+    pub fn unowned(&self) -> &Self {
+        match self {
+            Self::OwnedDiagnostic(diagnostic) => diagnostic.error().unowned(),
+            error => error,
+        }
+    }
+
+    /// Attach allocation receipts whose carrier metadata was acquired before
+    /// the compilation attempt. This transfers custody; it does not acquire or
+    /// reconstruct the diagnostic's payload allocation.
+    pub fn with_diagnostic_owner(
+        self,
+        allocations: std::sync::Arc<dyn Send + Sync>,
+        metadata: std::sync::Arc<dyn Send + Sync>,
+    ) -> Self {
+        Self::OwnedDiagnostic(std::sync::Arc::new(OwnedDiagnostic::new(
+            self,
+            allocations,
+            metadata,
+        )))
+    }
+
     /// Create a Kernel error with structured context: "op: detail: source".
     pub fn kernel_ctx(op: &str, detail: &str, source: &impl std::fmt::Display) -> Self {
         XlogError::Kernel(format!("{op}: {detail}: {source}"))

@@ -99,22 +99,37 @@ impl Term {
 
     /// Return all named variables referenced by this term.
     pub fn variables(&self) -> Vec<&str> {
+        let mut variables = Vec::new();
+        self.visit_variables(&mut |name| variables.push(name));
+        variables
+    }
+
+    /// Visit the original variable references in source order without an owned
+    /// collection. Compilation uses this same traversal before allocating it.
+    pub fn visit_variables<'a>(&'a self, visitor: &mut dyn FnMut(&'a str)) {
         match self {
-            Term::Variable(name) => vec![name.as_str()],
-            Term::List(items) => items.iter().flat_map(Term::variables).collect(),
-            Term::Cons { head, tail } => {
-                let mut vars = head.variables();
-                vars.extend(tail.variables());
-                vars
+            Term::Variable(name) => visitor(name),
+            Term::List(items) => {
+                for item in items {
+                    item.visit_variables(visitor);
+                }
             }
-            Term::Compound { args, .. } => args.iter().flat_map(Term::variables).collect(),
+            Term::Cons { head, tail } => {
+                head.visit_variables(visitor);
+                tail.visit_variables(visitor);
+            }
+            Term::Compound { args, .. } => {
+                for argument in args {
+                    argument.visit_variables(visitor);
+                }
+            }
             Term::Anonymous
             | Term::Integer(_)
             | Term::Float(_)
             | Term::String(_)
             | Term::Symbol(_)
             | Term::PredRef(_)
-            | Term::Aggregate(_) => vec![],
+            | Term::Aggregate(_) => {}
         }
     }
 }
@@ -236,9 +251,16 @@ pub enum ArithExpr {
 impl ArithExpr {
     /// Get all variable names used in this expression
     pub fn variables(&self) -> Vec<&str> {
+        let mut variables = Vec::new();
+        self.visit_variables(&mut |name| variables.push(name));
+        variables
+    }
+
+    /// Visit original expression variables in order without allocating.
+    pub fn visit_variables<'a>(&'a self, visitor: &mut dyn FnMut(&'a str)) {
         match self {
-            ArithExpr::Variable(name) => vec![name.as_str()],
-            ArithExpr::Integer(_) | ArithExpr::Float(_) => vec![],
+            ArithExpr::Variable(name) => visitor(name),
+            ArithExpr::Integer(_) | ArithExpr::Float(_) => {}
             ArithExpr::Add(l, r)
             | ArithExpr::Sub(l, r)
             | ArithExpr::Mul(l, r)
@@ -247,12 +269,15 @@ impl ArithExpr {
             | ArithExpr::Min(l, r)
             | ArithExpr::Max(l, r)
             | ArithExpr::Pow(l, r) => {
-                let mut vars = l.variables();
-                vars.extend(r.variables());
-                vars
+                l.visit_variables(visitor);
+                r.visit_variables(visitor);
             }
-            ArithExpr::Abs(e) | ArithExpr::Cast(e, _) => e.variables(),
-            ArithExpr::FuncCall { args, .. } => args.iter().flat_map(|a| a.variables()).collect(),
+            ArithExpr::Abs(e) | ArithExpr::Cast(e, _) => e.visit_variables(visitor),
+            ArithExpr::FuncCall { args, .. } => {
+                for argument in args {
+                    argument.visit_variables(visitor);
+                }
+            }
             ArithExpr::Conditional {
                 cond_left,
                 cond_right,
@@ -260,11 +285,10 @@ impl ArithExpr {
                 else_expr,
                 ..
             } => {
-                let mut vars = cond_left.variables();
-                vars.extend(cond_right.variables());
-                vars.extend(then_expr.variables());
-                vars.extend(else_expr.variables());
-                vars
+                cond_left.visit_variables(visitor);
+                cond_right.visit_variables(visitor);
+                then_expr.visit_variables(visitor);
+                else_expr.visit_variables(visitor);
             }
         }
     }
@@ -296,7 +320,16 @@ impl Atom {
 
     /// Collect all named variables in this atom.
     pub fn variables(&self) -> Vec<&str> {
-        self.terms.iter().flat_map(Term::variables).collect()
+        let mut variables = Vec::new();
+        self.visit_variables(&mut |name| variables.push(name));
+        variables
+    }
+
+    /// Visit original atom variables in order without allocating.
+    pub fn visit_variables<'a>(&'a self, visitor: &mut dyn FnMut(&'a str)) {
+        for term in &self.terms {
+            term.visit_variables(visitor);
+        }
     }
 }
 
@@ -396,24 +429,27 @@ impl BodyLiteral {
 
     /// Collect all named variables referenced by this literal.
     pub fn variables(&self) -> Vec<&str> {
+        let mut variables = Vec::new();
+        self.visit_variables(&mut |name| variables.push(name));
+        variables
+    }
+
+    /// Visit original literal variables in order without allocating.
+    pub fn visit_variables<'a>(&'a self, visitor: &mut dyn FnMut(&'a str)) {
         match self {
-            BodyLiteral::Positive(a) | BodyLiteral::Negated(a) => a.variables(),
-            BodyLiteral::Epistemic(lit) => lit.atom.variables(),
+            BodyLiteral::Positive(a) | BodyLiteral::Negated(a) => a.visit_variables(visitor),
+            BodyLiteral::Epistemic(lit) => lit.atom.visit_variables(visitor),
             BodyLiteral::Comparison(c) => {
-                let mut vars = vec![];
-                vars.extend(c.left.variables());
-                vars.extend(c.right.variables());
-                vars
+                c.left.visit_variables(visitor);
+                c.right.visit_variables(visitor);
             }
             BodyLiteral::IsExpr(is_expr) => {
-                let mut vars = is_expr.expr.variables();
-                vars.push(is_expr.target.as_str());
-                vars
+                is_expr.expr.visit_variables(visitor);
+                visitor(&is_expr.target);
             }
             BodyLiteral::Univ(univ) => {
-                let mut vars = univ.term.variables();
-                vars.extend(univ.parts.variables());
-                vars
+                univ.term.visit_variables(visitor);
+                univ.parts.visit_variables(visitor);
             }
         }
     }
@@ -497,6 +533,36 @@ impl Rule {
             }
         }
         None
+    }
+}
+
+impl Constraint {
+    /// Checked original constraint-body clone geometry.
+    pub fn owned_allocation_bytes(&self) -> Result<u64> {
+        let mut size = AstAllocationSize(0);
+        size.body(&self.body)?;
+        u64::try_from(size.0).map_err(|_| AstAllocationSize::overflow())
+    }
+}
+
+impl PredDecl {
+    /// Checked original declaration clone geometry, preserving both authored
+    /// type and named-column rosters.
+    pub fn owned_allocation_bytes(&self) -> Result<u64> {
+        let mut size = AstAllocationSize(0);
+        size.text(&self.name)?;
+        size.vector(&self.types)?;
+        for typ in &self.types {
+            size.type_ref(typ)?;
+        }
+        size.vector(&self.columns)?;
+        for column in &self.columns {
+            if let Some(name) = &column.name {
+                size.text(name)?;
+            }
+            size.type_ref(&column.typ)?;
+        }
+        u64::try_from(size.0).map_err(|_| AstAllocationSize::overflow())
     }
 }
 
@@ -958,7 +1024,350 @@ pub(crate) struct ProgramMergeReport {
     pub rules: Vec<usize>,
 }
 
+// Borrowed shape accounting for the same owned AST types. Inline enum/record
+// fields are already included by their outer carrier; only heap children are
+// added here. A Vec/String clone allocates its logical extent, not the source
+// allocation's unused capacity.
+struct AstAllocationSize(usize);
+
+impl AstAllocationSize {
+    fn overflow() -> XlogError {
+        XlogError::Compilation("AST allocation extent overflow".into())
+    }
+
+    fn add(&mut self, bytes: usize) -> Result<()> {
+        self.0 = self.0.checked_add(bytes).ok_or_else(Self::overflow)?;
+        Ok(())
+    }
+
+    fn vector<T>(&mut self, items: &[T]) -> Result<()> {
+        self.add(
+            items
+                .len()
+                .checked_mul(std::mem::size_of::<T>())
+                .ok_or_else(Self::overflow)?,
+        )
+    }
+
+    fn text(&mut self, text: &str) -> Result<()> {
+        self.add(text.len())
+    }
+
+    fn strings(&mut self, items: &[String]) -> Result<()> {
+        self.vector(items)?;
+        for item in items {
+            self.text(item)?;
+        }
+        Ok(())
+    }
+
+    fn type_ref(&mut self, typ: &TypeRef) -> Result<()> {
+        match typ {
+            TypeRef::Domain(name) => self.text(name),
+            TypeRef::List(inner) => {
+                self.add(std::mem::size_of::<TypeRef>())?;
+                self.type_ref(inner)
+            }
+            TypeRef::Scalar(_) | TypeRef::Term | TypeRef::Compound | TypeRef::PredRef => Ok(()),
+        }
+    }
+
+    fn term(&mut self, term: &Term) -> Result<()> {
+        match term {
+            Term::Variable(name) | Term::String(name) | Term::PredRef(name) => self.text(name),
+            Term::List(items) => {
+                self.vector(items)?;
+                for item in items {
+                    self.term(item)?;
+                }
+                Ok(())
+            }
+            Term::Cons { head, tail } => {
+                self.add(2 * std::mem::size_of::<Term>())?;
+                self.term(head)?;
+                self.term(tail)
+            }
+            Term::Compound { functor, args } => {
+                self.text(functor)?;
+                self.vector(args)?;
+                for arg in args {
+                    self.term(arg)?;
+                }
+                Ok(())
+            }
+            Term::Aggregate(aggregate) => self.text(&aggregate.variable),
+            Term::Anonymous | Term::Integer(_) | Term::Float(_) | Term::Symbol(_) => Ok(()),
+        }
+    }
+
+    fn atom(&mut self, atom: &Atom) -> Result<()> {
+        self.text(&atom.predicate)?;
+        self.vector(&atom.terms)?;
+        for term in &atom.terms {
+            self.term(term)?;
+        }
+        Ok(())
+    }
+
+    fn expression(&mut self, expression: &ArithExpr) -> Result<()> {
+        match expression {
+            ArithExpr::Variable(name) => self.text(name),
+            ArithExpr::Integer(_) | ArithExpr::Float(_) => Ok(()),
+            ArithExpr::Add(left, right)
+            | ArithExpr::Sub(left, right)
+            | ArithExpr::Mul(left, right)
+            | ArithExpr::Div(left, right)
+            | ArithExpr::Mod(left, right)
+            | ArithExpr::Min(left, right)
+            | ArithExpr::Max(left, right)
+            | ArithExpr::Pow(left, right) => {
+                self.add(2 * std::mem::size_of::<ArithExpr>())?;
+                self.expression(left)?;
+                self.expression(right)
+            }
+            ArithExpr::Abs(inner) | ArithExpr::Cast(inner, _) => {
+                self.add(std::mem::size_of::<ArithExpr>())?;
+                self.expression(inner)
+            }
+            ArithExpr::FuncCall { name, args } => {
+                self.text(name)?;
+                self.vector(args)?;
+                for arg in args {
+                    self.expression(arg)?;
+                }
+                Ok(())
+            }
+            ArithExpr::Conditional {
+                cond_left,
+                cond_right,
+                then_expr,
+                else_expr,
+                ..
+            } => {
+                self.add(4 * std::mem::size_of::<ArithExpr>())?;
+                self.expression(cond_left)?;
+                self.expression(cond_right)?;
+                self.expression(then_expr)?;
+                self.expression(else_expr)
+            }
+        }
+    }
+
+    fn body(&mut self, body: &[BodyLiteral]) -> Result<()> {
+        self.vector(body)?;
+        for literal in body {
+            match literal {
+                BodyLiteral::Positive(atom) | BodyLiteral::Negated(atom) => self.atom(atom)?,
+                BodyLiteral::Epistemic(literal) => self.atom(&literal.atom)?,
+                BodyLiteral::Comparison(comparison) => {
+                    self.term(&comparison.left)?;
+                    self.term(&comparison.right)?;
+                }
+                BodyLiteral::IsExpr(expression) => {
+                    self.text(&expression.target)?;
+                    self.expression(&expression.expr)?;
+                }
+                BodyLiteral::Univ(univ) => {
+                    self.term(&univ.term)?;
+                    self.term(&univ.parts)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn function_body(&mut self, body: &FuncBody) -> Result<()> {
+        match body {
+            FuncBody::Arithmetic(expression) => self.expression(expression),
+            FuncBody::Conditional(condition) => {
+                self.expression(&condition.cond_left)?;
+                self.expression(&condition.cond_right)?;
+                self.add(2 * std::mem::size_of::<FuncBody>())?;
+                self.function_body(&condition.then_branch)?;
+                self.function_body(&condition.else_branch)
+            }
+            FuncBody::Predicate { result, body } => {
+                self.text(result)?;
+                self.body(body)
+            }
+        }
+    }
+}
+
+impl Term {
+    /// Owned term geometry for a reservation before the original clone.
+    pub fn owned_allocation_bytes(&self) -> Result<u64> {
+        let mut size = AstAllocationSize(std::mem::size_of::<Self>());
+        size.term(self)?;
+        u64::try_from(size.0).map_err(|_| AstAllocationSize::overflow())
+    }
+}
+
+impl Atom {
+    /// Owned atom geometry for a reservation before the original clone.
+    pub fn owned_allocation_bytes(&self) -> Result<u64> {
+        let mut size = AstAllocationSize(std::mem::size_of::<Self>());
+        size.atom(self)?;
+        u64::try_from(size.0).map_err(|_| AstAllocationSize::overflow())
+    }
+}
+
+impl ArithExpr {
+    /// Owned expression geometry for a reservation before the original clone.
+    pub fn owned_allocation_bytes(&self) -> Result<u64> {
+        let mut size = AstAllocationSize(std::mem::size_of::<Self>());
+        size.expression(self)?;
+        u64::try_from(size.0).map_err(|_| AstAllocationSize::overflow())
+    }
+}
+
+impl TypeRef {
+    /// Owned type geometry for a reservation before the original clone.
+    pub fn owned_allocation_bytes(&self) -> Result<u64> {
+        let mut size = AstAllocationSize(std::mem::size_of::<Self>());
+        size.type_ref(self)?;
+        u64::try_from(size.0).map_err(|_| AstAllocationSize::overflow())
+    }
+}
+
+impl BodyLiteral {
+    /// Owned literal geometry for a reservation before the original clone.
+    pub fn owned_allocation_bytes(&self) -> Result<u64> {
+        let mut size = AstAllocationSize(0);
+        size.body(std::slice::from_ref(self))?;
+        u64::try_from(size.0).map_err(|_| AstAllocationSize::overflow())
+    }
+}
+
+impl FuncBody {
+    /// Owned function-body geometry for an original expansion task.
+    pub fn owned_allocation_bytes(&self) -> Result<u64> {
+        let mut size = AstAllocationSize(std::mem::size_of::<Self>());
+        size.function_body(self)?;
+        u64::try_from(size.0).map_err(|_| AstAllocationSize::overflow())
+    }
+}
+
+impl FuncDef {
+    /// Original function clone geometry, including parameter names and body.
+    pub fn owned_allocation_bytes(&self) -> Result<u64> {
+        let mut size = AstAllocationSize(std::mem::size_of::<Self>());
+        size.text(&self.name)?;
+        size.vector(&self.params)?;
+        for parameter in &self.params {
+            size.text(&parameter.name)?;
+        }
+        size.function_body(&self.body)?;
+        u64::try_from(size.0).map_err(|_| AstAllocationSize::overflow())
+    }
+}
+
+impl Rule {
+    /// Original rule clone geometry for stage-owned compilation.
+    pub fn owned_allocation_bytes(&self) -> Result<u64> {
+        let mut size = AstAllocationSize(std::mem::size_of::<Self>());
+        size.atom(&self.head)?;
+        size.body(&self.body)?;
+        u64::try_from(size.0).map_err(|_| AstAllocationSize::overflow())
+    }
+}
+
 impl Program {
+    /// Actual owned geometry of this AST, for reservation before an original
+    /// clone. This does not validate, normalize, or admit the program.
+    pub fn owned_allocation_bytes(&self) -> Result<u64> {
+        let mut size = AstAllocationSize(std::mem::size_of::<Self>());
+        size.vector(&self.imports)?;
+        for import in &self.imports {
+            size.strings(&import.module_path)?;
+            if let Some(imports) = &import.imports {
+                size.strings(imports)?;
+            }
+        }
+        size.vector(&self.functions)?;
+        for function in &self.functions {
+            size.text(&function.name)?;
+            size.vector(&function.params)?;
+            for parameter in &function.params {
+                size.text(&parameter.name)?;
+            }
+            size.function_body(&function.body)?;
+        }
+        size.vector(&self.domains)?;
+        for domain in &self.domains {
+            size.text(&domain.name)?;
+        }
+        size.vector(&self.predicates)?;
+        for predicate in &self.predicates {
+            size.text(&predicate.name)?;
+            size.vector(&predicate.types)?;
+            for typ in &predicate.types {
+                size.type_ref(typ)?;
+            }
+            size.vector(&predicate.columns)?;
+            for column in &predicate.columns {
+                if let Some(name) = &column.name {
+                    size.text(name)?;
+                }
+                size.type_ref(&column.typ)?;
+            }
+        }
+        size.vector(&self.rules)?;
+        for rule in &self.rules {
+            size.atom(&rule.head)?;
+            size.body(&rule.body)?;
+        }
+        size.vector(&self.constraints)?;
+        for constraint in &self.constraints {
+            size.body(&constraint.body)?;
+        }
+        size.vector(&self.queries)?;
+        for query in &self.queries {
+            size.atom(&query.atom)?;
+        }
+        size.vector(&self.prob_facts)?;
+        for fact in &self.prob_facts {
+            size.atom(&fact.atom)?;
+        }
+        size.vector(&self.annotated_disjunctions)?;
+        for disjunction in &self.annotated_disjunctions {
+            size.vector(&disjunction.choices)?;
+            for fact in &disjunction.choices {
+                size.atom(&fact.atom)?;
+            }
+        }
+        size.vector(&self.evidence)?;
+        for evidence in &self.evidence {
+            size.atom(&evidence.atom)?;
+        }
+        size.vector(&self.prob_queries)?;
+        for query in &self.prob_queries {
+            size.atom(&query.atom)?;
+        }
+        size.vector(&self.neural_predicates)?;
+        for neural in &self.neural_predicates {
+            size.text(&neural.network)?;
+            size.strings(&neural.inputs)?;
+            size.text(&neural.output)?;
+            if let Some(labels) = &neural.labels {
+                size.vector(labels)?;
+                for label in labels {
+                    if let NeuralLabel::Symbol(text) = label {
+                        size.text(text)?;
+                    }
+                }
+            }
+            size.atom(&neural.predicate)?;
+        }
+        size.vector(&self.learnable_rules)?;
+        for rule in &self.learnable_rules {
+            size.text(&rule.mask_name)?;
+            size.atom(&rule.head)?;
+            size.body(&rule.body)?;
+        }
+        u64::try_from(size.0).map_err(|_| AstAllocationSize::overflow())
+    }
+
     /// Create an empty program.
     pub fn new() -> Self {
         Self::default()

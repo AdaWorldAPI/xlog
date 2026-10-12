@@ -99,6 +99,52 @@ impl StatsManager {
         }
     }
 
+    /// Checked clone geometry of the original complete snapshot roster.
+    /// This does not snapshot, update, or synthesize any statistics.
+    pub fn snapshot_allocation_bytes(&self) -> xlog_core::Result<u64> {
+        fn vector<T>(count: usize) -> Option<usize> {
+            if count == 0 {
+                Some(0)
+            } else {
+                count.max(4).checked_mul(std::mem::size_of::<T>())
+            }
+        }
+        let overflow = || {
+            xlog_core::XlogError::Compilation(
+                "statistics snapshot allocation extent overflow".into(),
+            )
+        };
+        let mut bytes = vector::<RelationStats>(self.relations.len())
+            .and_then(|n| n.checked_add(vector::<JoinSelectivity>(self.join_selectivities.len())?))
+            .ok_or_else(overflow)?;
+        for relation in self.relations.values() {
+            bytes = bytes
+                .checked_add(
+                    vector::<ColumnStats>(relation.column_stats.len()).ok_or_else(overflow)?,
+                )
+                .ok_or_else(overflow)?;
+            bytes = bytes
+                .checked_add(
+                    vector::<crate::stats::PrefixDegreeStats>(relation.prefix_degrees.len())
+                        .ok_or_else(overflow)?,
+                )
+                .ok_or_else(overflow)?;
+            bytes = bytes
+                .checked_add(
+                    vector::<crate::stats::KeyHeatStats>(relation.key_heats.len())
+                        .ok_or_else(overflow)?,
+                )
+                .ok_or_else(overflow)?;
+        }
+        for selectivity in self.join_selectivities.values() {
+            bytes = bytes
+                .checked_add(vector::<usize>(selectivity.left_keys.len()).ok_or_else(overflow)?)
+                .and_then(|n| n.checked_add(vector::<usize>(selectivity.right_keys.len())?))
+                .ok_or_else(overflow)?;
+        }
+        u64::try_from(bytes).map_err(|_| overflow())
+    }
+
     /// Merge a previously captured snapshot into this manager.
     ///
     /// Existing entries are overwritten with the snapshot values.

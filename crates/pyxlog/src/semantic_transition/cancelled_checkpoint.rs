@@ -10,7 +10,9 @@ pyo3::create_exception!(
 );
 
 pub(super) struct OriginalCancelledCheckpointCustody {
-    manifest: SemanticCheckpointManifest,
+    material: xlog_cuda::SemanticReplayLoadedMaterial,
+    native: Mutex<xlog_cuda::SemanticReplayLoadedMaterial>,
+    seed: TaskCheckpointSeed,
     snapshot: AuthoritySnapshot,
     phase: CheckpointTaskPhase,
     binding: TaskCheckpointBinding,
@@ -20,12 +22,15 @@ pub(super) struct OriginalCancelledCheckpointCustody {
     source_material_digest: Identity256,
     source_checkpoint_digest: Identity256,
     completion: Mutex<CancelledCheckpointCompletion>,
+    budget: xlog_cuda::SemanticReplayMaterialBudget,
+    _metadata: xlog_cuda::SemanticReplayMaterialReservation,
 }
 
 #[derive(Default)]
 struct CancelledCheckpointCompletion {
-    assignments: Option<Arc<[u8]>>,
-    sealed: Option<Arc<[u8]>>,
+    assignments: Option<xlog_cuda::SemanticReplayLoadedMaterial>,
+    sealed: Option<xlog_cuda::SemanticReplayLoadedMaterial>,
+    handoff: Option<Py<material_bytes::PySemanticMaterialBytes>>,
 }
 
 pub(super) struct CancelledCheckpointTerminal {
@@ -50,8 +55,8 @@ fn initial_index(admission: &OriginalActorRefreshAdmission) -> PyResult<Identity
 }
 
 fn require_seed_fields(original: &ColdValue, current: &ColdValue, terminal: bool) -> PyResult<()> {
-    let original = original.fields(19)?;
-    let current = current.fields(19)?;
+    let original = original.fields(20)?;
+    let current = current.fields(20)?;
     if original
         .iter()
         .zip(current)
@@ -66,19 +71,22 @@ fn require_seed_fields(original: &ColdValue, current: &ColdValue, terminal: bool
 }
 
 fn require_initial_prefill_source(
-    manifest: &SemanticCheckpointManifest,
+    manifest: &impl CheckpointManifestReader,
     phase: &CheckpointTaskPhase,
     binding: TaskCheckpointBinding,
+    native: &mut xlog_cuda::SemanticReplayLoadedMaterial,
 ) -> PyResult<()> {
-    let has_initial_prefill = SemanticTransitionSession::verify_checkpoint_initial_prefill_source(
-        &manifest.initial_prefill,
-        &manifest.native,
-        Identity256::from_bytes(binding.identity),
-        binding.epoch,
-        binding.content_identity(),
-        *phase == CheckpointTaskPhase::InitialPrefillBound,
-    )
-    .map_err(xlog_err)?;
+    let manifest = manifest.borrowed();
+    let has_initial_prefill =
+        SemanticTransitionSession::verify_checkpoint_loaded_initial_prefill_source(
+            manifest.initial_prefill,
+            native,
+            Identity256::from_bytes(binding.identity),
+            binding.epoch,
+            binding.content_identity(),
+            *phase == CheckpointTaskPhase::InitialPrefillBound,
+        )
+        .map_err(xlog_err)?;
     if has_initial_prefill != (*phase == CheckpointTaskPhase::InitialPrefillBound)
         && !matches!(phase, CheckpointTaskPhase::Segment(_))
     {
@@ -91,18 +99,26 @@ fn require_initial_prefill_source(
 
 fn require_session_checkpoint_custody(
     session: &PySemanticTransitionSession,
-    manifest: &SemanticCheckpointManifest,
+    manifest: &impl CheckpointManifestReader,
     bytes: &[u8],
+    budget: &xlog_cuda::SemanticReplayMaterialBudget,
 ) -> PyResult<()> {
     let retained = session.checkpoint_custody()?;
     let custody = retained
         .as_ref()
         .ok_or_else(|| invalid("checkpoint source lost its original Session signing owner"))?;
     let digest: [u8; 32] = Sha256::digest(bytes).into();
-    if Some(digest) != custody.origin && custody.seal(manifest)? != manifest.phase_seal {
-        return Err(invalid(
-            "checkpoint source differs from this Session's authenticated custody",
-        ));
+    if Some(digest) != custody.origin {
+        let _seal_storage = budget
+            .reserve_auxiliary(custody.seal_extent() as u64)
+            .map_err(xlog_err)?;
+        let owner = session.owner()?;
+        if custody.seal(manifest, owner.learning_phase_history())? != manifest.borrowed().phase_seal
+        {
+            return Err(invalid(
+                "checkpoint source differs from this Session's authenticated custody",
+            ));
+        }
     }
     Ok(())
 }
@@ -114,14 +130,35 @@ impl OriginalCancelledCheckpointCustody {
         session: &PySemanticTransitionSession,
         task: &PySemanticTransitionTaskUse,
         parent: &PySemanticPublishedParent,
-        bytes: &[u8],
+        checkpoint: &Bound<'_, PyAny>,
     ) -> PyResult<Self> {
         session.require_creator()?;
         parent.require_task(py, task)?;
-        let manifest = SemanticCheckpointManifest::decode(bytes)?;
-        require_session_checkpoint_custody(session, &manifest, bytes)?;
-        let (seed, snapshot, phase, binding) = TaskCheckpointSeed::decode(&manifest.task)?;
-        require_initial_prefill_source(&manifest, &phase, binding)?;
+        if !checkpoint.is_exact_instance_of::<material_bytes::PySemanticMaterialBytes>() {
+            return Err(invalid(
+                "cancelled checkpoint custody requires original guarded material",
+            ));
+        }
+        let registry = Arc::clone(&task.checkpoint.material_sources);
+        let budget = registry.native_budget()?;
+        let metadata = budget
+            .reserve_auxiliary(
+                (std::mem::size_of::<Self>() + 2 * std::mem::size_of::<usize>()) as u64,
+            )
+            .map_err(xlog_err)?;
+        let carrier = checkpoint
+            .cast::<material_bytes::PySemanticMaterialBytes>()?
+            .borrow();
+        let material = carrier.original_loaded(&budget)?;
+        let bytes = material.as_bytes();
+        let manifest = SemanticCheckpointManifest::decode_borrowed(bytes)?;
+        require_session_checkpoint_custody(session, &manifest, bytes, &budget)?;
+        let mut native = material
+            .slice_payload(checkpoint_section_range(bytes, manifest.native)?)
+            .map_err(xlog_err)?;
+        let (seed, snapshot, phase, binding) =
+            TaskCheckpointSeed::decode_bound(manifest.task, &registry)?;
+        require_initial_prefill_source(&manifest, &phase, binding, &mut native)?;
         let config = SemanticCheckpointSessionConfig::decode(&manifest.session)?;
         if config.capacities != session.capacities
             || config.admission_limits != session.admission_limits
@@ -137,7 +174,7 @@ impl OriginalCancelledCheckpointCustody {
                 "cancelled checkpoint requires the original complete Program",
             ));
         }
-        if terminal_checkpoint(&manifest, &seed, &phase, binding)?.is_some() {
+        if terminal_checkpoint(&manifest, &seed, &phase, binding, &mut native)?.is_some() {
             return Err(invalid(
                 "a terminal cancelled checkpoint cannot admit another instruction",
             ));
@@ -164,7 +201,7 @@ impl OriginalCancelledCheckpointCustody {
         // a saved instance when the selected parent was created by fresh restore.
         let lease = parent.lease()?;
         let (source_material_digest, restored_from_exact_source) = owner
-            .verify_checkpoint_source_material(&lease, &manifest.native)
+            .verify_checkpoint_loaded_source_material(&lease, &mut native)
             .map_err(xlog_err)?;
         if binding.epoch != current_binding.epoch && !restored_from_exact_source {
             return Err(invalid(
@@ -175,14 +212,29 @@ impl OriginalCancelledCheckpointCustody {
         let current_task = task
             .checkpoint
             .encode(&owner, &snapshot, &phase, &binding)?;
-        let seed_value = checkpoint_cold_value(&manifest.task, manifest.task.len())?;
+        let original_plan =
+            checked_checkpoint_cold_value(manifest.task, manifest.task.len(), false, None)?;
+        let current_plan =
+            checked_checkpoint_cold_value(&current_task, current_task.len(), false, None)?;
+        let _values = budget
+            .reserve_auxiliary(
+                original_plan
+                    .owned_bytes
+                    .checked_add(current_plan.owned_bytes)
+                    .ok_or_else(|| invalid("cancelled checkpoint comparison storage overflow"))?,
+            )
+            .map_err(xlog_err)?;
+        let seed_value = checkpoint_cold_value(manifest.task, manifest.task.len())?;
         require_seed_fields(
             &seed_value,
             &checkpoint_cold_value(&current_task, current_task.len())?,
             false,
         )?;
+        let source_checkpoint_digest = material_digest(bytes);
         Ok(Self {
-            manifest,
+            material,
+            native: Mutex::new(native),
+            seed,
             snapshot,
             phase,
             binding,
@@ -190,8 +242,10 @@ impl OriginalCancelledCheckpointCustody {
             issuance: task.issuance.clone(),
             parent: selected,
             source_material_digest,
-            source_checkpoint_digest: material_digest(bytes),
+            source_checkpoint_digest,
             completion: Mutex::new(CancelledCheckpointCompletion::default()),
+            budget,
+            _metadata: metadata,
         })
     }
 
@@ -207,16 +261,22 @@ impl OriginalCancelledCheckpointCustody {
                 "cancelled checkpoint source parent changed before admission",
             ));
         }
-        let (source, _, _, _) = TaskCheckpointSeed::decode(&self.manifest.task)?;
-        let source_expense = source.proposal_expense()?;
-        let source_assignments = source.actor_refresh_assignments.as_deref().ok_or_else(|| {
-            invalid("cancelled checkpoint lost its original native source assignments")
-        })?;
+        let source_expense = self.seed.proposal_expense()?;
+        let source_assignments =
+            self.seed
+                .actor_refresh_assignments
+                .as_deref()
+                .ok_or_else(|| {
+                    invalid("cancelled checkpoint lost its original native source assignments")
+                })?;
         owner
-            .bind_segment_checkpoint_source(
+            .bind_segment_loaded_checkpoint_source(
                 admission,
                 parent,
-                &self.manifest.native,
+                &mut *self
+                    .native
+                    .lock()
+                    .map_err(|_| invalid("cancelled checkpoint native custody is poisoned"))?,
                 self.source_checkpoint_digest,
                 source_expense.spent,
                 source_assignments,
@@ -231,14 +291,14 @@ impl OriginalCancelledCheckpointCustody {
         task: &PySemanticTransitionTaskUse,
         owner: &mut SemanticTransitionSession,
         admission: &SemanticSegmentInstructionAdmission,
-    ) -> PyResult<Arc<[u8]>> {
+    ) -> PyResult<()> {
         session.require_creator()?;
         let mut completion = self
             .completion
             .lock()
             .map_err(|_| invalid("cancelled checkpoint custody mutex is poisoned"))?;
-        if let Some(sealed) = &completion.sealed {
-            return Ok(Arc::clone(sealed));
+        if completion.sealed.is_some() {
+            return Ok(());
         }
         if !self.issuance.same_as(&task.issuance) {
             return Err(invalid(
@@ -253,42 +313,71 @@ impl OriginalCancelledCheckpointCustody {
         }
         if completion.assignments.is_none() {
             let assignments = owner
-                .cancelled_segment_assignment_material(admission)
+                .cancelled_segment_loaded_assignment_material(admission)
                 .map_err(xlog_err)?;
             // Retain the native terminal disposition before any fallible encoding.
-            completion.assignments = Some(Arc::from(assignments));
+            completion.assignments = Some(assignments);
         }
         let task_bytes =
             task.checkpoint
                 .encode(owner, &self.snapshot, &self.phase, &self.binding)?;
+        let manifest = SemanticCheckpointManifest::decode_borrowed(self.material.as_bytes())?;
+        let original_plan =
+            checked_checkpoint_cold_value(manifest.task, manifest.task.len(), false, None)?;
+        let current_plan =
+            checked_checkpoint_cold_value(&task_bytes, task_bytes.len(), false, None)?;
+        let _values = self
+            .budget
+            .reserve_auxiliary(
+                original_plan
+                    .owned_bytes
+                    .checked_add(current_plan.owned_bytes)
+                    .ok_or_else(|| invalid("cancelled checkpoint comparison storage overflow"))?,
+            )
+            .map_err(xlog_err)?;
         let task_value = checkpoint_cold_value(&task_bytes, task_bytes.len())?;
         require_seed_fields(
-            &checkpoint_cold_value(&self.manifest.task, self.manifest.task.len())?,
+            &checkpoint_cold_value(manifest.task, manifest.task.len())?,
             &task_value,
             true,
         )?;
-        let fields = task_value.fields(19)?;
+        let fields = task_value.fields(20)?;
         let ColdValue::Bytes(assignments) = &fields[18] else {
             return Err(invalid(
                 "cancelled checkpoint has no original native assignment material",
             ));
         };
-        if completion.assignments.as_deref() != Some(assignments.as_ref()) {
+        if completion
+            .assignments
+            .as_ref()
+            .map(|original| original.as_bytes())
+            != Some(assignments.as_ref())
+        {
             return Err(invalid(
                 "cancelled checkpoint native assignment material changed while sealing",
             ));
         }
-        let (seed, _, _, binding) = TaskCheckpointSeed::decode(&task_bytes)?;
-        let terminal_manifest = SemanticCheckpointManifest {
-            native: self.manifest.native.clone(),
-            model: self.manifest.model.clone(),
-            task: task_bytes,
-            session: self.manifest.session.clone(),
-            initial_prefill: self.manifest.initial_prefill.clone(),
-            phase_seal: Vec::new(),
+        let (seed, _, _, binding) =
+            TaskCheckpointSeed::decode_bound(&task_bytes, &self.seed.material_sources)?;
+        let mut terminal_manifest = BorrowedSemanticCheckpointManifest {
+            native: manifest.native,
+            model: manifest.model,
+            task: &task_bytes,
+            session: manifest.session,
+            initial_prefill: manifest.initial_prefill,
+            phase_seal: &[],
         };
-        let terminal = terminal_checkpoint(&terminal_manifest, &seed, &self.phase, binding)?
-            .ok_or_else(|| invalid("native cancellation has no complete terminal disposition"))?;
+        let terminal = terminal_checkpoint(
+            &terminal_manifest,
+            &seed,
+            &self.phase,
+            binding,
+            &mut *self
+                .native
+                .lock()
+                .map_err(|_| invalid("cancelled checkpoint native custody is poisoned"))?,
+        )?
+        .ok_or_else(|| invalid("native cancellation has no complete terminal disposition"))?;
         if terminal.parent != self.parent
             || material_digest(&terminal_manifest.native) != self.source_material_digest
             || terminal.source_checkpoint_digest != self.source_checkpoint_digest
@@ -297,26 +386,75 @@ impl OriginalCancelledCheckpointCustody {
                 "cancelled checkpoint lost its original native source custody",
             ));
         }
-        let sealed: Arc<[u8]> = Arc::from(session.seal_owned_checkpoint(terminal_manifest)?);
-        completion.sealed = Some(Arc::clone(&sealed));
-        Ok(sealed)
+        let retained = session.checkpoint_custody()?;
+        let signing = retained
+            .as_ref()
+            .ok_or_else(|| invalid("cancelled checkpoint lost its original signing owner"))?;
+        let _seal_storage = self
+            .budget
+            .reserve_auxiliary(signing.seal_extent() as u64)
+            .map_err(xlog_err)?;
+        let phase_seal = signing.seal(&terminal_manifest, owner.learning_phase_history())?;
+        terminal_manifest.phase_seal = &phase_seal;
+        let extent = terminal_manifest.encoded_extent()?;
+        let output = self
+            .budget
+            .prepare_material_output(extent)
+            .map_err(xlog_err)?;
+        output
+            .declare_spans(extent, &[(0, extent)])
+            .map_err(xlog_err)?;
+        let mut offset = 0usize;
+        terminal_manifest.write_encoded(|part| {
+            if !part.is_empty() {
+                output.write_model(offset, part).map_err(xlog_err)?;
+                offset = offset
+                    .checked_add(part.len())
+                    .ok_or_else(|| invalid("cancelled checkpoint output extent overflow"))?;
+            }
+            Ok(())
+        })?;
+        if offset != extent {
+            return Err(invalid(
+                "cancelled checkpoint encoder changed its original extent",
+            ));
+        }
+        completion.sealed = Some(output.seal_model().map_err(xlog_err)?);
+        Ok(())
     }
 
-    pub(super) fn sealed_bytes(&self) -> PyResult<Option<Arc<[u8]>>> {
-        self.completion
+    pub(super) fn sealed_bytes(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<Option<Py<material_bytes::PySemanticMaterialBytes>>> {
+        let mut completion = self
+            .completion
             .lock()
-            .map(|completion| completion.sealed.as_ref().map(Arc::clone))
-            .map_err(|_| invalid("cancelled checkpoint custody mutex is poisoned"))
+            .map_err(|_| invalid("cancelled checkpoint custody mutex is poisoned"))?;
+        if let Some(handoff) = &completion.handoff {
+            return Ok(Some(handoff.clone_ref(py)));
+        }
+        let Some(sealed) = &completion.sealed else {
+            return Ok(None);
+        };
+        let handoff = Py::new(
+            py,
+            material_bytes::PySemanticMaterialBytes::from_native(py, sealed.clone(), &self.budget)?,
+        )?;
+        completion.handoff = Some(handoff.clone_ref(py));
+        Ok(Some(handoff))
     }
 }
 
 /// The normal and lightweight restore entries use this same metadata-only check.
 pub(super) fn terminal_checkpoint(
-    manifest: &SemanticCheckpointManifest,
+    manifest: &impl CheckpointManifestReader,
     seed: &TaskCheckpointSeed,
     phase: &CheckpointTaskPhase,
     binding: TaskCheckpointBinding,
+    native: &mut xlog_cuda::SemanticReplayLoadedMaterial,
 ) -> PyResult<Option<CancelledCheckpointTerminal>> {
+    let manifest = manifest.borrowed();
     let expense = seed.proposal_expense()?;
     let Some(original) = expense.original_admission else {
         return Ok(None);
@@ -341,9 +479,9 @@ pub(super) fn terminal_checkpoint(
             "cancelled checkpoint source or charged Proposal expense is inconsistent",
         ));
     }
-    SemanticTransitionSession::state_material_projection(&manifest.native).map_err(xlog_err)?;
+    SemanticTransitionSession::state_material_loaded_projection(native).map_err(xlog_err)?;
     SemanticCheckpointSessionConfig::decode(&manifest.session)?;
-    require_initial_prefill_source(manifest, phase, binding)?;
+    require_initial_prefill_source(&manifest, phase, binding, native)?;
     Ok(Some(CancelledCheckpointTerminal {
         first_program_ordinal: first,
         end_program_ordinal: end,
@@ -356,14 +494,14 @@ pub(super) fn terminal_checkpoint(
 
 pub(super) fn terminal_error(
     py: Python<'_>,
-    checkpoint: &[u8],
+    checkpoint: &Bound<'_, PyAny>,
     terminal: &CancelledCheckpointTerminal,
 ) -> PyResult<PyErr> {
     let error = SemanticTransitionCheckpointCancelled::new_err(
         "the original non-submitted instruction is durably cancelled; no further request can be admitted",
     );
     let value = error.value(py);
-    value.setattr("checkpoint", PyBytes::new(py, checkpoint))?;
+    value.setattr("checkpoint", checkpoint)?;
     value.setattr("task_identity", PyBytes::new(py, &terminal.task_identity))?;
     value.setattr("first_program_ordinal", terminal.first_program_ordinal)?;
     value.setattr("end_program_ordinal", terminal.end_program_ordinal)?;
@@ -381,7 +519,7 @@ pub(super) fn terminal_error(
 }
 
 #[pyfunction]
-#[pyo3(signature = (checkpoint, *, program_bytes, snapshot=None, learning_phase_issuer=None, learning_phase_records=None, learning_phase_record_limits=None, learning_phase_fence=None, learning_phase_checkpoint_issuer=None))]
+#[pyo3(signature = (checkpoint, *, program_bytes, material_source, max_resolved_material_bytes, snapshot=None, learning_phase_issuer=None, learning_phase_records=None, learning_phase_record_limits=None, learning_phase_fence=None, learning_phase_checkpoint_issuer=None))]
 #[expect(
     clippy::too_many_arguments,
     reason = "terminal recovery authenticates the original complete lifecycle without native execution"
@@ -390,6 +528,8 @@ pub(crate) fn restore_cancelled_checkpoint(
     py: Python<'_>,
     checkpoint: &Bound<'_, PyAny>,
     program_bytes: &Bound<'_, PyAny>,
+    material_source: &Bound<'_, PyAny>,
+    max_resolved_material_bytes: &Bound<'_, PyAny>,
     snapshot: Option<&Bound<'_, PyAny>>,
     learning_phase_issuer: Option<&Bound<'_, PyAny>>,
     learning_phase_records: Option<&Bound<'_, PyAny>>,
@@ -397,10 +537,43 @@ pub(crate) fn restore_cancelled_checkpoint(
     learning_phase_fence: Option<&Bound<'_, PyAny>>,
     learning_phase_checkpoint_issuer: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<()> {
-    let raw = exact_replay_bytes(checkpoint)?;
+    if !checkpoint.is_exact_instance_of::<material_bytes::PySemanticMaterialBytes>() {
+        return Err(invalid(
+            "cancelled checkpoint recovery requires original guarded material",
+        ));
+    }
+    let material = checkpoint
+        .cast::<material_bytes::PySemanticMaterialBytes>()?
+        .borrow();
+    let raw = material.as_bytes();
     let program = exact_replay_bytes(program_bytes)?;
-    let manifest = SemanticCheckpointManifest::decode(raw)?;
-    let (seed, _, phase, binding) = TaskCheckpointSeed::decode(&manifest.task)?;
+    let manifest = SemanticCheckpointManifest::decode_borrowed(raw)?;
+    let (saved_store, item_cap, store_cap, saved_resolved_cap) =
+        checkpoint_material_source_header(manifest.task)?;
+    if !max_resolved_material_bytes.is_exact_instance_of::<PyInt>() {
+        return Err(invalid(
+            "resolved material cap requires an exact positive integer",
+        ));
+    }
+    let resolved_cap = max_resolved_material_bytes.extract::<u64>()?;
+    if resolved_cap == 0 || resolved_cap != saved_resolved_cap {
+        return Err(invalid(
+            "cancelled checkpoint restore changed its original resolved material cap",
+        ));
+    }
+    let material_sources = material_owner::original_registry(material_source)?;
+    if material_sources.saved_caps()? != Some((item_cap, store_cap, resolved_cap)) {
+        return Err(invalid(
+            "cancelled checkpoint recovery changed its original material source caps",
+        ));
+    }
+    material_sources.require_store(saved_store)?;
+    let original_loaded = material.original_loaded(&material_sources.native_budget()?)?;
+    let (seed, _, phase, binding) =
+        TaskCheckpointSeed::decode_bound(manifest.task, &material_sources)?;
+    let mut native = original_loaded
+        .slice_payload(checkpoint_section_range(raw, manifest.native)?)
+        .map_err(xlog_err)?;
     let expense = seed.proposal_expense()?;
     if expense
         .original_admission
@@ -412,7 +585,7 @@ pub(crate) fn restore_cancelled_checkpoint(
             "cancelled checkpoint differs from the expected original Program",
         ));
     }
-    let _closure = learning_phase::cold_restore::read_checkpoint_restore_closure(
+    let _closure = learning_phase::cold_restore::read_checkpoint_restore_closure_bound(
         raw,
         snapshot,
         learning_phase_issuer,
@@ -420,8 +593,10 @@ pub(crate) fn restore_cancelled_checkpoint(
         learning_phase_record_limits,
         learning_phase_fence,
         learning_phase_checkpoint_issuer,
+        &material_sources,
+        &mut native,
     )?;
-    let terminal = terminal_checkpoint(&manifest, &seed, &phase, binding)?
+    let terminal = terminal_checkpoint(&manifest, &seed, &phase, binding, &mut native)?
         .ok_or_else(|| invalid("checkpoint is not a positively completed cancelled terminal"))?;
-    Err(terminal_error(py, raw, &terminal)?)
+    Err(terminal_error(py, checkpoint, &terminal)?)
 }

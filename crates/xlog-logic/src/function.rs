@@ -2,11 +2,14 @@
 
 use crate::ast::{ArithExpr, BodyLiteral, CompOp, CondExpr, FuncBody, FuncDef, Program};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// Errors related to functions
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum FunctionError {
+    /// The original compiler allocation owner refused a reached allocation.
+    AllocationRejected { cause: Arc<xlog_core::XlogError> },
     /// Duplicate function definition
     DuplicateDefinition {
         /// Function name that was defined more than once.
@@ -72,6 +75,7 @@ pub enum FunctionError {
 impl std::fmt::Display for FunctionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            FunctionError::AllocationRejected { cause } => std::fmt::Display::fmt(cause.as_ref(),f),
             FunctionError::DuplicateDefinition { name } => {
                 write!(f, "error[E0501]: duplicate function definition `{}`", name)
             }
@@ -182,10 +186,86 @@ impl FunctionRegistry {
 
     /// Register a function
     pub fn register(&mut self, func: FuncDef) -> Result<(), FunctionError> {
+        self.register_owned(func, None)
+    }
+
+    pub(crate) fn register_owned(
+        &mut self,
+        func: FuncDef,
+        mut allocate: Option<&mut dyn FnMut(u64) -> xlog_core::Result<Arc<dyn Send + Sync>>>,
+    ) -> Result<(), FunctionError> {
         if self.functions.contains_key(&func.name) {
             return Err(FunctionError::DuplicateDefinition {
                 name: func.name.clone(),
             });
+        }
+
+        if let Some(allocate) = allocate.as_deref_mut() {
+            let bytes = (|| -> xlog_core::Result<u64> {
+                let overflow = || {
+                    xlog_core::XlogError::Compilation(
+                        "function registry allocation extent overflow".into(),
+                    )
+                };
+                let mut bytes = func
+                    .body
+                    .owned_allocation_bytes()?
+                    .checked_mul(2)
+                    .ok_or_else(overflow)?;
+                // Each original call name and String carrier is contained in
+                // the actual function body; geometric push growth can retain
+                // an old and a replacement call vector.
+                bytes = bytes.checked_mul(3).ok_or_else(overflow)?;
+                bytes = bytes
+                    .checked_add(
+                        (func.name.len() as u64)
+                            .checked_mul(4)
+                            .ok_or_else(overflow)?,
+                    )
+                    .ok_or_else(overflow)?;
+                for (length, capacity, width) in [
+                    (
+                        self.functions.len(),
+                        self.functions.capacity(),
+                        std::mem::size_of::<(String, FuncDef)>(),
+                    ),
+                    (
+                        self.call_graph.len(),
+                        self.call_graph.capacity(),
+                        std::mem::size_of::<(String, Vec<String>)>(),
+                    ),
+                ] {
+                    if length == capacity {
+                        let buckets = (length + 1)
+                            .checked_mul(8)
+                            .and_then(|n| n.checked_add(6))
+                            .map(|n| n / 7)
+                            .and_then(|n| n.max(8).checked_next_power_of_two())
+                            .ok_or_else(overflow)?;
+                        let table = buckets
+                            .checked_mul(width + 1)
+                            .and_then(|n| n.checked_add(16))
+                            .and_then(|n| n.checked_mul(2))
+                            .and_then(|n| u64::try_from(n).ok())
+                            .ok_or_else(overflow)?;
+                        bytes = bytes.checked_add(table).ok_or_else(overflow)?;
+                    }
+                }
+                if self.registration_order.len() == self.registration_order.capacity() {
+                    bytes = bytes
+                        .checked_add(crate::compile::push_vector_allocation_bytes::<String>(
+                            self.registration_order.len() + 1,
+                        )?)
+                        .ok_or_else(overflow)?;
+                }
+                Ok(bytes)
+            })()
+            .map_err(|cause| FunctionError::AllocationRejected {
+                cause: Arc::new(cause),
+            })?;
+            allocate(bytes).map_err(|cause| FunctionError::AllocationRejected {
+                cause: Arc::new(cause),
+            })?;
         }
 
         // Build call graph

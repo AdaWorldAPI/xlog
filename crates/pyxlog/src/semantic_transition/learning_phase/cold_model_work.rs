@@ -38,7 +38,21 @@ impl ColdModelWorkCustody {
 #[pyclass(name = "SemanticColdModelWork", module = "pyxlog._native", frozen)]
 pub(crate) struct PySemanticColdModelWork {
     custody: Mutex<ColdModelWorkCustody>,
+    #[cfg(feature = "semantic-policy")]
+    checkpoint_writer: Mutex<Option<Py<material_bytes::PySemanticMaterialWriter>>>,
+    #[cfg(feature = "semantic-policy")]
+    checkpoint_writer_preparation: Mutex<Option<OriginalCheckpointWriterPreparation>>,
     pub(in crate::semantic_transition) active: AtomicBool,
+}
+
+#[cfg(feature = "semantic-policy")]
+struct OriginalCheckpointWriterPreparation {
+    selected_identity: usize,
+    callback_identity: usize,
+    selected: Option<Py<PyAny>>,
+    callback: Option<Py<PyAny>>,
+    result: Option<Py<material_bytes::PySemanticMaterialWriter>>,
+    error: Option<PyErr>,
 }
 
 impl PySemanticColdModelWork {
@@ -57,6 +71,10 @@ impl PySemanticColdModelWork {
                 region,
             }),
             active: AtomicBool::new(active),
+            #[cfg(feature = "semantic-policy")]
+            checkpoint_writer: Mutex::new(None),
+            #[cfg(feature = "semantic-policy")]
+            checkpoint_writer_preparation: Mutex::new(None),
         }
     }
 
@@ -193,6 +211,139 @@ impl PySemanticColdModelWork {
     }
 
     pub(in crate::semantic_transition) fn check(&self, py: Python<'_>) -> PyResult<()> {
+        self.check_callback(
+            py,
+            #[cfg(feature = "semantic-policy")]
+            ColdCallbackAccess::Active,
+        )
+    }
+
+    #[cfg(feature = "semantic-policy")]
+    pub(in crate::semantic_transition) fn original_checkpoint_writer_port(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<Py<material_bytes::PySemanticMaterialWriter>> {
+        self.custody(py)?
+            .reader
+            .borrow(py)
+            .session
+            .borrow(py)
+            .require_creator()?;
+        self.checkpoint_writer
+            .lock()
+            .map_err(|_| invalid("cold checkpoint writer custody is poisoned"))?
+            .as_ref()
+            .map(|port| port.clone_ref(py))
+            .ok_or_else(|| {
+                invalid("cold checkpoint requires its original pre-admission writer port")
+            })
+    }
+
+    #[cfg(feature = "semantic-policy")]
+    pub(super) fn prepare_original_checkpoint_writer(
+        &self,
+        py: Python<'_>,
+        selected: &Py<PyAny>,
+        callback: &Py<PyAny>,
+        original_handle: &Py<Self>,
+    ) -> PyResult<Py<material_bytes::PySemanticMaterialWriter>> {
+        self.check(py)?;
+        {
+            let mut retained = self
+                .checkpoint_writer_preparation
+                .lock()
+                .map_err(|_| invalid("checkpoint metadata preparation custody is poisoned"))?;
+            if let Some(original) = retained.as_ref() {
+                if original.selected_identity != selected.as_ptr() as usize
+                    || original.callback_identity != callback.as_ptr() as usize
+                {
+                    return Err(invalid(
+                        "checkpoint metadata preparation changed its original model or callback",
+                    ));
+                }
+                if let Some(error) = &original.error {
+                    return Err(error.clone_ref(py));
+                }
+                if let Some(writer) = &original.result {
+                    return Ok(writer.clone_ref(py));
+                }
+                return Err(invalid(
+                    "unknown checkpoint metadata preparation cannot repeat its original callback",
+                ));
+            }
+            *retained = Some(OriginalCheckpointWriterPreparation {
+                selected_identity: selected.as_ptr() as usize,
+                callback_identity: callback.as_ptr() as usize,
+                selected: Some(selected.clone_ref(py)),
+                callback: Some(callback.clone_ref(py)),
+                result: None,
+                error: None,
+            });
+        }
+        let returned = callback
+            .bind(py)
+            .call1((selected.clone_ref(py), original_handle.clone_ref(py)))
+            .and_then(|returned| {
+                if !returned.is_exact_instance_of::<material_bytes::PySemanticMaterialWriter>() {
+                    return Err(invalid(
+                        "checkpoint metadata preparation must return its original material writer",
+                    ));
+                }
+                let writer = self.original_checkpoint_writer_port(py)?;
+                if !returned.is(writer.bind(py).as_any()) {
+                    return Err(invalid(
+                        "checkpoint metadata preparation returned another writer object",
+                    ));
+                }
+                let custody = self.custody(py)?;
+                let reader = custody.reader.borrow(py);
+                let session = reader.session.borrow(py);
+                let budget = reader
+                    .task_use
+                    .borrow(py)
+                    .checkpoint
+                    .material_sources
+                    .native_budget()?;
+                let bounds = writer.borrow(py).original_cold_bounds()?;
+                let owner = session.owner()?;
+                writer.borrow(py).require_original_cold_port(
+                    &budget,
+                    &owner,
+                    &custody.inner,
+                    custody.region.as_ref(),
+                    custody.region.as_ref().map_or(0, |region| region.ordinal()),
+                    bounds.0,
+                    bounds.1,
+                )?;
+                Ok(writer)
+            });
+        let mut retained = self
+            .checkpoint_writer_preparation
+            .lock()
+            .map_err(|_| invalid("checkpoint metadata preparation custody is poisoned"))?;
+        let original = retained
+            .as_mut()
+            .expect("retained original metadata preparation");
+        match returned {
+            Ok(writer) => {
+                original.result = Some(writer.clone_ref(py));
+                let completed = (original.selected.take(), original.callback.take());
+                drop(retained);
+                drop(completed);
+                Ok(writer)
+            }
+            Err(error) => {
+                original.error = Some(error.clone_ref(py));
+                Err(error)
+            }
+        }
+    }
+
+    fn check_callback(
+        &self,
+        py: Python<'_>,
+        #[cfg(feature = "semantic-policy")] access: ColdCallbackAccess,
+    ) -> PyResult<()> {
         let custody = self.custody(py)?;
         let parent = custody.parent()?.borrow(py);
         let source = parent.session.borrow(py);
@@ -203,15 +354,34 @@ impl PySemanticColdModelWork {
             ));
         }
         #[cfg(feature = "semantic-policy")]
-        if require_admitted_cold_callback(py, &source, self)? {
+        if match access {
+            ColdCallbackAccess::Active => require_admitted_cold_callback(py, &source, self)?,
+            ColdCallbackAccess::OriginalCounter => {
+                require_original_counter_cold_callback(py, &source, self)?
+            }
+        } {
             return Ok(());
         }
         #[cfg(feature = "semantic-policy")]
-        if prepared_cold_callback_step(py, &source, self)?.is_some() {
+        if match access {
+            ColdCallbackAccess::Active => prepared_cold_callback_step(py, &source, self)?,
+            ColdCallbackAccess::OriginalCounter => {
+                original_counter_cold_callback_step(py, &source, self)?
+            }
+        }
+        .is_some()
+        {
             return Ok(());
         }
         #[cfg(feature = "semantic-policy")]
-        if admitted_retirement_cold_callback(py, &source, self)?.is_some() {
+        if match access {
+            ColdCallbackAccess::Active => admitted_retirement_cold_callback(py, &source, self)?,
+            ColdCallbackAccess::OriginalCounter => {
+                original_counter_retirement_cold_callback(py, &source, self)?
+            }
+        }
+        .is_some()
+        {
             return Ok(());
         }
         if !source.learning_preparing.load(Ordering::Acquire) {
@@ -263,6 +433,129 @@ impl PySemanticColdModelWork {
         Err(invalid(
             "private numerical cold work requires semantic-policy",
         ))
+    }
+
+    #[cfg(feature = "semantic-policy")]
+    pub(in crate::semantic_transition) fn issue_model_work_buffer_port(
+        &self,
+        py: Python<'_>,
+        stream: u64,
+    ) -> PyResult<xlog_cuda::SemanticModelWorkBufferPort> {
+        self.check(py)?;
+        let custody = self.custody(py)?;
+        let parent = custody.reader.borrow(py);
+        let source = parent.session.borrow(py);
+        source.require_creator()?;
+        let prepared = original_counter_cold_callback_step(py, &source, self)?;
+        let retirement = admitted_retirement_cold_callback(py, &source, self)?;
+        let owner = source.owner()?;
+        let result = if let Some(instruction) = retirement {
+            owner.admitted_retirement_cold_model_work_buffer_port(
+                &instruction.inner,
+                &custody.inner,
+                stream,
+            )
+        } else if let Some(step) = prepared {
+            owner.prepared_cold_model_work_buffer_port(
+                &step.borrow(py).inner,
+                &*parent.lease()?,
+                &custody.inner,
+                stream,
+                custody.region.as_ref(),
+            )
+        } else {
+            owner.cold_model_work_buffer_port(
+                &*parent.lease()?,
+                &custody.inner,
+                stream,
+                custody.region.as_ref(),
+            )
+        }
+        .map_err(xlog_err);
+        result
+    }
+
+    #[cfg(feature = "semantic-policy")]
+    pub(in crate::semantic_transition) fn export_model_work_buffer_port(
+        &self,
+        py: Python<'_>,
+        port: &xlog_cuda::SemanticModelWorkBufferPort,
+    ) -> PyResult<(
+        xlog_cuda::SemanticModelWorkBufferExport,
+        Py<PySemanticTransitionSession>,
+    )> {
+        self.check_callback(py, ColdCallbackAccess::OriginalCounter)?;
+        let custody = self.custody(py)?;
+        let parent = custody.reader.borrow(py);
+        let source = parent.session.borrow(py);
+        source.require_creator()?;
+        let prepared = original_counter_cold_callback_step(py, &source, self)?;
+        let retirement = original_counter_retirement_cold_callback(py, &source, self)?;
+        let mut owner = source.owner()?;
+        let result = if let Some(instruction) = retirement {
+            owner.export_admitted_retirement_cold_model_work_buffer_port(
+                &instruction.inner,
+                port,
+                &custody.inner,
+            )
+        } else if let Some(step) = prepared {
+            owner.export_prepared_cold_model_work_buffer_port(
+                &step.borrow(py).inner,
+                &*parent.lease()?,
+                port,
+                &custody.inner,
+                custody.region.as_ref(),
+            )
+        } else {
+            owner.export_cold_model_work_buffer_port(
+                &*parent.lease()?,
+                port,
+                &custody.inner,
+                custody.region.as_ref(),
+            )
+        }
+        .map_err(xlog_err)?;
+        Ok((result, parent.session.clone_ref(py)))
+    }
+
+    #[cfg(feature = "semantic-policy")]
+    pub(in crate::semantic_transition) fn finalized_model_work_extent(
+        &self,
+        py: Python<'_>,
+        port: &xlog_cuda::SemanticModelWorkBufferPort,
+    ) -> PyResult<usize> {
+        self.check_callback(py, ColdCallbackAccess::OriginalCounter)?;
+        let custody = self.custody(py)?;
+        let parent = custody.reader.borrow(py);
+        let source = parent.session.borrow(py);
+        source.require_creator()?;
+        let prepared = original_counter_cold_callback_step(py, &source, self)?;
+        let retirement = original_counter_retirement_cold_callback(py, &source, self)?;
+        let owner = source.owner()?;
+        let result = if let Some(instruction) = retirement {
+            owner.admitted_retirement_cold_model_work_buffer_port_finalized_extent(
+                &instruction.inner,
+                port,
+                &custody.inner,
+            )
+        } else if let Some(step) = prepared {
+            owner.prepared_cold_model_work_buffer_port_finalized_extent(
+                &step.borrow(py).inner,
+                &*parent.lease()?,
+                port,
+                &custody.inner,
+                custody.region.as_ref(),
+            )
+        } else {
+            owner.cold_model_work_buffer_port_finalized_extent(
+                &*parent.lease()?,
+                port,
+                &custody.inner,
+                custody.region.as_ref(),
+            )
+        }
+        .map_err(xlog_err);
+        result
     }
 }
 
@@ -365,6 +658,29 @@ impl PySemanticColdModelWork {
         let result = phase
             .borrow(py)
             .intermediate_restore_material_mode(py, self);
+        result
+    }
+
+    #[cfg(feature = "semantic-policy")]
+    fn prepare_resident_model_restoration(
+        &self,
+        py: Python<'_>,
+        memory: &crate::semantic_transition::resident_model_memory::PySemanticPreparedResidentModelMemory,
+    ) -> PyResult<Py<crate::semantic_transition::resident_model_memory::PySemanticPreparedResidentModelRestoration>>{
+        let custody = self.custody(py)?;
+        let reader = custody.reader.borrow(py);
+        let session = reader.session.borrow(py);
+        session.require_creator()?;
+        let phase = session
+            .learning_transition
+            .lock()
+            .map_err(|_| invalid("restore metadata lost its original phase mutex"))?
+            .as_ref()
+            .map(|phase| phase.clone_ref(py))
+            .ok_or_else(|| invalid("restore metadata requires its original phase owner"))?;
+        let result = phase
+            .borrow(py)
+            .prepare_intermediate_resident_model_restoration(py, self, memory);
         result
     }
 
@@ -557,8 +873,8 @@ impl PySemanticColdModelWork {
     /// Retain the complete physical operation recipe before original recording.
     /// Native returns (work bound, event count, call upper), not a Python estimate.
     #[pyo3(
-        signature = (operations, *, region_ends = Vec::new(), evaluation_content = None),
-        text_signature = "($self, operations, *, region_ends=(), evaluation_content=None)"
+        signature = (operations, *, region_ends = Vec::new(), evaluation_content = None, source_content = None, resident_reads = None),
+        text_signature = "($self, operations, *, region_ends=(), evaluation_content=None, source_content=None, resident_reads=None)"
     )]
     fn admit_plan(
         &self,
@@ -566,9 +882,80 @@ impl PySemanticColdModelWork {
         operations: &Bound<'_, PyAny>,
         #[pyo3(from_py_with = cold_region_ends)] region_ends: Vec<usize>,
         evaluation_content: Option<&Bound<'_, PyAny>>,
+        source_content: Option<&Bound<'_, PyAny>>,
+        resident_reads: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<(u64, u64, u64)> {
         self.check(py)?;
         let custody = self.custody(py)?;
+        let mut reads = Vec::new();
+        if let Some(values) = resident_reads {
+            if !values.is_exact_instance_of::<PyTuple>() {
+                return Err(invalid(
+                    "resident read admission requires an exact immutable tuple",
+                ));
+            }
+            let values = values.cast::<PyTuple>()?;
+            reads
+                .try_reserve_exact(values.len())
+                .map_err(|_| invalid("resident read declaration reservation failed"))?;
+            for entry in values.iter() {
+                if !entry.is_exact_instance_of::<PyTuple>() || entry.cast::<PyTuple>()?.len() != 2 {
+                    return Err(invalid(
+                        "resident read admission requires original region and occurrence pairs",
+                    ));
+                }
+                let entry = entry.cast::<PyTuple>()?;
+                let ordinal =
+                    usize::try_from(ColdValue::read(&entry.get_item(0)?, &mut 128, 0)?.unsigned()?)
+                        .map_err(|_| {
+                            invalid("resident read region exceeds the original native roster")
+                        })?;
+                let read = entry.get_item(1)?;
+                if !read.is_exact_instance_of::<crate::semantic_transition::resident_model_memory::PySemanticResidentModelRead>() {
+                    return Err(invalid("resident read admission requires its original native occurrence"));
+                }
+                let read = read.extract::<PyRef<
+                    '_,
+                    crate::semantic_transition::resident_model_memory::PySemanticResidentModelRead,
+                >>()?;
+                reads.push((ordinal, read.inner().clone()));
+            }
+        }
+        let mut sources = Vec::new();
+        if let Some(values) = source_content {
+            if !values.is_exact_instance_of::<PyTuple>() {
+                return Err(invalid(
+                    "SOURCE admission requires an exact immutable recipe tuple",
+                ));
+            }
+            for value in values.cast::<PyTuple>()?.iter() {
+                let original = if value
+                    .is_exact_instance_of::<prepared_import::PySemanticPreparedSourceContent>()
+                {
+                    let value = value
+                        .extract::<PyRef<'_, prepared_import::PySemanticPreparedSourceContent>>()?;
+                    value.require_original(py)?;
+                    value.inner.clone()
+                } else if value.is_exact_instance_of::<
+                    source_content_geometry::PySemanticPreparedSourceContentGeometry,
+                >() {
+                    let value = value.extract::<PyRef<
+                        '_,
+                        source_content_geometry::PySemanticPreparedSourceContentGeometry,
+                    >>()?;
+                    value.require_original(py)?;
+                    value
+                        .native()
+                        .bound_source_content_for_admission(&custody.inner)
+                        .map_err(xlog_err)?
+                } else {
+                    return Err(invalid(
+                        "SOURCE admission requires its original native recipe or historical geometry",
+                    ));
+                };
+                sources.push(original);
+            }
+        }
         // Invoke original tensor producers before taking either native Session
         // mutex. The actual evaluation owner guards every producer callback.
         let (phase, content) = if let Some(value) = evaluation_content {
@@ -619,14 +1006,32 @@ impl PySemanticColdModelWork {
                 recipe.push((kind, values[..rank].to_vec()));
             }
             let quantities = if let Some(region) = &custody.region {
-                owner.admit_cold_model_work_region_plan(region, &recipe, &region_ends, content)
+                owner.admit_cold_model_work_region_plan_with_sources(
+                    region,
+                    &recipe,
+                    &region_ends,
+                    content,
+                    &sources,
+                    &reads,
+                )
             } else {
-                owner.admit_cold_model_work_plan(&custody.inner, &recipe, &region_ends, content)
+                owner.admit_cold_model_work_plan_with_sources(
+                    &custody.inner,
+                    &recipe,
+                    &region_ends,
+                    content,
+                    &sources,
+                    &reads,
+                )
             }
             .map_err(xlog_err)?;
             Ok((quantities[0], quantities[1], quantities[2]))
         })();
-        if result.is_err() {
+        if result.is_err()
+            && !owner
+                .cold_model_work_plan_is_admitted(&custody.inner)
+                .unwrap_or(false)
+        {
             owner.fail_cold_model_work(&custody.inner);
         }
         drop(owner);
@@ -658,7 +1063,186 @@ impl PySemanticColdModelWork {
         result
     }
 
-    /// Exact future scratch port; no export, admission or numerical access.
+    /// The original scratch owner before its sole plan determines the extent.
+    #[cfg(feature = "semantic-policy")]
+    #[pyo3(signature = (*, region_ordinal, model_material_capacity, model_material_working_bytes, resident_read, codec_staging_bytes))]
+    fn prepare_checkpoint_writer(
+        slf: Py<Self>,
+        py: Python<'_>,
+        region_ordinal: usize,
+        model_material_capacity: usize,
+        model_material_working_bytes: u64,
+        resident_read: Py<super::super::resident_model_memory::PySemanticResidentModelRead>,
+        codec_staging_bytes: usize,
+    ) -> PyResult<Py<material_bytes::PySemanticMaterialWriter>> {
+        let work = slf.borrow(py);
+        let custody = work.custody(py)?;
+        let reader = custody.reader.borrow(py);
+        let source = reader.session.borrow(py);
+        source.require_creator()?;
+        let owner = source.owner()?;
+        let count = owner
+            .cold_model_work_region_count(&custody.inner)
+            .map_err(xlog_err)?
+            .max(1);
+        if region_ordinal >= count {
+            return Err(invalid(
+                "checkpoint writer has no such original report region",
+            ));
+        }
+        let budget = reader
+            .task_use
+            .borrow(py)
+            .checkpoint
+            .material_sources
+            .native_budget()?;
+        if custody
+            .region
+            .as_ref()
+            .is_some_and(|region| region.ordinal() == region_ordinal)
+            || (count == 1 && custody.region.is_none())
+        {
+            let cached = work
+                .checkpoint_writer
+                .lock()
+                .map_err(|_| invalid("cold checkpoint writer custody is poisoned"))?;
+            if let Some(writer) = &*cached {
+                writer.borrow(py).require_original_readback(
+                    py,
+                    &resident_read,
+                    codec_staging_bytes,
+                )?;
+                writer.borrow(py).require_original_cold_port(
+                    &budget,
+                    &owner,
+                    &custody.inner,
+                    custody.region.as_ref(),
+                    region_ordinal,
+                    model_material_capacity,
+                    model_material_working_bytes,
+                )?;
+                return Ok(writer.clone_ref(py));
+            }
+        }
+        let _roster_metadata = material_bytes::reserve_material_metadata(
+            &budget,
+            count
+                .checked_mul(
+                    2 * std::mem::size_of::<Py<Self>>()
+                        + std::mem::size_of::<Option<SemanticColdModelWorkRegion>>(),
+                )
+                .ok_or_else(|| invalid("checkpoint writer roster metadata extent overflow"))?,
+        )?;
+        drop(owner);
+        drop(source);
+        drop(reader);
+        let mut regions = None;
+        if custody
+            .region
+            .as_ref()
+            .is_some_and(|region| region.ordinal() == region_ordinal)
+            || (count == 1 && custody.region.is_none())
+        {
+            regions = Some(vec![slf.clone_ref(py)]);
+        } else {
+            work.check(py)?;
+            let callback = custody.parent()?.borrow(py);
+            let callback_session = callback.session.borrow(py);
+            if let Some(phase) = private_execution_owner(py, &callback_session)? {
+                let phase = phase.borrow(py);
+                regions = phase.delivery_cold_report_regions(py, &work)?;
+                if regions.is_none() {
+                    regions = phase.evaluation_cold_report_regions(py, &work)?;
+                }
+                if regions.is_none() {
+                    regions = phase.intermediate_cold_report_regions(py, &work)?;
+                }
+            }
+        }
+        let regions = regions.unwrap_or_else(|| vec![slf.clone_ref(py)]);
+        let selected_index = if regions.len() == 1 {
+            0
+        } else {
+            region_ordinal
+        };
+        if regions.len() != 1 && regions.len() != count {
+            return Err(invalid(
+                "checkpoint writer changed its original complete report roster",
+            ));
+        }
+        let selected = regions[selected_index].borrow(py);
+        let original = selected.custody(py)?;
+        if !original.inner.same_invocation(&custody.inner)
+            || original
+                .region
+                .as_ref()
+                .map_or(0, |region| region.ordinal())
+                != region_ordinal
+        {
+            return Err(invalid(
+                "checkpoint writer changed its original region owner",
+            ));
+        }
+        let mut cached = selected
+            .checkpoint_writer
+            .lock()
+            .map_err(|_| invalid("cold checkpoint writer custody is poisoned"))?;
+        let reader = custody.reader.borrow(py);
+        let source = reader.session.borrow(py);
+        let owner = source.owner()?;
+        if let Some(port) = &*cached {
+            port.borrow(py)
+                .require_original_readback(py, &resident_read, codec_staging_bytes)?;
+            port.borrow(py).require_original_cold_port(
+                &budget,
+                &owner,
+                &original.inner,
+                original.region.as_ref(),
+                region_ordinal,
+                model_material_capacity,
+                model_material_working_bytes,
+            )?;
+            return Ok(port.clone_ref(py));
+        }
+        owner
+            .require_cold_checkpoint_writer_preparation(&custody.inner, region_ordinal)
+            .map_err(xlog_err)?;
+        let port = material_bytes::PySemanticMaterialWriter::prepare_original_cold_port(
+            py,
+            &budget,
+            original.inner,
+            original.region,
+            region_ordinal,
+            model_material_capacity,
+            model_material_working_bytes,
+            &owner,
+            resident_read,
+            codec_staging_bytes,
+        )?;
+        *cached = Some(port.clone_ref(py));
+        Ok(port)
+    }
+
+    /// The original scratch owner before its sole plan determines the extent.
+    #[cfg(feature = "semantic-policy")]
+    #[pyo3(signature = (*, consumer_stream))]
+    fn model_work_buffer_port(
+        slf: Py<Self>,
+        py: Python<'_>,
+        consumer_stream: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<crate::semantic_transition::model_work_port::PySemanticModelWorkBufferPort>>
+    {
+        let stream = parse_witness_consumer_stream(consumer_stream, &mut 128)?;
+        let port = slf.borrow(py).issue_model_work_buffer_port(py, stream)?;
+        Py::new(
+            py,
+            crate::semantic_transition::model_work_port::PySemanticModelWorkBufferPort::new_cold(
+                slf, port,
+            ),
+        )
+    }
+
+    /// Exact materialized scratch geometry; it grants no numerical access.
     #[pyo3(signature = (*, consumer_stream))]
     fn model_work_buffer_layout(
         &self,
@@ -1009,7 +1593,8 @@ impl PySemanticTransitionTaskUse {
 
 #[pymethods]
 impl PySemanticTransitionTaskUse {
-    /// Original complete registrar roster and one authentic scratch allocation.
+    /// Original complete registrar roster and one shared unmaterialized port.
+    #[cfg(feature = "semantic-policy")]
     fn cold_model_work_report_layouts(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
         let active = self.already_issued_cold_model_work(py)?;
         let work = active.borrow(py);
@@ -1071,21 +1656,19 @@ impl PySemanticTransitionTaskUse {
             .cold_model_work_stream(&custody.inner)
             .map_err(xlog_err)?;
         drop(owner);
-        let stream_value = stream.into_pyobject(py)?;
-        let layout = work.model_work_buffer_layout(py, stream_value.as_any())?;
+        let native_port = work.issue_model_work_buffer_port(py, stream)?;
+        drop(work);
+        let port = Py::new(
+            py,
+            crate::semantic_transition::model_work_port::PySemanticModelWorkBufferPort::new_cold(
+                active.clone_ref(py),
+                native_port,
+            ),
+        )?;
         let mut rows = Vec::with_capacity(regions.len());
         for region in regions {
             rows.push(
-                (
-                    region,
-                    (
-                        layout.0.clone_ref(py),
-                        layout.1.clone_ref(py),
-                        layout.2.clone_ref(py),
-                        layout.3,
-                    ),
-                    stream,
-                )
+                (region, port.clone_ref(py), stream)
                     .into_pyobject(py)?
                     .unbind(),
             );

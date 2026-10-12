@@ -373,11 +373,13 @@ pub(super) struct ActorRefreshCustody {
     update: Py<PySemanticPreparedStep>,
     instruction: Arc<SegmentInstructionCustody>,
     member_ordinal: u64,
-    row: SemanticTrainingViewRow,
+    row: xlog_cuda::SemanticReplayTrainingViewRow,
     original_row: ReplayRow,
     replay: NativeReplayBinding,
     source: Arc<VerifiedCheckpointSource>,
     proof: xlog_cuda::SemanticPreparedActorRefresh,
+    _content_geometry:
+        [Py<super::source_content_geometry::PySemanticPreparedSourceContentGeometry>; 2],
     children: Mutex<[ActorRefreshChild; 2]>,
 }
 
@@ -523,6 +525,11 @@ impl ActorRefreshChild {
     }
 }
 
+pub(super) struct ActorConstructionMetadata {
+    _native_records: xlog_cuda::SemanticReplayMaterialReservation,
+    _retained_records: xlog_cuda::SemanticReplayMaterialReservation,
+}
+
 struct ActorRefreshConstruction {
     native: xlog_cuda::SemanticTransitionSessionConstruction,
     records: SemanticAdmissionRecords,
@@ -535,6 +542,7 @@ struct ActorRefreshConstruction {
     memory: u64,
     proposal_expense: Arc<Mutex<ProposalExpense>>,
     checkpoint_sources: Arc<Mutex<CheckpointSources>>,
+    metadata: Arc<ActorConstructionMetadata>,
     canary: Option<TrainingCanaryOwner>,
 }
 
@@ -603,7 +611,7 @@ pub(super) fn replay_source_checkpoint(
         .get(&referent.checkpoint_digest)
         .map(Arc::clone)
         .ok_or_else(|| invalid("original replay source was not retained by canonical admission"))?;
-    referent.verify_source(&source)?;
+    source.require_referent(&referent)?;
     if source.cold.is_none() {
         return Err(invalid(
             "original replay source has no canonical executable task admission",
@@ -616,38 +624,7 @@ pub(super) fn replay_source_projection(
     py: Python<'_>,
     source: &VerifiedCheckpointSource,
 ) -> PyResult<Py<PyTuple>> {
-    let cold = source
-        .cold
-        .as_ref()
-        .ok_or_else(|| invalid("original source lost its canonical cold task"))?;
-    let cold = (
-        cold.initial_theory.as_str(),
-        cold.input_facts.as_str(),
-        cold.observer_source.as_deref(),
-        PyTuple::new(py, &cold.statements)?,
-        PyTuple::new(py, &cold.query_records)?,
-    )
-        .into_pyobject(py)?
-        .unbind()
-        .into_any();
-    let fields = ColdValue::Sequence(vec![
-        ColdValue::Sequence(source.seed.authority.clone()),
-        ColdValue::Sequence(source.seed.evaluation.clone()),
-        source.seed.training_domain.clone(),
-        source.seed.initial_sources.clone(),
-        source.seed.source_mapping.clone(),
-        source.seed.replay_capacity.clone(),
-    ])
-    .python_value(py)?;
-    Ok(PyTuple::new(
-        py,
-        [
-            PyBytes::new(py, &source.bytes).unbind().into_any(),
-            cold,
-            fields,
-        ],
-    )?
-    .unbind())
+    source_content_geometry::source_task_projection(py, source)
 }
 
 impl ActorRefreshCustody {
@@ -872,6 +849,18 @@ impl ActorRefreshCustody {
                     return Err(invalid("original actor retirement callback cannot reenter"));
                 }
                 let _callback = PreparedRetirementGuard(callback_active.as_ref());
+                let original_session = session.borrow(py);
+                original_session.require_creator()?;
+                if original_session.importing.load(Ordering::Acquire)
+                    || original_session.recording.load(Ordering::Acquire)
+                    || original_session.retiring.swap(true, Ordering::AcqRel)
+                {
+                    return Err(invalid(
+                        "actor producer retirement cannot overlap its original Session operation",
+                    ));
+                }
+                let _retirement = PreparedRetirementGuard(&original_session.retiring);
+                let _producer_scope = OriginalProducerRetirementScope::enter(&original_session)?;
                 finish.call0()
             })?;
             if !finished.is_none() {
@@ -1533,9 +1522,23 @@ impl ActorRefreshCustody {
                         "actor constructor changed its original device or memory budget",
                     ));
                 }
-                let editable = cold_task::editable_source_from_admission(&records)?;
                 let update = self.update.borrow(py);
                 let target = update.session.borrow(py);
+                let budget = target.material_sources.native_budget()?;
+                let native_records = budget
+                    .reserve_admission_records(&records)
+                    .map_err(xlog_err)?;
+                let retained_records = budget
+                    .reserve_admission_records(&records)
+                    .map_err(xlog_err)?;
+                let metadata = Arc::new(ActorConstructionMetadata {
+                    _native_records: native_records,
+                    _retained_records: retained_records,
+                });
+                let editable = cold_task::editable_source_from_admission_bound(
+                    &records,
+                    &target.material_sources,
+                )?;
                 let native = target
                     .owner()?
                     .prepare_actor_refresh_construction(
@@ -1574,6 +1577,7 @@ impl ActorRefreshCustody {
                     memory,
                     proposal_expense: Arc::clone(&proposal_expense),
                     checkpoint_sources: Arc::clone(&checkpoint_sources),
+                    metadata,
                     canary: canary.clone(),
                 })));
             }
@@ -1646,7 +1650,7 @@ impl ActorRefreshCustody {
                 original
                     .editable
                     .as_ref()
-                    .map(|source| Arc::clone(&source.program)),
+                    .map(|source| source.actor_program_owner(Arc::clone(&original.metadata))),
                 original
                     .editable
                     .as_ref()
@@ -1667,6 +1671,7 @@ impl ActorRefreshCustody {
             memory,
             proposal_expense,
             checkpoint_sources,
+            Arc::clone(&self.update.borrow(py).session.borrow(py).material_sources),
             original_canary,
         );
         wrapper.editable_program = editable_program;
@@ -1893,6 +1898,9 @@ impl ActorRefreshCustody {
             )
         };
         let task = task.borrow(py);
+        self._content_geometry[bank]
+            .borrow(py)
+            .require_child_feedback_baseline(py, &task.session.borrow(py))?;
         let snapshot = task.state()?.snapshot.canonical.clone();
         let result = controller
             .borrow(py)
@@ -2315,7 +2323,8 @@ impl PySemanticPreparedActorRefresh {
             self.inner.member_ordinal,
             refresh_snapshot,
         )?;
-        if source.bytes != self.inner.source.bytes {
+        source.require_referent(&self.inner.source.referent)?;
+        if !Arc::ptr_eq(&source, &self.inner.source) {
             return Err(invalid(
                 "actor source changed after its original native binding",
             ));
@@ -2417,10 +2426,20 @@ impl PySemanticPreparedActorRefresh {
                     .resolve_actor_refresh_context(&self.inner.proof, bank)
                     .map_err(xlog_err)?;
             } else {
+                let resolved = self
+                    .inner
+                    .original_row()
+                    .resolve_native_predecessor(self.inner.material())?;
+                check_original()?;
                 session
                     .borrow(py)
                     .owner()?
-                    .restore_actor_refresh_context(self.inner.material(), &self.inner.proof, bank)
+                    .restore_actor_refresh_context(
+                        self.inner.material(),
+                        resolved,
+                        &self.inner.proof,
+                        bank,
+                    )
                     .map_err(xlog_err)?;
             }
             self.inner.children()?[bank].context_ready = true;
@@ -2608,14 +2627,27 @@ impl PySemanticPreparedActorRefresh {
 
 #[pymethods]
 impl PySemanticPreparedStep {
-    #[pyo3(signature = (member_ordinal, *, refresh_snapshot))]
+    #[pyo3(signature = (member_ordinal, *, refresh_snapshot, content_geometry))]
     fn prepare_actor_refresh(
         slf: Py<Self>,
         py: Python<'_>,
         member_ordinal: &Bound<'_, PyAny>,
         refresh_snapshot: &Bound<'_, PyAny>,
+        content_geometry: &Bound<'_, PyAny>,
     ) -> PyResult<Py<PySemanticPreparedActorRefresh>> {
         let ordinal = ColdValue::read(member_ordinal, &mut 128, 0)?.unsigned()?;
+        let geometry = exact_tuple(content_geometry, Some(2), &mut 128)?;
+        let geometry = [
+            geometry.get_item(0)?.extract::<Py<
+                super::source_content_geometry::PySemanticPreparedSourceContentGeometry,
+            >>()?,
+            geometry.get_item(1)?.extract::<Py<
+                super::source_content_geometry::PySemanticPreparedSourceContentGeometry,
+            >>()?,
+        ];
+        for handle in &geometry {
+            handle.borrow(py).require_original(py)?;
+        }
         let update = slf.borrow(py);
         let session = update.session.borrow(py);
         session.require_creator()?;
@@ -2685,6 +2717,10 @@ impl PySemanticPreparedStep {
                 &material.material,
                 batch_identity,
                 &batch_bytes,
+                [
+                    geometry[0].borrow(py).native().clone(),
+                    geometry[1].borrow(py).native().clone(),
+                ],
             )
             .map_err(xlog_err)?;
         drop(owner);
@@ -2697,6 +2733,7 @@ impl PySemanticPreparedStep {
             replay: material,
             source,
             proof,
+            _content_geometry: geometry,
             children: Mutex::new(std::array::from_fn(|_| ActorRefreshChild::default())),
         });
         session

@@ -35,6 +35,81 @@ use xlog_core::{RelId, Schema};
 use xlog_ir::{CompareOp, Expr, JoinType, RirNode};
 use xlog_stats::StatsManager;
 
+fn reserve_optimizer(
+    scope: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
+    bytes: u64,
+) -> xlog_core::Result<()> {
+    if bytes != 0 {
+        if let Some(scope) = scope.as_deref_mut() {
+            scope.acquire(bytes)?;
+        }
+    }
+    Ok(())
+}
+
+fn reserve_optimizer_vector<T>(
+    scope: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
+    count: usize,
+) -> xlog_core::Result<()> {
+    if scope.is_some() {
+        reserve_optimizer(
+            scope,
+            crate::compile::push_vector_allocation_bytes::<T>(count)?,
+        )?;
+    }
+    Ok(())
+}
+
+fn column_collection_allocation_bytes(expression: &Expr) -> xlog_core::Result<(usize, u64)> {
+    let overflow =
+        || xlog_core::XlogError::Compilation("column collection allocation extent overflow".into());
+    let mut count = 0usize;
+    let mut bytes = 0u64;
+    let mut child = |expression: &Expr| -> xlog_core::Result<()> {
+        let (child_count, child_bytes) = column_collection_allocation_bytes(expression)?;
+        count = count.checked_add(child_count).ok_or_else(overflow)?;
+        bytes = bytes.checked_add(child_bytes).ok_or_else(overflow)?;
+        Ok(())
+    };
+    match expression {
+        Expr::Column(_) => count = 1,
+        Expr::Const(_) => {}
+        Expr::Compare { left, right, .. }
+        | Expr::Add(left, right)
+        | Expr::Sub(left, right)
+        | Expr::Mul(left, right)
+        | Expr::Div(left, right)
+        | Expr::Mod(left, right)
+        | Expr::Min(left, right)
+        | Expr::Max(left, right)
+        | Expr::Pow(left, right) => {
+            child(left)?;
+            child(right)?;
+        }
+        Expr::And(expressions) | Expr::Or(expressions) => {
+            for expression in expressions {
+                child(expression)?;
+            }
+        }
+        Expr::Not(inner) | Expr::Abs(inner) | Expr::Cast(inner, _) => child(inner)?,
+        Expr::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            child(condition)?;
+            child(then_expr)?;
+            child(else_expr)?;
+        }
+    }
+    bytes = bytes
+        .checked_add(crate::compile::push_vector_allocation_bytes::<usize>(
+            count,
+        )?)
+        .ok_or_else(overflow)?;
+    Ok((count, bytes))
+}
+
 /// Configuration for query optimization.
 ///
 /// Controls optimizer behavior including thresholds for algorithm selection
@@ -232,10 +307,27 @@ impl Optimizer {
     ///
     /// An optimized plan that is semantically equivalent to the input
     pub fn optimize(&self, node: RirNode) -> RirNode {
+        self.optimize_core(node, &mut None)
+            .expect("ordinary optimization has no allocation callback")
+    }
+
+    pub fn optimize_with_allocation_owner(
+        &self,
+        node: RirNode,
+        scope: &mut crate::compile::CompilationAllocationScope<'_>,
+    ) -> xlog_core::Result<RirNode> {
+        self.optimize_core(node, &mut Some(scope))
+    }
+
+    fn optimize_core(
+        &self,
+        node: RirNode,
+        scope: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
+    ) -> xlog_core::Result<RirNode> {
         if self.config.enable_pushdown {
-            self.predicate_pushdown(node)
+            self.predicate_pushdown_core(node, scope)
         } else {
-            node
+            Ok(node)
         }
     }
 
@@ -257,7 +349,16 @@ impl Optimizer {
     ///
     /// The transformed plan with predicates pushed down where beneficial
     fn predicate_pushdown(&self, node: RirNode) -> RirNode {
-        match node {
+        self.predicate_pushdown_core(node, &mut None)
+            .expect("ordinary predicate pushdown has no allocation callback")
+    }
+
+    fn predicate_pushdown_core(
+        &self,
+        node: RirNode,
+        scope: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
+    ) -> xlog_core::Result<RirNode> {
+        Ok(match node {
             // Base case: scan nodes cannot be transformed further
             RirNode::Unit => RirNode::Unit,
             RirNode::Scan { rel } => RirNode::Scan { rel },
@@ -265,7 +366,7 @@ impl Optimizer {
             // Filter on top of another node: try to push down
             RirNode::Filter { input, predicate } => {
                 // First, recursively optimize the input
-                let optimized_input = self.predicate_pushdown(*input);
+                let optimized_input = self.predicate_pushdown_core(*input, scope)?;
 
                 match optimized_input {
                     // Filter on Filter: merge predicates
@@ -273,6 +374,7 @@ impl Optimizer {
                         input: inner_input,
                         predicate: inner_pred,
                     } => {
+                        reserve_optimizer_vector::<Expr>(scope, 2)?;
                         let merged = Expr::And(vec![inner_pred, predicate]);
                         RirNode::Filter {
                             input: inner_input,
@@ -285,10 +387,11 @@ impl Optimizer {
                         input: proj_input,
                         columns,
                     } => {
+                        reserve_optimizer(scope, std::mem::size_of::<RirNode>() as u64)?;
                         // Check if predicate only references pass-through columns
-                        if let Some(remapped) =
-                            self.remap_predicate_through_project(&predicate, &columns)
-                        {
+                        if let Some(remapped) = self.remap_predicate_through_project_with_owner(
+                            &predicate, &columns, scope,
+                        )? {
                             // Push the remapped predicate below the projection
                             RirNode::Project {
                                 input: Box::new(RirNode::Filter {
@@ -317,9 +420,10 @@ impl Optimizer {
                         right_keys,
                         join_type,
                     } => {
+                        reserve_optimizer(scope, 3 * std::mem::size_of::<RirNode>() as u64)?;
                         let left_width = self.estimate_width(&left);
-                        let (left_preds, right_preds, remaining) =
-                            self.split_predicate_for_join(&predicate, left_width);
+                        let (left_preds, right_preds, remaining) = self
+                            .split_predicate_for_join_with_owner(&predicate, left_width, scope)?;
 
                         // Apply pushed predicates to each side
                         let new_left = if !left_preds.is_empty() {
@@ -361,7 +465,10 @@ impl Optimizer {
 
                     // Default: cannot push further
                     other => RirNode::Filter {
-                        input: Box::new(other),
+                        input: {
+                            reserve_optimizer(scope, std::mem::size_of::<RirNode>() as u64)?;
+                            Box::new(other)
+                        },
                         predicate,
                     },
                 }
@@ -372,17 +479,27 @@ impl Optimizer {
             // binding, so recursing through this unary chain can exhaust the
             // native stack at the supported expansion-depth boundary.
             RirNode::Project { input, columns } => {
+                reserve_optimizer_vector::<Vec<xlog_ir::ProjectExpr>>(scope, 1)?;
                 let mut projections = vec![columns];
                 let mut base = *input;
                 while let RirNode::Project { input, columns } = base {
+                    if projections.len() == projections.capacity() {
+                        reserve_optimizer_vector::<Vec<xlog_ir::ProjectExpr>>(
+                            scope,
+                            projections.len() + 1,
+                        )?;
+                    }
                     projections.push(columns);
                     base = *input;
                 }
 
-                let mut optimized = self.predicate_pushdown(base);
+                let mut optimized = self.predicate_pushdown_core(base, scope)?;
                 for columns in projections.into_iter().rev() {
                     optimized = RirNode::Project {
-                        input: Box::new(optimized),
+                        input: {
+                            reserve_optimizer(scope, std::mem::size_of::<RirNode>() as u64)?;
+                            Box::new(optimized)
+                        },
                         columns,
                     };
                 }
@@ -397,8 +514,14 @@ impl Optimizer {
                 right_keys,
                 join_type,
             } => RirNode::Join {
-                left: Box::new(self.predicate_pushdown(*left)),
-                right: Box::new(self.predicate_pushdown(*right)),
+                left: {
+                    reserve_optimizer(scope, std::mem::size_of::<RirNode>() as u64)?;
+                    Box::new(self.predicate_pushdown_core(*left, scope)?)
+                },
+                right: {
+                    reserve_optimizer(scope, std::mem::size_of::<RirNode>() as u64)?;
+                    Box::new(self.predicate_pushdown_core(*right, scope)?)
+                },
                 left_keys,
                 right_keys,
                 join_type,
@@ -410,7 +533,10 @@ impl Optimizer {
                 key_cols,
                 aggs,
             } => RirNode::GroupBy {
-                input: Box::new(self.predicate_pushdown(*input)),
+                input: {
+                    reserve_optimizer(scope, std::mem::size_of::<RirNode>() as u64)?;
+                    Box::new(self.predicate_pushdown_core(*input, scope)?)
+                },
                 key_cols,
                 aggs,
             },
@@ -419,20 +545,29 @@ impl Optimizer {
             RirNode::Union { inputs } => RirNode::Union {
                 inputs: inputs
                     .into_iter()
-                    .map(|i| self.predicate_pushdown(i))
-                    .collect(),
+                    .map(|i| self.predicate_pushdown_core(i, scope))
+                    .collect::<xlog_core::Result<Vec<_>>>()?,
             },
 
             // Distinct: recursively optimize input
             RirNode::Distinct { input, key_cols } => RirNode::Distinct {
-                input: Box::new(self.predicate_pushdown(*input)),
+                input: {
+                    reserve_optimizer(scope, std::mem::size_of::<RirNode>() as u64)?;
+                    Box::new(self.predicate_pushdown_core(*input, scope)?)
+                },
                 key_cols,
             },
 
             // Diff: recursively optimize both sides
             RirNode::Diff { left, right } => RirNode::Diff {
-                left: Box::new(self.predicate_pushdown(*left)),
-                right: Box::new(self.predicate_pushdown(*right)),
+                left: {
+                    reserve_optimizer(scope, std::mem::size_of::<RirNode>() as u64)?;
+                    Box::new(self.predicate_pushdown_core(*left, scope)?)
+                },
+                right: {
+                    reserve_optimizer(scope, std::mem::size_of::<RirNode>() as u64)?;
+                    Box::new(self.predicate_pushdown_core(*right, scope)?)
+                },
             },
 
             // Fixpoint: recursively optimize base and recursive parts
@@ -444,8 +579,14 @@ impl Optimizer {
                 full_rel,
             } => RirNode::Fixpoint {
                 scc_id,
-                base: Box::new(self.predicate_pushdown(*base)),
-                recursive: Box::new(self.predicate_pushdown(*recursive)),
+                base: {
+                    reserve_optimizer(scope, std::mem::size_of::<RirNode>() as u64)?;
+                    Box::new(self.predicate_pushdown_core(*base, scope)?)
+                },
+                recursive: {
+                    reserve_optimizer(scope, std::mem::size_of::<RirNode>() as u64)?;
+                    Box::new(self.predicate_pushdown_core(*recursive, scope)?)
+                },
                 delta_rel,
                 full_rel,
             },
@@ -456,7 +597,7 @@ impl Optimizer {
             // optimizer runs. Required for compile safety and as a
             // no-op fallback if the call order ever changes.
             RirNode::MultiWayJoin { .. } | RirNode::ChainJoin { .. } => node,
-        }
+        })
     }
 
     /// Attempts to remap a predicate through a projection.
@@ -481,6 +622,31 @@ impl Optimizer {
         }
 
         self.remap_expr(predicate, &output_to_input)
+    }
+
+    fn remap_predicate_through_project_with_owner(
+        &self,
+        predicate: &Expr,
+        columns: &[xlog_ir::ProjectExpr],
+        scope: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
+    ) -> xlog_core::Result<Option<Expr>> {
+        let _mapping_owner = match scope.as_deref_mut() {
+            Some(scope) => Some(scope.reserve_allocation(
+                crate::compile::hash_allocation_bytes::<usize, usize>(columns.len())?,
+            )?),
+            None => None,
+        };
+        let output_owner = match scope.as_deref_mut() {
+            Some(scope) => Some(scope.reserve_allocation(predicate.owned_allocation_bytes()?)?),
+            None => None,
+        };
+        let output = self.remap_predicate_through_project(predicate, columns);
+        if output.is_some() {
+            if let (Some(scope), Some(owner)) = (scope.as_deref_mut(), output_owner) {
+                scope.retain(owner)?;
+            }
+        }
+        Ok(output)
     }
 
     /// Recursively remaps column references in an expression.
@@ -637,42 +803,102 @@ impl Optimizer {
         predicate: &Expr,
         left_width: usize,
     ) -> (Vec<Expr>, Vec<Expr>, Vec<Expr>) {
+        self.split_predicate_for_join_with_owner(predicate, left_width, &mut None)
+            .expect("ordinary predicate splitting has no allocation callback")
+    }
+
+    fn split_predicate_for_join_with_owner(
+        &self,
+        predicate: &Expr,
+        left_width: usize,
+        scope: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
+    ) -> xlog_core::Result<(Vec<Expr>, Vec<Expr>, Vec<Expr>)> {
         let mut left_preds = Vec::new();
         let mut right_preds = Vec::new();
         let mut remaining = Vec::new();
 
         // Flatten AND expressions
-        let conjuncts = Self::flatten_and(predicate);
+        let conjuncts = Self::flatten_and_with_owner(predicate, scope)?;
 
         for conj in conjuncts {
+            let _column_owner = match scope.as_deref_mut() {
+                Some(scope) => {
+                    Some(scope.reserve_allocation(column_collection_allocation_bytes(&conj)?.1)?)
+                }
+                None => None,
+            };
             let cols = Self::collect_columns(&conj);
             let max_col = cols.iter().copied().max().unwrap_or(0);
             let min_col = cols.iter().copied().min().unwrap_or(0);
 
             if cols.is_empty() {
                 // No columns referenced, can push to either side
+                if left_preds.len() == left_preds.capacity() {
+                    reserve_optimizer_vector::<Expr>(scope, left_preds.len() + 1)?;
+                }
                 left_preds.push(conj);
             } else if max_col < left_width {
                 // All columns from left side
+                if left_preds.len() == left_preds.capacity() {
+                    reserve_optimizer_vector::<Expr>(scope, left_preds.len() + 1)?;
+                }
                 left_preds.push(conj);
             } else if min_col >= left_width {
                 // All columns from right side - need to remap
+                if scope.is_some() {
+                    reserve_optimizer(scope, conj.owned_allocation_bytes()?)?;
+                }
                 let remapped = Self::remap_columns(&conj, |c| c - left_width);
+                if right_preds.len() == right_preds.capacity() {
+                    reserve_optimizer_vector::<Expr>(scope, right_preds.len() + 1)?;
+                }
                 right_preds.push(remapped);
             } else {
                 // References both sides, cannot push
+                if remaining.len() == remaining.capacity() {
+                    reserve_optimizer_vector::<Expr>(scope, remaining.len() + 1)?;
+                }
                 remaining.push(conj);
             }
         }
 
-        (left_preds, right_preds, remaining)
+        Ok((left_preds, right_preds, remaining))
     }
 
     /// Flattens nested AND expressions into a list of conjuncts.
     fn flatten_and(expr: &Expr) -> Vec<Expr> {
+        Self::flatten_and_with_owner(expr, &mut None)
+            .expect("ordinary conjunction flattening has no allocation callback")
+    }
+
+    fn flatten_and_with_owner(
+        expr: &Expr,
+        scope: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
+    ) -> xlog_core::Result<Vec<Expr>> {
         match expr {
-            Expr::And(exprs) => exprs.iter().flat_map(Self::flatten_and).collect(),
-            other => vec![other.clone()],
+            Expr::And(exprs) => {
+                let mut out = Vec::new();
+                for expression in exprs {
+                    let children = Self::flatten_and_with_owner(expression, scope)?;
+                    reserve_optimizer_vector::<Expr>(
+                        scope,
+                        out.len().checked_add(children.len()).ok_or_else(|| {
+                            xlog_core::XlogError::Compilation(
+                                "conjunction allocation extent overflow".into(),
+                            )
+                        })?,
+                    )?;
+                    out.extend(children);
+                }
+                Ok(out)
+            }
+            other => {
+                reserve_optimizer_vector::<Expr>(scope, 1)?;
+                if scope.is_some() {
+                    reserve_optimizer(scope, other.owned_allocation_bytes()?)?;
+                }
+                Ok(vec![other.clone()])
+            }
         }
     }
 
@@ -1330,6 +1556,25 @@ pub mod selectivity_pass {
     /// `StatsManager` entries either, the safety floor leaves
     /// every body unchanged (legacy no-op behavior preserved).
     pub fn run(plan: &mut ExecutionPlan, stats: &StatsManager, rel_ids: &HashMap<String, RelId>) {
+        run_core(plan, stats, rel_ids, &mut None)
+            .expect("ordinary selectivity rewriting has no allocation callback");
+    }
+
+    pub fn run_with_allocation_owner(
+        plan: &mut ExecutionPlan,
+        stats: &StatsManager,
+        rel_ids: &HashMap<String, RelId>,
+        scope: &mut crate::compile::CompilationAllocationScope<'_>,
+    ) -> xlog_core::Result<()> {
+        run_core(plan, stats, rel_ids, &mut Some(scope))
+    }
+
+    fn run_core(
+        plan: &mut ExecutionPlan,
+        stats: &StatsManager,
+        rel_ids: &HashMap<String, RelId>,
+        scope: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
+    ) -> xlog_core::Result<()> {
         // `rel_ids` is reserved for future shape-extension
         // work; the current rewriters operate on RelIds
         // directly from the body's Scans, so the map isn't
@@ -1338,15 +1583,68 @@ pub mod selectivity_pass {
         let _ = rel_ids;
         for rules in plan.rules_by_scc.iter_mut() {
             for rule in rules.iter_mut() {
-                if let Some(rewritten) = super::reorder::try_reorder_triangle(&rule.body, stats) {
+                let triangle_owner = match scope.as_deref_mut() {
+                    Some(scope) => Some(scope.reserve_allocation(reorder_allocation_bytes(3)?)?),
+                    None => None,
+                };
+                if let Some(rewritten) =
+                    super::reorder::try_reorder_triangle_with_owner(&rule.body, stats, scope)?
+                {
+                    if let (Some(scope), Some(owner)) = (scope.as_deref_mut(), triangle_owner) {
+                        scope.retain(owner)?;
+                    }
                     rule.body = rewritten;
                     continue;
                 }
-                if let Some(rewritten) = super::reorder::try_reorder_4cycle(&rule.body, stats) {
+                drop(triangle_owner);
+                let cycle_owner = match scope.as_deref_mut() {
+                    Some(scope) => Some(scope.reserve_allocation(reorder_allocation_bytes(4)?)?),
+                    None => None,
+                };
+                if let Some(rewritten) =
+                    super::reorder::try_reorder_4cycle_with_owner(&rule.body, stats, scope)?
+                {
+                    if let (Some(scope), Some(owner)) = (scope.as_deref_mut(), cycle_owner) {
+                        scope.retain(owner)?;
+                    }
                     rule.body = rewritten;
                 }
             }
         }
+        Ok(())
+    }
+
+    fn reorder_allocation_bytes(atoms: usize) -> xlog_core::Result<u64> {
+        let overflow = || {
+            xlog_core::XlogError::Compilation(
+                "selectivity rewrite allocation extent overflow".into(),
+            )
+        };
+        let nodes = atoms
+            .checked_mul(2)
+            .and_then(|n| n.checked_sub(1))
+            .ok_or_else(overflow)?;
+        let mut bytes = (nodes as u64)
+            .checked_mul(std::mem::size_of::<xlog_ir::RirNode>() as u64)
+            .ok_or_else(overflow)?;
+        bytes = bytes
+            .checked_add(crate::compile::hash_allocation_bytes::<u8, u8>(
+                atoms.checked_mul(2).ok_or_else(overflow)?,
+            )?)
+            .ok_or_else(overflow)?;
+        // Each original inner/outer join owns separate left/right key vectors.
+        for join in 0..atoms.saturating_sub(1) {
+            let keys = if join + 1 == atoms - 1 { 2 } else { 1 };
+            let pair = crate::compile::push_vector_allocation_bytes::<usize>(keys)?
+                .checked_mul(2)
+                .ok_or_else(overflow)?;
+            bytes = bytes.checked_add(pair).ok_or_else(overflow)?;
+        }
+        bytes
+            .checked_add(crate::compile::push_vector_allocation_bytes::<
+                xlog_ir::ProjectExpr,
+            >(atoms)?)
+            .ok_or_else(overflow)
     }
 }
 
@@ -1358,6 +1656,157 @@ pub mod helper_split_pass {
     use xlog_ir::rir::{HelperSplitSpec, KCliqueVariableOrder};
     use xlog_ir::{CompiledRule, ExecutionPlan, JoinType, ProjectExpr, RirMeta, RirNode, Scc};
     use xlog_stats::StatsManager;
+
+    fn checked_extent(bytes: Option<u64>) -> xlog_core::Result<u64> {
+        bytes.ok_or_else(|| {
+            xlog_core::XlogError::Compilation("helper allocation extent overflow".into())
+        })
+    }
+
+    fn graph_allocation_geometry(
+        node: &RirNode,
+        schemas: &HashMap<RelId, Schema>,
+    ) -> xlog_core::Result<(usize, usize, usize, u64)> {
+        use crate::compile::push_vector_allocation_bytes as vector;
+        match node {
+            RirNode::Scan { rel } => {
+                let width = schemas.get(rel).map(Schema::arity).unwrap_or(0);
+                Ok((
+                    1,
+                    width,
+                    0,
+                    checked_extent(vector::<RelId>(1)?.checked_add(vector::<usize>(width)?))?,
+                ))
+            }
+            RirNode::Join {
+                left,
+                right,
+                left_keys,
+                right_keys,
+                join_type,
+            } if *join_type == JoinType::Inner => {
+                let (left_leaves, left_width, left_equalities, left_bytes) =
+                    graph_allocation_geometry(left, schemas)?;
+                let (right_leaves, right_width, right_equalities, right_bytes) =
+                    graph_allocation_geometry(right, schemas)?;
+                let overflow = || {
+                    xlog_core::XlogError::Compilation(
+                        "helper graph allocation extent overflow".into(),
+                    )
+                };
+                let leaves = left_leaves.checked_add(right_leaves).ok_or_else(overflow)?;
+                let width = left_width.checked_add(right_width).ok_or_else(overflow)?;
+                let equalities = left_equalities
+                    .checked_add(right_equalities)
+                    .and_then(|n| n.checked_add(left_keys.len().min(right_keys.len())))
+                    .ok_or_else(overflow)?;
+                let bytes = checked_extent(
+                    left_bytes
+                        .checked_add(right_bytes)
+                        .and_then(|n| n.checked_add(vector::<RelId>(leaves).ok()?))
+                        .and_then(|n| n.checked_add(vector::<usize>(right_width).ok()?))
+                        .and_then(|n| n.checked_add(vector::<usize>(width).ok()?))
+                        .and_then(|n| n.checked_add(vector::<(usize, usize)>(equalities).ok()?)),
+                )?;
+                Ok((leaves, width, equalities, bytes))
+            }
+            _ => Ok((0, 0, 0, 0)),
+        }
+    }
+
+    fn linear_allocation_bytes(
+        body: &RirNode,
+        schemas: &HashMap<RelId, Schema>,
+    ) -> xlog_core::Result<u64> {
+        use crate::compile::push_vector_allocation_bytes as vector;
+        let RirNode::Project { input, columns } = body else {
+            return Ok(0);
+        };
+        let (leaves, width, _, mut bytes) = graph_allocation_geometry(input, schemas)?;
+        // Original offsets, union-find parent, per-leaf/final equivalence
+        // classes, derived left-deep key arrays and current-class workspace.
+        for extent in [
+            vector::<usize>(leaves)?,
+            vector::<usize>(width)?,
+            vector::<Vec<u32>>(leaves)?,
+            vector::<u32>(width)?,
+            vector::<u32>(width)?,
+            vector::<JoinStep>(leaves.saturating_sub(1))?,
+            vector::<usize>(width)?,
+            vector::<usize>(width)?,
+            vector::<u32>(width)?,
+            vector::<ProjectExpr>(columns.len())?,
+        ] {
+            bytes = checked_extent(bytes.checked_add(extent))?;
+        }
+        for column in columns {
+            if let ProjectExpr::Computed(expression, _) = column {
+                bytes = checked_extent(bytes.checked_add(expression.owned_allocation_bytes()?))?;
+            }
+        }
+        Ok(bytes)
+    }
+
+    fn candidate_allocation_bytes(
+        linear: &LinearBody,
+        schemas: &HashMap<RelId, Schema>,
+        pair_start: usize,
+    ) -> xlog_core::Result<u64> {
+        use crate::compile::{
+            formatted_text_allocation_bytes as text, hash_allocation_bytes as hash,
+            push_vector_allocation_bytes as vector,
+        };
+        let left = schemas
+            .get(&linear.leaves[pair_start])
+            .map(Schema::arity)
+            .unwrap_or(0);
+        let right = schemas
+            .get(&linear.leaves[pair_start + 1])
+            .map(Schema::arity)
+            .unwrap_or(0);
+        let width = left.checked_add(right).ok_or_else(|| {
+            xlog_core::XlogError::Compilation("helper candidate allocation extent overflow".into())
+        })?;
+        let all = linear
+            .leaf_classes
+            .iter()
+            .try_fold(0usize, |n, classes| n.checked_add(classes.len()))
+            .ok_or_else(|| {
+                xlog_core::XlogError::Compilation("helper class allocation extent overflow".into())
+            })?;
+        let keys = linear
+            .joins
+            .get(pair_start)
+            .map(|step| step.left_keys.len())
+            .unwrap_or(0);
+        let mut bytes = 0u64;
+        for extent in [
+            vector::<usize>(keys)?,
+            vector::<usize>(keys)?,
+            hash::<u32, ()>(keys)?,
+            hash::<u32, ()>(all)?,
+            hash::<u32, ()>(linear.project.len())?,
+            vector::<u32>(width)?,
+            vector::<ProjectExpr>(width)?,
+            vector::<(String, ScalarType)>(width)?,
+            vector::<usize>(width)?,
+            vector::<String>(width)?,
+        ] {
+            bytes = checked_extent(bytes.checked_add(extent))?;
+        }
+        for index in 0..width {
+            bytes = checked_extent(
+                bytes.checked_add(text(format_args!("c{index}"))?.checked_mul(2).ok_or_else(
+                    || {
+                        xlog_core::XlogError::Compilation(
+                            "helper text allocation extent overflow".into(),
+                        )
+                    },
+                )?),
+            )?;
+        }
+        Ok(bytes)
+    }
 
     const HEAVY_SKEW_RATIO: f64 = 10.0;
 
@@ -1400,6 +1849,7 @@ pub mod helper_split_pass {
         helper_join_left_keys: Vec<usize>,
         helper_join_right_keys: Vec<usize>,
         exposed_classes: Vec<u32>,
+        allocation_receipt: Option<std::sync::Arc<dyn Send + Sync>>,
     }
 
     struct Rewrite {
@@ -1426,15 +1876,71 @@ pub mod helper_split_pass {
     where
         F: FnMut(Schema) -> (String, RelId),
     {
+        run_core(plan, schemas, stats, &mut None, &mut |schema, _| {
+            Ok(allocate(schema))
+        })
+        .expect("ordinary helper splitting has no allocation callback")
+    }
+
+    pub fn run_with_allocation_owner<'pool, F>(
+        plan: &mut ExecutionPlan,
+        schemas: &HashMap<RelId, Schema>,
+        stats: &StatsManager,
+        scope: &mut crate::compile::CompilationAllocationScope<'pool>,
+        mut allocate: F,
+    ) -> xlog_core::Result<Vec<HelperRelationSpec>>
+    where
+        F: FnMut(
+            Schema,
+            &mut crate::compile::CompilationAllocationScope<'pool>,
+        ) -> xlog_core::Result<(String, RelId)>,
+    {
+        run_core(
+            plan,
+            schemas,
+            stats,
+            &mut Some(scope),
+            &mut |schema, scope| {
+                allocate(
+                    schema,
+                    scope
+                        .as_deref_mut()
+                        .expect("original helper allocation scope"),
+                )
+            },
+        )
+    }
+
+    fn run_core<'pool, F>(
+        plan: &mut ExecutionPlan,
+        schemas: &HashMap<RelId, Schema>,
+        stats: &StatsManager,
+        scope: &mut Option<&mut crate::compile::CompilationAllocationScope<'pool>>,
+        allocate: &mut F,
+    ) -> xlog_core::Result<Vec<HelperRelationSpec>>
+    where
+        F: FnMut(
+            Schema,
+            &mut Option<&mut crate::compile::CompilationAllocationScope<'pool>>,
+        ) -> xlog_core::Result<(String, RelId)>,
+    {
         let mut specs = Vec::new();
         for scc_idx in 0..plan.rules_by_scc.len() {
             let mut rule_idx = 0;
             while rule_idx < plan.rules_by_scc[scc_idx].len() {
                 let rewrite = {
                     let rule = &plan.rules_by_scc[scc_idx][rule_idx];
-                    try_rewrite_rule(rule, schemas, stats, &mut allocate)
+                    try_rewrite_rule_with_owner(rule, schemas, stats, allocate, scope)?
                 };
                 if let Some(rewrite) = rewrite {
+                    reserve_rewrite_installation(
+                        plan,
+                        scc_idx,
+                        &rewrite,
+                        specs.len(),
+                        specs.capacity(),
+                        scope,
+                    )?;
                     let helper_rule = CompiledRule {
                         head: rewrite.spec.name.clone(),
                         body: rewrite.helper_body,
@@ -1449,7 +1955,7 @@ pub mod helper_split_pass {
                 rule_idx += 1;
             }
         }
-        specs
+        Ok(specs)
     }
 
     /// K-clique helper split entry for K-clique plans that already carry
@@ -1465,15 +1971,63 @@ pub mod helper_split_pass {
     where
         F: FnMut(Schema) -> (String, RelId),
     {
+        run_kclique_specs_core(plan, schemas, &mut None, &mut |schema, _| {
+            Ok(allocate(schema))
+        })
+        .expect("ordinary helper splitting has no allocation callback")
+    }
+
+    pub fn run_kclique_specs_with_allocation_owner<'pool, F>(
+        plan: &mut ExecutionPlan,
+        schemas: &HashMap<RelId, Schema>,
+        scope: &mut crate::compile::CompilationAllocationScope<'pool>,
+        mut allocate: F,
+    ) -> xlog_core::Result<Vec<HelperRelationSpec>>
+    where
+        F: FnMut(
+            Schema,
+            &mut crate::compile::CompilationAllocationScope<'pool>,
+        ) -> xlog_core::Result<(String, RelId)>,
+    {
+        run_kclique_specs_core(plan, schemas, &mut Some(scope), &mut |schema, scope| {
+            allocate(
+                schema,
+                scope
+                    .as_deref_mut()
+                    .expect("original helper allocation scope"),
+            )
+        })
+    }
+
+    fn run_kclique_specs_core<'pool, F>(
+        plan: &mut ExecutionPlan,
+        schemas: &HashMap<RelId, Schema>,
+        scope: &mut Option<&mut crate::compile::CompilationAllocationScope<'pool>>,
+        allocate: &mut F,
+    ) -> xlog_core::Result<Vec<HelperRelationSpec>>
+    where
+        F: FnMut(
+            Schema,
+            &mut Option<&mut crate::compile::CompilationAllocationScope<'pool>>,
+        ) -> xlog_core::Result<(String, RelId)>,
+    {
         let mut specs = Vec::new();
         for scc_idx in 0..plan.rules_by_scc.len() {
             let mut rule_idx = 0;
             while rule_idx < plan.rules_by_scc[scc_idx].len() {
                 let rewrite = {
                     let rule = &plan.rules_by_scc[scc_idx][rule_idx];
-                    try_rewrite_kclique_rule(rule, schemas, &mut allocate)
+                    try_rewrite_kclique_rule_with_owner(rule, schemas, allocate, scope)?
                 };
                 if let Some(rewrite) = rewrite {
+                    reserve_rewrite_installation(
+                        plan,
+                        scc_idx,
+                        &rewrite,
+                        specs.len(),
+                        specs.capacity(),
+                        scope,
+                    )?;
                     let helper_rule = CompiledRule {
                         head: rewrite.spec.name.clone(),
                         body: rewrite.helper_body,
@@ -1488,7 +2042,7 @@ pub mod helper_split_pass {
                 rule_idx += 1;
             }
         }
-        specs
+        Ok(specs)
     }
 
     fn add_helper_to_scc(sccs: &mut [Scc], scc_idx: usize, helper: &str) {
@@ -1499,21 +2053,132 @@ pub mod helper_split_pass {
         }
     }
 
-    fn try_rewrite_rule<F>(
+    fn reserve_rewrite_installation(
+        plan: &ExecutionPlan,
+        scc_idx: usize,
+        rewrite: &Rewrite,
+        specs_len: usize,
+        specs_capacity: usize,
+        scope: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
+    ) -> xlog_core::Result<()> {
+        if scope.is_none() {
+            return Ok(());
+        }
+        super::reserve_optimizer(scope, rewrite.spec.schema.owned_allocation_bytes()?)?;
+        super::reserve_optimizer(scope, rewrite.spec.name.len() as u64)?;
+        let rules = &plan.rules_by_scc[scc_idx];
+        if rules.len() == rules.capacity() {
+            super::reserve_optimizer_vector::<CompiledRule>(scope, rules.len() + 1)?;
+        }
+        if let Some(scc) = plan.sccs.get(scc_idx) {
+            if !scc.predicates.contains(&rewrite.spec.name) {
+                super::reserve_optimizer(scope, rewrite.spec.name.len() as u64)?;
+                if scc.predicates.len() == scc.predicates.capacity() {
+                    super::reserve_optimizer_vector::<String>(scope, scc.predicates.len() + 1)?;
+                }
+            }
+        }
+        if specs_len == specs_capacity {
+            super::reserve_optimizer_vector::<HelperRelationSpec>(scope, specs_len + 1)?;
+        }
+        Ok(())
+    }
+
+    fn helper_output_allocation_bytes(
+        linear: &LinearBody,
+        candidate: &Candidate,
+    ) -> xlog_core::Result<u64> {
+        use crate::compile::push_vector_allocation_bytes as vector;
+        let mut bytes = 3 * std::mem::size_of::<RirNode>() as u64;
+        for extent in [
+            vector::<usize>(candidate.helper_join_left_keys.len())?,
+            vector::<usize>(candidate.helper_join_right_keys.len())?,
+            vector::<ProjectExpr>(candidate.helper_project.len())?,
+        ] {
+            bytes = checked_extent(bytes.checked_add(extent))?;
+        }
+        let mut classes = linear.leaf_classes.first().map(Vec::len).unwrap_or(0);
+        bytes = checked_extent(bytes.checked_add(vector::<u32>(classes)?))?;
+        for leaf_idx in 1..linear.leaves.len() {
+            if leaf_idx == candidate.pair_start + 1 {
+                continue;
+            }
+            let step = &linear.joins[leaf_idx - 1];
+            bytes = checked_extent(
+                bytes
+                    .checked_add(2 * std::mem::size_of::<RirNode>() as u64)
+                    .and_then(|n| n.checked_add(vector::<usize>(step.left_keys.len()).ok()?))
+                    .and_then(|n| n.checked_add(vector::<usize>(step.right_keys.len()).ok()?)),
+            )?;
+            classes = classes
+                .checked_add(if leaf_idx == candidate.pair_start {
+                    candidate.exposed_classes.len()
+                } else {
+                    linear.leaf_classes[leaf_idx].len()
+                })
+                .ok_or_else(|| {
+                    xlog_core::XlogError::Compilation(
+                        "helper output class allocation extent overflow".into(),
+                    )
+                })?;
+            bytes = checked_extent(bytes.checked_add(vector::<u32>(classes)?))?;
+        }
+        checked_extent(
+            bytes
+                .checked_add(std::mem::size_of::<RirNode>() as u64)
+                .and_then(|n| n.checked_add(vector::<ProjectExpr>(linear.project.len()).ok()?)),
+        )
+    }
+
+    fn try_rewrite_rule_with_owner<'pool, F>(
         rule: &CompiledRule,
         schemas: &HashMap<RelId, Schema>,
         stats: &StatsManager,
         allocate: &mut F,
-    ) -> Option<Rewrite>
+        scope: &mut Option<&mut crate::compile::CompilationAllocationScope<'pool>>,
+    ) -> xlog_core::Result<Option<Rewrite>>
     where
-        F: FnMut(Schema) -> (String, RelId),
+        F: FnMut(
+            Schema,
+            &mut Option<&mut crate::compile::CompilationAllocationScope<'pool>>,
+        ) -> xlog_core::Result<(String, RelId)>,
     {
-        let linear = linearize_project_body(&rule.body, schemas)?;
-        let candidate = choose_candidate(&linear, schemas, stats)?;
-        let (helper_name, helper_rel) = allocate(candidate.helper_schema.clone());
+        let _linear_owner = match scope.as_deref_mut() {
+            Some(scope) => {
+                Some(scope.reserve_allocation(linear_allocation_bytes(&rule.body, schemas)?)?)
+            }
+            None => None,
+        };
+        let Some(linear) = linearize_project_body(&rule.body, schemas) else {
+            return Ok(None);
+        };
+        let Some(mut candidate) = choose_candidate_with_owner(&linear, schemas, stats, scope)?
+        else {
+            return Ok(None);
+        };
+        if scope.is_some() {
+            super::reserve_optimizer(scope, candidate.helper_schema.owned_allocation_bytes()?)?;
+        }
+        let (helper_name, helper_rel) = allocate(candidate.helper_schema.clone(), scope)?;
+        let output_owner = match scope.as_deref_mut() {
+            Some(scope) => Some(
+                scope.reserve_allocation(helper_output_allocation_bytes(&linear, &candidate)?)?,
+            ),
+            None => None,
+        };
         let helper_body = build_helper_body(&linear, &candidate);
-        let outer_body = build_outer_body(&linear, &candidate, helper_rel)?;
-        Some(Rewrite {
+        let Some(outer_body) = build_outer_body(&linear, &candidate, helper_rel) else {
+            return Ok(None);
+        };
+        if let Some(scope) = scope.as_deref_mut() {
+            if let Some(owner) = output_owner {
+                scope.retain(owner)?;
+            }
+            if let Some(owner) = candidate.allocation_receipt.take() {
+                scope.retain(owner)?;
+            }
+        }
+        Ok(Some(Rewrite {
             helper_body,
             outer_body,
             spec: HelperRelationSpec {
@@ -1525,35 +2190,78 @@ pub mod helper_split_pass {
                     linear.leaves[candidate.pair_start + 1],
                 ],
             },
-        })
+        }))
     }
 
-    fn try_rewrite_kclique_rule<F>(
+    fn try_rewrite_kclique_rule_with_owner<'pool, F>(
         rule: &CompiledRule,
         schemas: &HashMap<RelId, Schema>,
         allocate: &mut F,
-    ) -> Option<Rewrite>
+        scope: &mut Option<&mut crate::compile::CompilationAllocationScope<'pool>>,
+    ) -> xlog_core::Result<Option<Rewrite>>
     where
-        F: FnMut(Schema) -> (String, RelId),
+        F: FnMut(
+            Schema,
+            &mut Option<&mut crate::compile::CompilationAllocationScope<'pool>>,
+        ) -> xlog_core::Result<(String, RelId)>,
     {
         if !matches!(&rule.body, RirNode::MultiWayJoin { .. }) {
-            return None;
+            return Ok(None);
         }
+        let output_owner = match scope.as_deref_mut() {
+            Some(scope) => Some(scope.reserve_allocation(rule.body.owned_allocation_bytes()?)?),
+            None => None,
+        };
         let mut outer_body = rule.body.clone();
         let RirNode::MultiWayJoin {
             inputs, var_order, ..
         } = &mut outer_body
         else {
-            return None;
+            return Ok(None);
         };
-        let kclique = var_order.as_ref()?.kclique.as_ref()?;
-        let spec = kclique.helper_split_specs.first()?;
-        let (hot_left, hot_right, target) = kclique_helper_edges(inputs, kclique, spec)?;
-        let helper_schema = schemas.get(&target.rel)?.clone();
-        let (helper_name, helper_rel) = allocate(helper_schema.clone());
-        let helper_body = build_kclique_helper_body(spec, hot_left, hot_right, target)?;
-        *inputs.get_mut(target.slot)? = RirNode::Scan { rel: helper_rel };
-        Some(Rewrite {
+        let Some(kclique) = var_order.as_ref().and_then(|order| order.kclique.as_ref()) else {
+            return Ok(None);
+        };
+        let Some(spec) = kclique.helper_split_specs.first() else {
+            return Ok(None);
+        };
+        let _edge_owner = match scope.as_deref_mut() {
+            Some(scope) => Some(scope.reserve_allocation(
+                crate::compile::push_vector_allocation_bytes::<KCliqueHelperEdge>(
+                    spec.edge_slots.len(),
+                )?,
+            )?),
+            None => None,
+        };
+        let Some((hot_left, hot_right, target)) = kclique_helper_edges(inputs, kclique, spec)
+        else {
+            return Ok(None);
+        };
+        let Some(schema) = schemas.get(&target.rel) else {
+            return Ok(None);
+        };
+        if scope.is_some() {
+            super::reserve_optimizer(scope, schema.owned_allocation_bytes()?)?;
+            super::reserve_optimizer(scope, schema.owned_allocation_bytes()?)?;
+            super::reserve_optimizer(scope, 5 * std::mem::size_of::<RirNode>() as u64)?;
+            for count in [1, 1, 2, 2] {
+                super::reserve_optimizer_vector::<usize>(scope, count)?;
+            }
+            super::reserve_optimizer_vector::<ProjectExpr>(scope, 2)?;
+        }
+        let helper_schema = schema.clone();
+        let (helper_name, helper_rel) = allocate(helper_schema.clone(), scope)?;
+        let Some(helper_body) = build_kclique_helper_body(spec, hot_left, hot_right, target) else {
+            return Ok(None);
+        };
+        let Some(target) = inputs.get_mut(target.slot) else {
+            return Ok(None);
+        };
+        *target = RirNode::Scan { rel: helper_rel };
+        if let (Some(scope), Some(owner)) = (scope.as_deref_mut(), output_owner) {
+            scope.retain(owner)?;
+        }
+        Ok(Some(Rewrite {
             helper_body,
             outer_body,
             spec: HelperRelationSpec {
@@ -1562,7 +2270,7 @@ pub mod helper_split_pass {
                 schema: helper_schema,
                 source_rels: [hot_left.rel, hot_right.rel],
             },
-        })
+        }))
     }
 
     fn kclique_helper_edges(
@@ -1820,18 +2528,28 @@ pub mod helper_split_pass {
         Some(joins)
     }
 
-    fn choose_candidate(
+    fn choose_candidate_with_owner(
         linear: &LinearBody,
         schemas: &HashMap<RelId, Schema>,
         stats: &StatsManager,
-    ) -> Option<Candidate> {
+        scope: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
+    ) -> xlog_core::Result<Option<Candidate>> {
         for pair_start in 3..linear.leaves.len().saturating_sub(1) {
-            let candidate = build_candidate(linear, schemas, pair_start)?;
+            let allocation_receipt = match scope.as_deref_mut() {
+                Some(scope) => Some(scope.reserve_allocation(candidate_allocation_bytes(
+                    linear, schemas, pair_start,
+                )?)?),
+                None => None,
+            };
+            let Some(mut candidate) = build_candidate(linear, schemas, pair_start) else {
+                return Ok(None);
+            };
+            candidate.allocation_receipt = allocation_receipt;
             if skew_ratio_for_candidate(linear, stats, &candidate) >= HEAVY_SKEW_RATIO {
-                return Some(candidate);
+                return Ok(Some(candidate));
             }
         }
-        None
+        Ok(None)
     }
 
     fn build_candidate(
@@ -1904,6 +2622,7 @@ pub mod helper_split_pass {
             helper_join_left_keys: helper_left_keys,
             helper_join_right_keys: helper_right_keys,
             exposed_classes,
+            allocation_receipt: None,
         })
     }
 
@@ -2537,13 +3256,20 @@ mod reorder {
         }
     }
 
-    pub(super) fn try_reorder_triangle(body: &RirNode, stats: &StatsManager) -> Option<RirNode> {
-        let s = match_and_infer_triangle(body)?;
-        let _ = (
-            populated_card(stats, s.rel_xy)?,
-            populated_card(stats, s.rel_yz)?,
-            populated_card(stats, s.rel_xz)?,
-        );
+    pub(super) fn try_reorder_triangle_with_owner(
+        body: &RirNode,
+        stats: &StatsManager,
+        scope: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
+    ) -> xlog_core::Result<Option<RirNode>> {
+        let Some(s) = match_and_infer_triangle(body) else {
+            return Ok(None);
+        };
+        if [s.rel_xy, s.rel_yz, s.rel_xz]
+            .iter()
+            .any(|rel| populated_card(stats, *rel).is_none())
+        {
+            return Ok(None);
+        }
         let est_y = stats.estimate_join_cardinality(s.rel_xy, s.rel_yz, &[1], &[0]);
         let est_x = stats.estimate_join_cardinality(s.rel_xy, s.rel_xz, &[0], &[0]);
         let est_z = stats.estimate_join_cardinality(s.rel_yz, s.rel_xz, &[1], &[1]);
@@ -2560,10 +3286,10 @@ mod reorder {
         // PartialEq, so compare via Debug — bodies are small
         // (≤ 6 Scans + 2 Joins + 1 Project) so the cost is
         // negligible relative to the optimizer's broader work.
-        if format!("{:?}", candidate) == format!("{:?}", body) {
-            return None;
+        if same_body_with_owner(&candidate, body, scope)? {
+            return Ok(None);
         }
-        Some(candidate)
+        Ok(Some(candidate))
     }
 
     // ---------------------------------------------------------
@@ -2811,14 +3537,20 @@ mod reorder {
         }
     }
 
-    pub(super) fn try_reorder_4cycle(body: &RirNode, stats: &StatsManager) -> Option<RirNode> {
-        let s = match_and_infer_4cycle(body)?;
-        let _ = (
-            populated_card(stats, s.rel_wx)?,
-            populated_card(stats, s.rel_xy)?,
-            populated_card(stats, s.rel_yz)?,
-            populated_card(stats, s.rel_zw)?,
-        );
+    pub(super) fn try_reorder_4cycle_with_owner(
+        body: &RirNode,
+        stats: &StatsManager,
+        scope: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
+    ) -> xlog_core::Result<Option<RirNode>> {
+        let Some(s) = match_and_infer_4cycle(body) else {
+            return Ok(None);
+        };
+        if [s.rel_wx, s.rel_xy, s.rel_yz, s.rel_zw]
+            .iter()
+            .any(|rel| populated_card(stats, *rel).is_none())
+        {
+            return Ok(None);
+        }
         let est_default = stats
             .estimate_join_cardinality(s.rel_wx, s.rel_xy, &[1], &[0])
             .saturating_add(stats.estimate_join_cardinality(s.rel_yz, s.rel_zw, &[1], &[0]));
@@ -2831,10 +3563,34 @@ mod reorder {
             Cycle4Grouping::Default
         };
         let candidate = build_4cycle_body(&s, chosen);
-        if format!("{:?}", candidate) == format!("{:?}", body) {
-            return None;
+        if same_body_with_owner(&candidate, body, scope)? {
+            return Ok(None);
         }
-        Some(candidate)
+        Ok(Some(candidate))
+    }
+
+    fn same_body_with_owner(
+        candidate: &RirNode,
+        original: &RirNode,
+        scope: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
+    ) -> xlog_core::Result<bool> {
+        let _comparison_owner = match scope.as_deref_mut() {
+            Some(scope) => {
+                let bytes =
+                    crate::compile::formatted_text_allocation_bytes(format_args!("{candidate:?}"))?
+                        .checked_add(crate::compile::formatted_text_allocation_bytes(
+                            format_args!("{original:?}"),
+                        )?)
+                        .ok_or_else(|| {
+                            xlog_core::XlogError::Compilation(
+                                "rewrite comparison allocation extent overflow".into(),
+                            )
+                        })?;
+                Some(scope.reserve_allocation(bytes)?)
+            }
+            None => None,
+        };
+        Ok(format!("{candidate:?}") == format!("{original:?}"))
     }
 }
 

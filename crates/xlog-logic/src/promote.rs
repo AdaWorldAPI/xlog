@@ -93,6 +93,283 @@ use crate::hypergraph::var_order::{
 use crate::hypergraph::VertexId;
 use crate::wcoj_var_ordering::{wcoj_cost_gate_predicts_wcoj, WcojVariableOrderingModel};
 
+#[derive(Clone, Copy)]
+enum PromotionShape {
+    Chain,
+    Triangle,
+    Cycle,
+    General,
+    Clique(usize),
+}
+
+fn promotion_allocation_bytes(
+    body: &RirNode,
+    arities: &HashMap<RelId, usize>,
+    shape: PromotionShape,
+) -> xlog_core::Result<u64> {
+    use crate::compile::{hash_allocation_bytes as hash, push_vector_allocation_bytes as vector};
+    let overflow =
+        || xlog_core::XlogError::Compilation("promotion allocation extent overflow".into());
+    fn graph(
+        node: &RirNode,
+        arities: &HashMap<RelId, usize>,
+        binary: bool,
+    ) -> xlog_core::Result<(usize, usize, usize)> {
+        let overflow = || {
+            xlog_core::XlogError::Compilation("promotion graph allocation extent overflow".into())
+        };
+        match node {
+            RirNode::Scan { rel } => Ok((
+                1,
+                if binary {
+                    2
+                } else {
+                    arities.get(rel).copied().unwrap_or(0)
+                },
+                0,
+            )),
+            RirNode::Project { input, .. } => graph(input, arities, binary),
+            RirNode::Join {
+                left,
+                right,
+                left_keys,
+                right_keys,
+                join_type,
+            } if *join_type == JoinType::Inner => {
+                let (left_scans, left_width, left_keys_count) = graph(left, arities, binary)?;
+                let (right_scans, right_width, right_keys_count) = graph(right, arities, binary)?;
+                Ok((
+                    left_scans.checked_add(right_scans).ok_or_else(overflow)?,
+                    left_width.checked_add(right_width).ok_or_else(overflow)?,
+                    left_keys_count
+                        .checked_add(right_keys_count)
+                        .and_then(|n| n.checked_add(left_keys.len().min(right_keys.len())))
+                        .ok_or_else(overflow)?,
+                ))
+            }
+            _ => Ok((0, 0, 0)),
+        }
+    }
+    let columns = match body {
+        RirNode::Project { columns, .. } => columns.as_slice(),
+        _ => &[],
+    };
+    let (atoms, width, keys) = graph(body, arities, !matches!(shape, PromotionShape::General))?;
+    let mut bytes = body.owned_allocation_bytes()?;
+    // The original fallback is one exact subtree clone. Projection clones
+    // are separate from that fallback, including computed expression owners.
+    bytes = bytes
+        .checked_add(vector::<ProjectExpr>(columns.len())?)
+        .ok_or_else(overflow)?;
+    for column in columns {
+        if let ProjectExpr::Computed(expression, _) = column {
+            bytes = bytes
+                .checked_add(expression.owned_allocation_bytes()?)
+                .ok_or_else(overflow)?;
+        }
+    }
+    match shape {
+        PromotionShape::Chain => {
+            bytes = bytes
+                .checked_add(2 * std::mem::size_of::<RirNode>() as u64)
+                .ok_or_else(overflow)?
+        }
+        PromotionShape::Triangle | PromotionShape::Cycle => {
+            let count = if matches!(shape, PromotionShape::Triangle) {
+                3
+            } else {
+                4
+            };
+            for extent in [
+                hash::<u8, u8>(2 * count)?,
+                vector::<RirNode>(count)?,
+                vector::<Vec<Option<u32>>>(count)?,
+                vector::<xlog_ir::rir::LookupPerm>(count)?,
+                vector::<ProjectExpr>(count)?,
+            ] {
+                bytes = bytes.checked_add(extent).ok_or_else(overflow)?;
+            }
+            bytes = bytes
+                .checked_add(
+                    vector::<Option<u32>>(2)?
+                        .checked_mul(count as u64)
+                        .ok_or_else(overflow)?,
+                )
+                .ok_or_else(overflow)?;
+        }
+        PromotionShape::General | PromotionShape::Clique(_) => {
+            for extent in [
+                vector::<RelId>(atoms)?,
+                vector::<usize>(atoms)?,
+                vector::<(usize, usize)>(keys)?,
+                vector::<usize>(width)?,
+                hash::<usize, u32>(width)?,
+                vector::<u32>(width)?,
+                vector::<RirNode>(atoms)?,
+                vector::<Vec<Option<u32>>>(atoms)?,
+                vector::<Option<u32>>(width)?,
+            ] {
+                bytes = bytes.checked_add(extent).ok_or_else(overflow)?;
+            }
+            if let PromotionShape::Clique(k) = shape {
+                for extent in [
+                    vector::<usize>(k)?,
+                    vector::<usize>(k)?,
+                    hash::<usize, usize>(width)?,
+                    hash::<usize, usize>(k)?,
+                    vector::<(usize, usize)>(atoms)?,
+                    hash::<(usize, usize), usize>(atoms)?,
+                    vector::<RelId>(atoms)?,
+                    vector::<KCliqueEdge>(atoms)?,
+                    vector::<ColumnSwap>(atoms)?,
+                    vector::<u8>(1)?,
+                    vector::<Vec<u8>>(1)?,
+                    vector::<u8>(2)?,
+                ] {
+                    bytes = bytes.checked_add(extent).ok_or_else(overflow)?;
+                }
+            }
+        }
+    }
+    Ok(bytes)
+}
+
+fn promotion_attempt<F>(
+    body: &RirNode,
+    arities: &HashMap<RelId, usize>,
+    shape: PromotionShape,
+    scope: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
+    attempt: F,
+) -> xlog_core::Result<Option<RirNode>>
+where
+    F: FnOnce() -> Option<RirNode>,
+{
+    let receipt = match scope.as_deref_mut() {
+        Some(scope) => {
+            Some(scope.reserve_allocation(promotion_allocation_bytes(body, arities, shape)?)?)
+        }
+        None => None,
+    };
+    let result = attempt();
+    if result.is_some() {
+        if let (Some(scope), Some(receipt)) = (scope.as_deref_mut(), receipt) {
+            scope.retain(receipt)?;
+        }
+    }
+    Ok(result)
+}
+
+fn aggregate_attempt<F>(
+    body: &mut RirNode,
+    arities: &HashMap<RelId, usize>,
+    shape: PromotionShape,
+    scope: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
+    attempt: F,
+) -> xlog_core::Result<bool>
+where
+    F: FnOnce(&mut RirNode) -> bool,
+{
+    let checkpoint = scope.as_deref().map(|scope| scope.receipt_checkpoint());
+    match scope.as_deref_mut() {
+        Some(scope) => {
+            let bytes = aggregate_allocation_bytes(body, arities, shape)?;
+            scope.acquire(bytes)?;
+        }
+        None => {}
+    }
+    let result = attempt(body);
+    if !result {
+        if let (Some(scope), Some(checkpoint)) = (scope.as_deref_mut(), checkpoint) {
+            scope.retire_since(checkpoint)?;
+        }
+    }
+    Ok(result)
+}
+
+fn aggregate_allocation_bytes(
+    body: &RirNode,
+    arities: &HashMap<RelId, usize>,
+    shape: PromotionShape,
+) -> xlog_core::Result<u64> {
+    use crate::compile::{hash_allocation_bytes as hash, push_vector_allocation_bytes as vector};
+    let RirNode::Project { input, .. } = body else {
+        return Ok(0);
+    };
+    let RirNode::GroupBy { input, .. } = input.as_ref() else {
+        return Ok(0);
+    };
+    let RirNode::Project {
+        input: inner,
+        columns,
+    } = input.as_ref()
+    else {
+        return Ok(0);
+    };
+    let overflow = || {
+        xlog_core::XlogError::Compilation("aggregate promotion allocation extent overflow".into())
+    };
+    let mut bytes = promotion_allocation_bytes(inner, arities, shape)?;
+    // Canonical synthetic input is cloned from this real inner tree. The
+    // triangle/cycle normalizer can own one further exact inner-tree clone.
+    bytes = bytes
+        .checked_add(inner.owned_allocation_bytes()?)
+        .ok_or_else(overflow)?;
+    if matches!(shape, PromotionShape::Triangle | PromotionShape::Cycle) {
+        bytes = bytes
+            .checked_add(inner.owned_allocation_bytes()?)
+            .ok_or_else(overflow)?;
+    }
+    let generated_columns = match shape {
+        PromotionShape::Triangle => 3,
+        PromotionShape::Cycle => 4,
+        PromotionShape::Clique(k) => k,
+        _ => columns.len(),
+    };
+    for extent in [
+        vector::<ProjectExpr>(generated_columns)?,
+        vector::<ProjectExpr>(generated_columns)?,
+        vector::<ProjectExpr>(columns.len())?,
+        3 * std::mem::size_of::<RirNode>() as u64,
+    ] {
+        bytes = bytes.checked_add(extent).ok_or_else(overflow)?;
+    }
+    if matches!(shape, PromotionShape::General) {
+        // Original candidate columns clone, followed by the identity replacement.
+        for column in columns {
+            if let ProjectExpr::Computed(expression, _) = column {
+                bytes = bytes
+                    .checked_add(expression.owned_allocation_bytes()?)
+                    .ok_or_else(overflow)?;
+            }
+        }
+        bytes = bytes
+            .checked_add(vector::<ProjectExpr>(columns.len())?)
+            .ok_or_else(overflow)?;
+    }
+    if let PromotionShape::Clique(k) = shape {
+        let edges = k
+            .checked_mul(k.saturating_sub(1))
+            .map(|n| n / 2)
+            .ok_or_else(overflow)?;
+        let slots = edges.checked_mul(2).ok_or_else(overflow)?;
+        for extent in [
+            vector::<RelId>(edges)?,
+            vector::<(usize, usize)>(slots)?,
+            vector::<usize>(slots)?,
+            vector::<usize>(k)?,
+            hash::<usize, usize>(slots)?,
+            hash::<usize, usize>(k)?,
+            vector::<usize>(k)?,
+            vector::<usize>(k)?,
+            vector::<usize>(k)?,
+            hash::<usize, usize>(k)?,
+        ] {
+            bytes = bytes.checked_add(extent).ok_or_else(overflow)?;
+        }
+    }
+    Ok(bytes)
+}
+
 /// Walk an `ExecutionPlan` and rewrite eligible triangle / 4-cycle
 /// subtrees in each rule body to `RirNode::MultiWayJoin`. Idempotent.
 ///
@@ -118,10 +395,38 @@ pub fn promote_multiway(
     stats: &StatsManager,
     config: &CompilerConfig,
 ) {
+    promote_multiway_core(plan, _rel_ids, stats, config, &mut None)
+        .expect("ordinary promotion has no allocation callback");
+}
+
+pub fn promote_multiway_with_allocation_owner(
+    plan: &mut ExecutionPlan,
+    rel_ids: &HashMap<String, RelId>,
+    stats: &StatsManager,
+    config: &CompilerConfig,
+    scope: &mut crate::compile::CompilationAllocationScope<'_>,
+) -> xlog_core::Result<()> {
+    promote_multiway_core(plan, rel_ids, stats, config, &mut Some(scope))
+}
+
+fn promote_multiway_core(
+    plan: &mut ExecutionPlan,
+    _rel_ids: &HashMap<String, RelId>,
+    stats: &StatsManager,
+    config: &CompilerConfig,
+    scope: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
+) -> xlog_core::Result<()> {
     // Generic Free Join: the general multiway promoter sizes Scan leaves
     // from relation arities (the clique walker's hardcoded arity-2
     // assumption does not generalize). Cloned up front because the
     // per-rule loop holds `rules_by_scc` mutably.
+    let _arities_owner =
+        match scope.as_deref_mut() {
+            Some(scope) => Some(scope.reserve_allocation(
+                crate::compile::hash_allocation_bytes::<RelId, usize>(plan.rel_arities.len())?,
+            )?),
+            None => None,
+        };
     let rel_arities = plan.rel_arities.clone();
     for (scc_id, rules) in plan.rules_by_scc.iter_mut().enumerate() {
         if plan.sccs.get(scc_id).is_none() {
@@ -154,14 +459,26 @@ pub fn promote_multiway(
             // the executor's fused group-by-root count hook dispatches it,
             // and a declined dispatch still executes the embedded binary
             // fallback unchanged.
-            if try_promote_triangle_inside_aggregate(&mut rule.body, stats, config) {
+            if aggregate_attempt(
+                &mut rule.body,
+                &rel_arities,
+                PromotionShape::Triangle,
+                scope,
+                |body| try_promote_triangle_inside_aggregate(body, stats, config),
+            )? {
                 continue;
             }
             // 4-cycle aggregate descent: sibling of the descent above (atom-count gates
             // make the two matchers disjoint). The executor's fused hook
             // dispatches Count only; declined dispatches still execute the
             // embedded binary fallback unchanged.
-            if try_promote_4cycle_inside_aggregate(&mut rule.body, stats, config) {
+            if aggregate_attempt(
+                &mut rule.body,
+                &rel_arities,
+                PromotionShape::Cycle,
+                scope,
+                |body| try_promote_4cycle_inside_aggregate(body, stats, config),
+            )? {
                 continue;
             }
             // K-clique aggregate descent: k = 5, 6 sibling of the descents above
@@ -169,7 +486,12 @@ pub fn promote_multiway(
             // executor's fused hook dispatches Count grouped by the
             // plan's root variable only; declined dispatches still
             // execute the embedded binary fallback unchanged.
-            if try_promote_clique_inside_aggregate(&mut rule.body, stats) {
+            if try_promote_clique_inside_aggregate_with_owner(
+                &mut rule.body,
+                stats,
+                &rel_arities,
+                scope,
+            )? {
                 continue;
             }
             // Generic multiway aggregate descent: sibling of the descents above
@@ -179,10 +501,22 @@ pub fn promote_multiway(
             // dispatches factorized count-by-root only; declined
             // dispatches still execute the embedded binary fallback
             // unchanged.
-            if try_promote_general_multiway_inside_aggregate(&mut rule.body, &rel_arities) {
+            if aggregate_attempt(
+                &mut rule.body,
+                &rel_arities,
+                PromotionShape::General,
+                scope,
+                |body| try_promote_general_multiway_inside_aggregate(body, &rel_arities),
+            )? {
                 continue;
             }
-            if let Some(promoted) = try_promote_chain(&rule.body) {
+            if let Some(promoted) = promotion_attempt(
+                &rule.body,
+                &rel_arities,
+                PromotionShape::Chain,
+                scope,
+                || try_promote_chain(&rule.body),
+            )? {
                 rule.body = promoted;
                 continue;
             }
@@ -195,15 +529,35 @@ pub fn promote_multiway(
             // commutativity-rewrites them to the canonical left-deep
             // form before matching. Idempotent on already-canonical
             // bodies — left-deep input passes through unchanged.
+            let _normalized_tri_owner = match scope.as_deref_mut() {
+                Some(scope) => Some(scope.reserve_allocation(rule.body.owned_allocation_bytes()?)?),
+                None => None,
+            };
             let normalized_tri = normalize_triangle_to_left_deep(&rule.body);
             let body_for_tri = normalized_tri.as_ref().unwrap_or(&rule.body);
-            if let Some(promoted) = try_promote_triangle(body_for_tri, stats, config) {
+            if let Some(promoted) = promotion_attempt(
+                body_for_tri,
+                &rel_arities,
+                PromotionShape::Triangle,
+                scope,
+                || try_promote_triangle(body_for_tri, stats, config),
+            )? {
                 rule.body = promoted;
                 continue;
             }
+            let _normalized_cycle_owner = match scope.as_deref_mut() {
+                Some(scope) => Some(scope.reserve_allocation(rule.body.owned_allocation_bytes()?)?),
+                None => None,
+            };
             let normalized_4c = normalize_4cycle_to_bushy(&rule.body);
             let body_for_4c = normalized_4c.as_ref().unwrap_or(&rule.body);
-            if let Some(promoted) = try_promote_4cycle(body_for_4c, stats, config) {
+            if let Some(promoted) = promotion_attempt(
+                body_for_4c,
+                &rel_arities,
+                PromotionShape::Cycle,
+                scope,
+                || try_promote_4cycle(body_for_4c, stats, config),
+            )? {
                 rule.body = promoted;
                 continue;
             }
@@ -214,11 +568,16 @@ pub fn promote_multiway(
             // (different scan count). Recursive clique bodies are
             // admitted so the runtime can rebuild leader-edge
             // metadata from the current semi-naive store state.
-            if let Some(promoted) = try_promote_clique_k(&rule.body, 5, stats)
-                .or_else(|| try_promote_clique_k(&rule.body, 6, stats))
-                .or_else(|| try_promote_clique_k(&rule.body, 7, stats))
-                .or_else(|| try_promote_clique_k(&rule.body, 8, stats))
-            {
+            let mut clique = None;
+            for k in 5..=8 {
+                if let Some(promoted) =
+                    try_promote_clique_k_with_owner(&rule.body, k, stats, &rel_arities, scope)?
+                {
+                    clique = Some(promoted);
+                    break;
+                }
+            }
+            if let Some(promoted) = clique {
                 rule.body = promoted;
                 continue;
             }
@@ -230,12 +589,19 @@ pub fn promote_multiway(
             // (non-prefix bound columns, non-u32/Symbol inputs,
             // repeated cover vars, dedicated-shape carve-outs) execute
             // the embedded binary fallback unchanged.
-            if let Some(promoted) = try_promote_general_multiway(&rule.body, &rel_arities) {
+            if let Some(promoted) = promotion_attempt(
+                &rule.body,
+                &rel_arities,
+                PromotionShape::General,
+                scope,
+                || try_promote_general_multiway(&rule.body, &rel_arities),
+            )? {
                 rule.body = promoted;
                 continue;
             }
         }
     }
+    Ok(())
 }
 
 /// Triangle semantic-slot encoding: encode each atom-column slot as a u8 in `0..6` —
@@ -791,125 +1157,162 @@ fn try_promote_4cycle_inside_aggregate(
 /// wrapper that the executor cannot fuse). Returns false — leaving the
 /// rule untouched — on any structural mismatch.
 fn try_promote_clique_inside_aggregate(body: &mut RirNode, stats: &StatsManager) -> bool {
-    let RirNode::Project { input: gb, .. } = body else {
-        return false;
-    };
-    let RirNode::GroupBy {
-        input: group_input, ..
-    } = gb.as_mut()
-    else {
-        return false;
-    };
-    let RirNode::Project {
-        input: inner,
-        columns: group_cols,
-    } = group_input.as_mut()
-    else {
-        return false;
-    };
-    // Flatten the inner join tree directly (no head projection exists
-    // under the aggregate wrapper).
-    let mut scans: Vec<RelId> = Vec::new();
-    let mut key_pairs: Vec<(usize, usize)> = Vec::new();
-    if walk_clique_node(inner, &mut scans, &mut key_pairs).is_none() {
-        return false;
+    try_promote_clique_inside_aggregate_with_owner(body, stats, &HashMap::new(), &mut None)
+        .expect("ordinary aggregate clique promotion has no allocation callback")
+}
+
+fn try_promote_clique_inside_aggregate_with_owner(
+    body: &mut RirNode,
+    stats: &StatsManager,
+    arities: &HashMap<RelId, usize>,
+    scope: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
+) -> xlog_core::Result<bool> {
+    let checkpoint = scope.as_deref().map(|scope| scope.receipt_checkpoint());
+    if let Some(scope) = scope.as_deref_mut() {
+        scope.acquire(aggregate_allocation_bytes(
+            body,
+            arities,
+            PromotionShape::Clique(6),
+        )?)?;
     }
-    let k = match scans.len() {
-        10 => 5,
-        15 => 6,
-        _ => return false,
-    };
-    // Union-find on the global slot space; representative slot per
-    // class in first-appearance order defines the head variables.
-    let n_slots = 2 * scans.len();
-    let mut parent: Vec<usize> = (0..n_slots).collect();
-    for (a, b) in &key_pairs {
-        if *a >= n_slots || *b >= n_slots {
+    let mut failure = None;
+    let result = (|| -> bool {
+        let RirNode::Project { input: gb, .. } = body else {
+            return false;
+        };
+        let RirNode::GroupBy {
+            input: group_input, ..
+        } = gb.as_mut()
+        else {
+            return false;
+        };
+        let RirNode::Project {
+            input: inner,
+            columns: group_cols,
+        } = group_input.as_mut()
+        else {
+            return false;
+        };
+        // Flatten the inner join tree directly (no head projection exists
+        // under the aggregate wrapper).
+        let mut scans: Vec<RelId> = Vec::new();
+        let mut key_pairs: Vec<(usize, usize)> = Vec::new();
+        if walk_clique_node(inner, &mut scans, &mut key_pairs).is_none() {
             return false;
         }
-        uf_union_clique(&mut parent, *a, *b);
-    }
-    let mut class_roots: Vec<usize> = Vec::new();
-    let mut first_slot_of_class: HashMap<usize, usize> = HashMap::new();
-    for slot in 0..n_slots {
-        let root = uf_find_clique(&mut parent, slot);
-        if let std::collections::hash_map::Entry::Vacant(entry) = first_slot_of_class.entry(root) {
-            entry.insert(slot);
-            class_roots.push(root);
+        let k = match scans.len() {
+            10 => 5,
+            15 => 6,
+            _ => return false,
+        };
+        // Union-find on the global slot space; representative slot per
+        // class in first-appearance order defines the head variables.
+        let n_slots = 2 * scans.len();
+        let mut parent: Vec<usize> = (0..n_slots).collect();
+        for (a, b) in &key_pairs {
+            if *a >= n_slots || *b >= n_slots {
+                return false;
+            }
+            uf_union_clique(&mut parent, *a, *b);
         }
-    }
-    if class_roots.len() != k {
-        return false;
-    }
-    // The clique matcher's orientation invariant requires every atom's
-    // col0 class to precede its col1 class in head order. The class
-    // digraph of a canonical complete-K_k body (one atom per unordered
-    // pair, consistent orientation) is a transitive tournament, whose
-    // unique topological order sorts classes by in-degree: head index h
-    // = the class with in-degree h. Duplicate in-degrees mean the
-    // orientation is not transitive (the top-level matcher would reject
-    // it too) — leave the rule untouched. NOTE: first-appearance slot
-    // order is NOT usable here because the lowerer's bushy DP plan
-    // reorders the scan leaves.
-    let class_idx: HashMap<usize, usize> = class_roots
-        .iter()
-        .enumerate()
-        .map(|(idx, root)| (*root, idx))
-        .collect();
-    let mut in_degree = vec![0usize; k];
-    for atom in 0..scans.len() {
-        let cls_a = uf_find_clique(&mut parent, 2 * atom);
-        let cls_b = uf_find_clique(&mut parent, 2 * atom + 1);
-        if cls_a == cls_b {
+        let mut class_roots: Vec<usize> = Vec::new();
+        let mut first_slot_of_class: HashMap<usize, usize> = HashMap::new();
+        for slot in 0..n_slots {
+            let root = uf_find_clique(&mut parent, slot);
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                first_slot_of_class.entry(root)
+            {
+                entry.insert(slot);
+                class_roots.push(root);
+            }
+        }
+        if class_roots.len() != k {
             return false;
         }
-        in_degree[class_idx[&cls_b]] += 1;
-    }
-    let mut class_pos_by_head = vec![usize::MAX; k];
-    for (pos, deg) in in_degree.iter().enumerate() {
-        if *deg >= k || class_pos_by_head[*deg] != usize::MAX {
-            return false;
-        }
-        class_pos_by_head[*deg] = pos;
-    }
-    let representative_slots: Vec<usize> = class_pos_by_head
-        .iter()
-        .map(|pos| first_slot_of_class[&class_roots[*pos]])
-        .collect();
-    let class_to_head: HashMap<usize, usize> = class_pos_by_head
-        .iter()
-        .enumerate()
-        .map(|(head_idx, pos)| (class_roots[*pos], head_idx))
-        .collect();
-    let canonical = RirNode::Project {
-        input: inner.clone(),
-        columns: representative_slots
+        // The clique matcher's orientation invariant requires every atom's
+        // col0 class to precede its col1 class in head order. The class
+        // digraph of a canonical complete-K_k body (one atom per unordered
+        // pair, consistent orientation) is a transitive tournament, whose
+        // unique topological order sorts classes by in-degree: head index h
+        // = the class with in-degree h. Duplicate in-degrees mean the
+        // orientation is not transitive (the top-level matcher would reject
+        // it too) — leave the rule untouched. NOTE: first-appearance slot
+        // order is NOT usable here because the lowerer's bushy DP plan
+        // reorders the scan leaves.
+        let class_idx: HashMap<usize, usize> = class_roots
             .iter()
-            .map(|slot| ProjectExpr::Column(*slot))
-            .collect(),
-    };
-    let Some(promoted) = try_promote_clique_k(&canonical, k, stats) else {
-        return false;
-    };
-    // Remap the group projection from join-output (global slot) space
-    // into the clique head-variable space via the slot classes.
-    let mut remapped: Vec<ProjectExpr> = Vec::with_capacity(group_cols.len());
-    for col in group_cols.iter() {
-        let ProjectExpr::Column(c) = col else {
-            return false;
-        };
-        if *c >= n_slots {
-            return false;
+            .enumerate()
+            .map(|(idx, root)| (*root, idx))
+            .collect();
+        let mut in_degree = vec![0usize; k];
+        for atom in 0..scans.len() {
+            let cls_a = uf_find_clique(&mut parent, 2 * atom);
+            let cls_b = uf_find_clique(&mut parent, 2 * atom + 1);
+            if cls_a == cls_b {
+                return false;
+            }
+            in_degree[class_idx[&cls_b]] += 1;
         }
-        let root = uf_find_clique(&mut parent, *c);
-        let Some(head_idx) = class_to_head.get(&root) else {
-            return false;
+        let mut class_pos_by_head = vec![usize::MAX; k];
+        for (pos, deg) in in_degree.iter().enumerate() {
+            if *deg >= k || class_pos_by_head[*deg] != usize::MAX {
+                return false;
+            }
+            class_pos_by_head[*deg] = pos;
+        }
+        let representative_slots: Vec<usize> = class_pos_by_head
+            .iter()
+            .map(|pos| first_slot_of_class[&class_roots[*pos]])
+            .collect();
+        let class_to_head: HashMap<usize, usize> = class_pos_by_head
+            .iter()
+            .enumerate()
+            .map(|(head_idx, pos)| (class_roots[*pos], head_idx))
+            .collect();
+        let canonical = RirNode::Project {
+            input: inner.clone(),
+            columns: representative_slots
+                .iter()
+                .map(|slot| ProjectExpr::Column(*slot))
+                .collect(),
         };
-        remapped.push(ProjectExpr::Column(*head_idx));
+        let promoted = match try_promote_clique_k_with_owner(&canonical, k, stats, arities, scope) {
+            Ok(Some(promoted)) => promoted,
+            Ok(None) => return false,
+            Err(error) => {
+                failure = Some(error);
+                return false;
+            }
+        };
+        // Remap the group projection from join-output (global slot) space
+        // into the clique head-variable space via the slot classes.
+        let mut remapped: Vec<ProjectExpr> = Vec::with_capacity(group_cols.len());
+        for col in group_cols.iter() {
+            let ProjectExpr::Column(c) = col else {
+                return false;
+            };
+            if *c >= n_slots {
+                return false;
+            }
+            let root = uf_find_clique(&mut parent, *c);
+            let Some(head_idx) = class_to_head.get(&root) else {
+                return false;
+            };
+            remapped.push(ProjectExpr::Column(*head_idx));
+        }
+        *group_cols = remapped;
+        **inner = promoted;
+        true
+    })();
+    if !result {
+        if let (Some(scope), Some(checkpoint)) = (scope.as_deref_mut(), checkpoint) {
+            scope.retire_since(checkpoint)?;
+        }
     }
-    *group_cols = remapped;
-    **inner = promoted;
-    true
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    Ok(result)
 }
 
 /// `[XY, YZ, XZ]` regardless of positional layout. Returns
@@ -1702,200 +2105,313 @@ fn try_promote_general_multiway_inside_aggregate(
 /// constants, and any non-canonical shape; admits recursive
 /// bodies so runtime metadata refresh can observe each merge.
 fn try_promote_clique_k(body: &RirNode, k: usize, stats: &StatsManager) -> Option<RirNode> {
+    try_promote_clique_k_with_owner(body, k, stats, &HashMap::new(), &mut None)
+        .expect("ordinary clique promotion has no allocation callback")
+}
+
+fn try_promote_clique_k_with_owner(
+    body: &RirNode,
+    k: usize,
+    stats: &StatsManager,
+    arities: &HashMap<RelId, usize>,
+    scope: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
+) -> xlog_core::Result<Option<RirNode>> {
     if !(5..=8).contains(&k) {
-        return None;
+        return Ok(None);
     }
-    let expected_edges = k * (k - 1) / 2;
-
-    // 1. Flatten body. Rejects Filter, non-canonical nodes.
-    let (scans, key_pairs, project_globals) = flatten_clique_body(body)?;
-
-    // 2. Scan count must equal C(k, 2).
-    if scans.len() != expected_edges {
-        return None;
-    }
-
-    // 3. Head must have exactly k variables.
-    if project_globals.len() != k {
-        return None;
-    }
-
-    // 4. Union-find on global slot space (size 2 * expected_edges)
-    // to derive variable equivalence classes.
-    let n_slots = 2 * expected_edges;
-    let mut parent: Vec<usize> = (0..n_slots).collect();
-    for (a, b) in &key_pairs {
-        if *a >= n_slots || *b >= n_slots {
+    let checkpoint = scope.as_deref().map(|scope| scope.receipt_checkpoint());
+    let receipt = match scope.as_deref_mut() {
+        Some(scope) => Some(scope.reserve_allocation(promotion_allocation_bytes(
+            body,
+            arities,
+            PromotionShape::Clique(k),
+        )?)?),
+        None => None,
+    };
+    let mut failure = None;
+    let result = (|| -> Option<RirNode> {
+        if !(5..=8).contains(&k) {
             return None;
         }
-        uf_union_clique(&mut parent, *a, *b);
-    }
+        let expected_edges = k * (k - 1) / 2;
 
-    // 5. Find unique class representative per Project column.
-    // Each Project column references a global slot; resolve to
-    // its class root.
-    let mut head_class: Vec<usize> = Vec::with_capacity(k);
-    for col in &project_globals {
-        if *col >= n_slots {
+        // 1. Flatten body. Rejects Filter, non-canonical nodes.
+        let (scans, key_pairs, project_globals) = flatten_clique_body(body)?;
+
+        // 2. Scan count must equal C(k, 2).
+        if scans.len() != expected_edges {
             return None;
         }
-        head_class.push(uf_find_clique(&mut parent, *col));
-    }
-    // 6. The k head classes must be distinct.
-    let mut sorted_head_classes = head_class.clone();
-    sorted_head_classes.sort();
-    sorted_head_classes.dedup();
-    if sorted_head_classes.len() != k {
-        return None;
-    }
 
-    // 7. Total distinct classes across all slots must equal k.
-    // (No "extra" non-head variables in atom slots — every slot's
-    // class must be one of the k head classes.)
-    let mut all_class_count: HashMap<usize, usize> = HashMap::new();
-    for slot in 0..n_slots {
-        let root = uf_find_clique(&mut parent, slot);
-        *all_class_count.entry(root).or_insert(0) += 1;
-    }
-    if all_class_count.len() != k {
-        return None;
-    }
-    // 8. Every class must have exactly k-1 slots (each variable
-    // appears in exactly k-1 atoms = clique edges incident to it).
-    for &count in all_class_count.values() {
-        if count != k - 1 {
+        // 3. Head must have exactly k variables.
+        if project_globals.len() != k {
             return None;
         }
-    }
 
-    // 9. Map class → head-var index. The Project column ordering
-    // defines the head-var indices (Project col i = head var i).
-    let mut class_to_head_idx: HashMap<usize, usize> = HashMap::new();
-    for (head_idx, cls) in head_class.iter().enumerate() {
-        class_to_head_idx.insert(*cls, head_idx);
-    }
+        // 4. Union-find on global slot space (size 2 * expected_edges)
+        // to derive variable equivalence classes.
+        let n_slots = 2 * expected_edges;
+        let mut parent: Vec<usize> = (0..n_slots).collect();
+        for (a, b) in &key_pairs {
+            if *a >= n_slots || *b >= n_slots {
+                return None;
+            }
+            uf_union_clique(&mut parent, *a, *b);
+        }
 
-    // 10. For each scan, derive its (var_a, var_b) pair from the
-    // class memberships of its two slots. Reject self-edges
-    // (both slots in same class) and atoms touching a non-head
-    // class (already filtered above by class-count check, but
-    // defensive).
-    let mut atom_pairs: Vec<(usize, usize)> = Vec::with_capacity(expected_edges);
-    let mut canonical_to_scan_idx: HashMap<(usize, usize), usize> = HashMap::new();
-    for (atom_i, _rel) in scans.iter().enumerate() {
-        let slot_a = 2 * atom_i;
-        let slot_b = 2 * atom_i + 1;
-        let cls_a = uf_find_clique(&mut parent, slot_a);
-        let cls_b = uf_find_clique(&mut parent, slot_b);
-        if cls_a == cls_b {
-            // Self-edge e(X, X) — reject.
+        // 5. Find unique class representative per Project column.
+        // Each Project column references a global slot; resolve to
+        // its class root.
+        let mut head_class: Vec<usize> = Vec::with_capacity(k);
+        for col in &project_globals {
+            if *col >= n_slots {
+                return None;
+            }
+            head_class.push(uf_find_clique(&mut parent, *col));
+        }
+        // 6. The k head classes must be distinct.
+        let mut sorted_head_classes = head_class.clone();
+        sorted_head_classes.sort();
+        sorted_head_classes.dedup();
+        if sorted_head_classes.len() != k {
             return None;
         }
-        let head_a = class_to_head_idx.get(&cls_a)?;
-        let head_b = class_to_head_idx.get(&cls_b)?;
-        // 11. Reversed-atom rejection: canonical form requires
-        // col0 maps to lower head idx, col1 to higher. If col0
-        // is at higher idx, the atom is reversed (this promoter does
-        // not implement column-swap layout for clique edges).
-        if *head_a > *head_b {
-            return None;
-        }
-        let (lo, hi) = (*head_a, *head_b);
-        atom_pairs.push((lo, hi));
-        // 12. Reject duplicate edges (same (i, j) appearing twice).
-        if canonical_to_scan_idx.insert((lo, hi), atom_i).is_some() {
-            return None;
-        }
-    }
 
-    // 13. Verify the atom_pairs set equals the complete K_k edge
-    // set {(i, j) | 0 <= i < j < k}.
-    if canonical_to_scan_idx.len() != expected_edges {
-        return None;
-    }
-    for i in 0..k {
-        for j in (i + 1)..k {
-            if !canonical_to_scan_idx.contains_key(&(i, j)) {
+        // 7. Total distinct classes across all slots must equal k.
+        // (No "extra" non-head variables in atom slots — every slot's
+        // class must be one of the k head classes.)
+        let mut all_class_count: HashMap<usize, usize> = HashMap::new();
+        for slot in 0..n_slots {
+            let root = uf_find_clique(&mut parent, slot);
+            *all_class_count.entry(root).or_insert(0) += 1;
+        }
+        if all_class_count.len() != k {
+            return None;
+        }
+        // 8. Every class must have exactly k-1 slots (each variable
+        // appears in exactly k-1 atoms = clique edges incident to it).
+        for &count in all_class_count.values() {
+            if count != k - 1 {
                 return None;
             }
         }
-    }
 
-    // 14. Reorder scans into canonical lex (i, j) order.
-    let mut reordered_scans: Vec<RelId> = Vec::with_capacity(expected_edges);
-    for i in 0..k {
-        for j in (i + 1)..k {
-            let scan_idx = canonical_to_scan_idx[&(i, j)];
-            reordered_scans.push(scans[scan_idx]);
+        // 9. Map class → head-var index. The Project column ordering
+        // defines the head-var indices (Project col i = head var i).
+        let mut class_to_head_idx: HashMap<usize, usize> = HashMap::new();
+        for (head_idx, cls) in head_class.iter().enumerate() {
+            class_to_head_idx.insert(*cls, head_idx);
         }
-    }
 
-    // 15. Build canonical MultiWayJoin.inputs (one Scan per
-    // canonical edge in lex order) + slot_vars (each atom's
-    // (col0, col1) bind (head_i, head_j) for canonical edge
-    // (i, j)).
-    let inputs: Vec<RirNode> = reordered_scans
-        .iter()
-        .map(|rel| RirNode::Scan { rel: *rel })
-        .collect();
-    let mut slot_vars: Vec<Vec<Option<u32>>> = Vec::with_capacity(expected_edges);
-    for i in 0..k {
-        for j in (i + 1)..k {
-            let _ = clique_edge_idx(i, j, k); // sanity; locked invariant
-            slot_vars.push(vec![Some(i as u32), Some(j as u32)]);
-        }
-    }
-    // Project's existing column list defines the head-output
-    // mapping; we preserve it on the MultiWayJoin's
-    // output_columns.
-    let RirNode::Project { columns, .. } = body else {
-        return None;
-    };
-    let output_columns = columns.clone();
-    let fallback = Box::new(body.clone());
-    let shape = build_kclique_shape(k, &reordered_scans)?;
-    let planner_stats = kclique_planner_stats(stats);
-
-    // Cost-planned K-clique routing follows the arXiv paper's
-    // conditional-win-on-skew caveat: recognized paper-aligned shapes
-    // emit a positive route. Hash is represented by
-    // `PlannedHashRoute`, never by a post-recognition raw decline.
-    let (plan, var_order) = match plan_kclique_var_order(&shape, &planner_stats) {
-        Some(full_order) => {
-            let evidence = rir_cost_prediction(&full_order);
-            if wcoj_cost_gate_predicts_wcoj(evidence.wcoj_cost, evidence.hash_cost) {
-                let kclique_order = kclique_variable_order_from_plan(&shape, &full_order)?;
-                (
-                    MultiwayPlan::WcojWithPlan(kclique_order.clone()),
-                    Some(VariableOrder::kclique(kclique_order)),
-                )
-            } else {
-                (
-                    MultiwayPlan::PlannedHashRoute {
-                        reason: PlannedHashReason::PlannerPredictsHashWins,
-                        planner_evidence: evidence,
-                    },
-                    None,
-                )
+        // 10. For each scan, derive its (var_a, var_b) pair from the
+        // class memberships of its two slots. Reject self-edges
+        // (both slots in same class) and atoms touching a non-head
+        // class (already filtered above by class-count check, but
+        // defensive).
+        let mut atom_pairs: Vec<(usize, usize)> = Vec::with_capacity(expected_edges);
+        let mut canonical_to_scan_idx: HashMap<(usize, usize), usize> = HashMap::new();
+        for (atom_i, _rel) in scans.iter().enumerate() {
+            let slot_a = 2 * atom_i;
+            let slot_b = 2 * atom_i + 1;
+            let cls_a = uf_find_clique(&mut parent, slot_a);
+            let cls_b = uf_find_clique(&mut parent, slot_b);
+            if cls_a == cls_b {
+                // Self-edge e(X, X) — reject.
+                return None;
+            }
+            let head_a = class_to_head_idx.get(&cls_a)?;
+            let head_b = class_to_head_idx.get(&cls_b)?;
+            // 11. Reversed-atom rejection: canonical form requires
+            // col0 maps to lower head idx, col1 to higher. If col0
+            // is at higher idx, the atom is reversed (this promoter does
+            // not implement column-swap layout for clique edges).
+            if *head_a > *head_b {
+                return None;
+            }
+            let (lo, hi) = (*head_a, *head_b);
+            atom_pairs.push((lo, hi));
+            // 12. Reject duplicate edges (same (i, j) appearing twice).
+            if canonical_to_scan_idx.insert((lo, hi), atom_i).is_some() {
+                return None;
             }
         }
-        None => (
-            MultiwayPlan::PlannedHashRoute {
-                reason: PlannedHashReason::IncompleteStatsSafeDefault,
-                planner_evidence: RirCostPredictionRecord::empty(),
-            },
-            None,
-        ),
-    };
 
-    Some(RirNode::MultiWayJoin {
-        inputs,
-        slot_vars,
-        output_columns,
-        fallback,
-        plan: Some(plan),
-        var_order,
-    })
+        // 13. Verify the atom_pairs set equals the complete K_k edge
+        // set {(i, j) | 0 <= i < j < k}.
+        if canonical_to_scan_idx.len() != expected_edges {
+            return None;
+        }
+        for i in 0..k {
+            for j in (i + 1)..k {
+                if !canonical_to_scan_idx.contains_key(&(i, j)) {
+                    return None;
+                }
+            }
+        }
+
+        // 14. Reorder scans into canonical lex (i, j) order.
+        let mut reordered_scans: Vec<RelId> = Vec::with_capacity(expected_edges);
+        for i in 0..k {
+            for j in (i + 1)..k {
+                let scan_idx = canonical_to_scan_idx[&(i, j)];
+                reordered_scans.push(scans[scan_idx]);
+            }
+        }
+
+        // 15. Build canonical MultiWayJoin.inputs (one Scan per
+        // canonical edge in lex order) + slot_vars (each atom's
+        // (col0, col1) bind (head_i, head_j) for canonical edge
+        // (i, j)).
+        let inputs: Vec<RirNode> = reordered_scans
+            .iter()
+            .map(|rel| RirNode::Scan { rel: *rel })
+            .collect();
+        let mut slot_vars: Vec<Vec<Option<u32>>> = Vec::with_capacity(expected_edges);
+        for i in 0..k {
+            for j in (i + 1)..k {
+                let _ = clique_edge_idx(i, j, k); // sanity; locked invariant
+                slot_vars.push(vec![Some(i as u32), Some(j as u32)]);
+            }
+        }
+        // Project's existing column list defines the head-output
+        // mapping; we preserve it on the MultiWayJoin's
+        // output_columns.
+        let RirNode::Project { columns, .. } = body else {
+            return None;
+        };
+        let output_columns = columns.clone();
+        let fallback = Box::new(body.clone());
+        let shape = build_kclique_shape(k, &reordered_scans)?;
+        let _stats_owner = match scope.as_deref_mut() {
+            Some(scope) => match scope.reserve_allocation(
+                stats
+                    .snapshot_allocation_bytes()
+                    .map_err(|error| {
+                        failure = Some(error);
+                    })
+                    .ok()?,
+            ) {
+                Ok(owner) => Some(owner),
+                Err(error) => {
+                    failure = Some(error);
+                    return None;
+                }
+            },
+            None => None,
+        };
+        let planner_stats = kclique_planner_stats(stats);
+
+        // Cost-planned K-clique routing follows the arXiv paper's
+        // conditional-win-on-skew caveat: recognized paper-aligned shapes
+        // emit a positive route. Hash is represented by
+        // `PlannedHashRoute`, never by a post-recognition raw decline.
+        let planned = match scope.as_deref_mut() {
+            Some(scope) => {
+                match crate::hypergraph::var_order::plan_kclique_var_order_with_allocation_owner(
+                    &shape,
+                    &planner_stats,
+                    scope,
+                ) {
+                    Ok(planned) => planned,
+                    Err(error) => {
+                        failure = Some(error);
+                        return None;
+                    }
+                }
+            }
+            None => plan_kclique_var_order(&shape, &planner_stats),
+        };
+        let (plan, var_order) = match planned {
+            Some(full_order) => {
+                let evidence = rir_cost_prediction(&full_order);
+                if wcoj_cost_gate_predicts_wcoj(evidence.wcoj_cost, evidence.hash_cost) {
+                    if let Some(scope) = scope.as_deref_mut() {
+                        let helpers = crate::compile::push_vector_allocation_bytes::<
+                            xlog_ir::rir::HelperSplitSpec,
+                        >(full_order.helper_split_specs.len())
+                        .map_err(|error| {
+                            failure = Some(error);
+                        })
+                        .ok()?;
+                        let mut bytes = helpers;
+                        for helper in &full_order.helper_split_specs {
+                            bytes = bytes.checked_add(helper.edge_slots.len() as u64).or_else(
+                                || {
+                                    failure = Some(xlog_core::XlogError::Compilation(
+                                        "helper-split clone allocation extent overflow".into(),
+                                    ));
+                                    None
+                                },
+                            )?;
+                        }
+                        scope
+                            .acquire(bytes)
+                            .map_err(|error| {
+                                failure = Some(error);
+                            })
+                            .ok()?;
+                    }
+                    let kclique_order = kclique_variable_order_from_plan(&shape, &full_order)?;
+                    if let Some(scope) = scope.as_deref_mut() {
+                        let bytes = kclique_order
+                            .owned_allocation_bytes()
+                            .map_err(|error| {
+                                failure = Some(error);
+                            })
+                            .ok()?;
+                        scope
+                            .acquire(bytes)
+                            .map_err(|error| {
+                                failure = Some(error);
+                            })
+                            .ok()?;
+                    }
+                    (
+                        MultiwayPlan::WcojWithPlan(kclique_order.clone()),
+                        Some(VariableOrder::kclique(kclique_order)),
+                    )
+                } else {
+                    (
+                        MultiwayPlan::PlannedHashRoute {
+                            reason: PlannedHashReason::PlannerPredictsHashWins,
+                            planner_evidence: evidence,
+                        },
+                        None,
+                    )
+                }
+            }
+            None => (
+                MultiwayPlan::PlannedHashRoute {
+                    reason: PlannedHashReason::IncompleteStatsSafeDefault,
+                    planner_evidence: RirCostPredictionRecord::empty(),
+                },
+                None,
+            ),
+        };
+
+        Some(RirNode::MultiWayJoin {
+            inputs,
+            slot_vars,
+            output_columns,
+            fallback,
+            plan: Some(plan),
+            var_order,
+        })
+    })();
+    if result.is_none() {
+        if let (Some(scope), Some(checkpoint)) = (scope.as_deref_mut(), checkpoint) {
+            scope.retire_since(checkpoint)?;
+        }
+    }
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    if result.is_some() {
+        if let (Some(scope), Some(receipt)) = (scope.as_deref_mut(), receipt) {
+            scope.retain(receipt)?;
+        }
+    }
+    Ok(result)
 }
 
 fn build_kclique_shape(k: usize, rels: &[RelId]) -> Option<KCliqueShape> {

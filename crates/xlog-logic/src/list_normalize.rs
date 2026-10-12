@@ -1,6 +1,7 @@
 //! Finite list normalization for the language-completeness surface.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use xlog_core::{Result, ScalarType, XlogError};
 
@@ -31,7 +32,23 @@ pub fn normalize_list_builtins(program: &Program) -> Result<Program> {
 /// untouched (the pass is the identity on them, see
 /// `ListNormalizer::fact_is_identity`), everything else is rebuilt as before.
 pub fn normalize_list_builtins_owned(program: Program) -> Result<Program> {
-    let mut normalizer = ListNormalizer::new(&program)?;
+    normalize_list_builtins_with_owner(program, None)
+}
+
+/// Run the same finite-list normalizer with original allocation custody.
+pub fn normalize_list_builtins_owned_with_allocation_owner(
+    program: Program,
+    allocations: &mut crate::compile::CompilationAllocationScope<'_>,
+) -> Result<Program> {
+    let mut allocate = |bytes| allocations.acquire(bytes);
+    normalize_list_builtins_with_owner(program, Some(&mut allocate))
+}
+
+fn normalize_list_builtins_with_owner(
+    program: Program,
+    allocate: Option<&mut dyn FnMut(u64) -> Result<Arc<dyn Send + Sync>>>,
+) -> Result<Program> {
+    let mut normalizer = ListNormalizer::new(&program, allocate)?;
     normalizer.normalize_program(program)
 }
 
@@ -76,7 +93,7 @@ struct ListColumn {
     elem_type: ScalarType,
 }
 
-struct ListNormalizer {
+struct ListNormalizer<'a> {
     /// Declared `list<T>` columns per predicate: `(column index, column)`.
     list_columns: HashMap<String, Vec<(usize, ListColumn)>>,
     lists_by_key: HashMap<(ScalarType, Vec<LiteralKey>), u64>,
@@ -85,10 +102,187 @@ struct ListNormalizer {
     helper_preds: HashSet<String>,
     operation_rows: HashSet<(ListOp, ScalarType, Vec<u64>)>,
     fresh_counter: usize,
+    allocation_owner: Option<&'a mut dyn FnMut(u64) -> Result<Arc<dyn Send + Sync>>>,
 }
 
-impl ListNormalizer {
-    fn new(program: &Program) -> Result<Self> {
+impl<'a> ListNormalizer<'a> {
+    fn acquire(&mut self, bytes: u64) -> Result<()> {
+        if bytes != 0 {
+            if let Some(allocate) = self.allocation_owner.as_deref_mut() {
+                allocate(bytes)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn acquire_vector<T>(&mut self, count: usize) -> Result<()> {
+        if self.allocation_owner.is_some() {
+            self.acquire(crate::compile::push_vector_allocation_bytes::<T>(count)?)?;
+        }
+        Ok(())
+    }
+
+    fn acquire_term(&mut self, term: &Term) -> Result<()> {
+        if self.allocation_owner.is_some() {
+            self.acquire(term.owned_allocation_bytes()? - std::mem::size_of::<Term>() as u64)?;
+        }
+        Ok(())
+    }
+
+    fn items_clone_bytes(items: &[Term]) -> Result<u64> {
+        items.iter().try_fold(0u64, |n, item| {
+            n.checked_add(item.owned_allocation_bytes()?)
+                .ok_or_else(|| list_error("list clone allocation extent overflow"))
+        })
+    }
+
+    fn keys_clone_bytes(keys: &[LiteralKey]) -> Result<u64> {
+        let mut bytes = crate::compile::push_vector_allocation_bytes::<LiteralKey>(keys.len())?;
+        for key in keys {
+            if let LiteralKey::Symbol(text) = key {
+                bytes = bytes
+                    .checked_add(text.len() as u64)
+                    .ok_or_else(|| list_error("list key allocation extent overflow"))?;
+            }
+        }
+        Ok(bytes)
+    }
+
+    fn acquire_list_clone(&mut self, id: u64) -> Result<()> {
+        if self.allocation_owner.is_some() {
+            let list = self.list_by_id(id)?;
+            let bytes = Self::items_clone_bytes(&list.items)?
+                .checked_add(Self::keys_clone_bytes(&list.keys)?)
+                .ok_or_else(|| list_error("list clone allocation extent overflow"))?;
+            self.acquire(bytes)?;
+        }
+        Ok(())
+    }
+
+    fn acquire_lists_clone(&mut self) -> Result<()> {
+        if self.allocation_owner.is_some() {
+            let mut bytes =
+                crate::compile::push_vector_allocation_bytes::<ListDef>(self.lists.len())?;
+            for list in &self.lists {
+                bytes = bytes
+                    .checked_add(Self::items_clone_bytes(&list.items)?)
+                    .and_then(|n| n.checked_add(Self::keys_clone_bytes(&list.keys).ok()?))
+                    .ok_or_else(|| list_error("list roster allocation extent overflow"))?;
+            }
+            self.acquire(bytes)?;
+        }
+        Ok(())
+    }
+
+    fn reserve_vector<T>(&mut self, vector: &mut Vec<T>, additional: usize) -> Result<()> {
+        if self.allocation_owner.is_some() && vector.capacity() - vector.len() < additional {
+            let count = vector
+                .len()
+                .checked_add(additional)
+                .ok_or_else(|| list_error("list vector allocation extent overflow"))?;
+            self.acquire_vector::<T>(count)?;
+            vector.reserve_exact(additional);
+        }
+        Ok(())
+    }
+
+    fn acquire_hash_growth<K, V>(&mut self, length: usize, capacity: usize) -> Result<()> {
+        if self.allocation_owner.is_some() && length == capacity {
+            let bytes = crate::compile::hash_allocation_bytes::<K, V>(
+                length
+                    .checked_add(1)
+                    .ok_or_else(|| list_error("list table extent overflow"))?,
+            )?
+            .checked_mul(2)
+            .ok_or_else(|| list_error("list table allocation extent overflow"))?;
+            self.acquire(bytes)?;
+        }
+        Ok(())
+    }
+
+    fn bind_list_type(
+        &mut self,
+        types: &mut HashMap<String, ScalarType>,
+        name: &str,
+        typ: ScalarType,
+    ) -> Result<()> {
+        self.acquire(name.len() as u64)?;
+        if !types.contains_key(name) {
+            self.acquire_hash_growth::<String, ScalarType>(types.len(), types.capacity())?;
+        }
+        types.insert(name.to_string(), typ);
+        Ok(())
+    }
+
+    fn acquire_format(&mut self, args: std::fmt::Arguments<'_>) -> Result<()> {
+        if self.allocation_owner.is_some() {
+            self.acquire(crate::compile::formatted_text_allocation_bytes(args)?)?;
+        }
+        Ok(())
+    }
+
+    fn new(
+        program: &Program,
+        mut allocation_owner: Option<&'a mut dyn FnMut(u64) -> Result<Arc<dyn Send + Sync>>>,
+    ) -> Result<Self> {
+        if let Some(allocate) = allocation_owner.as_deref_mut() {
+            let mut bytes =
+                crate::compile::hash_allocation_bytes::<String, ScalarType>(program.domains.len())?;
+            bytes = bytes
+                .checked_add(crate::compile::hash_allocation_bytes::<
+                    String,
+                    Vec<(usize, ListColumn)>,
+                >(program.predicates.len())?)
+                .ok_or_else(|| list_error("list declaration allocation extent overflow"))?;
+            for domain in &program.domains {
+                bytes = bytes
+                    .checked_add(domain.name.len() as u64)
+                    .ok_or_else(|| list_error("list declaration extent overflow"))?;
+            }
+            for predicate in &program.predicates {
+                let count = if predicate.columns.is_empty() {
+                    predicate.types.len()
+                } else {
+                    predicate.columns.len()
+                };
+                bytes = bytes
+                    .checked_add(crate::compile::push_vector_allocation_bytes::<(
+                        usize,
+                        ListColumn,
+                    )>(count)?)
+                    .and_then(|n| {
+                        n.checked_add(
+                            crate::compile::push_vector_allocation_bytes::<PredColumn>(count)
+                                .ok()?,
+                        )
+                    })
+                    .and_then(|n| {
+                        n.checked_add((predicate.name.len() as u64).checked_mul(count as u64)?)
+                    })
+                    .ok_or_else(|| list_error("list declaration allocation extent overflow"))?;
+                for typ in predicate
+                    .types
+                    .iter()
+                    .chain(predicate.columns.iter().map(|column| &column.typ))
+                {
+                    bytes = bytes
+                        .checked_add(typ.owned_allocation_bytes()?)
+                        .ok_or_else(|| list_error("list type extent overflow"))?;
+                }
+                for column in &predicate.columns {
+                    if let Some(name) = &column.name {
+                        bytes = bytes
+                            .checked_add(name.len() as u64)
+                            .ok_or_else(|| list_error("list name extent overflow"))?;
+                    }
+                }
+            }
+            allocate(
+                bytes
+                    .checked_mul(2)
+                    .ok_or_else(|| list_error("list declaration extent overflow"))?,
+            )?;
+        }
         let domains: HashMap<String, ScalarType> = program
             .domains
             .iter()
@@ -116,6 +310,7 @@ impl ListNormalizer {
             helper_preds: HashSet::new(),
             operation_rows: HashSet::new(),
             fresh_counter: 0,
+            allocation_owner,
         })
     }
 
@@ -134,15 +329,19 @@ impl ListNormalizer {
 
     fn normalize_program(&mut self, program: Program) -> Result<Program> {
         let mut out = program;
+        self.acquire_vector::<Rule>(out.rules.len())?;
         let mut rules = Vec::with_capacity(out.rules.len());
         for rule in std::mem::take(&mut out.rules) {
             if Self::fact_is_identity(&rule) {
                 rules.push(rule);
             } else {
-                rules.extend(self.normalize_rule(&rule)?);
+                let expanded = self.normalize_rule(&rule)?;
+                self.reserve_vector(&mut rules, expanded.len())?;
+                rules.extend(expanded);
             }
         }
         out.rules = rules;
+        self.acquire_vector::<crate::ast::Constraint>(out.constraints.len())?;
         out.constraints = std::mem::take(&mut out.constraints)
             .into_iter()
             .map(|constraint| {
@@ -153,6 +352,7 @@ impl ListNormalizer {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        self.acquire_vector::<Query>(out.queries.len())?;
         out.queries = std::mem::take(&mut out.queries)
             .into_iter()
             .map(|query| self.normalize_query(&query))
@@ -163,6 +363,9 @@ impl ListNormalizer {
     }
 
     fn normalize_query(&mut self, query: &Query) -> Result<Query> {
+        if self.allocation_owner.is_some() {
+            self.acquire(query.atom.owned_allocation_bytes()?)?;
+        }
         let mut var_list_types = HashMap::new();
         let atoms = self.expand_atom(&query.atom, false, &mut var_list_types)?;
         let atom = atoms
@@ -173,6 +376,7 @@ impl ListNormalizer {
     }
 
     fn normalize_rule(&mut self, rule: &Rule) -> Result<Vec<Rule>> {
+        self.acquire_vector::<Rule>(1)?;
         let mut var_list_types = HashMap::new();
         let head = self.normalize_head_atom(&rule.head)?;
         let body = self.normalize_body_with_env(&rule.body, &mut var_list_types)?;
@@ -191,9 +395,11 @@ impl ListNormalizer {
     ) -> Result<Vec<BodyLiteral>> {
         let mut out = Vec::new();
         for lit in body {
+            self.reserve_vector(&mut out, 1)?;
             match lit {
                 BodyLiteral::Positive(atom) => {
                     for atom in self.expand_atom(atom, false, var_list_types)? {
+                        self.reserve_vector(&mut out, 1)?;
                         out.push(BodyLiteral::Positive(atom));
                     }
                 }
@@ -213,8 +419,18 @@ impl ListNormalizer {
                         right: self.normalize_value_term(&cmp.right, None)?,
                     }));
                 }
-                BodyLiteral::Epistemic(lit) => out.push(BodyLiteral::Epistemic(lit.clone())),
-                BodyLiteral::IsExpr(is_expr) => out.push(BodyLiteral::IsExpr(is_expr.clone())),
+                BodyLiteral::Epistemic(epistemic) => {
+                    if self.allocation_owner.is_some() {
+                        self.acquire(lit.owned_allocation_bytes()?)?;
+                    }
+                    out.push(BodyLiteral::Epistemic(epistemic.clone()))
+                }
+                BodyLiteral::IsExpr(is_expr) => {
+                    if self.allocation_owner.is_some() {
+                        self.acquire(lit.owned_allocation_bytes()?)?;
+                    }
+                    out.push(BodyLiteral::IsExpr(is_expr.clone()))
+                }
                 BodyLiteral::Univ(_) => {
                     return Err(list_error(
                         "univ literals must be normalized by the meta-term pass before list normalization",
@@ -234,6 +450,8 @@ impl ListNormalizer {
     }
 
     fn normalize_head_atom(&mut self, atom: &Atom) -> Result<Atom> {
+        self.acquire_vector::<Term>(atom.terms.len())?;
+        self.acquire(atom.predicate.len() as u64)?;
         let mut terms = Vec::with_capacity(atom.terms.len());
         for (idx, term) in atom.terms.iter().enumerate() {
             let expected = self.list_column_elem(&atom.predicate, idx);
@@ -260,6 +478,15 @@ impl ListNormalizer {
             ));
         }
 
+        self.acquire_vector::<Term>(atom.terms.len())?;
+        self.acquire_vector::<Atom>(atom.terms.len())?;
+        self.acquire_vector::<Atom>(
+            atom.terms
+                .len()
+                .checked_add(1)
+                .ok_or_else(|| list_error("list atom extent overflow"))?,
+        )?;
+        self.acquire(atom.predicate.len() as u64)?;
         let mut terms = Vec::with_capacity(atom.terms.len());
         let mut extra_atoms = Vec::new();
         for (idx, term) in atom.terms.iter().enumerate() {
@@ -267,8 +494,9 @@ impl ListNormalizer {
             match term {
                 Term::Variable(name) => {
                     if let Some(elem_type) = expected {
-                        var_list_types.insert(name.clone(), elem_type);
+                        self.bind_list_type(var_list_types, name, elem_type)?;
                     }
+                    self.acquire_term(term)?;
                     terms.push(term.clone());
                 }
                 Term::Cons { head, tail } => {
@@ -280,13 +508,19 @@ impl ListNormalizer {
                     let elem_type = expected.ok_or_else(|| {
                         list_error("cons pattern requires a declared list<T> column")
                     })?;
-                    let list_var = self.fresh_var("list_cons");
+                    let list_var = self.fresh_var("list_cons")?;
                     let head_term = self.normalize_scalar_term(head, Some(elem_type))?.1;
                     let tail_arg =
                         self.normalize_list_arg(tail, Some(elem_type), var_list_types)?;
                     if let Term::Variable(name) = &tail_arg.term {
-                        var_list_types.insert(name.clone(), elem_type);
+                        self.bind_list_type(var_list_types, name, elem_type)?;
                     }
+                    self.acquire(list_var.len() as u64)?;
+                    self.acquire_vector::<Term>(3)?;
+                    self.acquire_format(format_args!(
+                        "__xlog_list_cons_{}",
+                        scalar_suffix(elem_type)
+                    ))?;
                     terms.push(Term::Variable(list_var.clone()));
                     extra_atoms.push(Atom {
                         predicate: cons_pred(elem_type),
@@ -314,6 +548,27 @@ impl ListNormalizer {
         var_list_types: &mut HashMap<String, ScalarType>,
     ) -> Result<Option<Vec<Atom>>> {
         let pred = atom.predicate.as_str();
+        if matches!(
+            pred,
+            "is_list"
+                | "member"
+                | "memberchk"
+                | "length"
+                | "nth"
+                | "append"
+                | "sort"
+                | "msort"
+                | "list_to_set"
+        ) {
+            self.acquire_vector::<Atom>(1)?;
+            self.acquire_vector::<Term>(3)?;
+            // Every emitted helper has one original scalar suffix. The
+            // longest original spelling is selected without constructing it.
+            self.acquire_format(format_args!(
+                "__xlog_list_to_set_{}",
+                scalar_suffix(ScalarType::Symbol)
+            ))?;
+        }
         match pred {
             "is_list" => {
                 require_arity(atom, 1)?;
@@ -390,13 +645,18 @@ impl ListNormalizer {
                     Some(id) => id,
                     None => self.concat_lists(left_id, right_id)?,
                 };
+                self.acquire_hash_growth::<(ListOp, ScalarType, Vec<u64>), ()>(
+                    self.operation_rows.len(),
+                    self.operation_rows.capacity(),
+                )?;
+                self.acquire_vector::<u64>(3)?;
                 self.operation_rows.insert((
                     ListOp::Append,
                     left.elem_type,
                     vec![left_id, right_id, out_id],
                 ));
                 if let Term::Variable(name) = &out.term {
-                    var_list_types.insert(name.clone(), left.elem_type);
+                    self.bind_list_type(var_list_types, name, left.elem_type)?;
                 }
                 Ok(Some(vec![Atom {
                     predicate: append_pred(left.elem_type),
@@ -424,10 +684,15 @@ impl ListNormalizer {
                     Some(id) => id,
                     None => self.derived_ordered_list(input_id, op)?,
                 };
+                self.acquire_hash_growth::<(ListOp, ScalarType, Vec<u64>), ()>(
+                    self.operation_rows.len(),
+                    self.operation_rows.capacity(),
+                )?;
+                self.acquire_vector::<u64>(2)?;
                 self.operation_rows
                     .insert((op, input.elem_type, vec![input_id, out_id]));
                 if let Term::Variable(name) = &out.term {
-                    var_list_types.insert(name.clone(), input.elem_type);
+                    self.bind_list_type(var_list_types, name, input.elem_type)?;
                 }
                 let helper = match op {
                     ListOp::Sort => sort_pred(input.elem_type),
@@ -457,18 +722,27 @@ impl ListNormalizer {
                 let elem_type = expected_list_elem.ok_or_else(|| {
                     list_error("cons literal requires a declared list<T> context")
                 })?;
+                self.acquire_vector::<Term>(1)?;
                 let mut items = vec![self.normalize_scalar_term(head, Some(elem_type))?.1];
                 let tail_arg =
                     self.normalize_list_arg(tail, Some(elem_type), &mut HashMap::new())?;
                 let tail_id = tail_arg
                     .id
                     .ok_or_else(|| list_error("cons literal tail must be a finite list literal"))?;
+                if self.allocation_owner.is_some() {
+                    let bytes = Self::items_clone_bytes(&self.list_by_id(tail_id)?.items)?;
+                    self.acquire(bytes)?;
+                }
                 let tail_items = self.list_by_id(tail_id)?.items.clone();
+                self.reserve_vector(&mut items, tail_items.len())?;
                 items.extend(tail_items);
                 let id = self.register_list_terms(items, Some(elem_type))?;
                 Ok(Term::Integer(id as i64))
             }
-            _ => Ok(term.clone()),
+            _ => {
+                self.acquire_term(term)?;
+                Ok(term.clone())
+            }
         }
     }
 
@@ -480,6 +754,9 @@ impl ListNormalizer {
     ) -> Result<ListArg> {
         match term {
             Term::List(items) => {
+                if self.allocation_owner.is_some() {
+                    self.acquire(Self::items_clone_bytes(items)?)?;
+                }
                 let id = self.register_list_terms(items.clone(), expected_elem_type)?;
                 let elem_type = self.list_by_id(id)?.elem_type;
                 Ok(ListArg {
@@ -526,7 +803,8 @@ impl ListNormalizer {
                             "list built-in requires a finite literal or known list<T> variable",
                         )
                     })?;
-                var_list_types.insert(name.clone(), elem_type);
+                self.bind_list_type(var_list_types, name, elem_type)?;
+                self.acquire_term(term)?;
                 Ok(ListArg {
                     term: term.clone(),
                     id: None,
@@ -556,6 +834,7 @@ impl ListNormalizer {
         term: &Term,
         expected: Option<ScalarType>,
     ) -> Result<(ScalarType, Term)> {
+        self.acquire_term(term)?;
         match term {
             Term::Variable(_) | Term::Anonymous => {
                 let typ = expected.ok_or_else(|| {
@@ -643,6 +922,8 @@ impl ListNormalizer {
         items: Vec<Term>,
         expected_elem_type: Option<ScalarType>,
     ) -> Result<u64> {
+        self.acquire_vector::<Term>(items.len())?;
+        self.acquire_vector::<LiteralKey>(items.len())?;
         let mut elem_type = expected_elem_type;
         let mut normalized = Vec::with_capacity(items.len());
         let mut keys = Vec::with_capacity(items.len());
@@ -664,16 +945,30 @@ impl ListNormalizer {
             } else {
                 elem_type = Some(item_type);
             }
-            keys.push(literal_key(&term, item_type)?);
+            keys.push(literal_key_with_owner(
+                &term,
+                item_type,
+                &mut self.allocation_owner,
+            )?);
             normalized.push(term);
         }
 
         let elem_type = elem_type.unwrap_or(LIST_ID_TYPE);
+        if self.allocation_owner.is_some() {
+            self.acquire(Self::keys_clone_bytes(&keys)?)?;
+        }
         let key = (elem_type, keys.clone());
         if let Some(id) = self.lists_by_key.get(&key) {
             return Ok(*id);
         }
 
+        self.acquire_hash_growth::<(ScalarType, Vec<LiteralKey>), u64>(
+            self.lists_by_key.len(),
+            self.lists_by_key.capacity(),
+        )?;
+        if self.lists.len() == self.lists.capacity() {
+            self.acquire_vector::<ListDef>(self.lists.len() + 1)?;
+        }
         let id = self.next_list_id;
         self.next_list_id += 1;
         self.lists_by_key.insert(key, id);
@@ -687,7 +982,9 @@ impl ListNormalizer {
     }
 
     fn concat_lists(&mut self, left_id: u64, right_id: u64) -> Result<u64> {
+        self.acquire_list_clone(left_id)?;
         let left = self.list_by_id(left_id)?.clone();
+        self.acquire_list_clone(right_id)?;
         let right = self.list_by_id(right_id)?.clone();
         if left.elem_type != right.elem_type {
             return Err(list_error(
@@ -695,11 +992,29 @@ impl ListNormalizer {
             ));
         }
         let mut items = left.items;
+        self.reserve_vector(&mut items, right.items.len())?;
         items.extend(right.items);
         self.register_list_terms(items, Some(right.elem_type))
     }
 
     fn derived_ordered_list(&mut self, input_id: u64, op: ListOp) -> Result<u64> {
+        self.acquire_list_clone(input_id)?;
+        if self.allocation_owner.is_some() {
+            let input = self.list_by_id(input_id)?;
+            let mut formatted = 0u64;
+            for key in &input.keys {
+                formatted = formatted.max(crate::compile::formatted_text_allocation_bytes(
+                    format_args!("{key:?}"),
+                )?);
+            }
+            let count = input.items.len();
+            let bytes = crate::compile::push_vector_allocation_bytes::<(LiteralKey, Term)>(count)?
+                .checked_mul(2)
+                .and_then(|n| n.checked_add(formatted.checked_mul(2)?))
+                .ok_or_else(|| list_error("list sorting allocation extent overflow"))?;
+            self.acquire(bytes)?;
+            self.acquire_vector::<Term>(count)?;
+        }
         let input = self.list_by_id(input_id)?.clone();
         let mut pairs: Vec<(LiteralKey, Term)> = input.keys.into_iter().zip(input.items).collect();
         pairs.sort_by(|(a, _), (b, _)| format!("{a:?}").cmp(&format!("{b:?}")));
@@ -712,6 +1027,91 @@ impl ListNormalizer {
 
     fn append_helper_declarations_and_facts(&mut self, program: &mut Program) -> Result<()> {
         self.ensure_tail_lists()?;
+
+        self.acquire_lists_clone()?;
+        if self.allocation_owner.is_some() {
+            let mut facts = 0usize;
+            let mut bytes = 0u64;
+            let mut names = 0usize;
+            for list in &self.lists {
+                facts = facts
+                    .checked_add(1)
+                    .and_then(|n| n.checked_add(list.items.len()))
+                    .and_then(|n| n.checked_add(usize::from(!list.items.is_empty())))
+                    .ok_or_else(|| list_error("list helper allocation extent overflow"))?;
+                names = names
+                    .checked_add(3)
+                    .ok_or_else(|| list_error("list helper allocation extent overflow"))?;
+                let name = crate::compile::formatted_text_allocation_bytes(format_args!(
+                    "__xlog_list_cons_{}",
+                    scalar_suffix(list.elem_type)
+                ))?;
+                bytes = bytes
+                    .checked_add(
+                        name.checked_mul((list.items.len() + 6) as u64)
+                            .ok_or_else(|| list_error("list helper extent overflow"))?,
+                    )
+                    .and_then(|n| n.checked_add(Self::items_clone_bytes(&list.items).ok()?))
+                    .ok_or_else(|| list_error("list helper extent overflow"))?;
+                if let Some(head) = list.items.first() {
+                    bytes = bytes
+                        .checked_add(head.owned_allocation_bytes()?)
+                        .ok_or_else(|| list_error("list helper extent overflow"))?;
+                }
+            }
+            facts = facts
+                .checked_add(self.operation_rows.len())
+                .ok_or_else(|| list_error("list helper extent overflow"))?;
+            names = names
+                .checked_add(self.operation_rows.len())
+                .ok_or_else(|| list_error("list helper extent overflow"))?;
+            for (_, typ, ids) in &self.operation_rows {
+                let name = crate::compile::formatted_text_allocation_bytes(format_args!(
+                    "__xlog_list_to_set_{}",
+                    scalar_suffix(*typ)
+                ))?;
+                bytes = bytes
+                    .checked_add(
+                        name.checked_mul(3)
+                            .ok_or_else(|| list_error("list helper extent overflow"))?,
+                    )
+                    .and_then(|n| {
+                        n.checked_add(
+                            crate::compile::push_vector_allocation_bytes::<u64>(ids.len()).ok()?,
+                        )
+                    })
+                    .ok_or_else(|| list_error("list helper extent overflow"))?;
+            }
+            bytes = bytes
+                .checked_add(crate::compile::push_vector_allocation_bytes::<Rule>(facts)?)
+                .and_then(|n| {
+                    n.checked_add(
+                        crate::compile::push_vector_allocation_bytes::<Term>(3)
+                            .ok()?
+                            .checked_mul(facts as u64)?,
+                    )
+                })
+                .and_then(|n| {
+                    n.checked_add(
+                        crate::compile::hash_allocation_bytes::<String, ()>(names)
+                            .ok()?
+                            .checked_mul(2)?,
+                    )
+                })
+                .and_then(|n| {
+                    n.checked_add(
+                        crate::compile::push_vector_allocation_bytes::<(
+                            ListOp,
+                            ScalarType,
+                            Vec<u64>,
+                        )>(self.operation_rows.len())
+                        .ok()?,
+                    )
+                })
+                .ok_or_else(|| list_error("list helper allocation extent overflow"))?;
+            self.acquire(bytes)?;
+            self.reserve_vector(&mut program.rules, facts)?;
+        }
 
         let mut helper_rules = Vec::new();
         for list in self.lists.clone() {
@@ -773,7 +1173,7 @@ impl ListNormalizer {
             ));
         }
 
-        self.append_helper_pred_decls(program);
+        self.append_helper_pred_decls(program)?;
         program.rules.extend(helper_rules);
         Ok(())
     }
@@ -781,9 +1181,13 @@ impl ListNormalizer {
     fn ensure_tail_lists(&mut self) -> Result<()> {
         loop {
             let before = self.lists.len();
+            self.acquire_lists_clone()?;
             for list in self.lists.clone() {
                 if list.items.is_empty() {
                     continue;
+                }
+                if self.allocation_owner.is_some() {
+                    self.acquire(Self::items_clone_bytes(&list.items[1..])?)?;
                 }
                 self.register_list_terms(list.items[1..].to_vec(), Some(list.elem_type))?;
             }
@@ -794,7 +1198,16 @@ impl ListNormalizer {
         Ok(())
     }
 
-    fn cons_fact_parts(&self, list_id: u64) -> Result<Option<(Term, u64)>> {
+    fn cons_fact_parts(&mut self, list_id: u64) -> Result<Option<(Term, u64)>> {
+        if self.allocation_owner.is_some() {
+            let list = self.list_by_id(list_id)?;
+            if let Some(head) = list.items.first() {
+                let bytes = Self::keys_clone_bytes(&list.keys[1..])?
+                    .checked_add(head.owned_allocation_bytes()?)
+                    .ok_or_else(|| list_error("list cons allocation extent overflow"))?;
+                self.acquire(bytes)?;
+            }
+        }
         let list = self.list_by_id(list_id)?;
         let Some(head) = list.items.first() else {
             return Ok(None);
@@ -808,7 +1221,51 @@ impl ListNormalizer {
         Ok(Some((head.clone(), tail_id)))
     }
 
-    fn append_helper_pred_decls(&self, program: &mut Program) {
+    fn append_helper_pred_decls(&mut self, program: &mut Program) -> Result<()> {
+        if self.allocation_owner.is_some() {
+            let count = program
+                .predicates
+                .len()
+                .checked_add(self.helper_preds.len())
+                .ok_or_else(|| list_error("list declarations extent overflow"))?;
+            let mut bytes = crate::compile::hash_allocation_bytes::<String, ()>(count)?
+                .checked_mul(2)
+                .ok_or_else(|| list_error("list declarations extent overflow"))?;
+            for predicate in &program.predicates {
+                bytes = bytes
+                    .checked_add(predicate.name.len() as u64)
+                    .ok_or_else(|| list_error("list declarations extent overflow"))?;
+            }
+            for name in &self.helper_preds {
+                bytes = bytes
+                    .checked_add(
+                        (name.len() as u64)
+                            .checked_mul(2)
+                            .ok_or_else(|| list_error("list declarations extent overflow"))?,
+                    )
+                    .and_then(|n| {
+                        n.checked_add(
+                            crate::compile::push_vector_allocation_bytes::<PredColumn>(3).ok()?,
+                        )
+                    })
+                    .and_then(|n| {
+                        n.checked_add(
+                            crate::compile::push_vector_allocation_bytes::<TypeRef>(3).ok()?,
+                        )
+                    })
+                    .and_then(|n| {
+                        n.checked_add("list_idindexvaluetailleft_idright_idout_id".len() as u64)
+                    })
+                    .ok_or_else(|| list_error("list declarations extent overflow"))?;
+            }
+            bytes = bytes
+                .checked_add(crate::compile::push_vector_allocation_bytes::<&String>(
+                    self.helper_preds.len(),
+                )?)
+                .ok_or_else(|| list_error("list declarations extent overflow"))?;
+            self.acquire(bytes)?;
+            self.reserve_vector(&mut program.predicates, self.helper_preds.len())?;
+        }
         let mut existing: HashSet<String> = program
             .predicates
             .iter()
@@ -832,6 +1289,7 @@ impl ListNormalizer {
             });
             existing.insert(pred.clone());
         }
+        Ok(())
     }
 
     fn list_by_id(&self, id: u64) -> Result<&ListDef> {
@@ -841,14 +1299,16 @@ impl ListNormalizer {
             .ok_or_else(|| list_error("unknown normalized list id"))
     }
 
-    fn fresh_var(&mut self, prefix: &str) -> String {
+    fn fresh_var(&mut self, prefix: &str) -> Result<String> {
+        self.acquire(prefix.len() as u64)?;
+        self.acquire_format(format_args!("__XLOG_{prefix}_{}", self.fresh_counter))?;
         let var = format!(
             "__XLOG_{}_{}",
             prefix.to_ascii_uppercase(),
             self.fresh_counter
         );
         self.fresh_counter += 1;
-        var
+        Ok(var)
     }
 
     fn storage_type_for_type_ref(
@@ -891,7 +1351,11 @@ fn require_arity(atom: &Atom, expected: usize) -> Result<()> {
     }
 }
 
-fn literal_key(term: &Term, typ: ScalarType) -> Result<LiteralKey> {
+fn literal_key_with_owner(
+    term: &Term,
+    typ: ScalarType,
+    allocate: &mut Option<&mut dyn FnMut(u64) -> Result<Arc<dyn Send + Sync>>>,
+) -> Result<LiteralKey> {
     match (typ, term) {
         (ScalarType::U32, Term::Integer(v)) => Ok(LiteralKey::U32(*v as u32)),
         (ScalarType::U64, Term::Integer(v)) => Ok(LiteralKey::U64(*v as u64)),
@@ -900,9 +1364,25 @@ fn literal_key(term: &Term, typ: ScalarType) -> Result<LiteralKey> {
         (ScalarType::F32, Term::Float(v)) => Ok(LiteralKey::F32((*v as f32).to_bits())),
         (ScalarType::F64, Term::Float(v)) => Ok(LiteralKey::F64(v.to_bits())),
         (ScalarType::Bool, Term::Integer(v)) => Ok(LiteralKey::Bool(*v != 0)),
-        (ScalarType::Symbol, Term::String(s)) => Ok(LiteralKey::Symbol(s.clone())),
+        (ScalarType::Symbol, Term::String(s)) => {
+            if let Some(allocate) = allocate.as_deref_mut() {
+                allocate(s.len() as u64)?;
+            }
+            Ok(LiteralKey::Symbol(s.clone()))
+        }
         (ScalarType::Symbol, Term::Symbol(id)) => {
-            Ok(LiteralKey::Symbol(xlog_core::symbol::resolve(*id)))
+            let text = if let Some(allocate) = allocate.as_deref_mut() {
+                let mut reserve = |bytes: usize| {
+                    allocate(
+                        u64::try_from(bytes)
+                            .map_err(|_| list_error("list symbol allocation extent overflow"))?,
+                    )
+                };
+                xlog_core::symbol::resolve_with_allocation_owner(*id, &mut reserve)?.0
+            } else {
+                xlog_core::symbol::resolve(*id)
+            };
+            Ok(LiteralKey::Symbol(text))
         }
         _ => Err(list_error(
             "list literal element did not normalize to expected scalar type",
