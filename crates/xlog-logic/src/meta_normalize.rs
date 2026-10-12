@@ -36,13 +36,12 @@ pub fn normalize_meta_builtins_owned_with_allocation_owner(
     program: Program,
     allocations: &mut crate::compile::CompilationAllocationScope<'_>,
 ) -> Result<Program> {
-    let mut reserve = |bytes| allocations.acquire(bytes);
-    normalize_meta_builtins_with_owner(program, Some(&mut reserve))
+    normalize_meta_builtins_with_owner(program, Some(allocations))
 }
 
 fn normalize_meta_builtins_with_owner(
     program: Program,
-    reserve: Option<&mut dyn FnMut(u64) -> Result<Arc<dyn Send + Sync>>>,
+    reserve: Option<&mut crate::compile::CompilationAllocationScope<'_>>,
 ) -> Result<Program> {
     let mut normalizer = MetaNormalizer::new(&program, reserve)?;
     normalizer.normalize_program(program)
@@ -72,7 +71,38 @@ struct TermRecord {
     kind: RegisteredTerm,
 }
 
-struct MetaNormalizer<'a> {
+struct RetainedSourceFacts {
+    facts: Vec<Atom>,
+    _allocation_owner: Option<Arc<dyn Send + Sync>>,
+}
+
+struct RetainedTermKey {
+    text: String,
+    _allocation_owner: Option<Arc<dyn Send + Sync>>,
+}
+
+struct RetainedBindings {
+    values: HashMap<String, Term>,
+    _allocation_owner: Option<Arc<dyn Send + Sync>>,
+}
+
+struct RetainedTermRow {
+    values: Vec<Term>,
+    allocation_owner: Option<Arc<dyn Send + Sync>>,
+}
+
+struct RetainedTermRows {
+    rows: Vec<RetainedTermRow>,
+    _allocation_owner: Option<Arc<dyn Send + Sync>>,
+}
+
+struct RetainedRegisteredTerm {
+    key: RetainedTermKey,
+    kind: RegisteredTerm,
+    allocation_owners: [Option<Arc<dyn Send + Sync>>; 2],
+}
+
+struct MetaNormalizer<'a, 'pool> {
     domains: HashMap<String, ScalarType>,
     /// Declared column types per predicate (index = column position).
     pred_columns: HashMap<String, Vec<TypeRef>>,
@@ -92,14 +122,58 @@ struct MetaNormalizer<'a> {
     helper_fact_keys: HashSet<String>,
     findall_counter: usize,
     maplist_counter: usize,
-    allocation_owner: Option<&'a mut dyn FnMut(u64) -> Result<Arc<dyn Send + Sync>>>,
+    allocation_owner: Option<&'a mut crate::compile::CompilationAllocationScope<'pool>>,
+    _environment_owner: Option<Arc<dyn Send + Sync>>,
 }
 
-impl<'a> MetaNormalizer<'a> {
+impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
+    fn reserve_temporary(&mut self, bytes: u64) -> Result<Option<Arc<dyn Send + Sync>>> {
+        if bytes == 0 {
+            return Ok(None);
+        }
+        self.allocation_owner
+            .as_deref_mut()
+            .map(|scope| scope.reserve_allocation(bytes))
+            .transpose()
+    }
+
+    fn retain_temporary(&mut self, owner: Option<Arc<dyn Send + Sync>>) -> Result<()> {
+        if let Some(owner) = owner {
+            self.allocation_owner
+                .as_deref_mut()
+                .expect("original meta allocation scope")
+                .retain(owner)?;
+        }
+        Ok(())
+    }
+
+    fn reserve_binding_map(
+        &mut self,
+        body: &[BodyLiteral],
+    ) -> Result<(usize, Option<Arc<dyn Send + Sync>>)> {
+        if self.allocation_owner.is_none() {
+            return Ok((0, None));
+        }
+        let mut variables = Some((0usize, 0u64));
+        for literal in body {
+            literal.visit_variables(&mut |name| {
+                variables = variables.and_then(|(count, bytes)| {
+                    Some((count.checked_add(1)?, bytes.checked_add(name.len() as u64)?))
+                });
+            });
+        }
+        let (count, text) = variables
+            .ok_or_else(|| XlogError::allocation_extent_overflow("finite meta binding"))?;
+        let bytes = crate::compile::hash_allocation_bytes::<String, ScalarType>(count)?
+            .checked_add(text)
+            .ok_or_else(|| XlogError::allocation_extent_overflow("finite meta binding"))?;
+        Ok((count, self.reserve_temporary(bytes)?))
+    }
+
     fn acquire(&mut self, bytes: u64) -> Result<()> {
         if bytes != 0 {
             if let Some(reserve) = self.allocation_owner.as_deref_mut() {
-                reserve(bytes)?;
+                reserve.acquire(bytes)?;
             }
         }
         Ok(())
@@ -123,7 +197,7 @@ impl<'a> MetaNormalizer<'a> {
         match self.allocation_owner.as_deref_mut() {
             Some(reserve) => {
                 let (text, _) = symbol::resolve_with_allocation_owner(id, &mut |bytes| {
-                    reserve(
+                    reserve.acquire(
                         u64::try_from(bytes)
                             .map_err(|_| XlogError::allocation_extent_overflow("meta symbol"))?,
                     )
@@ -137,7 +211,7 @@ impl<'a> MetaNormalizer<'a> {
     fn intern_symbol(&mut self, text: &str) -> Result<u32> {
         match self.allocation_owner.as_deref_mut() {
             Some(reserve) => symbol::intern_with_allocation_owner(text, &mut |bytes| {
-                reserve(
+                reserve.reserve_allocation(
                     u64::try_from(bytes)
                         .map_err(|_| XlogError::allocation_extent_overflow("meta symbol"))?,
                 )
@@ -153,8 +227,8 @@ impl<'a> MetaNormalizer<'a> {
         Ok(())
     }
 
-    fn term_key(&mut self, term: &Term) -> Result<String> {
-        term_match_key(term, &mut self.allocation_owner)
+    fn term_keys_equal(&mut self, left: &Term, right: &Term) -> Result<bool> {
+        term_keys_equal(left, right, &mut self.allocation_owner)
     }
 
     fn acquire_hash_growth<K, V>(&mut self, length: usize, capacity: usize) -> Result<()> {
@@ -217,50 +291,32 @@ impl<'a> MetaNormalizer<'a> {
         Ok(self.column_type(predicate, index).cloned())
     }
 
-    fn cloned_source_facts(&mut self, predicate: &str) -> Result<Vec<Atom>> {
+    fn cloned_source_facts(&mut self, predicate: &str) -> Result<RetainedSourceFacts> {
+        let mut bytes = 0u64;
         if self.allocation_owner.is_some() {
-            let mut bytes = 0u64;
             for fact in self.source_facts.get(predicate).into_iter().flatten() {
                 bytes = bytes
                     .checked_add(fact.owned_allocation_bytes()?)
                     .ok_or_else(|| XlogError::allocation_extent_overflow("finite fact clone"))?;
             }
-            self.acquire(bytes)?;
         }
-        Ok(self
+        let allocation_owner = self.reserve_temporary(bytes)?;
+        let facts = self
             .source_facts
             .get(predicate)
             .cloned()
-            .unwrap_or_default())
-    }
-
-    fn acquire_btree_insert<K, V>(&mut self, length: usize) -> Result<()> {
-        if self.allocation_owner.is_some() {
-            // Original B-tree insertion can split one full node per reached
-            // level and add a new root. Node capacity is eleven entries.
-            let mut height = 1u64;
-            let mut entries = length;
-            while entries >= 6 {
-                entries /= 6;
-                height += 1;
-            }
-            let node = (2 * std::mem::size_of::<usize>()
-                + 2 * std::mem::size_of::<u16>()
-                + 11 * std::mem::size_of::<(K, V)>()
-                + 12 * std::mem::size_of::<usize>()) as u64;
-            self.acquire(
-                node.checked_mul(height + 1)
-                    .ok_or_else(|| XlogError::allocation_extent_overflow("finite tree"))?,
-            )?;
-        }
-        Ok(())
+            .unwrap_or_default();
+        Ok(RetainedSourceFacts {
+            facts,
+            _allocation_owner: allocation_owner,
+        })
     }
 
     fn new(
         program: &Program,
-        mut allocation_owner: Option<&'a mut dyn FnMut(u64) -> Result<Arc<dyn Send + Sync>>>,
+        mut allocation_owner: Option<&'a mut crate::compile::CompilationAllocationScope<'pool>>,
     ) -> Result<Self> {
-        if let Some(reserve) = allocation_owner.as_deref_mut() {
+        let environment_owner = if let Some(reserve) = allocation_owner.as_deref_mut() {
             use crate::compile::hash_allocation_bytes;
             let overflow = || XlogError::allocation_extent_overflow("finite meta environment");
             let add = |left: u64, right: u64| left.checked_add(right).ok_or_else(overflow);
@@ -343,8 +399,10 @@ impl<'a> MetaNormalizer<'a> {
             // Hash-table collection can temporarily hold both original and
             // replacement buffers during growth; payload clones are included
             // above and the reached rosters, not source length, set the sizes.
-            reserve(bytes.checked_mul(2).ok_or_else(overflow)?)?;
-        }
+            Some(reserve.reserve_allocation(bytes.checked_mul(2).ok_or_else(overflow)?)?)
+        } else {
+            None
+        };
         let domains: HashMap<String, ScalarType> = program
             .domains
             .iter()
@@ -401,6 +459,7 @@ impl<'a> MetaNormalizer<'a> {
             findall_counter: 0,
             maplist_counter: 0,
             allocation_owner,
+            _environment_owner: environment_owner,
         })
     }
 
@@ -434,7 +493,8 @@ impl<'a> MetaNormalizer<'a> {
         out.constraints = std::mem::take(&mut out.constraints)
             .into_iter()
             .map(|constraint| {
-                let mut bound = HashMap::new();
+                let (capacity, _bound_owner) = self.reserve_binding_map(&constraint.body)?;
+                let mut bound = HashMap::with_capacity(capacity);
                 Ok(Constraint {
                     authored_index: constraint.authored_index,
                     body: self.normalize_body(&constraint.body, &mut bound)?,
@@ -497,7 +557,8 @@ impl<'a> MetaNormalizer<'a> {
         out.learnable_rules = std::mem::take(&mut out.learnable_rules)
             .into_iter()
             .map(|mut learnable| {
-                let mut bound = HashMap::new();
+                let (capacity, _bound_owner) = self.reserve_binding_map(&learnable.body)?;
+                let mut bound = HashMap::with_capacity(capacity);
                 learnable.head = self.normalize_atom_values(&learnable.head)?;
                 learnable.body = self.normalize_body(&learnable.body, &mut bound)?;
                 Ok(learnable)
@@ -531,7 +592,8 @@ impl<'a> MetaNormalizer<'a> {
 
     fn normalize_rule(&mut self, rule: &Rule) -> Result<Rule> {
         let head = self.normalize_atom_values(&rule.head)?;
-        let mut bound = HashMap::new();
+        let (capacity, _bound_owner) = self.reserve_binding_map(&rule.body)?;
+        let mut bound = HashMap::with_capacity(capacity);
         let body = self.normalize_body(&rule.body, &mut bound)?;
         Ok(Rule { head, body })
     }
@@ -545,20 +607,6 @@ impl<'a> MetaNormalizer<'a> {
             self.acquire(crate::compile::push_vector_allocation_bytes::<BodyLiteral>(
                 body.len(),
             )?)?;
-            let mut variables = Some((0usize, 0u64));
-            for literal in body {
-                literal.visit_variables(&mut |name| {
-                    variables = variables.and_then(|(count, bytes)| {
-                        Some((count.checked_add(1)?, bytes.checked_add(name.len() as u64)?))
-                    });
-                });
-            }
-            let (count, bytes) = variables
-                .ok_or_else(|| XlogError::allocation_extent_overflow("finite meta binding"))?;
-            self.acquire(crate::compile::hash_allocation_bytes::<String, ScalarType>(
-                count,
-            )?)?;
-            self.acquire(bytes)?;
         }
         let mut out = Vec::new();
         for lit in body {
@@ -798,7 +846,13 @@ impl<'a> MetaNormalizer<'a> {
     ) -> Result<Vec<BodyLiteral>> {
         require_arity(atom, 3, &mut self.allocation_owner)?;
         let template = &atom.terms[0];
-        self.acquire_term_clone(&atom.terms[1])?;
+        let _goal_owner = if self.allocation_owner.is_some() {
+            self.reserve_temporary(
+                atom.terms[1].owned_allocation_bytes()? - std::mem::size_of::<Term>() as u64,
+            )?
+        } else {
+            None
+        };
         let goal = compound_goal_atom(&atom.terms[1], "findall/3", &mut self.allocation_owner)?;
         self.acquire_term_clone(&atom.terms[2])?;
         let out_list = atom.terms[2].clone();
@@ -806,7 +860,7 @@ impl<'a> MetaNormalizer<'a> {
             return Err(meta_error(format_args!("{}", "findall/3 is limited to finite source facts; derived goals are reserved for a later aggregate-backed collection path"), &mut self.allocation_owner));
         }
 
-        if self.allocation_owner.is_some() {
+        let _variables_owner = if self.allocation_owner.is_some() {
             let mut variables = Some((0usize, 0u64));
             template.visit_variables(&mut |name| {
                 variables = variables
@@ -814,14 +868,17 @@ impl<'a> MetaNormalizer<'a> {
             });
             let (count, text) = variables
                 .ok_or_else(|| XlogError::allocation_extent_overflow("finite variable"))?;
-            self.acquire_vector::<&str>(count)?;
-            self.acquire(crate::compile::hash_allocation_bytes::<String, ()>(count)?)?;
-            self.acquire(text)?;
-            self.acquire(crate::compile::push_vector_allocation_bytes::<(
-                usize,
-                String,
-            )>(goal.terms.len())?)?;
-            let text = goal
+            let mut bytes = crate::compile::push_vector_allocation_bytes::<&str>(count)?
+                .checked_add(crate::compile::hash_allocation_bytes::<String, ()>(count)?)
+                .and_then(|bytes| bytes.checked_add(text))
+                .ok_or_else(|| XlogError::allocation_extent_overflow("finite variable"))?;
+            bytes = bytes
+                .checked_add(crate::compile::push_vector_allocation_bytes::<(
+                    usize,
+                    String,
+                )>(goal.terms.len())?)
+                .ok_or_else(|| XlogError::allocation_extent_overflow("finite variable"))?;
+            let group_text = goal
                 .terms
                 .iter()
                 .filter_map(|term| {
@@ -836,8 +893,13 @@ impl<'a> MetaNormalizer<'a> {
                         .checked_add(n)
                         .ok_or_else(|| XlogError::allocation_extent_overflow("finite variable"))
                 })?;
-            self.acquire(text)?;
-        }
+            bytes = bytes
+                .checked_add(group_text)
+                .ok_or_else(|| XlogError::allocation_extent_overflow("finite variable"))?;
+            self.reserve_temporary(bytes)?
+        } else {
+            None
+        };
         let template_vars: HashSet<String> = template
             .variables()
             .into_iter()
@@ -882,57 +944,112 @@ impl<'a> MetaNormalizer<'a> {
         });
         self.register_helper_decl(&helper, columns)?;
 
-        let mut groups: BTreeMap<String, (Vec<Term>, Vec<Term>)> = BTreeMap::new();
-        for fact in self.cloned_source_facts(&goal.predicate)? {
+        let _groups_owner = if self.allocation_owner.is_some() {
+            let count = self
+                .source_facts
+                .get(&goal.predicate)
+                .map_or(0, Vec::len)
+                .max(1);
+            let mut bytes = 0u64;
+            for length in 0..count {
+                bytes = bytes
+                    .checked_add(xlog_core::btree_insert_allocation_bytes::<
+                        String,
+                        (RetainedTermRow, Vec<Term>, Option<Arc<dyn Send + Sync>>),
+                    >(length)?)
+                    .ok_or_else(|| {
+                        XlogError::allocation_extent_overflow("finite findall groups")
+                    })?;
+            }
+            self.reserve_temporary(bytes)?
+        } else {
+            None
+        };
+        let mut groups: BTreeMap<
+            String,
+            (RetainedTermRow, Vec<Term>, Option<Arc<dyn Send + Sync>>),
+        > = BTreeMap::new();
+        let mut source_facts = self.cloned_source_facts(&goal.predicate)?;
+        for fact in std::mem::take(&mut source_facts.facts) {
             if fact.terms.len() != goal.terms.len() {
                 continue;
             }
             let Some(bindings) = self.match_goal_fact(&goal, &fact)? else {
                 continue;
             };
-            self.acquire_vector::<Term>(group_positions.len())?;
-            for (idx, _) in &group_positions {
-                self.acquire_term_clone(&fact.terms[*idx])?;
-            }
+            let allocation_owner = if self.allocation_owner.is_some() {
+                let mut bytes = 0u64;
+                for (idx, _) in &group_positions {
+                    bytes = bytes
+                        .checked_add(fact.terms[*idx].owned_allocation_bytes()?)
+                        .ok_or_else(|| {
+                            XlogError::allocation_extent_overflow("finite findall group")
+                        })?;
+                }
+                self.reserve_temporary(bytes)?
+            } else {
+                None
+            };
             let group_terms: Vec<Term> = group_positions
                 .iter()
                 .map(|(idx, _)| fact.terms[*idx].clone())
                 .collect();
-            self.acquire_vector::<String>(group_terms.len())?;
+            let group_terms = RetainedTermRow {
+                values: group_terms,
+                allocation_owner,
+            };
+            let _keys_owner = if self.allocation_owner.is_some() {
+                self.reserve_temporary(crate::compile::push_vector_allocation_bytes::<
+                    RetainedTermKey,
+                >(group_terms.values.len())?)?
+            } else {
+                None
+            };
             let keys = group_terms
+                .values
                 .iter()
-                .map(|term| self.term_key(term))
+                .map(|term| retained_term_key(term, &mut self.allocation_owner))
                 .collect::<Result<Vec<_>>>()?;
-            let key_bytes = joined_text_bytes(&keys, "|")?;
-            self.acquire(key_bytes)?;
-            let key = keys.join("|");
-            let template_value = self.substitute_template(template, &bindings, &elem_type_ref)?;
-            if !groups.contains_key(&key) {
-                self.acquire_btree_insert::<String, (Vec<Term>, Vec<Term>)>(groups.len())?;
-            }
+            let key = retained_joined_keys(&keys, "|", &mut self.allocation_owner)?;
+            let template_value =
+                self.substitute_template(template, &bindings.values, &elem_type_ref)?;
             let (length, capacity) = groups
-                .get(&key)
-                .map(|(_, values)| (values.len(), values.capacity()))
+                .get(&key.text)
+                .map(|(_, values, _)| (values.len(), values.capacity()))
                 .unwrap_or((0, 0));
             self.acquire_vector_growth::<Term>(length, capacity)?;
             groups
-                .entry(key)
-                .or_insert_with(|| (group_terms, Vec::new()))
+                .entry(key.text)
+                .or_insert_with(|| (group_terms, Vec::new(), key._allocation_owner))
                 .1
                 .push(template_value);
         }
+        drop(source_facts);
 
         if groups.is_empty() && group_positions.is_empty() {
-            self.acquire_btree_insert::<String, (Vec<Term>, Vec<Term>)>(0)?;
-            groups.insert(String::new(), (Vec::new(), Vec::new()));
+            groups.insert(
+                String::new(),
+                (
+                    RetainedTermRow {
+                        values: Vec::new(),
+                        allocation_owner: None,
+                    },
+                    Vec::new(),
+                    None,
+                ),
+            );
         }
 
-        for (_, (mut group_terms, values)) in groups {
+        for (_, (mut group_terms, values, _key_owner)) in groups {
             let list = Term::List(values);
-            self.acquire_vector_growth::<Term>(group_terms.len(), group_terms.capacity())?;
-            group_terms.push(list);
-            self.add_helper_fact(&helper, group_terms)?;
+            self.acquire_vector_growth::<Term>(
+                group_terms.values.len(),
+                group_terms.values.capacity(),
+            )?;
+            group_terms.values.push(list);
+            self.add_helper_fact_retained(&helper, group_terms)?;
         }
+        drop(_groups_owner);
 
         self.acquire(crate::compile::push_vector_allocation_bytes::<Term>(
             group_positions.len() + 1,
@@ -1042,11 +1159,19 @@ impl<'a> MetaNormalizer<'a> {
                 },
             ],
         )?;
-        for output in self.maplist_binary_outputs(&pred, &input_list, &output_type)? {
+        let mut outputs = self.maplist_binary_outputs(&pred, &input_list, &output_type)?;
+        for output in std::mem::take(&mut outputs.rows) {
             self.acquire_vector::<Term>(2)?;
             self.acquire_term_clone(&input_list)?;
-            self.add_helper_fact(&helper, vec![input_list.clone(), Term::List(output)])?;
+            self.add_helper_fact_retained(
+                &helper,
+                RetainedTermRow {
+                    values: vec![input_list.clone(), Term::List(output.values)],
+                    allocation_owner: output.allocation_owner,
+                },
+            )?;
         }
+        drop(outputs);
         self.acquire_vector::<Term>(2)?;
         self.acquire_term_clone(&atom.terms[1])?;
         self.acquire_term_clone(&atom.terms[2])?;
@@ -1066,8 +1191,8 @@ impl<'a> MetaNormalizer<'a> {
         let facts = self.cloned_source_facts(pred)?;
         for item in items {
             let mut present = false;
-            for fact in &facts {
-                if fact.terms.len() == 1 && self.term_key(&fact.terms[0])? == self.term_key(item)? {
+            for fact in &facts.facts {
+                if fact.terms.len() == 1 && self.term_keys_equal(&fact.terms[0], item)? {
                     present = true;
                     break;
                 }
@@ -1084,7 +1209,7 @@ impl<'a> MetaNormalizer<'a> {
         pred: &str,
         input: &Term,
         output_type: &TypeRef,
-    ) -> Result<Vec<Vec<Term>>> {
+    ) -> Result<RetainedTermRows> {
         let Term::List(items) = input else {
             return Err(meta_error(
                 format_args!("{}", "maplist input did not normalize to a finite list"),
@@ -1092,70 +1217,81 @@ impl<'a> MetaNormalizer<'a> {
             ));
         };
         if items.is_empty() {
-            self.acquire_vector::<Vec<Term>>(1)?;
-            return Ok(vec![Vec::new()]);
+            let allocation_owner =
+                self.reserve_temporary(std::mem::size_of::<RetainedTermRow>() as u64)?;
+            return Ok(RetainedTermRows {
+                rows: vec![RetainedTermRow {
+                    values: Vec::new(),
+                    allocation_owner: None,
+                }],
+                _allocation_owner: allocation_owner,
+            });
         }
         let facts = self.cloned_source_facts(pred)?;
-        self.acquire(crate::compile::push_vector_allocation_bytes::<Vec<Term>>(
-            items.len(),
-        )?)?;
+        let _choices_owner = if self.allocation_owner.is_some() {
+            let outer = crate::compile::push_vector_allocation_bytes::<Vec<Term>>(items.len())?;
+            let inner = crate::compile::push_vector_allocation_bytes::<Term>(facts.facts.len())?;
+            let bytes = inner
+                .checked_mul(items.len() as u64)
+                .and_then(|bytes| bytes.checked_add(outer))
+                .ok_or_else(|| XlogError::allocation_extent_overflow("finite maplist choices"))?;
+            self.reserve_temporary(bytes)?
+        } else {
+            None
+        };
         let mut choices: Vec<Vec<Term>> = Vec::new();
         for item in items {
             let mut outs = Vec::new();
-            for fact in &facts {
-                if fact.terms.len() == 2 && self.term_key(&fact.terms[0])? == self.term_key(item)? {
-                    self.acquire_vector_growth::<Term>(outs.len(), outs.capacity())?;
+            for fact in &facts.facts {
+                if fact.terms.len() == 2 && self.term_keys_equal(&fact.terms[0], item)? {
                     outs.push(self.normalize_value_term(&fact.terms[1], Some(output_type))?);
                 }
             }
             if outs.is_empty() {
-                return Ok(Vec::new());
+                return Ok(RetainedTermRows {
+                    rows: Vec::new(),
+                    _allocation_owner: None,
+                });
             }
             choices.push(outs);
         }
         cartesian_product(&choices, &mut self.allocation_owner)
     }
 
-    fn match_goal_fact(
-        &mut self,
-        goal: &Atom,
-        fact: &Atom,
-    ) -> Result<Option<HashMap<String, Term>>> {
-        if self.allocation_owner.is_some() {
-            let mut bytes =
-                crate::compile::hash_allocation_bytes::<String, Term>(goal.terms.len())?;
-            for (goal_term, fact_term) in goal.terms.iter().zip(&fact.terms) {
-                if let Term::Variable(name) = goal_term {
-                    let term_bytes = fact_term.owned_allocation_bytes()?;
-                    bytes = bytes
-                        .checked_add(name.len() as u64)
-                        .and_then(|n| n.checked_add(term_bytes))
-                        .ok_or_else(|| XlogError::allocation_extent_overflow("finite binding"))?;
+    fn match_goal_fact(&mut self, goal: &Atom, fact: &Atom) -> Result<Option<RetainedBindings>> {
+        let Some(scope) = self.allocation_owner.as_deref_mut() else {
+            return Ok(match_goal_fact_core(goal, fact, &mut None)?.map(|values| {
+                RetainedBindings {
+                    values,
+                    _allocation_owner: None,
                 }
-            }
-            self.acquire(bytes)?;
+            }));
+        };
+        let mut stage = scope.child_scope();
+        let Some(original) = match_goal_fact_core(goal, fact, &mut Some(&mut stage))? else {
+            return Ok(None);
+        };
+        let mut bytes = crate::compile::hash_allocation_bytes::<String, Term>(original.len())?;
+        for (name, value) in &original {
+            let value_bytes = value.owned_allocation_bytes()?;
+            bytes = bytes
+                .checked_add(name.len() as u64)
+                .and_then(|n| n.checked_add(value_bytes))
+                .and_then(|n| n.checked_sub(std::mem::size_of::<Term>() as u64))
+                .ok_or_else(|| XlogError::allocation_extent_overflow("finite binding clone"))?;
         }
-        let mut bindings = HashMap::new();
-        for (goal_term, fact_term) in goal.terms.iter().zip(&fact.terms) {
-            match goal_term {
-                Term::Variable(name) => {
-                    if let Some(existing) = bindings.get(name) {
-                        if self.term_key(existing)? != self.term_key(fact_term)? {
-                            return Ok(None);
-                        }
-                    } else {
-                        bindings.insert(name.clone(), fact_term.clone());
-                    }
-                }
-                Term::Anonymous => {}
-                _ => {
-                    if self.term_key(goal_term)? != self.term_key(fact_term)? {
-                        return Ok(None);
-                    }
-                }
-            }
+        let allocation_owner = stage.reserve_allocation(bytes)?;
+        let mut values =
+            HashMap::with_capacity_and_hasher(original.len(), original.hasher().clone());
+        for (name, value) in &original {
+            values.insert(name.clone(), value.clone());
         }
-        Ok(Some(bindings))
+        drop(original);
+        drop(stage);
+        Ok(Some(RetainedBindings {
+            values,
+            _allocation_owner: Some(allocation_owner),
+        }))
     }
 
     fn substitute_template(
@@ -1368,72 +1504,103 @@ impl<'a> MetaNormalizer<'a> {
     }
 
     fn register_term(&mut self, term: &Term, expected: ExpectedTerm) -> Result<u64> {
-        let (key, kind) = match term {
+        let registered = match term {
             Term::Integer(value) if expected != ExpectedTerm::PredRef => {
-                self.acquire_format(format_args!("i:{value}"))?;
-                (format!("i:{value}"), RegisteredTerm::Scalar)
+                RetainedRegisteredTerm {
+                    key: retained_format(format_args!("i:{value}"), &mut self.allocation_owner)?,
+                    kind: RegisteredTerm::Scalar,
+                    allocation_owners: [None, None],
+                }
             }
             Term::Float(value) if expected != ExpectedTerm::PredRef => {
-                self.acquire_format(format_args!("f:{}", value.to_bits()))?;
-                (format!("f:{}", value.to_bits()), RegisteredTerm::Scalar)
+                RetainedRegisteredTerm {
+                    key: retained_format(format_args!("f:{}", value.to_bits()), &mut self.allocation_owner)?,
+                    kind: RegisteredTerm::Scalar,
+                    allocation_owners: [None, None],
+                }
             }
             Term::String(value) if expected != ExpectedTerm::PredRef => {
-                self.acquire_format(format_args!("s:{value}"))?;
-                (format!("s:{value}"), RegisteredTerm::Scalar)
+                RetainedRegisteredTerm {
+                    key: retained_format(format_args!("s:{value}"), &mut self.allocation_owner)?,
+                    kind: RegisteredTerm::Scalar,
+                    allocation_owners: [None, None],
+                }
             }
             Term::Symbol(id) if expected == ExpectedTerm::PredRef => {
-                let name = self.resolve_symbol(*id)?;
-                self.acquire_format(format_args!("predref:{name}"))?;
-                (format!("predref:{name}"), RegisteredTerm::PredRef)
+                let name = retained_symbol(*id, &mut self.allocation_owner)?;
+                RetainedRegisteredTerm {
+                    key: retained_format(format_args!("predref:{}", name.text), &mut self.allocation_owner)?,
+                    kind: RegisteredTerm::PredRef,
+                    allocation_owners: [None, None],
+                }
             }
             Term::String(name) if expected == ExpectedTerm::PredRef => {
-                self.acquire_format(format_args!("predref:{name}"))?;
-                (format!("predref:{name}"), RegisteredTerm::PredRef)
+                RetainedRegisteredTerm {
+                    key: retained_format(format_args!("predref:{name}"), &mut self.allocation_owner)?,
+                    kind: RegisteredTerm::PredRef,
+                    allocation_owners: [None, None],
+                }
             }
             Term::PredRef(name) => {
-                self.acquire_format(format_args!("predref:{name}"))?;
-                (format!("predref:{name}"), RegisteredTerm::PredRef)
+                RetainedRegisteredTerm {
+                    key: retained_format(format_args!("predref:{name}"), &mut self.allocation_owner)?,
+                    kind: RegisteredTerm::PredRef,
+                    allocation_owners: [None, None],
+                }
             }
             Term::Symbol(id) => {
-                let name = self.resolve_symbol(*id)?;
-                self.acquire_format(format_args!("sym:{name}"))?;
-                (format!("sym:{name}"), RegisteredTerm::Scalar)
+                let name = retained_symbol(*id, &mut self.allocation_owner)?;
+                RetainedRegisteredTerm {
+                    key: retained_format(format_args!("sym:{}", name.text), &mut self.allocation_owner)?,
+                    kind: RegisteredTerm::Scalar,
+                    allocation_owners: [None, None],
+                }
             }
             Term::Compound { functor, args } if expected != ExpectedTerm::PredRef => {
-                self.acquire_vector::<u64>(args.len())?;
+                let arguments_owner = if self.allocation_owner.is_some() {
+                    self.reserve_temporary((args.len() as u64)
+                        .checked_mul(std::mem::size_of::<u64>() as u64)
+                        .ok_or_else(|| XlogError::allocation_extent_overflow("meta term arguments"))?)?
+                } else { None };
                 let mut arg_ids = Vec::with_capacity(args.len());
                 for arg in args {
                     arg_ids.push(self.register_term(arg, ExpectedTerm::Any)?);
                 }
                 let symbol_id = self.intern_symbol(functor)?;
                 let functor_id = self.register_term(&Term::Symbol(symbol_id), ExpectedTerm::Any)?;
-                if self.allocation_owner.is_some() {
+                let parts_owner = if self.allocation_owner.is_some() {
                     let count = args.len().checked_add(1).ok_or_else(|| {
                         XlogError::allocation_extent_overflow("meta term parts")
                     })?;
-                    self.acquire(crate::compile::push_vector_allocation_bytes::<u64>(count)?)?;
-                    self.acquire(functor.len() as u64)?;
-                    // join_ids builds decimal strings plus the joined result.
-                    let mut text_bytes = 0u64;
-                    for id in &arg_ids {
-                        text_bytes = text_bytes
-                            .checked_add(crate::compile::formatted_text_allocation_bytes(format_args!("{id}"))?)
-                            .ok_or_else(|| XlogError::allocation_extent_overflow("meta term text"))?;
-                    }
-                    self.acquire_vector::<String>(arg_ids.len())?;
-                    self.acquire(text_bytes)?;
-                    self.acquire_format(format_args!("compound:{functor}({:?})", arg_ids))?;
-                }
+                    let bytes = crate::compile::push_vector_allocation_bytes::<u64>(count)?
+                        .checked_add(functor.len() as u64)
+                        .ok_or_else(|| XlogError::allocation_extent_overflow("meta term parts"))?;
+                    self.reserve_temporary(bytes)?
+                } else { None };
                 let mut parts = vec![functor_id];
                 parts.extend(arg_ids.iter().copied());
-                (
-                    format!("compound:{functor}({})", join_ids(&arg_ids)),
-                    RegisteredTerm::Compound {
+                let _joined_owner = if self.allocation_owner.is_some() {
+                    let overflow = || XlogError::allocation_extent_overflow("meta term text");
+                    let mut bytes = crate::compile::push_vector_allocation_bytes::<String>(arg_ids.len())?;
+                    let mut joined = arg_ids.len().saturating_sub(1) as u64;
+                    for id in &arg_ids {
+                        bytes = bytes.checked_add(crate::compile::formatted_text_allocation_bytes(format_args!("{id}"))?)
+                            .ok_or_else(overflow)?;
+                        joined = joined.checked_add(xlog_core::error::formatted_text_extent(format_args!("{id}"))?)
+                            .ok_or_else(overflow)?;
+                    }
+                    self.reserve_temporary(bytes.checked_add(joined).ok_or_else(overflow)?)?
+                } else { None };
+                let joined = join_ids(&arg_ids);
+                RetainedRegisteredTerm {
+                    key: retained_format(format_args!("compound:{functor}({joined})"), &mut self.allocation_owner)?,
+                    kind: RegisteredTerm::Compound {
                         functor: functor.clone(),
                         args: arg_ids,
                         parts,
                     },
-                )
+                    allocation_owners: [arguments_owner, parts_owner],
+                }
             }
             Term::List(_) | Term::Cons { .. } => {
                 return Err(meta_error(format_args!("{}", "finite list terms inside term values are reserved for a later term-value encoding path"), &mut self.allocation_owner))
@@ -1452,20 +1619,23 @@ impl<'a> MetaNormalizer<'a> {
             }
         };
 
-        if expected == ExpectedTerm::Compound && !matches!(kind, RegisteredTerm::Compound { .. }) {
+        if expected == ExpectedTerm::Compound
+            && !matches!(registered.kind, RegisteredTerm::Compound { .. })
+        {
             return Err(meta_error(
                 format_args!("{}", "compound column requires a finite compound term"),
                 &mut self.allocation_owner,
             ));
         }
-        if expected == ExpectedTerm::PredRef && !matches!(kind, RegisteredTerm::PredRef) {
+        if expected == ExpectedTerm::PredRef && !matches!(registered.kind, RegisteredTerm::PredRef)
+        {
             return Err(meta_error(
                 format_args!("{}", "predref column requires a static predicate reference"),
                 &mut self.allocation_owner,
             ));
         }
 
-        if let Some(id) = self.term_ids.get(&key) {
+        if let Some(id) = self.term_ids.get(&registered.key.text) {
             return Ok(*id);
         }
         let id = self.next_term_id;
@@ -1475,8 +1645,15 @@ impl<'a> MetaNormalizer<'a> {
             self.term_records.len(),
             self.term_records.capacity(),
         )?;
-        self.term_ids.insert(key, id);
-        self.term_records.push(TermRecord { id, kind });
+        self.retain_temporary(registered.key._allocation_owner.clone())?;
+        for owner in &registered.allocation_owners {
+            self.retain_temporary(owner.clone())?;
+        }
+        self.term_ids.insert(registered.key.text, id);
+        self.term_records.push(TermRecord {
+            id,
+            kind: registered.kind,
+        });
         Ok(id)
     }
 
@@ -1571,9 +1748,10 @@ impl<'a> MetaNormalizer<'a> {
         ])?;
         self.register_helper_decl(arg_pred(), columns)?;
 
-        if self.allocation_owner.is_some() {
-            self.acquire_vector::<TermRecord>(self.term_records.len())?;
-            let mut bytes = 0u64;
+        let _records_owner = if self.allocation_owner.is_some() {
+            let mut bytes = (self.term_records.len() as u64)
+                .checked_mul(std::mem::size_of::<TermRecord>() as u64)
+                .ok_or_else(|| XlogError::allocation_extent_overflow("meta term record"))?;
             for record in &self.term_records {
                 if let RegisteredTerm::Compound {
                     functor,
@@ -1598,8 +1776,10 @@ impl<'a> MetaNormalizer<'a> {
                         .ok_or_else(|| XlogError::allocation_extent_overflow("meta term record"))?;
                 }
             }
-            self.acquire(bytes)?;
-        }
+            self.reserve_temporary(bytes)?
+        } else {
+            None
+        };
 
         for record in self.term_records.clone() {
             if let RegisteredTerm::Compound {
@@ -1678,23 +1858,37 @@ impl<'a> MetaNormalizer<'a> {
     }
 
     fn add_helper_fact(&mut self, pred: &str, terms: Vec<Term>) -> Result<()> {
-        self.acquire_format(format_args!("{pred}:{:?}", terms))?;
-        let key = format!("{pred}:{:?}", terms);
-        if !self.helper_fact_keys.contains(&key) {
+        self.add_helper_fact_retained(
+            pred,
+            RetainedTermRow {
+                values: terms,
+                allocation_owner: None,
+            },
+        )
+    }
+
+    fn add_helper_fact_retained(&mut self, pred: &str, terms: RetainedTermRow) -> Result<()> {
+        let key = retained_format(
+            format_args!("{pred}:{:?}", terms.values),
+            &mut self.allocation_owner,
+        )?;
+        if !self.helper_fact_keys.contains(&key.text) {
             self.acquire_hash_growth::<String, ()>(
                 self.helper_fact_keys.len(),
                 self.helper_fact_keys.capacity(),
             )?;
+            self.retain_temporary(key._allocation_owner.clone())?;
         }
-        if !self.helper_fact_keys.insert(key) {
+        if !self.helper_fact_keys.insert(key.text) {
             return Ok(());
         }
         self.acquire(pred.len() as u64)?;
         self.acquire_vector_growth::<Rule>(self.helper_facts.len(), self.helper_facts.capacity())?;
+        self.retain_temporary(terms.allocation_owner.clone())?;
         self.helper_facts.push(Rule {
             head: Atom {
                 predicate: pred.to_string(),
-                terms,
+                terms: terms.values,
             },
             body: vec![],
         });
@@ -1733,7 +1927,7 @@ enum MetaTruthKind {
 fn require_arity(
     atom: &Atom,
     expected: usize,
-    owner: &mut Option<&mut dyn FnMut(u64) -> Result<Arc<dyn Send + Sync>>>,
+    owner: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
 ) -> Result<()> {
     if atom.terms.len() == expected {
         Ok(())
@@ -1753,7 +1947,7 @@ fn require_arity(
 fn compound_goal_atom(
     term: &Term,
     context: &str,
-    owner: &mut Option<&mut dyn FnMut(u64) -> Result<Arc<dyn Send + Sync>>>,
+    owner: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
 ) -> Result<Atom> {
     match term {
         Term::Compound { functor, args } => Ok(Atom {
@@ -1770,7 +1964,7 @@ fn compound_goal_atom(
 fn finite_list_items<'a>(
     term: &'a Term,
     context: &str,
-    owner: &mut Option<&mut dyn FnMut(u64) -> Result<Arc<dyn Send + Sync>>>,
+    owner: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
 ) -> Result<&'a [Term]> {
     match term {
         Term::List(items) => Ok(items),
@@ -1783,7 +1977,7 @@ fn finite_list_items<'a>(
 
 fn static_pred_name(
     term: &Term,
-    owner: &mut Option<&mut dyn FnMut(u64) -> Result<Arc<dyn Send + Sync>>>,
+    owner: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
 ) -> Result<String> {
     match term {
         Term::Symbol(id) => Ok(symbol::resolve(*id)),
@@ -1835,63 +2029,66 @@ fn infer_type_ref_from_terms(items: &[Term]) -> TypeRef {
 
 fn cartesian_product(
     choices: &[Vec<Term>],
-    allocate: &mut Option<&mut dyn FnMut(u64) -> Result<Arc<dyn Send + Sync>>>,
-) -> Result<Vec<Vec<Term>>> {
-    if let Some(allocate) = allocate.as_deref_mut() {
-        allocate(std::mem::size_of::<Vec<Term>>() as u64)?;
-    }
-    let mut rows: Vec<Vec<Term>> = vec![Vec::new()];
+    allocate: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
+) -> Result<RetainedTermRows> {
+    let mut rows_owner = allocate
+        .as_deref_mut()
+        .map(|scope| scope.reserve_allocation(std::mem::size_of::<RetainedTermRow>() as u64))
+        .transpose()?;
+    let mut rows = vec![RetainedTermRow {
+        values: Vec::new(),
+        allocation_owner: None,
+    }];
     for choice in choices {
-        if let Some(allocate) = allocate.as_deref_mut() {
-            let overflow = || XlogError::allocation_extent_overflow("finite meta product");
-            let next_rows = rows.len().checked_mul(choice.len()).ok_or_else(overflow)?;
-            // The actual push-built outer vector can grow geometrically; its
-            // old and replacement buffers coexist at growth. Every row clone
-            // and appended value below comes from this exact reached product.
-            let outer = next_rows
-                .checked_mul(2)
-                .and_then(|n| n.checked_add(4))
-                .and_then(|n| n.checked_mul(3))
-                .and_then(|n| n.checked_mul(std::mem::size_of::<Vec<Term>>()))
-                .and_then(|n| u64::try_from(n).ok())
-                .ok_or_else(overflow)?;
-            let mut bytes = outer;
-            for row in &rows {
-                let clone_bytes = row.iter().try_fold(0u64, |total, term| {
-                    total
-                        .checked_add(term.owned_allocation_bytes()?)
-                        .ok_or_else(overflow)
-                })?;
-                let replacement = row
-                    .len()
-                    .checked_add(1)
-                    .and_then(|n| n.checked_mul(2))
-                    .and_then(|n| n.checked_add(4))
-                    .and_then(|n| n.checked_mul(std::mem::size_of::<Term>()))
-                    .and_then(|n| u64::try_from(n).ok())
-                    .ok_or_else(overflow)?;
-                for value in choice {
-                    let value_bytes = value.owned_allocation_bytes()?;
-                    bytes = bytes
-                        .checked_add(clone_bytes)
-                        .and_then(|n| n.checked_add(replacement))
-                        .and_then(|n| n.checked_add(value_bytes))
-                        .ok_or_else(overflow)?;
-                }
-            }
-            allocate(bytes)?;
-        }
+        let next_owner =
+            if let Some(allocate) = allocate.as_deref_mut() {
+                let overflow = || XlogError::allocation_extent_overflow("finite meta product");
+                let next_rows = rows.len().checked_mul(choice.len()).ok_or_else(overflow)?;
+                Some(allocate.reserve_allocation(
+                    crate::compile::push_vector_allocation_bytes::<RetainedTermRow>(next_rows)?,
+                )?)
+            } else {
+                None
+            };
         let mut next = Vec::new();
         for row in &rows {
             for value in choice {
-                let mut row = row.clone();
-                row.push(value.clone());
-                next.push(row);
+                let allocation_owner = if let Some(allocate) = allocate.as_deref_mut() {
+                    let overflow = || XlogError::allocation_extent_overflow("finite meta product");
+                    let clone_bytes = row.values.iter().try_fold(0u64, |total, term| {
+                        total
+                            .checked_add(term.owned_allocation_bytes()?)
+                            .ok_or_else(overflow)
+                    })?;
+                    let count = row.values.len().checked_add(1).ok_or_else(overflow)?;
+                    let replacement = crate::compile::push_vector_allocation_bytes::<Term>(count)?;
+                    let value_bytes = value.owned_allocation_bytes()?;
+                    let bytes = clone_bytes
+                        .checked_add(replacement)
+                        .and_then(|bytes| bytes.checked_add(value_bytes))
+                        .ok_or_else(overflow)?;
+                    Some(allocate.reserve_allocation(bytes)?)
+                } else {
+                    None
+                };
+                let mut values = row.values.clone();
+                values.push(value.clone());
+                next.push(RetainedTermRow {
+                    values,
+                    allocation_owner,
+                });
             }
         }
+        // The old batch and each of its row receipts retire together. The new
+        // batch was acquired before any clone while all original rows lived.
+        drop(rows);
         rows = next;
+        rows_owner = next_owner;
     }
-    Ok(rows)
+    Ok(RetainedTermRows {
+        rows,
+        _allocation_owner: rows_owner,
+    })
 }
 
 fn joined_text_bytes(items: &[String], separator: &str) -> Result<u64> {
@@ -1910,17 +2107,165 @@ fn joined_text_bytes(items: &[String], separator: &str) -> Result<u64> {
 
 fn format_owned(
     arguments: std::fmt::Arguments<'_>,
-    owner: &mut Option<&mut dyn FnMut(u64) -> Result<Arc<dyn Send + Sync>>>,
+    owner: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
 ) -> Result<String> {
     if let Some(reserve) = owner.as_deref_mut() {
-        reserve(crate::compile::formatted_text_allocation_bytes(arguments)?)?;
+        reserve.acquire(crate::compile::formatted_text_allocation_bytes(arguments)?)?;
     }
     Ok(format!("{arguments}"))
 }
 
+fn retained_format(
+    arguments: std::fmt::Arguments<'_>,
+    owner: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
+) -> Result<RetainedTermKey> {
+    let allocation_owner = owner
+        .as_deref_mut()
+        .map(|scope| {
+            scope.reserve_allocation(crate::compile::formatted_text_allocation_bytes(arguments)?)
+        })
+        .transpose()?;
+    Ok(RetainedTermKey {
+        text: format!("{arguments}"),
+        _allocation_owner: allocation_owner,
+    })
+}
+
+fn retained_symbol(
+    id: u32,
+    owner: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
+) -> Result<RetainedTermKey> {
+    match owner.as_deref_mut() {
+        Some(scope) => {
+            let (text, allocation_owner) =
+                symbol::resolve_with_allocation_owner(id, &mut |bytes| {
+                    scope.reserve_allocation(
+                        u64::try_from(bytes)
+                            .map_err(|_| XlogError::allocation_extent_overflow("meta symbol"))?,
+                    )
+                })?;
+            Ok(RetainedTermKey {
+                text,
+                _allocation_owner: Some(allocation_owner),
+            })
+        }
+        None => Ok(RetainedTermKey {
+            text: symbol::resolve(id),
+            _allocation_owner: None,
+        }),
+    }
+}
+
+fn retained_joined_keys(
+    keys: &[RetainedTermKey],
+    separator: &str,
+    owner: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
+) -> Result<RetainedTermKey> {
+    let overflow = || XlogError::allocation_extent_overflow("finite joined keys");
+    let mut length = keys
+        .len()
+        .saturating_sub(1)
+        .checked_mul(separator.len())
+        .ok_or_else(overflow)?;
+    for key in keys {
+        length = length.checked_add(key.text.len()).ok_or_else(overflow)?;
+    }
+    let allocation_owner = owner
+        .as_deref_mut()
+        .map(|scope| scope.reserve_allocation(u64::try_from(length).map_err(|_| overflow())?))
+        .transpose()?;
+    let mut text = String::with_capacity(length);
+    for (index, key) in keys.iter().enumerate() {
+        if index != 0 {
+            text.push_str(separator);
+        }
+        text.push_str(&key.text);
+    }
+    Ok(RetainedTermKey {
+        text,
+        _allocation_owner: allocation_owner,
+    })
+}
+
+fn match_goal_fact_core(
+    goal: &Atom,
+    fact: &Atom,
+    owner: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
+) -> Result<Option<HashMap<String, Term>>> {
+    if owner.is_some() {
+        let mut bytes = crate::compile::hash_allocation_bytes::<String, Term>(goal.terms.len())?;
+        for (goal_term, fact_term) in goal.terms.iter().zip(&fact.terms) {
+            if let Term::Variable(name) = goal_term {
+                let term_bytes = fact_term.owned_allocation_bytes()?;
+                bytes = bytes
+                    .checked_add(name.len() as u64)
+                    .and_then(|n| n.checked_add(term_bytes))
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("finite binding"))?;
+            }
+        }
+        owner
+            .as_deref_mut()
+            .expect("original matching scope")
+            .acquire(bytes)?;
+    }
+    let mut bindings = HashMap::with_capacity(if owner.is_some() { goal.terms.len() } else { 0 });
+    for (goal_term, fact_term) in goal.terms.iter().zip(&fact.terms) {
+        match goal_term {
+            Term::Variable(name) => {
+                if let Some(existing) = bindings.get(name) {
+                    if !term_keys_equal(existing, fact_term, owner)? {
+                        return Ok(None);
+                    }
+                } else {
+                    bindings.insert(name.clone(), fact_term.clone());
+                }
+            }
+            Term::Anonymous => {}
+            _ => {
+                if !term_keys_equal(goal_term, fact_term, owner)? {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+    Ok(Some(bindings))
+}
+
+fn retained_term_key(
+    term: &Term,
+    owner: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
+) -> Result<RetainedTermKey> {
+    let Some(scope) = owner.as_deref_mut() else {
+        return Ok(RetainedTermKey {
+            text: term_match_key(term, &mut None)?,
+            _allocation_owner: None,
+        });
+    };
+    let mut stage = scope.child_scope();
+    let original = term_match_key(term, &mut Some(&mut stage))?;
+    let allocation_owner = stage.reserve_allocation(original.len() as u64)?;
+    let text = original.clone();
+    drop(original);
+    drop(stage);
+    Ok(RetainedTermKey {
+        text,
+        _allocation_owner: Some(allocation_owner),
+    })
+}
+
+fn term_keys_equal(
+    left: &Term,
+    right: &Term,
+    owner: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
+) -> Result<bool> {
+    let left = retained_term_key(left, owner)?;
+    let right = retained_term_key(right, owner)?;
+    Ok(left.text == right.text)
+}
+
 fn term_match_key(
     term: &Term,
-    owner: &mut Option<&mut dyn FnMut(u64) -> Result<Arc<dyn Send + Sync>>>,
+    owner: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
 ) -> Result<String> {
     match term {
         Term::Variable(name) => format_owned(format_args!("var:{name}"), owner),
@@ -1933,7 +2278,7 @@ fn term_match_key(
                 match owner.as_deref_mut() {
                     Some(reserve) => {
                         symbol::resolve_with_allocation_owner(*id, &mut |bytes| {
-                            reserve(u64::try_from(bytes).map_err(|_| {
+                            reserve.acquire(u64::try_from(bytes).map_err(|_| {
                                 XlogError::allocation_extent_overflow("meta symbol")
                             })?)
                         })?
@@ -1945,7 +2290,7 @@ fn term_match_key(
         }
         Term::List(items) => {
             if let Some(reserve) = owner.as_deref_mut() {
-                reserve(
+                reserve.acquire(
                     (items.len() as u64)
                         .checked_mul(std::mem::size_of::<String>() as u64)
                         .ok_or_else(|| XlogError::allocation_extent_overflow("meta key vector"))?,
@@ -1956,7 +2301,7 @@ fn term_match_key(
                 .map(|item| term_match_key(item, owner))
                 .collect::<Result<Vec<_>>>()?;
             if let Some(reserve) = owner.as_deref_mut() {
-                reserve(joined_text_bytes(&keys, ",")?)?;
+                reserve.acquire(joined_text_bytes(&keys, ",")?)?;
             }
             let joined = keys.join(",");
             format_owned(format_args!("list:[{joined}]"), owner)
@@ -1968,7 +2313,7 @@ fn term_match_key(
         }
         Term::Compound { functor, args } => {
             if let Some(reserve) = owner.as_deref_mut() {
-                reserve(
+                reserve.acquire(
                     (args.len() as u64)
                         .checked_mul(std::mem::size_of::<String>() as u64)
                         .ok_or_else(|| XlogError::allocation_extent_overflow("meta key vector"))?,
@@ -1979,7 +2324,7 @@ fn term_match_key(
                 .map(|argument| term_match_key(argument, owner))
                 .collect::<Result<Vec<_>>>()?;
             if let Some(reserve) = owner.as_deref_mut() {
-                reserve(joined_text_bytes(&keys, ",")?)?;
+                reserve.acquire(joined_text_bytes(&keys, ",")?)?;
             }
             let joined = keys.join(",");
             format_owned(format_args!("compound:{functor}({joined})"), owner)
@@ -2056,7 +2401,7 @@ fn is_blocked_dynamic_predicate(name: &str) -> bool {
 
 fn dynamic_predicate_error(
     name: &str,
-    owner: &mut Option<&mut dyn FnMut(u64) -> Result<Arc<dyn Send + Sync>>>,
+    owner: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
 ) -> XlogError {
     match name {
         "call" => meta_error(
@@ -2095,14 +2440,19 @@ fn fail_pred() -> &'static str {
 
 fn meta_error(
     message: std::fmt::Arguments<'_>,
-    owner: &mut Option<&mut dyn FnMut(u64) -> Result<Arc<dyn Send + Sync>>>,
+    owner: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
 ) -> XlogError {
-    match xlog_core::CompilationAllocationScope::prepare_diagnostic(
-        xlog_core::error::formatted_text_allocation_bytes(format_args!(
-            "meta normalization error: {message}"
-        )),
-        owner.as_deref_mut(),
-    ) {
+    let bytes = xlog_core::error::formatted_text_allocation_bytes(format_args!(
+        "meta normalization error: {message}"
+    ));
+    let producer = match owner.as_deref_mut() {
+        Some(scope) => xlog_core::CompilationAllocationScope::prepare_diagnostic(
+            bytes,
+            Some(&mut |bytes| scope.reserve_allocation(bytes)),
+        ),
+        None => xlog_core::CompilationAllocationScope::prepare_diagnostic(bytes, None),
+    };
+    match producer {
         Ok(producer) => producer
             .finish(|| XlogError::Compilation(format!("meta normalization error: {message}"))),
         Err(error) => error,
