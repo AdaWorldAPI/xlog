@@ -132,7 +132,7 @@ impl<'a> ListNormalizer<'a> {
     fn items_clone_bytes(items: &[Term]) -> Result<u64> {
         items.iter().try_fold(0u64, |n, item| {
             n.checked_add(item.owned_allocation_bytes()?)
-                .ok_or_else(|| list_error("list clone allocation extent overflow"))
+                .ok_or_else(|| XlogError::allocation_extent_overflow("list clone"))
         })
     }
 
@@ -142,7 +142,7 @@ impl<'a> ListNormalizer<'a> {
             if let LiteralKey::Symbol(text) = key {
                 bytes = bytes
                     .checked_add(text.len() as u64)
-                    .ok_or_else(|| list_error("list key allocation extent overflow"))?;
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("list key"))?;
             }
         }
         Ok(bytes)
@@ -150,10 +150,10 @@ impl<'a> ListNormalizer<'a> {
 
     fn acquire_list_clone(&mut self, id: u64) -> Result<()> {
         if self.allocation_owner.is_some() {
-            let list = self.list_by_id(id)?;
+            let list = Self::list_by_id(&self.lists, id, &mut self.allocation_owner)?;
             let bytes = Self::items_clone_bytes(&list.items)?
                 .checked_add(Self::keys_clone_bytes(&list.keys)?)
-                .ok_or_else(|| list_error("list clone allocation extent overflow"))?;
+                .ok_or_else(|| XlogError::allocation_extent_overflow("list clone"))?;
             self.acquire(bytes)?;
         }
         Ok(())
@@ -167,7 +167,7 @@ impl<'a> ListNormalizer<'a> {
                 bytes = bytes
                     .checked_add(Self::items_clone_bytes(&list.items)?)
                     .and_then(|n| n.checked_add(Self::keys_clone_bytes(&list.keys).ok()?))
-                    .ok_or_else(|| list_error("list roster allocation extent overflow"))?;
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("list roster"))?;
             }
             self.acquire(bytes)?;
         }
@@ -179,7 +179,7 @@ impl<'a> ListNormalizer<'a> {
             let count = vector
                 .len()
                 .checked_add(additional)
-                .ok_or_else(|| list_error("list vector allocation extent overflow"))?;
+                .ok_or_else(|| XlogError::allocation_extent_overflow("list vector"))?;
             self.acquire_vector::<T>(count)?;
             vector.reserve_exact(additional);
         }
@@ -191,10 +191,10 @@ impl<'a> ListNormalizer<'a> {
             let bytes = crate::compile::hash_allocation_bytes::<K, V>(
                 length
                     .checked_add(1)
-                    .ok_or_else(|| list_error("list table extent overflow"))?,
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("list table"))?,
             )?
             .checked_mul(2)
-            .ok_or_else(|| list_error("list table allocation extent overflow"))?;
+            .ok_or_else(|| XlogError::allocation_extent_overflow("list table"))?;
             self.acquire(bytes)?;
         }
         Ok(())
@@ -233,11 +233,11 @@ impl<'a> ListNormalizer<'a> {
                     String,
                     Vec<(usize, ListColumn)>,
                 >(program.predicates.len())?)
-                .ok_or_else(|| list_error("list declaration allocation extent overflow"))?;
+                .ok_or_else(|| XlogError::allocation_extent_overflow("list declaration"))?;
             for domain in &program.domains {
                 bytes = bytes
                     .checked_add(domain.name.len() as u64)
-                    .ok_or_else(|| list_error("list declaration extent overflow"))?;
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("list declaration"))?;
             }
             for predicate in &program.predicates {
                 let count = if predicate.columns.is_empty() {
@@ -259,7 +259,7 @@ impl<'a> ListNormalizer<'a> {
                     .and_then(|n| {
                         n.checked_add((predicate.name.len() as u64).checked_mul(count as u64)?)
                     })
-                    .ok_or_else(|| list_error("list declaration allocation extent overflow"))?;
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("list declaration"))?;
                 for typ in predicate
                     .types
                     .iter()
@@ -267,20 +267,20 @@ impl<'a> ListNormalizer<'a> {
                 {
                     bytes = bytes
                         .checked_add(typ.owned_allocation_bytes()?)
-                        .ok_or_else(|| list_error("list type extent overflow"))?;
+                        .ok_or_else(|| XlogError::allocation_extent_overflow("list type"))?;
                 }
                 for column in &predicate.columns {
                     if let Some(name) = &column.name {
                         bytes = bytes
                             .checked_add(name.len() as u64)
-                            .ok_or_else(|| list_error("list name extent overflow"))?;
+                            .ok_or_else(|| XlogError::allocation_extent_overflow("list name"))?;
                     }
                 }
             }
             allocate(
                 bytes
                     .checked_mul(2)
-                    .ok_or_else(|| list_error("list declaration extent overflow"))?,
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("list declaration"))?,
             )?;
         }
         let domains: HashMap<String, ScalarType> = program
@@ -293,7 +293,8 @@ impl<'a> ListNormalizer<'a> {
         for pred in &program.predicates {
             for (idx, col) in pred.schema_columns().iter().enumerate() {
                 if let TypeRef::List(inner) = &col.typ {
-                    let elem_type = Self::storage_type_for_type_ref(inner, &domains)?;
+                    let elem_type =
+                        Self::storage_type_for_type_ref(inner, &domains, &mut allocation_owner)?;
                     list_columns
                         .entry(pred.name.clone())
                         .or_default()
@@ -407,7 +408,11 @@ impl<'a> ListNormalizer<'a> {
                     let atoms = self.expand_atom(atom, true, var_list_types)?;
                     if atoms.len() != 1 {
                         return Err(list_error(
-                            "negated list pattern expansion would require multiple atoms",
+                            format_args!(
+                                "{}",
+                                "negated list pattern expansion would require multiple atoms"
+                            ),
+                            &mut self.allocation_owner,
                         ));
                     }
                     out.push(BodyLiteral::Negated(atoms.into_iter().next().unwrap()));
@@ -432,9 +437,7 @@ impl<'a> ListNormalizer<'a> {
                     out.push(BodyLiteral::IsExpr(is_expr.clone()))
                 }
                 BodyLiteral::Univ(_) => {
-                    return Err(list_error(
-                        "univ literals must be normalized by the meta-term pass before list normalization",
-                    ));
+                    return Err(list_error(format_args!("{}", "univ literals must be normalized by the meta-term pass before list normalization"), &mut self.allocation_owner));
                 }
             }
         }
@@ -473,9 +476,7 @@ impl<'a> ListNormalizer<'a> {
             return Ok(atoms);
         }
         if is_reserved_pair_helper(atom) {
-            return Err(list_error(
-                "pair helpers are reserved for meta-term normalization and are not implemented in list normalization",
-            ));
+            return Err(list_error(format_args!("{}", "pair helpers are reserved for meta-term normalization and are not implemented in list normalization"), &mut self.allocation_owner));
         }
 
         self.acquire_vector::<Term>(atom.terms.len())?;
@@ -484,7 +485,7 @@ impl<'a> ListNormalizer<'a> {
             atom.terms
                 .len()
                 .checked_add(1)
-                .ok_or_else(|| list_error("list atom extent overflow"))?,
+                .ok_or_else(|| XlogError::allocation_extent_overflow("list atom"))?,
         )?;
         self.acquire(atom.predicate.len() as u64)?;
         let mut terms = Vec::with_capacity(atom.terms.len());
@@ -501,12 +502,13 @@ impl<'a> ListNormalizer<'a> {
                 }
                 Term::Cons { head, tail } => {
                     if negated {
-                        return Err(list_error(
-                            "cons patterns in negated atoms are unsupported before a positive binder",
-                        ));
+                        return Err(list_error(format_args!("{}", "cons patterns in negated atoms are unsupported before a positive binder"), &mut self.allocation_owner));
                     }
                     let elem_type = expected.ok_or_else(|| {
-                        list_error("cons pattern requires a declared list<T> column")
+                        list_error(
+                            format_args!("{}", "cons pattern requires a declared list<T> column"),
+                            &mut self.allocation_owner,
+                        )
                     })?;
                     let list_var = self.fresh_var("list_cons")?;
                     let head_term = self.normalize_scalar_term(head, Some(elem_type))?.1;
@@ -571,7 +573,7 @@ impl<'a> ListNormalizer<'a> {
         }
         match pred {
             "is_list" => {
-                require_arity(atom, 1)?;
+                require_arity(atom, 1, &mut self.allocation_owner)?;
                 let arg = self.normalize_list_arg(&atom.terms[0], None, var_list_types)?;
                 Ok(Some(vec![Atom {
                     predicate: len_pred().to_string(),
@@ -579,7 +581,7 @@ impl<'a> ListNormalizer<'a> {
                 }]))
             }
             "member" | "memberchk" => {
-                require_arity(atom, 2)?;
+                require_arity(atom, 2, &mut self.allocation_owner)?;
                 let list = self.normalize_list_arg(&atom.terms[1], None, var_list_types)?;
                 let value = self
                     .normalize_scalar_term(&atom.terms[0], Some(list.elem_type))?
@@ -590,7 +592,7 @@ impl<'a> ListNormalizer<'a> {
                 }]))
             }
             "length" => {
-                require_arity(atom, 2)?;
+                require_arity(atom, 2, &mut self.allocation_owner)?;
                 let list = self.normalize_list_arg(&atom.terms[0], None, var_list_types)?;
                 let len = self
                     .normalize_scalar_term(&atom.terms[1], Some(ScalarType::U32))?
@@ -601,7 +603,7 @@ impl<'a> ListNormalizer<'a> {
                 }]))
             }
             "nth" => {
-                require_arity(atom, 3)?;
+                require_arity(atom, 3, &mut self.allocation_owner)?;
                 let idx = self
                     .normalize_scalar_term(&atom.terms[0], Some(ScalarType::U32))?
                     .1;
@@ -615,29 +617,29 @@ impl<'a> ListNormalizer<'a> {
                 }]))
             }
             "append" => {
-                require_arity(atom, 3)?;
+                require_arity(atom, 3, &mut self.allocation_owner)?;
                 if matches!(atom.terms[2], Term::List(_) | Term::Cons { .. })
                     && !matches!(atom.terms[0], Term::List(_) | Term::Cons { .. })
                     && !matches!(atom.terms[1], Term::List(_) | Term::Cons { .. })
                 {
-                    return Err(list_error(
-                        "unbounded append/3 generation is unsupported during list normalization; bind the first two lists to finite literals",
-                    ));
+                    return Err(list_error(format_args!("{}", "unbounded append/3 generation is unsupported during list normalization; bind the first two lists to finite literals"), &mut self.allocation_owner));
                 }
                 let left = self.normalize_list_arg(&atom.terms[0], None, var_list_types)?;
                 let right =
                     self.normalize_list_arg(&atom.terms[1], Some(left.elem_type), var_list_types)?;
                 if left.elem_type != right.elem_type {
                     return Err(list_error(
-                        "append/3 list arguments must have the same element type",
+                        format_args!(
+                            "{}",
+                            "append/3 list arguments must have the same element type"
+                        ),
+                        &mut self.allocation_owner,
                     ));
                 }
                 let out =
                     self.normalize_list_arg(&atom.terms[2], Some(left.elem_type), var_list_types)?;
                 if !left.is_literal || !right.is_literal {
-                    return Err(list_error(
-                        "unbounded append/3 generation is unsupported during list normalization; bind the first two lists to finite literals",
-                    ));
+                    return Err(list_error(format_args!("{}", "unbounded append/3 generation is unsupported during list normalization; bind the first two lists to finite literals"), &mut self.allocation_owner));
                 }
                 let left_id = left.id.expect("literal list has id");
                 let right_id = right.id.expect("literal list has id");
@@ -664,12 +666,10 @@ impl<'a> ListNormalizer<'a> {
                 }]))
             }
             "sort" | "msort" | "list_to_set" => {
-                require_arity(atom, 2)?;
+                require_arity(atom, 2, &mut self.allocation_owner)?;
                 let input = self.normalize_list_arg(&atom.terms[0], None, var_list_types)?;
                 if !input.is_literal {
-                    return Err(list_error(
-                        "sort/msort/list_to_set require a finite list literal during list normalization",
-                    ));
+                    return Err(list_error(format_args!("{}", "sort/msort/list_to_set require a finite list literal during list normalization"), &mut self.allocation_owner));
                 }
                 let op = match pred {
                     "sort" => ListOp::Sort,
@@ -720,20 +720,31 @@ impl<'a> ListNormalizer<'a> {
                 .term),
             Term::Cons { head, tail } => {
                 let elem_type = expected_list_elem.ok_or_else(|| {
-                    list_error("cons literal requires a declared list<T> context")
+                    list_error(
+                        format_args!("{}", "cons literal requires a declared list<T> context"),
+                        &mut self.allocation_owner,
+                    )
                 })?;
                 self.acquire_vector::<Term>(1)?;
                 let mut items = vec![self.normalize_scalar_term(head, Some(elem_type))?.1];
                 let tail_arg =
                     self.normalize_list_arg(tail, Some(elem_type), &mut HashMap::new())?;
-                let tail_id = tail_arg
-                    .id
-                    .ok_or_else(|| list_error("cons literal tail must be a finite list literal"))?;
+                let tail_id = tail_arg.id.ok_or_else(|| {
+                    list_error(
+                        format_args!("{}", "cons literal tail must be a finite list literal"),
+                        &mut self.allocation_owner,
+                    )
+                })?;
                 if self.allocation_owner.is_some() {
-                    let bytes = Self::items_clone_bytes(&self.list_by_id(tail_id)?.items)?;
+                    let bytes = Self::items_clone_bytes(
+                        &Self::list_by_id(&self.lists, tail_id, &mut self.allocation_owner)?.items,
+                    )?;
                     self.acquire(bytes)?;
                 }
-                let tail_items = self.list_by_id(tail_id)?.items.clone();
+                let tail_items =
+                    Self::list_by_id(&self.lists, tail_id, &mut self.allocation_owner)?
+                        .items
+                        .clone();
                 self.reserve_vector(&mut items, tail_items.len())?;
                 items.extend(tail_items);
                 let id = self.register_list_terms(items, Some(elem_type))?;
@@ -758,7 +769,8 @@ impl<'a> ListNormalizer<'a> {
                     self.acquire(Self::items_clone_bytes(items)?)?;
                 }
                 let id = self.register_list_terms(items.clone(), expected_elem_type)?;
-                let elem_type = self.list_by_id(id)?.elem_type;
+                let elem_type =
+                    Self::list_by_id(&self.lists, id, &mut self.allocation_owner)?.elem_type;
                 Ok(ListArg {
                     term: Term::Integer(id as i64),
                     id: Some(id),
@@ -772,11 +784,16 @@ impl<'a> ListNormalizer<'a> {
                     Term::Integer(id) if id >= 0 => id as u64,
                     _ => {
                         return Err(list_error(
-                            "cons list argument must normalize to a finite list id",
+                            format_args!(
+                                "{}",
+                                "cons list argument must normalize to a finite list id"
+                            ),
+                            &mut self.allocation_owner,
                         ));
                     }
                 };
-                let elem_type = self.list_by_id(id)?.elem_type;
+                let elem_type =
+                    Self::list_by_id(&self.lists, id, &mut self.allocation_owner)?.elem_type;
                 Ok(ListArg {
                     term: Term::Integer(id as i64),
                     id: Some(id),
@@ -786,8 +803,13 @@ impl<'a> ListNormalizer<'a> {
             }
             Term::Integer(id) if *id > 0 => {
                 let elem_type = expected_elem_type
-                    .or_else(|| self.list_by_id(*id as u64).ok().map(|list| list.elem_type))
-                    .ok_or_else(|| list_error("list id requires a known list<T> type"))?;
+                    .or_else(|| find_list_by_id(&self.lists, *id as u64).map(|list| list.elem_type))
+                    .ok_or_else(|| {
+                        list_error(
+                            format_args!("{}", "list id requires a known list<T> type"),
+                            &mut self.allocation_owner,
+                        )
+                    })?;
                 Ok(ListArg {
                     term: term.clone(),
                     id: Some(*id as u64),
@@ -800,7 +822,11 @@ impl<'a> ListNormalizer<'a> {
                     .or_else(|| var_list_types.get(name).copied())
                     .ok_or_else(|| {
                         list_error(
-                            "list built-in requires a finite literal or known list<T> variable",
+                            format_args!(
+                                "{}",
+                                "list built-in requires a finite literal or known list<T> variable"
+                            ),
+                            &mut self.allocation_owner,
                         )
                     })?;
                 self.bind_list_type(var_list_types, name, elem_type)?;
@@ -814,7 +840,13 @@ impl<'a> ListNormalizer<'a> {
             }
             Term::Anonymous => {
                 let elem_type = expected_elem_type.ok_or_else(|| {
-                    list_error("anonymous list argument requires a known list<T> type")
+                    list_error(
+                        format_args!(
+                            "{}",
+                            "anonymous list argument requires a known list<T> type"
+                        ),
+                        &mut self.allocation_owner,
+                    )
                 })?;
                 Ok(ListArg {
                     term: term.clone(),
@@ -824,7 +856,11 @@ impl<'a> ListNormalizer<'a> {
                 })
             }
             _ => Err(list_error(
-                "expected finite list literal or known list<T> variable",
+                format_args!(
+                    "{}",
+                    "expected finite list literal or known list<T> variable"
+                ),
+                &mut self.allocation_owner,
             )),
         }
     }
@@ -838,24 +874,24 @@ impl<'a> ListNormalizer<'a> {
         match term {
             Term::Variable(_) | Term::Anonymous => {
                 let typ = expected.ok_or_else(|| {
-                    list_error("list element variable requires a known list<T> element type")
+                    list_error(format_args!("{}", "list element variable requires a known list<T> element type"), &mut self.allocation_owner)
                 })?;
                 Ok((typ, term.clone()))
             }
             Term::Integer(i) => match expected {
                 Some(ScalarType::U32) => {
                     let value = u32::try_from(*i)
-                        .map_err(|_| list_error("integer list element is out of range for u32"))?;
+                        .map_err(|_| list_error(format_args!("{}", "integer list element is out of range for u32"), &mut self.allocation_owner))?;
                     Ok((ScalarType::U32, Term::Integer(value as i64)))
                 }
                 Some(ScalarType::U64) => {
                     let value = u64::try_from(*i)
-                        .map_err(|_| list_error("integer list element is out of range for u64"))?;
+                        .map_err(|_| list_error(format_args!("{}", "integer list element is out of range for u64"), &mut self.allocation_owner))?;
                     Ok((ScalarType::U64, Term::Integer(value as i64)))
                 }
                 Some(ScalarType::I32) => {
                     let value = i32::try_from(*i)
-                        .map_err(|_| list_error("integer list element is out of range for i32"))?;
+                        .map_err(|_| list_error(format_args!("{}", "integer list element is out of range for i32"), &mut self.allocation_owner))?;
                     Ok((ScalarType::I32, Term::Integer(value as i64)))
                 }
                 Some(ScalarType::I64) | None if *i < 0 || *i > u32::MAX as i64 => {
@@ -868,34 +904,28 @@ impl<'a> ListNormalizer<'a> {
                 Some(ScalarType::Bool) if *i == 0 || *i == 1 => {
                     Ok((ScalarType::Bool, Term::Integer(*i)))
                 }
-                Some(ScalarType::Bool) => Err(list_error("bool list elements must be 0 or 1")),
+                Some(ScalarType::Bool) => Err(list_error(format_args!("{}", "bool list elements must be 0 or 1"), &mut self.allocation_owner)),
                 Some(ScalarType::Symbol) => {
-                    Err(list_error("integer list element is not valid for symbol"))
+                    Err(list_error(format_args!("{}", "integer list element is not valid for symbol"), &mut self.allocation_owner))
                 }
             },
             Term::Float(f) => match expected {
                 Some(ScalarType::F32) => Ok((ScalarType::F32, Term::Float(*f))),
                 Some(ScalarType::F64) | None => Ok((ScalarType::F64, Term::Float(*f))),
-                Some(_) => Err(list_error(
-                    "float list element is not valid for expected type",
-                )),
+                Some(_) => Err(list_error(format_args!("{}", "float list element is not valid for expected type"), &mut self.allocation_owner)),
             },
             Term::String(s) => {
                 if expected.is_none() || expected == Some(ScalarType::Symbol) {
                     Ok((ScalarType::Symbol, Term::String(s.clone())))
                 } else {
-                    Err(list_error(
-                        "string list element is only valid for symbol lists",
-                    ))
+                    Err(list_error(format_args!("{}", "string list element is only valid for symbol lists"), &mut self.allocation_owner))
                 }
             }
             Term::Symbol(id) => {
                 if expected.is_none() || expected == Some(ScalarType::Symbol) {
                     Ok((ScalarType::Symbol, Term::Symbol(*id)))
                 } else {
-                    Err(list_error(
-                        "symbol list element is not valid for expected type",
-                    ))
+                    Err(list_error(format_args!("{}", "symbol list element is not valid for expected type"), &mut self.allocation_owner))
                 }
             }
             Term::List(_) | Term::Cons { .. } => {
@@ -905,15 +935,11 @@ impl<'a> ListNormalizer<'a> {
                     .expect("literal list has id");
                 let typ = expected.unwrap_or(LIST_ID_TYPE);
                 if typ != LIST_ID_TYPE {
-                    return Err(list_error(
-                        "nested list element requires list<list<T>> or list<u64> context",
-                    ));
+                    return Err(list_error(format_args!("{}", "nested list element requires list<list<T>> or list<u64> context"), &mut self.allocation_owner));
                 }
                 Ok((LIST_ID_TYPE, Term::Integer(id as i64)))
             }
-            Term::Compound { .. } | Term::PredRef(_) | Term::Aggregate(_) => Err(list_error(
-                "compound, predref, and aggregate list elements require meta-term normalization support",
-            )),
+            Term::Compound { .. } | Term::PredRef(_) | Term::Aggregate(_) => Err(list_error(format_args!("{}", "compound, predref, and aggregate list elements require meta-term normalization support"), &mut self.allocation_owner)),
         }
     }
 
@@ -931,15 +957,25 @@ impl<'a> ListNormalizer<'a> {
         for item in &items {
             let (item_type, term) = match self.normalize_scalar_term(item, elem_type) {
                 Ok(value) => value,
+                Err(err) if matches!(err.unowned(), XlogError::AllocationRefused { .. }) => {
+                    return Err(err)
+                }
                 Err(err) if elem_type.is_some() => {
-                    return Err(list_error(format!("heterogeneous list literal: {}", err)));
+                    return Err(list_error(
+                        format_args!("heterogeneous list literal: {}", err),
+                        &mut self.allocation_owner,
+                    ));
                 }
                 Err(err) => return Err(err),
             };
             if let Some(existing) = elem_type {
                 if existing != item_type {
                     return Err(list_error(
-                        "heterogeneous list literals require a declared finite term type",
+                        format_args!(
+                            "{}",
+                            "heterogeneous list literals require a declared finite term type"
+                        ),
+                        &mut self.allocation_owner,
                     ));
                 }
             } else {
@@ -983,12 +1019,16 @@ impl<'a> ListNormalizer<'a> {
 
     fn concat_lists(&mut self, left_id: u64, right_id: u64) -> Result<u64> {
         self.acquire_list_clone(left_id)?;
-        let left = self.list_by_id(left_id)?.clone();
+        let left = Self::list_by_id(&self.lists, left_id, &mut self.allocation_owner)?.clone();
         self.acquire_list_clone(right_id)?;
-        let right = self.list_by_id(right_id)?.clone();
+        let right = Self::list_by_id(&self.lists, right_id, &mut self.allocation_owner)?.clone();
         if left.elem_type != right.elem_type {
             return Err(list_error(
-                "append/3 list arguments must have the same element type",
+                format_args!(
+                    "{}",
+                    "append/3 list arguments must have the same element type"
+                ),
+                &mut self.allocation_owner,
             ));
         }
         let mut items = left.items;
@@ -1000,7 +1040,7 @@ impl<'a> ListNormalizer<'a> {
     fn derived_ordered_list(&mut self, input_id: u64, op: ListOp) -> Result<u64> {
         self.acquire_list_clone(input_id)?;
         if self.allocation_owner.is_some() {
-            let input = self.list_by_id(input_id)?;
+            let input = Self::list_by_id(&self.lists, input_id, &mut self.allocation_owner)?;
             let mut formatted = 0u64;
             for key in &input.keys {
                 formatted = formatted.max(crate::compile::formatted_text_allocation_bytes(
@@ -1011,11 +1051,11 @@ impl<'a> ListNormalizer<'a> {
             let bytes = crate::compile::push_vector_allocation_bytes::<(LiteralKey, Term)>(count)?
                 .checked_mul(2)
                 .and_then(|n| n.checked_add(formatted.checked_mul(2)?))
-                .ok_or_else(|| list_error("list sorting allocation extent overflow"))?;
+                .ok_or_else(|| XlogError::allocation_extent_overflow("list sorting"))?;
             self.acquire(bytes)?;
             self.acquire_vector::<Term>(count)?;
         }
-        let input = self.list_by_id(input_id)?.clone();
+        let input = Self::list_by_id(&self.lists, input_id, &mut self.allocation_owner)?.clone();
         let mut pairs: Vec<(LiteralKey, Term)> = input.keys.into_iter().zip(input.items).collect();
         pairs.sort_by(|(a, _), (b, _)| format!("{a:?}").cmp(&format!("{b:?}")));
         if matches!(op, ListOp::Sort | ListOp::ListToSet) {
@@ -1038,10 +1078,10 @@ impl<'a> ListNormalizer<'a> {
                     .checked_add(1)
                     .and_then(|n| n.checked_add(list.items.len()))
                     .and_then(|n| n.checked_add(usize::from(!list.items.is_empty())))
-                    .ok_or_else(|| list_error("list helper allocation extent overflow"))?;
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("list helper"))?;
                 names = names
                     .checked_add(3)
-                    .ok_or_else(|| list_error("list helper allocation extent overflow"))?;
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("list helper"))?;
                 let name = crate::compile::formatted_text_allocation_bytes(format_args!(
                     "__xlog_list_cons_{}",
                     scalar_suffix(list.elem_type)
@@ -1049,22 +1089,22 @@ impl<'a> ListNormalizer<'a> {
                 bytes = bytes
                     .checked_add(
                         name.checked_mul((list.items.len() + 6) as u64)
-                            .ok_or_else(|| list_error("list helper extent overflow"))?,
+                            .ok_or_else(|| XlogError::allocation_extent_overflow("list helper"))?,
                     )
                     .and_then(|n| n.checked_add(Self::items_clone_bytes(&list.items).ok()?))
-                    .ok_or_else(|| list_error("list helper extent overflow"))?;
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("list helper"))?;
                 if let Some(head) = list.items.first() {
                     bytes = bytes
                         .checked_add(head.owned_allocation_bytes()?)
-                        .ok_or_else(|| list_error("list helper extent overflow"))?;
+                        .ok_or_else(|| XlogError::allocation_extent_overflow("list helper"))?;
                 }
             }
             facts = facts
                 .checked_add(self.operation_rows.len())
-                .ok_or_else(|| list_error("list helper extent overflow"))?;
+                .ok_or_else(|| XlogError::allocation_extent_overflow("list helper"))?;
             names = names
                 .checked_add(self.operation_rows.len())
-                .ok_or_else(|| list_error("list helper extent overflow"))?;
+                .ok_or_else(|| XlogError::allocation_extent_overflow("list helper"))?;
             for (_, typ, ids) in &self.operation_rows {
                 let name = crate::compile::formatted_text_allocation_bytes(format_args!(
                     "__xlog_list_to_set_{}",
@@ -1073,14 +1113,14 @@ impl<'a> ListNormalizer<'a> {
                 bytes = bytes
                     .checked_add(
                         name.checked_mul(3)
-                            .ok_or_else(|| list_error("list helper extent overflow"))?,
+                            .ok_or_else(|| XlogError::allocation_extent_overflow("list helper"))?,
                     )
                     .and_then(|n| {
                         n.checked_add(
                             crate::compile::push_vector_allocation_bytes::<u64>(ids.len()).ok()?,
                         )
                     })
-                    .ok_or_else(|| list_error("list helper extent overflow"))?;
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("list helper"))?;
             }
             bytes = bytes
                 .checked_add(crate::compile::push_vector_allocation_bytes::<Rule>(facts)?)
@@ -1108,7 +1148,7 @@ impl<'a> ListNormalizer<'a> {
                         .ok()?,
                     )
                 })
-                .ok_or_else(|| list_error("list helper allocation extent overflow"))?;
+                .ok_or_else(|| XlogError::allocation_extent_overflow("list helper"))?;
             self.acquire(bytes)?;
             self.reserve_vector(&mut program.rules, facts)?;
         }
@@ -1200,24 +1240,25 @@ impl<'a> ListNormalizer<'a> {
 
     fn cons_fact_parts(&mut self, list_id: u64) -> Result<Option<(Term, u64)>> {
         if self.allocation_owner.is_some() {
-            let list = self.list_by_id(list_id)?;
+            let list = Self::list_by_id(&self.lists, list_id, &mut self.allocation_owner)?;
             if let Some(head) = list.items.first() {
                 let bytes = Self::keys_clone_bytes(&list.keys[1..])?
                     .checked_add(head.owned_allocation_bytes()?)
-                    .ok_or_else(|| list_error("list cons allocation extent overflow"))?;
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("list cons"))?;
                 self.acquire(bytes)?;
             }
         }
-        let list = self.list_by_id(list_id)?;
+        let list = Self::list_by_id(&self.lists, list_id, &mut self.allocation_owner)?;
         let Some(head) = list.items.first() else {
             return Ok(None);
         };
         let tail_key = (list.elem_type, list.keys[1..].to_vec());
-        let tail_id = self
-            .lists_by_key
-            .get(&tail_key)
-            .copied()
-            .ok_or_else(|| list_error("missing normalized list tail"))?;
+        let tail_id = self.lists_by_key.get(&tail_key).copied().ok_or_else(|| {
+            list_error(
+                format_args!("{}", "missing normalized list tail"),
+                &mut self.allocation_owner,
+            )
+        })?;
         Ok(Some((head.clone(), tail_id)))
     }
 
@@ -1227,22 +1268,20 @@ impl<'a> ListNormalizer<'a> {
                 .predicates
                 .len()
                 .checked_add(self.helper_preds.len())
-                .ok_or_else(|| list_error("list declarations extent overflow"))?;
+                .ok_or_else(|| XlogError::allocation_extent_overflow("list declarations"))?;
             let mut bytes = crate::compile::hash_allocation_bytes::<String, ()>(count)?
                 .checked_mul(2)
-                .ok_or_else(|| list_error("list declarations extent overflow"))?;
+                .ok_or_else(|| XlogError::allocation_extent_overflow("list declarations"))?;
             for predicate in &program.predicates {
                 bytes = bytes
                     .checked_add(predicate.name.len() as u64)
-                    .ok_or_else(|| list_error("list declarations extent overflow"))?;
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("list declarations"))?;
             }
             for name in &self.helper_preds {
                 bytes = bytes
-                    .checked_add(
-                        (name.len() as u64)
-                            .checked_mul(2)
-                            .ok_or_else(|| list_error("list declarations extent overflow"))?,
-                    )
+                    .checked_add((name.len() as u64).checked_mul(2).ok_or_else(|| {
+                        XlogError::allocation_extent_overflow("list declarations")
+                    })?)
                     .and_then(|n| {
                         n.checked_add(
                             crate::compile::push_vector_allocation_bytes::<PredColumn>(3).ok()?,
@@ -1256,13 +1295,13 @@ impl<'a> ListNormalizer<'a> {
                     .and_then(|n| {
                         n.checked_add("list_idindexvaluetailleft_idright_idout_id".len() as u64)
                     })
-                    .ok_or_else(|| list_error("list declarations extent overflow"))?;
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("list declarations"))?;
             }
             bytes = bytes
                 .checked_add(crate::compile::push_vector_allocation_bytes::<&String>(
                     self.helper_preds.len(),
                 )?)
-                .ok_or_else(|| list_error("list declarations extent overflow"))?;
+                .ok_or_else(|| XlogError::allocation_extent_overflow("list declarations"))?;
             self.acquire(bytes)?;
             self.reserve_vector(&mut program.predicates, self.helper_preds.len())?;
         }
@@ -1292,11 +1331,17 @@ impl<'a> ListNormalizer<'a> {
         Ok(())
     }
 
-    fn list_by_id(&self, id: u64) -> Result<&ListDef> {
-        self.lists
-            .iter()
-            .find(|list| list.id == id)
-            .ok_or_else(|| list_error("unknown normalized list id"))
+    fn list_by_id<'list>(
+        lists: &'list [ListDef],
+        id: u64,
+        owner: &mut Option<&mut dyn FnMut(u64) -> Result<Arc<dyn Send + Sync>>>,
+    ) -> Result<&'list ListDef> {
+        find_list_by_id(lists, id).ok_or_else(|| {
+            list_error(
+                format_args!("{}", "unknown normalized list id"),
+                &mut *owner,
+            )
+        })
     }
 
     fn fresh_var(&mut self, prefix: &str) -> Result<String> {
@@ -1314,13 +1359,16 @@ impl<'a> ListNormalizer<'a> {
     fn storage_type_for_type_ref(
         typ: &TypeRef,
         domains: &HashMap<String, ScalarType>,
+        owner: &mut Option<&mut dyn FnMut(u64) -> Result<Arc<dyn Send + Sync>>>,
     ) -> Result<ScalarType> {
         match typ {
             TypeRef::Scalar(ty) => Ok(*ty),
-            TypeRef::Domain(name) => domains
-                .get(name)
-                .copied()
-                .ok_or_else(|| list_error(format!("unknown domain alias '{}' in list<T>", name))),
+            TypeRef::Domain(name) => domains.get(name).copied().ok_or_else(|| {
+                list_error(
+                    format_args!("unknown domain alias '{}' in list<T>", name),
+                    &mut *owner,
+                )
+            }),
             TypeRef::List(_) | TypeRef::Term | TypeRef::Compound | TypeRef::PredRef => {
                 Ok(LIST_ID_TYPE)
             }
@@ -1338,16 +1386,23 @@ fn fact(pred: &str, terms: Vec<Term>) -> Rule {
     }
 }
 
-fn require_arity(atom: &Atom, expected: usize) -> Result<()> {
+fn require_arity(
+    atom: &Atom,
+    expected: usize,
+    owner: &mut Option<&mut dyn FnMut(u64) -> Result<Arc<dyn Send + Sync>>>,
+) -> Result<()> {
     if atom.terms.len() == expected {
         Ok(())
     } else {
-        Err(list_error(format!(
-            "{} expects {} arguments, got {}",
-            atom.predicate,
-            expected,
-            atom.terms.len()
-        )))
+        Err(list_error(
+            format_args!(
+                "{} expects {} arguments, got {}",
+                atom.predicate,
+                expected,
+                atom.terms.len()
+            ),
+            owner,
+        ))
     }
 }
 
@@ -1375,7 +1430,7 @@ fn literal_key_with_owner(
                 let mut reserve = |bytes: usize| {
                     allocate(
                         u64::try_from(bytes)
-                            .map_err(|_| list_error("list symbol allocation extent overflow"))?,
+                            .map_err(|_| XlogError::allocation_extent_overflow("list symbol"))?,
                     )
                 };
                 xlog_core::symbol::resolve_with_allocation_owner(*id, &mut reserve)?.0
@@ -1385,7 +1440,11 @@ fn literal_key_with_owner(
             Ok(LiteralKey::Symbol(text))
         }
         _ => Err(list_error(
-            "list literal element did not normalize to expected scalar type",
+            format_args!(
+                "{}",
+                "list literal element did not normalize to expected scalar type"
+            ),
+            allocate,
         )),
     }
 }
@@ -1494,6 +1553,22 @@ fn is_reserved_pair_helper(atom: &Atom) -> bool {
     )
 }
 
-fn list_error(message: impl Into<String>) -> XlogError {
-    XlogError::Compilation(format!("list normalization error: {}", message.into()))
+fn find_list_by_id(lists: &[ListDef], id: u64) -> Option<&ListDef> {
+    lists.iter().find(|list| list.id == id)
+}
+
+fn list_error(
+    message: std::fmt::Arguments<'_>,
+    owner: &mut Option<&mut dyn FnMut(u64) -> Result<Arc<dyn Send + Sync>>>,
+) -> XlogError {
+    match xlog_core::CompilationAllocationScope::prepare_diagnostic(
+        xlog_core::error::formatted_text_allocation_bytes(format_args!(
+            "list normalization error: {message}"
+        )),
+        owner.as_deref_mut(),
+    ) {
+        Ok(producer) => producer
+            .finish(|| XlogError::Compilation(format!("list normalization error: {message}"))),
+        Err(error) => error,
+    }
 }

@@ -11,51 +11,292 @@ use std::sync::Arc;
 #[cfg(all(test, feature = "resident-graph-tests"))]
 use std::cell::Cell;
 
-use xlog_core::{RelId, Result, ScalarType, Schema};
+use xlog_core::{CompilationAllocationScope, RelId, Result, ScalarType, Schema, XlogError};
 use xlog_ir::{ConstValue, ExecutionPlan, Expr, JoinType, ProjectExpr, RirNode};
 
 const RESIDENT_GRAPH_MAX_INTERMEDIATE_ARITY: usize = 17;
 
+#[derive(Clone, Default)]
+struct ResidentAllocationOwner(Option<Arc<dyn Send + Sync>>);
+
+impl fmt::Debug for ResidentAllocationOwner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(if self.0.is_some() {
+            "retained"
+        } else {
+            "ordinary"
+        })
+    }
+}
+
+struct ResidentText {
+    value: String,
+    owner: Option<Arc<dyn Send + Sync>>,
+}
+
+impl fmt::Display for ResidentText {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.value)
+    }
+}
+
+impl ResidentText {
+    fn empty() -> Self {
+        Self {
+            value: String::new(),
+            owner: None,
+        }
+    }
+
+    fn append(
+        &mut self,
+        scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+        args: fmt::Arguments<'_>,
+    ) -> Result<()> {
+        if let Some(scope) = scope.as_deref_mut() {
+            let extent = xlog_core::error::formatted_text_extent(args)?;
+            let length =
+                self.value
+                    .len()
+                    .checked_add(usize::try_from(extent).map_err(|_| {
+                        XlogError::allocation_extent_overflow("resident descriptor")
+                    })?)
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("resident descriptor"))?;
+            if length > self.value.capacity() {
+                let owner = scope
+                    .reserve_allocation(xlog_core::push_vector_allocation_bytes::<u8>(length)?)?;
+                self.value.reserve(length - self.value.len());
+                self.owner = Some(owner);
+            }
+        }
+        self.value
+            .write_fmt(args)
+            .expect("String formatter cannot fail");
+        Ok(())
+    }
+
+    fn into_retained(
+        self,
+        scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+    ) -> Result<String> {
+        if let (Some(scope), Some(owner)) = (scope.as_deref_mut(), self.owner.as_ref()) {
+            scope.retain(Arc::clone(owner))?;
+        }
+        Ok(self.value)
+    }
+}
+
+fn resident_text(
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+    args: fmt::Arguments<'_>,
+) -> Result<ResidentText> {
+    let mut text = ResidentText::empty();
+    text.append(scope, args)?;
+    Ok(text)
+}
+
+fn reserve_resident_vector<T>(
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+    count: usize,
+) -> Result<Option<Arc<dyn Send + Sync>>> {
+    scope
+        .as_deref_mut()
+        .map(|scope| scope.reserve_allocation(xlog_core::push_vector_allocation_bytes::<T>(count)?))
+        .transpose()
+}
+
 /// Schemas keyed by the relation identities carried by compiled scan nodes.
 #[derive(Debug, Clone, Default)]
 pub struct ResidentGraphSchemaCatalog {
-    by_relation: HashMap<RelId, Vec<(String, Schema)>>,
+    by_relation: HashMap<RelId, ResidentSchemaAliases>,
+    _table_owner: ResidentAllocationOwner,
+    _allocation_owner: ResidentAllocationOwner,
+}
+
+#[derive(Debug, Clone)]
+struct ResidentSchemaAlias {
+    name: String,
+    schema: Schema,
+    _allocation_owner: ResidentAllocationOwner,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ResidentSchemaAliases {
+    entries: Vec<ResidentSchemaAlias>,
+    _storage_owner: ResidentAllocationOwner,
+}
+
+enum ResidentSchemaEntry<'a> {
+    Owned(String, RelId, Schema),
+    Borrowed(&'a str, RelId, &'a Schema),
 }
 
 impl ResidentGraphSchemaCatalog {
     /// Builds a catalog from compiler-assigned names, relation ids, and schemas.
     pub fn from_named_schemas(entries: impl IntoIterator<Item = (String, RelId, Schema)>) -> Self {
-        let mut by_relation: HashMap<RelId, Vec<(String, Schema)>> = HashMap::new();
-        for (name, relation, schema) in entries {
-            by_relation
-                .entry(relation)
-                .or_default()
-                .push((name, schema));
-        }
-        for aliases in by_relation.values_mut() {
-            aliases.sort_by(|left, right| left.0.cmp(&right.0));
-            aliases.dedup();
-        }
-        Self { by_relation }
+        Self::from_entries(
+            entries
+                .into_iter()
+                .map(|(name, relation, schema)| ResidentSchemaEntry::Owned(name, relation, schema)),
+            &mut None,
+        )
+        .expect("ordinary schema catalog has no allocation callback")
     }
 
-    fn descriptor(&self, relation: RelId) -> Option<String> {
-        let aliases = self.by_relation.get(&relation)?;
-        Some(
+    /// Copy the original compiler schema roster under its allocation authority.
+    pub fn from_named_schema_references_with_allocation_owner<'a>(
+        entries: impl IntoIterator<Item = (&'a str, RelId, &'a Schema)>,
+        scope: &mut CompilationAllocationScope<'_>,
+    ) -> Result<Self> {
+        let mut owned = scope.child_scope();
+        owned.prepare_owner()?;
+        match Self::from_entries(
+            entries.into_iter().map(|(name, relation, schema)| {
+                ResidentSchemaEntry::Borrowed(name, relation, schema)
+            }),
+            &mut Some(&mut owned),
+        ) {
+            Ok(mut catalog) => {
+                catalog._allocation_owner = ResidentAllocationOwner(Some(owned.into_owner()?));
+                Ok(catalog)
+            }
+            Err(error) => Err(owned.into_failure(error)),
+        }
+    }
+
+    fn from_entries<'a>(
+        entries: impl IntoIterator<Item = ResidentSchemaEntry<'a>>,
+        scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+    ) -> Result<Self> {
+        let mut table_owner = ResidentAllocationOwner::default();
+        let mut by_relation: HashMap<RelId, ResidentSchemaAliases> = HashMap::new();
+        for entry in entries {
+            let (alias, relation) = match entry {
+                ResidentSchemaEntry::Owned(name, relation, schema) => (
+                    ResidentSchemaAlias {
+                        name,
+                        schema,
+                        _allocation_owner: ResidentAllocationOwner::default(),
+                    },
+                    relation,
+                ),
+                ResidentSchemaEntry::Borrowed(name, relation, schema) => {
+                    let owner = scope
+                        .as_deref_mut()
+                        .map(|scope| {
+                            let bytes = (name.len() as u64)
+                                .checked_add(schema.owned_allocation_bytes()?)
+                                .ok_or_else(|| {
+                                    XlogError::allocation_extent_overflow("resident schema clone")
+                                })?;
+                            scope.reserve_allocation(bytes)
+                        })
+                        .transpose()?;
+                    (
+                        ResidentSchemaAlias {
+                            name: name.to_owned(),
+                            schema: schema.clone(),
+                            _allocation_owner: ResidentAllocationOwner(owner),
+                        },
+                        relation,
+                    )
+                }
+            };
+            if !by_relation.contains_key(&relation) && by_relation.len() == by_relation.capacity() {
+                let next_owner = scope
+                    .as_deref_mut()
+                    .map(|scope| {
+                        let count = by_relation.len().checked_add(1).ok_or_else(|| {
+                            XlogError::allocation_extent_overflow("resident schema catalog")
+                        })?;
+                        scope.reserve_allocation(xlog_core::hash_allocation_bytes::<
+                            RelId,
+                            ResidentSchemaAliases,
+                        >(count)?)
+                    })
+                    .transpose()?;
+                by_relation.reserve(1);
+                table_owner = ResidentAllocationOwner(next_owner);
+            }
+            let aliases = by_relation.entry(relation).or_default();
+            if aliases.entries.len() == aliases.entries.capacity() {
+                let count = aliases.entries.len().checked_add(1).ok_or_else(|| {
+                    XlogError::allocation_extent_overflow("resident schema aliases")
+                })?;
+                let next_owner = reserve_resident_vector::<ResidentSchemaAlias>(scope, count)?;
+                aliases.entries.reserve(1);
+                aliases._storage_owner = ResidentAllocationOwner(next_owner);
+            }
+            aliases.entries.push(alias);
+        }
+        for aliases in by_relation.values_mut() {
+            let _sort_receipt =
+                reserve_resident_vector::<ResidentSchemaAlias>(scope, aliases.entries.len())?;
             aliases
-                .iter()
-                .map(|(name, schema)| format!("{name}={schema:#?}"))
-                .collect::<Vec<_>>()
-                .join("|"),
-        )
+                .entries
+                .sort_by(|left, right| left.name.cmp(&right.name));
+            aliases
+                .entries
+                .dedup_by(|left, right| left.name == right.name && left.schema == right.schema);
+        }
+        Ok(Self {
+            by_relation,
+            _table_owner: table_owner,
+            _allocation_owner: ResidentAllocationOwner::default(),
+        })
+    }
+
+    fn clone_with_allocation_owner(
+        &self,
+        scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+    ) -> Result<Self> {
+        match scope.as_deref_mut() {
+            Some(scope) => Self::from_named_schema_references_with_allocation_owner(
+                self.by_relation.iter().flat_map(|(&relation, aliases)| {
+                    aliases
+                        .entries
+                        .iter()
+                        .map(move |alias| (alias.name.as_str(), relation, &alias.schema))
+                }),
+                scope,
+            ),
+            None => Ok(self.clone()),
+        }
+    }
+
+    fn descriptor(
+        &self,
+        relation: RelId,
+        scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+    ) -> Result<Option<ResidentText>> {
+        let Some(aliases) = self.by_relation.get(&relation) else {
+            return Ok(None);
+        };
+        let _parts_receipt = reserve_resident_vector::<ResidentText>(scope, aliases.entries.len())?;
+        let mut parts = Vec::with_capacity(aliases.entries.len());
+        for alias in &aliases.entries {
+            parts.push(resident_text(
+                scope,
+                format_args!("{}={:#?}", alias.name, alias.schema),
+            )?);
+        }
+        let mut text = ResidentText::empty();
+        for (index, part) in parts.iter().enumerate() {
+            if index != 0 {
+                text.append(scope, format_args!("|"))?;
+            }
+            text.append(scope, format_args!("{part}"))?;
+        }
+        Ok(Some(text))
     }
 
     pub(crate) fn schema(&self, relation: RelId) -> Option<&Schema> {
         let aliases = self.by_relation.get(&relation)?;
-        let (_, first) = aliases.first()?;
+        let first = &aliases.entries.first()?.schema;
         aliases
+            .entries
             .iter()
-            .all(|(_, schema)| schema == first)
+            .all(|alias| &alias.schema == first)
             .then_some(first)
     }
 }
@@ -117,6 +358,8 @@ pub struct ResidentGraphRouteCertificate {
     declines: Vec<ResidentGraphDeclineReason>,
     schema_catalog: ResidentGraphSchemaCatalog,
     plan_fingerprint: u64,
+    _decline_storage: ResidentAllocationOwner,
+    _allocation_owner: ResidentAllocationOwner,
 }
 
 /// A route certificate sealed to the exact immutable plan allocation it inspected.
@@ -128,93 +371,138 @@ pub struct ResidentGraphRouteCertificate {
 pub struct ResidentGraphCertifiedPlan {
     plan: Arc<ExecutionPlan>,
     certificate: ResidentGraphRouteCertificate,
+    _allocation_owner: ResidentAllocationOwner,
 }
 
-fn append_resident_expression_descriptor(descriptor: &mut String, expression: &Expr) {
-    fn schedule_binary<'a>(pending: &mut Vec<&'a Expr>, left: &'a Expr, right: &'a Expr) {
+fn append_resident_expression_descriptor(
+    descriptor: &mut ResidentText,
+    expression: &Expr,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<()> {
+    fn grow_pending<'a>(
+        pending: &mut Vec<&'a Expr>,
+        extra: usize,
+        scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+        receipt: &mut Option<Arc<dyn Send + Sync>>,
+    ) -> Result<()> {
+        let count = pending
+            .len()
+            .checked_add(extra)
+            .ok_or_else(|| XlogError::allocation_extent_overflow("resident expression roster"))?;
+        if count > pending.capacity() {
+            let next = reserve_resident_vector::<&Expr>(scope, count)?;
+            pending.reserve(extra);
+            *receipt = next;
+        }
+        Ok(())
+    }
+    fn schedule_binary<'a>(
+        pending: &mut Vec<&'a Expr>,
+        left: &'a Expr,
+        right: &'a Expr,
+        scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+        receipt: &mut Option<Arc<dyn Send + Sync>>,
+    ) -> Result<()> {
+        grow_pending(pending, 2, scope, receipt)?;
         pending.push(right);
         pending.push(left);
+        Ok(())
     }
-
+    let mut pending_receipt = reserve_resident_vector::<&Expr>(scope, 1)?;
     let mut pending = vec![expression];
     while let Some(expression) = pending.pop() {
         match expression {
-            Expr::Column(index) => write!(descriptor, "column:{index};").unwrap(),
+            Expr::Column(index) => descriptor.append(scope, format_args!("column:{index};"))?,
             Expr::Const(value) => {
-                descriptor.push_str("constant:");
+                descriptor.append(scope, format_args!("{}", "constant:"))?;
                 match value {
-                    ConstValue::U32(value) => write!(descriptor, "u32:{value};").unwrap(),
-                    ConstValue::U64(value) => write!(descriptor, "u64:{value};").unwrap(),
-                    ConstValue::I32(value) => write!(descriptor, "i32:{value};").unwrap(),
-                    ConstValue::I64(value) => write!(descriptor, "i64:{value};").unwrap(),
+                    ConstValue::U32(value) => {
+                        descriptor.append(scope, format_args!("u32:{value};"))?
+                    }
+                    ConstValue::U64(value) => {
+                        descriptor.append(scope, format_args!("u64:{value};"))?
+                    }
+                    ConstValue::I32(value) => {
+                        descriptor.append(scope, format_args!("i32:{value};"))?
+                    }
+                    ConstValue::I64(value) => {
+                        descriptor.append(scope, format_args!("i64:{value};"))?
+                    }
                     ConstValue::F32(value) => {
-                        write!(descriptor, "f32:{:08x};", value.to_bits()).unwrap()
+                        descriptor.append(scope, format_args!("f32:{:08x};", value.to_bits()))?
                     }
                     ConstValue::F64(value) => {
-                        write!(descriptor, "f64:{:016x};", value.to_bits()).unwrap()
+                        descriptor.append(scope, format_args!("f64:{:016x};", value.to_bits()))?
                     }
-                    ConstValue::Bool(value) => write!(descriptor, "bool:{value};").unwrap(),
+                    ConstValue::Bool(value) => {
+                        descriptor.append(scope, format_args!("bool:{value};"))?
+                    }
                     ConstValue::Symbol(value) => {
-                        write!(descriptor, "symbol:{}:", value.len()).unwrap();
-                        descriptor.push_str(value);
+                        descriptor.append(scope, format_args!("symbol:{}:", value.len()))?;
+                        descriptor.append(scope, format_args!("{}", value))?;
                         descriptor.push(';');
                     }
                 }
             }
             Expr::Compare { left, op, right } => {
-                write!(descriptor, "compare:{op:?};").unwrap();
-                schedule_binary(&mut pending, left, right);
+                descriptor.append(scope, format_args!("compare:{op:?};"))?;
+                schedule_binary(&mut pending, left, right, scope, &mut pending_receipt)?;
             }
             Expr::And(items) => {
-                write!(descriptor, "and:{};", items.len()).unwrap();
+                descriptor.append(scope, format_args!("and:{};", items.len()))?;
+                grow_pending(&mut pending, items.len(), scope, &mut pending_receipt)?;
                 pending.extend(items.iter().rev());
             }
             Expr::Or(items) => {
-                write!(descriptor, "or:{};", items.len()).unwrap();
+                descriptor.append(scope, format_args!("or:{};", items.len()))?;
+                grow_pending(&mut pending, items.len(), scope, &mut pending_receipt)?;
                 pending.extend(items.iter().rev());
             }
             Expr::Not(inner) => {
                 descriptor.push_str("not;");
+                grow_pending(&mut pending, 1, scope, &mut pending_receipt)?;
                 pending.push(inner);
             }
             Expr::Add(left, right) => {
                 descriptor.push_str("add;");
-                schedule_binary(&mut pending, left, right);
+                schedule_binary(&mut pending, left, right, scope, &mut pending_receipt)?;
             }
             Expr::Sub(left, right) => {
                 descriptor.push_str("subtract;");
-                schedule_binary(&mut pending, left, right);
+                schedule_binary(&mut pending, left, right, scope, &mut pending_receipt)?;
             }
             Expr::Mul(left, right) => {
                 descriptor.push_str("multiply;");
-                schedule_binary(&mut pending, left, right);
+                schedule_binary(&mut pending, left, right, scope, &mut pending_receipt)?;
             }
             Expr::Div(left, right) => {
                 descriptor.push_str("divide;");
-                schedule_binary(&mut pending, left, right);
+                schedule_binary(&mut pending, left, right, scope, &mut pending_receipt)?;
             }
             Expr::Mod(left, right) => {
                 descriptor.push_str("modulo;");
-                schedule_binary(&mut pending, left, right);
+                schedule_binary(&mut pending, left, right, scope, &mut pending_receipt)?;
             }
             Expr::Abs(inner) => {
                 descriptor.push_str("absolute_value;");
+                grow_pending(&mut pending, 1, scope, &mut pending_receipt)?;
                 pending.push(inner);
             }
             Expr::Min(left, right) => {
                 descriptor.push_str("minimum;");
-                schedule_binary(&mut pending, left, right);
+                schedule_binary(&mut pending, left, right, scope, &mut pending_receipt)?;
             }
             Expr::Max(left, right) => {
                 descriptor.push_str("maximum;");
-                schedule_binary(&mut pending, left, right);
+                schedule_binary(&mut pending, left, right, scope, &mut pending_receipt)?;
             }
             Expr::Pow(left, right) => {
                 descriptor.push_str("power;");
-                schedule_binary(&mut pending, left, right);
+                schedule_binary(&mut pending, left, right, scope, &mut pending_receipt)?;
             }
             Expr::Cast(inner, target) => {
-                write!(descriptor, "cast:{target:?};").unwrap();
+                descriptor.append(scope, format_args!("cast:{target:?};"))?;
+                grow_pending(&mut pending, 1, scope, &mut pending_receipt)?;
                 pending.push(inner);
             }
             Expr::Conditional {
@@ -223,98 +511,74 @@ fn append_resident_expression_descriptor(descriptor: &mut String, expression: &E
                 else_expr,
             } => {
                 descriptor.push_str("conditional;");
+                grow_pending(&mut pending, 3, scope, &mut pending_receipt)?;
                 pending.push(else_expr);
                 pending.push(then_expr);
                 pending.push(condition);
             }
         }
     }
+    Ok(())
 }
 
-fn resident_project_columns_descriptor(columns: &[ProjectExpr]) -> String {
-    let mut descriptor = format!("column_count={};", columns.len());
+fn resident_project_columns_descriptor(
+    columns: &[ProjectExpr],
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<ResidentText> {
+    let mut descriptor = resident_text(scope, format_args!("column_count={};", columns.len()))?;
     for column in columns {
         match column {
-            ProjectExpr::Column(index) => write!(descriptor, "column:{index};").unwrap(),
+            ProjectExpr::Column(index) => {
+                descriptor.append(scope, format_args!("column:{index};"))?
+            }
             ProjectExpr::Computed(expression, scalar_type) => {
-                write!(descriptor, "computed:{scalar_type:?};").unwrap();
-                append_resident_expression_descriptor(&mut descriptor, expression);
+                descriptor.append(scope, format_args!("computed:{scalar_type:?};"))?;
+                append_resident_expression_descriptor(&mut descriptor, expression, scope)?;
             }
         }
     }
-    descriptor
+    Ok(descriptor)
 }
 
-fn resident_node_descriptor(node: &RirNode) -> String {
+fn resident_node_descriptor(
+    node: &RirNode,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<ResidentText> {
     match node {
-        RirNode::Unit => "unit".to_owned(),
-        RirNode::Scan { rel } => format!("scan;relation={}", rel.0),
+        RirNode::Unit => resident_text(scope, format_args!("unit")),
+        RirNode::Scan { rel } => resident_text(scope, format_args!("scan;relation={}", rel.0)),
         RirNode::Filter { predicate, .. } => {
-            let mut descriptor = "filter;predicate=".to_owned();
-            append_resident_expression_descriptor(&mut descriptor, predicate);
-            descriptor
+            let mut descriptor = resident_text(scope, format_args!("filter;predicate="))?;
+            append_resident_expression_descriptor(&mut descriptor, predicate, scope)?;
+            Ok(descriptor)
         }
         RirNode::Project { columns, .. } => {
-            format!("project;{}", resident_project_columns_descriptor(columns))
+            let columns = resident_project_columns_descriptor(columns, scope)?;
+            resident_text(scope, format_args!("project;{columns}"))
         }
-        RirNode::Join {
-            left_keys,
-            right_keys,
-            join_type,
-            ..
-        } => format!(
+        RirNode::Join { left_keys, right_keys, join_type, .. } => resident_text(scope, format_args!(
             "join;left_keys={left_keys:?};right_keys={right_keys:?};join_type={join_type:?}"
-        ),
-        RirNode::ChainJoin {
-            left_key,
-            right_key,
-            output_columns,
-            ..
-        } => format!(
-            "chain_join;left_key={left_key};right_key={right_key};output_{}",
-            resident_project_columns_descriptor(output_columns)
-        ),
-        RirNode::GroupBy { key_cols, aggs, .. } => {
-            format!("group_by;key_cols={key_cols:?};aggregates={aggs:?}")
+        )),
+        RirNode::ChainJoin { left_key, right_key, output_columns, .. } => {
+            let output = resident_project_columns_descriptor(output_columns, scope)?;
+            resident_text(scope, format_args!("chain_join;left_key={left_key};right_key={right_key};output_{output}"))
         }
-        RirNode::Union { inputs } => format!("union;input_count={}", inputs.len()),
-        RirNode::Distinct { key_cols, .. } => format!("distinct;key_cols={key_cols:?}"),
-        RirNode::Diff { .. } => "difference".to_owned(),
-        RirNode::Fixpoint {
-            scc_id,
-            delta_rel,
-            full_rel,
-            ..
-        } => format!(
-            "fixpoint;scc_id={scc_id};delta_relation={};full_relation={}",
-            delta_rel.0, full_rel.0
-        ),
-        RirNode::MultiWayJoin {
-            inputs,
-            slot_vars,
-            output_columns,
-            plan,
-            var_order,
-            ..
-        } => format!(
-            "multi_way_join;input_count={};slot_variables={slot_vars:?};output_{};plan={plan:?};variable_order={var_order:?}",
-            inputs.len(),
-            resident_project_columns_descriptor(output_columns)
-        ),
-        RirNode::TensorMaskedJoin {
-            mask_name,
-            schema_size,
-            left_keys,
-            right_keys,
-            rel_index,
-            head_rel_name,
-            head_rel_id,
-            max_active_rules,
-            head_projection,
-        } => format!(
-            "tensor_masked_join;mask={mask_name:?};schema_size={schema_size};left_keys={left_keys:?};right_keys={right_keys:?};relation_index={rel_index:?};head_relation_name={head_rel_name:?};head_relation_id={};max_active_rules={max_active_rules};head_projection={head_projection:?}",
-            head_rel_id.0
-        ),
+        RirNode::GroupBy { key_cols, aggs, .. } => resident_text(scope, format_args!("group_by;key_cols={key_cols:?};aggregates={aggs:?}")),
+        RirNode::Union { inputs } => resident_text(scope, format_args!("union;input_count={}", inputs.len())),
+        RirNode::Distinct { key_cols, .. } => resident_text(scope, format_args!("distinct;key_cols={key_cols:?}")),
+        RirNode::Diff { .. } => resident_text(scope, format_args!("difference")),
+        RirNode::Fixpoint { scc_id, delta_rel, full_rel, .. } => resident_text(scope, format_args!(
+            "fixpoint;scc_id={scc_id};delta_relation={};full_relation={}", delta_rel.0, full_rel.0
+        )),
+        RirNode::MultiWayJoin { inputs, slot_vars, output_columns, plan, var_order, .. } => {
+            let output = resident_project_columns_descriptor(output_columns, scope)?;
+            resident_text(scope, format_args!(
+                "multi_way_join;input_count={};slot_variables={slot_vars:?};output_{output};plan={plan:?};variable_order={var_order:?}", inputs.len()
+            ))
+        }
+        RirNode::TensorMaskedJoin { mask_name, schema_size, left_keys, right_keys, rel_index, head_rel_name, head_rel_id, max_active_rules, head_projection } => resident_text(scope, format_args!(
+            "tensor_masked_join;mask={mask_name:?};schema_size={schema_size};left_keys={left_keys:?};right_keys={right_keys:?};relation_index={rel_index:?};head_relation_name={head_rel_name:?};head_relation_id={};max_active_rules={max_active_rules};head_projection={head_projection:?}", head_rel_id.0
+        )),
     }
 }
 
@@ -322,7 +586,31 @@ impl ResidentGraphCertifiedPlan {
     /// Inspect and seal one immutable plan allocation.
     pub fn inspect(plan: Arc<ExecutionPlan>, catalog: &ResidentGraphSchemaCatalog) -> Result<Self> {
         let certificate = ResidentGraphRouteCertificate::inspect(&plan, catalog)?;
-        Ok(Self { plan, certificate })
+        Ok(Self {
+            plan,
+            certificate,
+            _allocation_owner: ResidentAllocationOwner::default(),
+        })
+    }
+
+    /// Seal the same immutable plan with the original allocation receipts.
+    pub fn inspect_with_allocation_owner(
+        plan: Arc<ExecutionPlan>,
+        catalog: &ResidentGraphSchemaCatalog,
+        scope: &mut CompilationAllocationScope<'_>,
+        plan_allocation_owner: Arc<dyn Send + Sync>,
+    ) -> Result<Self> {
+        let plan_custody = (plan, plan_allocation_owner);
+        let certificate = ResidentGraphRouteCertificate::inspect_with_allocation_owner(
+            &plan_custody.0,
+            catalog,
+            scope,
+        )?;
+        Ok(Self {
+            plan: plan_custody.0,
+            certificate,
+            _allocation_owner: ResidentAllocationOwner(Some(plan_custody.1)),
+        })
     }
 
     /// Return the exact plan inspected by this seal.
@@ -352,79 +640,203 @@ pub(crate) fn resident_route_inspection_count() -> usize {
 }
 
 impl ResidentGraphRouteCertificate {
+    fn insert_descriptor(
+        &mut self,
+        descriptor: ResidentText,
+        scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+    ) -> Result<()> {
+        if self.covered_route_descriptors.contains(&descriptor.value) {
+            return Ok(());
+        }
+        if let Some(scope) = scope.as_deref_mut() {
+            scope.acquire(xlog_core::btree_insert_allocation_bytes::<String, ()>(
+                self.covered_route_descriptors.len(),
+            )?)?;
+        }
+        let descriptor = descriptor.into_retained(scope)?;
+        self.covered_route_descriptors.insert(descriptor);
+        Ok(())
+    }
+
+    fn push_decline(
+        &mut self,
+        decline: ResidentGraphDeclineReason,
+        scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+    ) -> Result<()> {
+        if self.declines.len() == self.declines.capacity() {
+            let next_owner = reserve_resident_vector::<ResidentGraphDeclineReason>(
+                scope,
+                self.declines.len().checked_add(1).ok_or_else(|| {
+                    XlogError::allocation_extent_overflow("resident decline roster")
+                })?,
+            )?;
+            self.declines.reserve(1);
+            self._decline_storage = ResidentAllocationOwner(next_owner);
+        }
+        self.declines.push(decline);
+        Ok(())
+    }
     /// Inspects every explicit and implicit route in deterministic plan order.
     pub fn inspect(plan: &ExecutionPlan, catalog: &ResidentGraphSchemaCatalog) -> Result<Self> {
+        Self::inspect_core(plan, catalog, &mut None)
+    }
+
+    /// Inspect the same complete route roster with intrinsic allocation custody.
+    pub fn inspect_with_allocation_owner(
+        plan: &ExecutionPlan,
+        catalog: &ResidentGraphSchemaCatalog,
+        scope: &mut CompilationAllocationScope<'_>,
+    ) -> Result<Self> {
+        let mut owned = scope.child_scope();
+        owned.prepare_owner()?;
+        match Self::inspect_core(plan, catalog, &mut Some(&mut owned)) {
+            Ok(mut certificate) => {
+                certificate._allocation_owner = ResidentAllocationOwner(Some(owned.into_owner()?));
+                Ok(certificate)
+            }
+            Err(error) => Err(owned.into_failure(error)),
+        }
+    }
+
+    fn inspect_core(
+        plan: &ExecutionPlan,
+        catalog: &ResidentGraphSchemaCatalog,
+        scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+    ) -> Result<Self> {
         #[cfg(all(test, feature = "resident-graph-tests"))]
         RESIDENT_ROUTE_INSPECTION_COUNT.with(|count| count.set(count.get() + 1));
         let mut certificate = Self {
             covered_route_descriptors: BTreeSet::new(),
             declines: Vec::new(),
-            schema_catalog: catalog.clone(),
+            schema_catalog: catalog.clone_with_allocation_owner(scope)?,
             plan_fingerprint: 0,
+            _decline_storage: ResidentAllocationOwner::default(),
+            _allocation_owner: ResidentAllocationOwner::default(),
         };
-        certificate
-            .covered_route_descriptors
-            .insert(format!("plan;scc_count={}", plan.sccs.len()));
+        certificate.insert_descriptor(
+            resident_text(scope, format_args!("plan;scc_count={}", plan.sccs.len()))?,
+            scope,
+        )?;
         for (scc_index, scc) in plan.sccs.iter().enumerate() {
-            certificate.covered_route_descriptors.insert(format!(
-                "plan;scc={scc_index};id={};recursive={};predicate_count={}",
-                scc.id,
-                scc.is_recursive,
-                scc.predicates.len()
-            ));
+            certificate.insert_descriptor(
+                resident_text(
+                    scope,
+                    format_args!(
+                        "plan;scc={scc_index};id={};recursive={};predicate_count={}",
+                        scc.id,
+                        scc.is_recursive,
+                        scc.predicates.len()
+                    ),
+                )?,
+                scope,
+            )?;
             for (predicate_index, predicate) in scc.predicates.iter().enumerate() {
-                certificate.covered_route_descriptors.insert(format!(
-                    "plan;scc={scc_index};predicate={predicate_index};name={predicate:?}"
-                ));
+                certificate.insert_descriptor(
+                    resident_text(
+                        scope,
+                        format_args!(
+                            "plan;scc={scc_index};predicate={predicate_index};name={predicate:?}"
+                        ),
+                    )?,
+                    scope,
+                )?;
             }
         }
-        certificate
-            .covered_route_descriptors
-            .insert(format!("plan;stratum_count={}", plan.strata.len()));
+        certificate.insert_descriptor(
+            resident_text(
+                scope,
+                format_args!("plan;stratum_count={}", plan.strata.len()),
+            )?,
+            scope,
+        )?;
         for (stratum_index, stratum) in plan.strata.iter().enumerate() {
-            certificate.covered_route_descriptors.insert(format!(
-                "plan;stratum={stratum_index};id={};scc_count={}",
-                stratum.id,
-                stratum.sccs.len()
-            ));
+            certificate.insert_descriptor(
+                resident_text(
+                    scope,
+                    format_args!(
+                        "plan;stratum={stratum_index};id={};scc_count={}",
+                        stratum.id,
+                        stratum.sccs.len()
+                    ),
+                )?,
+                scope,
+            )?;
             for (scc_position, scc_id) in stratum.sccs.iter().enumerate() {
-                certificate.covered_route_descriptors.insert(format!(
-                    "plan;stratum={stratum_index};scc={scc_position};id={scc_id}"
-                ));
+                certificate.insert_descriptor(
+                    resident_text(
+                        scope,
+                        format_args!("plan;stratum={stratum_index};scc={scc_position};id={scc_id}"),
+                    )?,
+                    scope,
+                )?;
             }
         }
-        certificate.covered_route_descriptors.insert(format!(
-            "plan;rules_by_scc_count={}",
-            plan.rules_by_scc.len()
-        ));
-        certificate.covered_route_descriptors.insert(format!(
-            "plan;generated_query_rule_count={}",
-            plan.generated_query_rules.len()
-        ));
+        certificate.insert_descriptor(
+            resident_text(
+                scope,
+                format_args!("plan;rules_by_scc_count={}", plan.rules_by_scc.len()),
+            )?,
+            scope,
+        )?;
+        certificate.insert_descriptor(
+            resident_text(
+                scope,
+                format_args!(
+                    "plan;generated_query_rule_count={}",
+                    plan.generated_query_rules.len()
+                ),
+            )?,
+            scope,
+        )?;
         for (position, provenance) in plan.generated_query_rules.iter().enumerate() {
-            certificate.covered_route_descriptors.insert(format!(
-                "plan;generated_query_rule={position};query_index={};scc={};rule={}",
-                provenance.query_index, provenance.scc_index, provenance.rule_index
-            ));
+            certificate.insert_descriptor(
+                resident_text(
+                    scope,
+                    format_args!(
+                        "plan;generated_query_rule={position};query_index={};scc={};rule={}",
+                        provenance.query_index, provenance.scc_index, provenance.rule_index
+                    ),
+                )?,
+                scope,
+            )?;
         }
         for (scc_index, rules) in plan.rules_by_scc.iter().enumerate() {
-            certificate.covered_route_descriptors.insert(format!(
-                "plan;rules_by_scc={scc_index};rule_count={}",
-                rules.len()
-            ));
+            certificate.insert_descriptor(
+                resident_text(
+                    scope,
+                    format_args!("plan;rules_by_scc={scc_index};rule_count={}", rules.len()),
+                )?,
+                scope,
+            )?;
             for (rule_index, rule) in rules.iter().enumerate() {
-                certificate.covered_route_descriptors.insert(format!(
-                    "plan;rules_by_scc={scc_index};rule={rule_index};head={:?};meta={:?}",
-                    rule.head, rule.meta
-                ));
+                certificate.insert_descriptor(
+                    resident_text(
+                        scope,
+                        format_args!(
+                            "plan;rules_by_scc={scc_index};rule={rule_index};head={:?};meta={:?}",
+                            rule.head, rule.meta
+                        ),
+                    )?,
+                    scope,
+                )?;
             }
         }
-        certificate
-            .covered_route_descriptors
-            .insert(format!("plan;est_memory_peak={}", plan.est_memory_peak));
-        certificate
-            .covered_route_descriptors
-            .insert(format!("plan;rel_arity_count={}", plan.rel_arities.len()));
+        certificate.insert_descriptor(
+            resident_text(
+                scope,
+                format_args!("plan;est_memory_peak={}", plan.est_memory_peak),
+            )?,
+            scope,
+        )?;
+        certificate.insert_descriptor(
+            resident_text(
+                scope,
+                format_args!("plan;rel_arity_count={}", plan.rel_arities.len()),
+            )?,
+            scope,
+        )?;
+        let _rel_arities_receipt =
+            reserve_resident_vector::<(RelId, usize)>(scope, plan.rel_arities.len())?;
         let mut rel_arities = plan
             .rel_arities
             .iter()
@@ -432,19 +844,27 @@ impl ResidentGraphRouteCertificate {
             .collect::<Vec<_>>();
         rel_arities.sort_unstable_by_key(|(relation, _)| *relation);
         for (position, (relation, arity)) in rel_arities.into_iter().enumerate() {
-            certificate.covered_route_descriptors.insert(format!(
-                "plan;rel_arity={position};relation={};arity={arity}",
-                relation.0
-            ));
+            certificate.insert_descriptor(
+                resident_text(
+                    scope,
+                    format_args!(
+                        "plan;rel_arity={position};relation={};arity={arity}",
+                        relation.0
+                    ),
+                )?,
+                scope,
+            )?;
         }
         for (scc_index, scc) in plan.sccs.iter().enumerate() {
             let Some(rules) = plan.rules_by_scc.get(scc_index) else {
-                certificate
-                    .declines
-                    .push(ResidentGraphDeclineReason::UnsupportedNode {
-                        path: format!("scc={scc_index}"),
+                certificate.push_decline(
+                    ResidentGraphDeclineReason::UnsupportedNode {
+                        path: resident_text(scope, format_args!("scc={scc_index}"))?
+                            .into_retained(scope)?,
                         node: "missing_rule_vector",
-                    });
+                    },
+                    scope,
+                )?;
                 continue;
             };
             for (rule_index, rule) in rules.iter().enumerate() {
@@ -455,24 +875,38 @@ impl ResidentGraphRouteCertificate {
                     scc.is_recursive,
                     &rule.body,
                     "primary/root",
-                );
-                let identity = format!(
-                    "scc={scc_index};rule={rule_index};head={};schema={:#?}",
-                    rule.head, rule.meta.schema
-                );
-                certificate
-                    .covered_route_descriptors
-                    .insert(format!("{identity};implicit=rule_result_union"));
-                certificate
-                    .covered_route_descriptors
-                    .insert(format!("{identity};implicit=full_row_dedup"));
+                    scope,
+                )?;
+                let identity = resident_text(
+                    scope,
+                    format_args!(
+                        "scc={scc_index};rule={rule_index};head={};schema={:#?}",
+                        rule.head, rule.meta.schema
+                    ),
+                )?;
+                certificate.insert_descriptor(
+                    resident_text(scope, format_args!("{identity};implicit=rule_result_union"))?,
+                    scope,
+                )?;
+                certificate.insert_descriptor(
+                    resident_text(scope, format_args!("{identity};implicit=full_row_dedup"))?,
+                    scope,
+                )?;
                 if scc.is_recursive {
-                    certificate
-                        .covered_route_descriptors
-                        .insert(format!("{identity};implicit=novel_tuple_difference"));
-                    certificate
-                        .covered_route_descriptors
-                        .insert(format!("{identity};implicit=device_convergence"));
+                    certificate.insert_descriptor(
+                        resident_text(
+                            scope,
+                            format_args!("{identity};implicit=novel_tuple_difference"),
+                        )?,
+                        scope,
+                    )?;
+                    certificate.insert_descriptor(
+                        resident_text(
+                            scope,
+                            format_args!("{identity};implicit=device_convergence"),
+                        )?,
+                        scope,
+                    )?;
                 }
             }
         }
@@ -531,23 +965,26 @@ impl ResidentGraphRouteCertificate {
         recursive: bool,
         node: &RirNode,
         path: &str,
-    ) {
-        self.validate_node_route(catalog, node, path);
+        scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+    ) -> Result<()> {
+        self.validate_node_route(catalog, node, path, scope)?;
         let scan_schema = match node {
-            RirNode::Scan { rel } => match catalog.descriptor(*rel) {
+            RirNode::Scan { rel } => match catalog.descriptor(*rel, scope)? {
                 Some(descriptor) => descriptor,
                 None => {
-                    self.declines
-                        .push(ResidentGraphDeclineReason::MissingScanSchema { relation: *rel });
-                    String::new()
+                    self.push_decline(
+                        ResidentGraphDeclineReason::MissingScanSchema { relation: *rel },
+                        scope,
+                    )?;
+                    ResidentText::empty()
                 }
             },
-            _ => String::new(),
+            _ => ResidentText::empty(),
         };
-        let node_descriptor = resident_node_descriptor(node);
-        self.covered_route_descriptors.insert(format!(
+        let node_descriptor = resident_node_descriptor(node, scope)?;
+        self.insert_descriptor(resident_text(scope, format_args!(
             "scc={scc_index};rule={rule_index};recursive={recursive};path={path};node={node_descriptor};scan_schema={scan_schema}"
-        ));
+        ))?, scope)?;
         match node {
             RirNode::Unit | RirNode::Scan { .. } => {}
             RirNode::Filter { input, .. }
@@ -558,8 +995,9 @@ impl ResidentGraphRouteCertificate {
                 rule_index,
                 recursive,
                 input,
-                &format!("{path}/input"),
-            ),
+                &resident_text(scope, format_args!("{path}/input"))?.value,
+                scope,
+            )?,
             RirNode::Join {
                 left,
                 right,
@@ -567,11 +1005,14 @@ impl ResidentGraphRouteCertificate {
                 ..
             } => {
                 if !matches!(join_type, JoinType::Inner | JoinType::Semi) {
-                    self.declines
-                        .push(ResidentGraphDeclineReason::UnsupportedJoin {
-                            path: path.to_string(),
+                    self.push_decline(
+                        ResidentGraphDeclineReason::UnsupportedJoin {
+                            path: resident_text(scope, format_args!("{path}"))?
+                                .into_retained(scope)?,
                             join_type: *join_type,
-                        });
+                        },
+                        scope,
+                    )?;
                 }
                 self.visit(
                     catalog,
@@ -579,16 +1020,18 @@ impl ResidentGraphRouteCertificate {
                     rule_index,
                     recursive,
                     left,
-                    &format!("{path}/left"),
-                );
+                    &resident_text(scope, format_args!("{path}/left"))?.value,
+                    scope,
+                )?;
                 self.visit(
                     catalog,
                     scc_index,
                     rule_index,
                     recursive,
                     right,
-                    &format!("{path}/right"),
-                );
+                    &resident_text(scope, format_args!("{path}/right"))?.value,
+                    scope,
+                )?;
             }
             RirNode::ChainJoin {
                 left,
@@ -602,24 +1045,28 @@ impl ResidentGraphRouteCertificate {
                     rule_index,
                     recursive,
                     left,
-                    &format!("{path}/primary/left"),
-                );
+                    &resident_text(scope, format_args!("{path}/primary/left"))?.value,
+                    scope,
+                )?;
                 self.visit(
                     catalog,
                     scc_index,
                     rule_index,
                     recursive,
                     right,
-                    &format!("{path}/primary/right"),
-                );
+                    &resident_text(scope, format_args!("{path}/primary/right"))?.value,
+                    scope,
+                )?;
                 self.visit(
                     catalog,
                     scc_index,
                     rule_index,
                     recursive,
                     fallback,
-                    &format!("{path}/alternative/captured_fallback"),
-                );
+                    &resident_text(scope, format_args!("{path}/alternative/captured_fallback"))?
+                        .value,
+                    scope,
+                )?;
             }
             RirNode::Union { inputs } => {
                 for (index, input) in inputs.iter().enumerate() {
@@ -629,8 +1076,9 @@ impl ResidentGraphRouteCertificate {
                         rule_index,
                         recursive,
                         input,
-                        &format!("{path}/input[{index}]"),
-                    );
+                        &resident_text(scope, format_args!("{path}/input[{index}]"))?.value,
+                        scope,
+                    )?;
                 }
             }
             RirNode::Diff { left, right } => {
@@ -640,16 +1088,18 @@ impl ResidentGraphRouteCertificate {
                     rule_index,
                     recursive,
                     left,
-                    &format!("{path}/left"),
-                );
+                    &resident_text(scope, format_args!("{path}/left"))?.value,
+                    scope,
+                )?;
                 self.visit(
                     catalog,
                     scc_index,
                     rule_index,
                     recursive,
                     right,
-                    &format!("{path}/right"),
-                );
+                    &resident_text(scope, format_args!("{path}/right"))?.value,
+                    scope,
+                )?;
             }
             RirNode::Fixpoint {
                 base,
@@ -662,25 +1112,29 @@ impl ResidentGraphRouteCertificate {
                     rule_index,
                     recursive,
                     base,
-                    &format!("{path}/base"),
-                );
+                    &resident_text(scope, format_args!("{path}/base"))?.value,
+                    scope,
+                )?;
                 self.visit(
                     catalog,
                     scc_index,
                     rule_index,
                     recursive,
                     step,
-                    &format!("{path}/recursive"),
-                );
+                    &resident_text(scope, format_args!("{path}/recursive"))?.value,
+                    scope,
+                )?;
             }
             RirNode::MultiWayJoin {
                 inputs, fallback, ..
             } => {
-                self.declines
-                    .push(ResidentGraphDeclineReason::UnsupportedNode {
-                        path: path.to_string(),
+                self.push_decline(
+                    ResidentGraphDeclineReason::UnsupportedNode {
+                        path: resident_text(scope, format_args!("{path}"))?.into_retained(scope)?,
                         node: "multi_way_join",
-                    });
+                    },
+                    scope,
+                )?;
                 for (index, input) in inputs.iter().enumerate() {
                     self.visit(
                         catalog,
@@ -688,8 +1142,9 @@ impl ResidentGraphRouteCertificate {
                         rule_index,
                         recursive,
                         input,
-                        &format!("{path}/primary/input[{index}]"),
-                    );
+                        &resident_text(scope, format_args!("{path}/primary/input[{index}]"))?.value,
+                        scope,
+                    )?;
                 }
                 self.visit(
                     catalog,
@@ -697,32 +1152,38 @@ impl ResidentGraphRouteCertificate {
                     rule_index,
                     recursive,
                     fallback,
-                    &format!("{path}/alternative/captured_fallback"),
-                );
+                    &resident_text(scope, format_args!("{path}/alternative/captured_fallback"))?
+                        .value,
+                    scope,
+                )?;
             }
             RirNode::GroupBy { input, .. } => {
-                self.declines
-                    .push(ResidentGraphDeclineReason::UnsupportedNode {
-                        path: path.to_string(),
+                self.push_decline(
+                    ResidentGraphDeclineReason::UnsupportedNode {
+                        path: resident_text(scope, format_args!("{path}"))?.into_retained(scope)?,
                         node: "group_by",
-                    });
+                    },
+                    scope,
+                )?;
                 self.visit(
                     catalog,
                     scc_index,
                     rule_index,
                     recursive,
                     input,
-                    &format!("{path}/input"),
-                );
+                    &resident_text(scope, format_args!("{path}/input"))?.value,
+                    scope,
+                )?;
             }
-            RirNode::TensorMaskedJoin { .. } => {
-                self.declines
-                    .push(ResidentGraphDeclineReason::UnsupportedNode {
-                        path: path.to_string(),
-                        node: "tensor_masked_join",
-                    })
-            }
+            RirNode::TensorMaskedJoin { .. } => self.push_decline(
+                ResidentGraphDeclineReason::UnsupportedNode {
+                    path: resident_text(scope, format_args!("{path}"))?.into_retained(scope)?,
+                    node: "tensor_masked_join",
+                },
+                scope,
+            )?,
         }
+        Ok(())
     }
 
     fn validate_node_route(
@@ -730,30 +1191,33 @@ impl ResidentGraphRouteCertificate {
         catalog: &ResidentGraphSchemaCatalog,
         node: &RirNode,
         path: &str,
-    ) {
-        let schema = node_schema(catalog, node);
-        let unsupported = schema
+        scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+    ) -> Result<()> {
+        let schema = node_schema_core(catalog, node, scope)?;
+        let mut unsupported = schema
             .as_ref()
-            .is_some_and(|schema| schema.arity() > RESIDENT_GRAPH_MAX_INTERMEDIATE_ARITY)
+            .is_some_and(|schema| schema.schema.arity() > RESIDENT_GRAPH_MAX_INTERMEDIATE_ARITY)
             .then_some("intermediate_arity")
             .or_else(|| {
                 schema
                     .as_ref()
                     .is_some_and(|schema| {
                         schema
+                            .schema
                             .columns
                             .iter()
                             .any(|(_, scalar)| !resident_scalar_supported(*scalar))
                     })
                     .then_some("scalar_type")
-            })
-            .or_else(|| match node {
-                RirNode::Filter { input, predicate } => node_schema(catalog, input)
-                    .filter(|schema| resident_predicate_supported(predicate, schema))
+            });
+        if unsupported.is_none() {
+            unsupported = match node {
+                RirNode::Filter { input, predicate } => node_schema_core(catalog, input, scope)?
+                    .filter(|schema| resident_predicate_supported(predicate, &schema.schema))
                     .is_none()
                     .then_some("filter_expression"),
-                RirNode::Project { input, columns } => node_schema(catalog, input)
-                    .filter(|schema| resident_projection_supported(columns, schema))
+                RirNode::Project { input, columns } => node_schema_core(catalog, input, scope)?
+                    .filter(|schema| resident_projection_supported(columns, &schema.schema))
                     .is_none()
                     .then_some("project_expression"),
                 RirNode::Join {
@@ -763,16 +1227,25 @@ impl ResidentGraphRouteCertificate {
                     right_keys,
                     join_type: JoinType::Inner | JoinType::Semi,
                 } => {
-                    let compatible = (|| {
-                        let left_schema = node_schema(catalog, left)?;
-                        let right_schema = node_schema(catalog, right)?;
+                    let compatible = (|| -> Result<Option<()>> {
+                        let Some(left_schema) = node_schema_core(catalog, left, scope)? else {
+                            return Ok(None);
+                        };
+                        let Some(right_schema) = node_schema_core(catalog, right, scope)? else {
+                            return Ok(None);
+                        };
                         if left_keys.len() != 1 || right_keys.len() != 1 {
-                            return None;
+                            return Ok(None);
                         }
-                        let left_ty = left_schema.column_type(left_keys[0])?;
-                        let right_ty = right_schema.column_type(right_keys[0])?;
-                        (left_ty == right_ty && resident_scalar_supported(left_ty)).then_some(())
-                    })()
+                        let Some(left_ty) = left_schema.schema.column_type(left_keys[0]) else {
+                            return Ok(None);
+                        };
+                        let Some(right_ty) = right_schema.schema.column_type(right_keys[0]) else {
+                            return Ok(None);
+                        };
+                        Ok((left_ty == right_ty && resident_scalar_supported(left_ty))
+                            .then_some(()))
+                    })()?
                     .is_some();
                     (!compatible).then_some("join_key_layout")
                 }
@@ -784,33 +1257,49 @@ impl ResidentGraphRouteCertificate {
                     output_columns,
                     ..
                 } => {
-                    let compatible = (|| {
-                        let left_schema = node_schema(catalog, left)?;
-                        let right_schema = node_schema(catalog, right)?;
-                        let left_ty = left_schema.column_type(*left_key)?;
-                        let right_ty = right_schema.column_type(*right_key)?;
+                    let compatible = (|| -> Result<Option<()>> {
+                        let Some(left_schema) = node_schema_core(catalog, left, scope)? else {
+                            return Ok(None);
+                        };
+                        let Some(right_schema) = node_schema_core(catalog, right, scope)? else {
+                            return Ok(None);
+                        };
+                        let Some(left_ty) = left_schema.schema.column_type(*left_key) else {
+                            return Ok(None);
+                        };
+                        let Some(right_ty) = right_schema.schema.column_type(*right_key) else {
+                            return Ok(None);
+                        };
                         if left_ty != right_ty || !resident_scalar_supported(left_ty) {
-                            return None;
+                            return Ok(None);
                         }
-                        let joined = joined_schema(&left_schema, &right_schema);
-                        resident_projection_supported(output_columns, &joined).then_some(())
-                    })()
+                        let joined =
+                            joined_schema_core(&left_schema.schema, &right_schema.schema, scope)?;
+                        Ok(
+                            resident_projection_supported(output_columns, &joined.schema)
+                                .then_some(()),
+                        )
+                    })()?
                     .is_some();
                     (!compatible).then_some("chain_join_layout")
                 }
-                RirNode::Distinct { input, key_cols } => node_schema(catalog, input)
-                    .filter(|schema| key_cols.iter().copied().eq(0..schema.arity()))
+                RirNode::Distinct { input, key_cols } => node_schema_core(catalog, input, scope)?
+                    .filter(|schema| key_cols.iter().copied().eq(0..schema.schema.arity()))
                     .is_none()
                     .then_some("partial_row_distinct"),
                 _ => None,
-            });
-        if let Some(node) = unsupported {
-            self.declines
-                .push(ResidentGraphDeclineReason::UnsupportedNode {
-                    path: path.to_string(),
-                    node,
-                });
+            };
         }
+        if let Some(node) = unsupported {
+            self.push_decline(
+                ResidentGraphDeclineReason::UnsupportedNode {
+                    path: resident_text(scope, format_args!("{path}"))?.into_retained(scope)?,
+                    node,
+                },
+                scope,
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -875,38 +1364,113 @@ fn resident_projection_supported(expressions: &[ProjectExpr], schema: &Schema) -
     })
 }
 
-fn joined_schema(left: &Schema, right: &Schema) -> Schema {
-    Schema::new(
-        left.columns
-            .iter()
-            .chain(&right.columns)
-            .enumerate()
-            .map(|(index, (_, ty))| (format!("column_{index}"), *ty))
-            .collect(),
+struct ResidentSchema {
+    schema: Schema,
+    _allocation_owner: ResidentAllocationOwner,
+}
+
+fn generated_schema(
+    count: usize,
+    mut scalar: impl FnMut(usize) -> Option<ScalarType>,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<Option<ResidentSchema>> {
+    let owner = if let Some(scope) = scope.as_deref_mut() {
+        let mut bytes = xlog_core::push_vector_allocation_bytes::<(String, ScalarType)>(count)?
+            .checked_add(xlog_core::push_vector_allocation_bytes::<usize>(count)?)
+            .and_then(|bytes| {
+                bytes.checked_add(xlog_core::push_vector_allocation_bytes::<String>(count).ok()?)
+            })
+            .ok_or_else(|| XlogError::allocation_extent_overflow("resident schema"))?;
+        for index in 0..count {
+            let name =
+                xlog_core::error::formatted_text_allocation_bytes(format_args!("column_{index}"))?;
+            // Schema::new keeps both the column name and its original sort-label clone.
+            bytes = bytes
+                .checked_add(name)
+                .and_then(|bytes| bytes.checked_add(name))
+                .ok_or_else(|| XlogError::allocation_extent_overflow("resident schema names"))?;
+        }
+        Some(scope.reserve_allocation(bytes)?)
+    } else {
+        None
+    };
+    let output = (0..count)
+        .map(|index| scalar(index).map(|scalar| (format!("column_{index}"), scalar)))
+        .collect::<Option<Vec<_>>>();
+    Ok(output.map(|output| ResidentSchema {
+        schema: Schema::new(output),
+        _allocation_owner: ResidentAllocationOwner(owner),
+    }))
+}
+
+fn joined_schema_core(
+    left: &Schema,
+    right: &Schema,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<ResidentSchema> {
+    let count = left
+        .columns
+        .len()
+        .checked_add(right.columns.len())
+        .ok_or_else(|| XlogError::allocation_extent_overflow("resident joined schema"))?;
+    generated_schema(
+        count,
+        |index| {
+            if index < left.columns.len() {
+                Some(left.columns[index].1)
+            } else {
+                Some(right.columns[index - left.columns.len()].1)
+            }
+        },
+        scope,
     )
+    .map(|schema| schema.expect("joined source columns have scalar types"))
 }
 
 pub(crate) fn node_schema(catalog: &ResidentGraphSchemaCatalog, node: &RirNode) -> Option<Schema> {
+    node_schema_core(catalog, node, &mut None)
+        .expect("ordinary schema has no allocation callback")
+        .map(|schema| schema.schema)
+}
+
+fn node_schema_core(
+    catalog: &ResidentGraphSchemaCatalog,
+    node: &RirNode,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<Option<ResidentSchema>> {
     match node {
-        RirNode::Unit => Some(Schema::new(Vec::new())),
-        RirNode::Scan { rel } => catalog.schema(*rel).cloned(),
+        RirNode::Unit => Ok(Some(ResidentSchema {
+            schema: Schema::new(Vec::new()),
+            _allocation_owner: ResidentAllocationOwner::default(),
+        })),
+        RirNode::Scan { rel } => {
+            let Some(schema) = catalog.schema(*rel) else {
+                return Ok(None);
+            };
+            let owner = scope
+                .as_deref_mut()
+                .map(|scope| scope.reserve_allocation(schema.owned_allocation_bytes()?))
+                .transpose()?;
+            Ok(Some(ResidentSchema {
+                schema: schema.clone(),
+                _allocation_owner: ResidentAllocationOwner(owner),
+            }))
+        }
         RirNode::Filter { input, .. } | RirNode::Distinct { input, .. } => {
-            node_schema(catalog, input)
+            node_schema_core(catalog, input, scope)
         }
         RirNode::Project { input, columns } => {
-            let input = node_schema(catalog, input)?;
-            let output = columns
-                .iter()
-                .enumerate()
-                .map(|(index, expression)| {
-                    let scalar = match expression {
-                        ProjectExpr::Column(column) => input.column_type(*column),
-                        ProjectExpr::Computed(_, scalar) => Some(*scalar),
-                    };
-                    scalar.map(|scalar| (format!("column_{index}"), scalar))
-                })
-                .collect::<Option<Vec<_>>>()?;
-            Some(Schema::new(output))
+            let Some(input) = node_schema_core(catalog, input, scope)? else {
+                return Ok(None);
+            };
+            generated_schema(
+                columns.len(),
+                |index| match &columns[index] {
+                    ProjectExpr::Column(column) => input.schema.column_type(*column),
+                    ProjectExpr::Computed(_, scalar) => Some(*scalar),
+                },
+                scope,
+            )
         }
         RirNode::Join {
             left,
@@ -914,20 +1478,32 @@ pub(crate) fn node_schema(catalog: &ResidentGraphSchemaCatalog, node: &RirNode) 
             join_type,
             ..
         } => {
-            let left = node_schema(catalog, left)?;
+            let Some(left) = node_schema_core(catalog, left, scope)? else {
+                return Ok(None);
+            };
             if matches!(join_type, JoinType::Semi | JoinType::Anti) {
-                Some(left)
+                Ok(Some(left))
             } else {
-                Some(joined_schema(&left, &node_schema(catalog, right)?))
+                let Some(right) = node_schema_core(catalog, right, scope)? else {
+                    return Ok(None);
+                };
+                Ok(Some(joined_schema_core(
+                    &left.schema,
+                    &right.schema,
+                    scope,
+                )?))
             }
         }
         RirNode::ChainJoin { fallback, .. } | RirNode::MultiWayJoin { fallback, .. } => {
-            node_schema(catalog, fallback)
+            node_schema_core(catalog, fallback, scope)
         }
-        RirNode::Union { inputs } => inputs.first().and_then(|input| node_schema(catalog, input)),
-        RirNode::Diff { left, .. } => node_schema(catalog, left),
-        RirNode::Fixpoint { base, .. } => node_schema(catalog, base),
-        RirNode::GroupBy { .. } | RirNode::TensorMaskedJoin { .. } => None,
+        RirNode::Union { inputs } => match inputs.first() {
+            Some(input) => node_schema_core(catalog, input, scope),
+            None => Ok(None),
+        },
+        RirNode::Diff { left, .. } => node_schema_core(catalog, left, scope),
+        RirNode::Fixpoint { base, .. } => node_schema_core(catalog, base, scope),
+        RirNode::GroupBy { .. } | RirNode::TensorMaskedJoin { .. } => Ok(None),
     }
 }
 

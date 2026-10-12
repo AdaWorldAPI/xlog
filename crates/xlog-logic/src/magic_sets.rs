@@ -30,7 +30,7 @@ impl MagicAllocations<'_, '_> {
             let count = vector
                 .len()
                 .checked_add(additional)
-                .ok_or_else(|| magic_error("magic vector allocation extent overflow"))?;
+                .ok_or_else(|| XlogError::allocation_extent_overflow("magic vector"))?;
             self.vector::<T>(count)?;
             vector.reserve_exact(additional);
         }
@@ -60,7 +60,7 @@ impl MagicAllocations<'_, '_> {
             for literal in body {
                 bytes = bytes
                     .checked_add(literal.owned_allocation_bytes()?)
-                    .ok_or_else(|| magic_error("magic body allocation extent overflow"))?;
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("magic body"))?;
             }
             self.acquire(bytes)?;
         }
@@ -80,10 +80,10 @@ impl MagicAllocations<'_, '_> {
                 crate::compile::hash_allocation_bytes::<K, V>(
                     length
                         .checked_add(1)
-                        .ok_or_else(|| magic_error("magic table extent overflow"))?,
+                        .ok_or_else(|| XlogError::allocation_extent_overflow("magic table"))?,
                 )?
                 .checked_mul(2)
-                .ok_or_else(|| magic_error("magic table allocation extent overflow"))?,
+                .ok_or_else(|| XlogError::allocation_extent_overflow("magic table"))?,
             )?;
         }
         Ok(())
@@ -96,7 +96,7 @@ impl MagicAllocations<'_, '_> {
                     .and_then(|(n, b)| Some((n.checked_add(1)?, b.checked_add(name.len() as u64)?)))
             });
             let (count, text) =
-                extent.ok_or_else(|| magic_error("magic variable allocation extent overflow"))?;
+                extent.ok_or_else(|| XlogError::allocation_extent_overflow("magic variable"))?;
             self.vector::<&str>(count)?;
             self.acquire(text)?;
             self.acquire(crate::compile::hash_allocation_bytes::<String, ()>(count)?)?;
@@ -301,7 +301,10 @@ fn decline_or_error(
     allocations: &mut MagicAllocations<'_, '_>,
 ) -> Result<MagicSetRewrite> {
     if mode == MagicSetsMode::On {
-        return Err(magic_error(reasons.join("; ")));
+        return Err(magic_error(
+            format_args!("{}", MagicReasons(&reasons)),
+            allocations,
+        ));
     }
     if allocations.scope.is_some() {
         allocations.acquire(program.owned_allocation_bytes()?)?;
@@ -317,8 +320,40 @@ fn decline_or_error(
     })
 }
 
-fn magic_error(message: impl Into<String>) -> XlogError {
-    XlogError::Compilation(format!("magic_sets error: {}", message.into()))
+struct MagicReasons<'a>(&'a [String]);
+
+impl std::fmt::Display for MagicReasons<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (index, reason) in self.0.iter().enumerate() {
+            if index != 0 {
+                formatter.write_str("; ")?;
+            }
+            formatter.write_str(reason)?;
+        }
+        Ok(())
+    }
+}
+
+fn magic_error(
+    message: std::fmt::Arguments<'_>,
+    allocations: &mut MagicAllocations<'_, '_>,
+) -> XlogError {
+    let bytes = xlog_core::error::formatted_text_allocation_bytes(format_args!(
+        "magic_sets error: {message}"
+    ));
+    let producer = match allocations.scope.as_deref_mut() {
+        Some(scope) => {
+            let mut reserve = |bytes| scope.reserve_allocation(bytes);
+            xlog_core::CompilationAllocationScope::prepare_diagnostic(bytes, Some(&mut reserve))
+        }
+        None => xlog_core::CompilationAllocationScope::prepare_diagnostic(bytes, None),
+    };
+    match producer {
+        Ok(producer) => {
+            producer.finish(|| XlogError::Compilation(format!("magic_sets error: {message}")))
+        }
+        Err(error) => error,
+    }
 }
 
 fn collect_query_seeds(
@@ -443,11 +478,14 @@ fn discover_body_adornments(
                     allocations.vector::<bool>(atom.terms.len())?;
                     let pattern = atom_adornment(atom, &bound);
                     if !pattern.iter().any(|is_bound| *is_bound) {
-                        return Err(magic_error(format!(
-                            "recursive call {}/{} has no bound argument under supported SIPS",
-                            atom.predicate,
-                            atom.arity()
-                        )));
+                        return Err(magic_error(
+                            format_args!(
+                                "recursive call {}/{} has no bound argument under supported SIPS",
+                                atom.predicate,
+                                atom.arity()
+                            ),
+                            allocations,
+                        ));
                     }
                     allocations.acquire(atom.predicate.len() as u64)?;
                     allocations.reserve_vector(&mut out, 1)?;
@@ -589,11 +627,14 @@ fn propagation_rules(
             allocations.vector::<bool>(atom.terms.len())?;
             let pattern = atom_adornment(atom, &bound);
             if !pattern.iter().any(|is_bound| *is_bound) {
-                return Err(magic_error(format!(
-                    "recursive call {}/{} has no bound argument under supported SIPS",
-                    atom.predicate,
-                    atom.arity()
-                )));
+                return Err(magic_error(
+                    format_args!(
+                        "recursive call {}/{} has no bound argument under supported SIPS",
+                        atom.predicate,
+                        atom.arity()
+                    ),
+                    allocations,
+                ));
             }
             allocations.atom(atom)?;
             allocations.vector::<u8>(pattern.len())?;
@@ -639,9 +680,9 @@ fn unsupported_target_reasons(
                 .body
                 .len()
                 .checked_mul(2)
-                .ok_or_else(|| magic_error("magic reason extent overflow"))?
+                .ok_or_else(|| XlogError::allocation_extent_overflow("magic reason"))?
                 .checked_add(2)
-                .ok_or_else(|| magic_error("magic reason extent overflow"))?;
+                .ok_or_else(|| XlogError::allocation_extent_overflow("magic reason"))?;
             let mut bytes = 0u64;
             let mut longest = rule.head.predicate.len();
             for literal in &rule.body {
@@ -662,15 +703,15 @@ fn unsupported_target_reasons(
                         .and_then(|length: u64| length.checked_mul(6))
                         .and_then(|extra| text.checked_add(extra))
                         .and_then(|n| n.checked_mul(count as u64))
-                        .ok_or_else(|| magic_error("magic reason extent overflow"))?,
+                        .ok_or_else(|| XlogError::allocation_extent_overflow("magic reason"))?,
                 )
-                .ok_or_else(|| magic_error("magic reason extent overflow"))?;
+                .ok_or_else(|| XlogError::allocation_extent_overflow("magic reason"))?;
             for offset in 0..count {
                 bytes = bytes
                     .checked_add(crate::compile::btree_insert_allocation_bytes::<String, ()>(
                         reasons.len() + offset,
                     )?)
-                    .ok_or_else(|| magic_error("magic reason extent overflow"))?;
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("magic reason"))?;
             }
             allocations.acquire(bytes)?;
         }
@@ -746,18 +787,18 @@ fn recursive_predicates(
         let count = deps
             .values()
             .try_fold(deps.len(), |n, preds| n.checked_add(preds.len()))
-            .ok_or_else(|| magic_error("magic dependency extent overflow"))?;
+            .ok_or_else(|| XlogError::allocation_extent_overflow("magic dependency"))?;
         let mut bytes = crate::compile::hash_allocation_bytes::<String, ()>(count)?
             .checked_mul(2)
-            .ok_or_else(|| magic_error("magic dependency extent overflow"))?;
+            .ok_or_else(|| XlogError::allocation_extent_overflow("magic dependency"))?;
         for (name, preds) in &deps {
             bytes = bytes
                 .checked_add(name.len() as u64)
-                .ok_or_else(|| magic_error("magic dependency extent overflow"))?;
+                .ok_or_else(|| XlogError::allocation_extent_overflow("magic dependency"))?;
             for pred in preds {
                 bytes = bytes
                     .checked_add(pred.len() as u64)
-                    .ok_or_else(|| magic_error("magic dependency extent overflow"))?;
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("magic dependency"))?;
             }
         }
         // The reachability search has one original seen set at a time; the
@@ -765,7 +806,7 @@ fn recursive_predicates(
         allocations.acquire(
             bytes
                 .checked_mul(2)
-                .ok_or_else(|| magic_error("magic dependency extent overflow"))?,
+                .ok_or_else(|| XlogError::allocation_extent_overflow("magic dependency"))?,
         )?;
     }
     Ok(deps

@@ -956,6 +956,25 @@ model-state `bytes` copy or second checkpoint backing is created. Unknown
 completion retains the original export, callback, writer, bounds and cursor;
 continuation does not invoke a replacement producer.
 
+An original owned compiler failure uses the exact native
+`pyxlog._native._OwnedCompilerError`, a `RuntimeError` whose original `args[0]`
+is an immutable `_OwnedCompilerDiagnostic`, not a second text copy. Native
+custody survives reassignment of `args`; traceback, cause and context keep
+their standard Python behavior. Recognize these exported native types exactly,
+not by class name or duck typing.
+Retain the payload while using its cached `text_utf8_bytes()` and
+`format_workspace_bytes()` scalar projections. Before formatting, encoding or
+JSON serialization, call
+`payload.reserve_projection_workspace(original_material_source, allocation_bytes)`.
+This checks the authentic same-pool owner and returns the existing
+`SemanticMaterialReadWorkspace`, retaining that payload as well as the original
+process/store owner. The native minimum includes formatting scratch, overlapping
+Unicode decoder buffers and a possible UTF-8 cache; the caller must additionally
+reserve every actual overlapping text, JSON and durable-cause copy. Keep the
+workspace with those derived objects until their last use. Fresh-process reads
+acquire their own original process reservation; they do not deserialize a prior
+process receipt.
+
 For a compiled cold report, obtain each original region's metadata-only writer
 before freeze with `work.prepare_checkpoint_writer(region_ordinal=...,
 model_material_capacity=..., model_material_working_bytes=...)`. Derive both

@@ -110,9 +110,7 @@ impl StatsManager {
             }
         }
         let overflow = || {
-            xlog_core::XlogError::Compilation(
-                "statistics snapshot allocation extent overflow".into(),
-            )
+            xlog_core::XlogError::allocation_extent_overflow("statistics snapshot")
         };
         let mut bytes = vector::<RelationStats>(self.relations.len())
             .and_then(|n| n.checked_add(vector::<JoinSelectivity>(self.join_selectivities.len())?))

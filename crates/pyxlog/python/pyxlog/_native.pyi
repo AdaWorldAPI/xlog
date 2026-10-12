@@ -971,6 +971,29 @@ class SemanticRetainedFinalUsePending(RuntimeError):
     historical import, or numerical work after this exception.
     """
 
+class _OwnedCompilerDiagnostic:
+    """Immutable original compiler payload; no public constructor.
+
+    These exact native types are exported for authenticated error recognition.
+    Acquire the projection workspace before str/encode/JSON and retain it with
+    every derived object. Scalar extent getters share pre-acquired metadata:
+    retain this payload while using those scalars. The returned workspace also
+    retains the authentic payload, not only the original capacity pool.
+    """
+    def __str__(self) -> str: ...
+    def text_utf8_bytes(self) -> int: ...
+    def format_workspace_bytes(self) -> int: ...
+    def reserve_projection_workspace(
+        self, material_source: SemanticMaterialSource, allocation_bytes: int,
+    ) -> SemanticMaterialReadWorkspace: ...
+
+class _OwnedCompilerError(RuntimeError):
+    """Original args[0] is _OwnedCompilerDiagnostic, not a copied string.
+
+    Native custody survives reassignment of args. Standard traceback, cause,
+    context and notes remain mutable; none grant early allocation retirement.
+    """
+
 class SemanticMaterialBytes:
     """Immutable byte-buffer view retaining the original bounded native allocation.
 

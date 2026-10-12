@@ -1252,6 +1252,7 @@ pub struct CompiledIlpProgram {
 #[pymodule]
 #[pyo3(name = "_native")]
 fn pyxlog(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    types::initialize_owned_diagnostic_types(_py, m)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<Program>()?;
     m.add_class::<CompiledProgram>()?;

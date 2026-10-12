@@ -62,7 +62,7 @@ fn reserve_optimizer_vector<T>(
 
 fn column_collection_allocation_bytes(expression: &Expr) -> xlog_core::Result<(usize, u64)> {
     let overflow =
-        || xlog_core::XlogError::Compilation("column collection allocation extent overflow".into());
+        || xlog_core::XlogError::allocation_extent_overflow("column collection");
     let mut count = 0usize;
     let mut bytes = 0u64;
     let mut child = |expression: &Expr| -> xlog_core::Result<()> {
@@ -883,9 +883,7 @@ impl Optimizer {
                     reserve_optimizer_vector::<Expr>(
                         scope,
                         out.len().checked_add(children.len()).ok_or_else(|| {
-                            xlog_core::XlogError::Compilation(
-                                "conjunction allocation extent overflow".into(),
-                            )
+                            xlog_core::XlogError::allocation_extent_overflow("conjunction")
                         })?,
                     )?;
                     out.extend(children);
@@ -1616,9 +1614,7 @@ pub mod selectivity_pass {
 
     fn reorder_allocation_bytes(atoms: usize) -> xlog_core::Result<u64> {
         let overflow = || {
-            xlog_core::XlogError::Compilation(
-                "selectivity rewrite allocation extent overflow".into(),
-            )
+            xlog_core::XlogError::allocation_extent_overflow("selectivity rewrite")
         };
         let nodes = atoms
             .checked_mul(2)
@@ -1659,7 +1655,7 @@ pub mod helper_split_pass {
 
     fn checked_extent(bytes: Option<u64>) -> xlog_core::Result<u64> {
         bytes.ok_or_else(|| {
-            xlog_core::XlogError::Compilation("helper allocation extent overflow".into())
+            xlog_core::XlogError::allocation_extent_overflow("helper")
         })
     }
 
@@ -1690,9 +1686,7 @@ pub mod helper_split_pass {
                 let (right_leaves, right_width, right_equalities, right_bytes) =
                     graph_allocation_geometry(right, schemas)?;
                 let overflow = || {
-                    xlog_core::XlogError::Compilation(
-                        "helper graph allocation extent overflow".into(),
-                    )
+                    xlog_core::XlogError::allocation_extent_overflow("helper graph")
                 };
                 let leaves = left_leaves.checked_add(right_leaves).ok_or_else(overflow)?;
                 let width = left_width.checked_add(right_width).ok_or_else(overflow)?;
@@ -1765,14 +1759,14 @@ pub mod helper_split_pass {
             .map(Schema::arity)
             .unwrap_or(0);
         let width = left.checked_add(right).ok_or_else(|| {
-            xlog_core::XlogError::Compilation("helper candidate allocation extent overflow".into())
+            xlog_core::XlogError::allocation_extent_overflow("helper candidate")
         })?;
         let all = linear
             .leaf_classes
             .iter()
             .try_fold(0usize, |n, classes| n.checked_add(classes.len()))
             .ok_or_else(|| {
-                xlog_core::XlogError::Compilation("helper class allocation extent overflow".into())
+                xlog_core::XlogError::allocation_extent_overflow("helper class")
             })?;
         let keys = linear
             .joins
@@ -1798,9 +1792,7 @@ pub mod helper_split_pass {
             bytes = checked_extent(
                 bytes.checked_add(text(format_args!("c{index}"))?.checked_mul(2).ok_or_else(
                     || {
-                        xlog_core::XlogError::Compilation(
-                            "helper text allocation extent overflow".into(),
-                        )
+                        xlog_core::XlogError::allocation_extent_overflow("helper text")
                     },
                 )?),
             )?;
@@ -2117,9 +2109,7 @@ pub mod helper_split_pass {
                     linear.leaf_classes[leaf_idx].len()
                 })
                 .ok_or_else(|| {
-                    xlog_core::XlogError::Compilation(
-                        "helper output class allocation extent overflow".into(),
-                    )
+                    xlog_core::XlogError::allocation_extent_overflow("helper output class")
                 })?;
             bytes = checked_extent(bytes.checked_add(vector::<u32>(classes)?))?;
         }
@@ -3582,9 +3572,7 @@ mod reorder {
                             format_args!("{original:?}"),
                         )?)
                         .ok_or_else(|| {
-                            xlog_core::XlogError::Compilation(
-                                "rewrite comparison allocation extent overflow".into(),
-                            )
+                            xlog_core::XlogError::allocation_extent_overflow("rewrite comparison")
                         })?;
                 Some(scope.reserve_allocation(bytes)?)
             }

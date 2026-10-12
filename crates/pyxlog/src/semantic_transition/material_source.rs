@@ -1,5 +1,6 @@
 use super::*;
 use std::sync::Weak;
+use crate::types::PreparedDiagnosticHandoff;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct MaterialStoreIdentity(pub(super) [u64; 2]);
@@ -179,13 +180,230 @@ struct NativeReplayBindings {
 }
 
 #[derive(Default)]
+struct CompilerDiagnosticCache {
+    available: Option<PreparedDiagnosticHandoff>,
+    blocking: Option<PyErr>,
+    loaned: bool,
+}
+
+struct CompilerDiagnosticAcquisition<'a> {
+    acquiring: &'a AtomicBool,
+}
+
+impl Drop for CompilerDiagnosticAcquisition<'_> {
+    fn drop(&mut self) {
+        self.acquiring.store(false, Ordering::Release);
+    }
+}
+
+fn compiler_diagnostic_custody_refusal() -> xlog_core::XlogError {
+    xlog_core::XlogError::AllocationRefused {
+        operation: "compiler diagnostic custody",
+        reason: xlog_core::error::AllocationRefusal::Poisoned,
+    }
+}
+
+#[derive(Default)]
 pub(super) struct MaterialSourceRegistry {
     original: Mutex<Option<OriginalMaterialSource>>,
     native_bindings: Mutex<NativeReplayBindings>,
+    compiler_diagnostic: Mutex<CompilerDiagnosticCache>,
+    compiler_diagnostic_acquiring: AtomicBool,
     owner_metadata: Mutex<Option<xlog_cuda::SemanticReplayMaterialReservation>>,
 }
 
 impl MaterialSourceRegistry {
+    /// Warm the same original cache before acquiring a consumer's own mutex.
+    /// This grants no compiler entry and returns only an unbound family.
+    pub(super) fn ensure_compiler_diagnostic(&self, py: Python<'_>) -> PyResult<()> {
+        let family = self.take_compiler_diagnostic(py)?;
+        self.return_compiler_diagnostic(py, family)?;
+        // Retiring the previous exception can run a destructor that reenters
+        // another compiler and consumes the returned family. Check only after
+        // that retirement; never let the caller construct under its own lock.
+        let cached = match self.compiler_diagnostic.lock() {
+            Ok(cached) => cached,
+            Err(poison) => {
+                let cached = poison.into_inner();
+                return Err(cached.blocking.as_ref()
+                    .expect("poisoned compiler entry retains its original outcome")
+                    .clone_ref(py));
+            }
+        };
+        if cached.available.is_some() && !cached.loaned {
+            Ok(())
+        } else {
+            Err(cached.blocking.as_ref()
+                .expect("reentered compiler entry retains its original outcome")
+                .clone_ref(py))
+        }
+    }
+
+    /// Lend an original family before compiler entry. After a published failure,
+    /// replacement refusal returns that same outcome without starting a scope.
+    pub(super) fn take_compiler_diagnostic(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<PreparedDiagnosticHandoff> {
+        let budget = self.native_budget()?;
+        let mut cached = match self.compiler_diagnostic.lock() {
+            Ok(cached) => cached,
+            Err(poison) => {
+                let mut cached = poison.into_inner();
+                if let Some(error) = &cached.blocking {
+                    let error = error.clone_ref(py);
+                    drop(cached);
+                    return Err(error);
+                }
+                let family = cached.available.take();
+                drop(cached);
+                // Poison grants no compiler entry. Its inline refusal uses
+                // only an already-acquired original family, never a new one.
+                return Err(self.publish_compiler_failure(
+                    py,
+                    family.expect("poisoned compiler diagnostic requires its original available family or outcome"),
+                    compiler_diagnostic_custody_refusal(),
+                ));
+            }
+        };
+        if let Some(family) = cached.available.take() {
+            assert!(
+                !cached.loaned,
+                "original compiler diagnostic is already loaned"
+            );
+            cached.loaned = true;
+            drop(cached);
+            assert!(
+                family.is_unbound_for(py, &budget),
+                "cached compiler diagnostic requires its unbound original pool"
+            );
+            return Ok(family);
+        }
+        let blocking = cached.blocking.as_ref().map(|error| error.clone_ref(py));
+        if cached.loaned || self.compiler_diagnostic_acquiring.load(Ordering::Acquire) {
+            drop(cached);
+            // The first loan spans only the canonical callback-free Rust
+            // compiler. Replacement construction can reenter through Python GC,
+            // and must keep its already-published original outcome available.
+            return Err(blocking.expect("original compiler diagnostic loan cannot be reentered"));
+        }
+        let blocking = blocking
+            .expect("original compiler diagnostic requires its admitted family or outcome");
+        self.compiler_diagnostic_acquiring
+            .store(true, Ordering::Release);
+        let acquisition = CompilerDiagnosticAcquisition {
+            acquiring: &self.compiler_diagnostic_acquiring,
+        };
+        drop(cached);
+        // Python allocation can execute GC callbacks. No cache mutex is held,
+        // and the original blocking outcome stays charged through this attempt.
+        let result = crate::types::prepare_owned_diagnostic_handoff(py, &budget);
+        let mut cached = match self.compiler_diagnostic.lock() {
+            Ok(cached) => cached,
+            Err(poison) => {
+                let cached = poison.into_inner();
+                let error = cached.blocking.as_ref().map(|error| error.clone_ref(py));
+                drop(cached);
+                drop(result);
+                drop(acquisition);
+                return Err(error.unwrap_or(blocking));
+            }
+        };
+        let result = match result {
+            Ok(family) => {
+                assert!(
+                    family.is_unbound_for(py, &budget),
+                    "replacement compiler diagnostic requires its original pool"
+                );
+                assert!(
+                    cached.available.is_none() && !cached.loaned,
+                    "replacement compiler diagnostic changed its original entry"
+                );
+                cached.loaned = true;
+                Ok(family)
+            }
+            Err(error) => {
+                drop(cached);
+                drop(error);
+                drop(acquisition);
+                return Err(blocking);
+            }
+        };
+        drop(cached);
+        drop(acquisition);
+        result
+    }
+
+    /// A known successful attempt returns its unused family. A published
+    /// diagnostic is permanently bound and must never return to this cache.
+    pub(super) fn return_compiler_diagnostic(
+        &self,
+        py: Python<'_>,
+        family: PreparedDiagnosticHandoff,
+    ) -> PyResult<()> {
+        let budget = self.native_budget()?;
+        assert!(
+            family.is_unbound_for(py, &budget),
+            "only an unbound original compiler diagnostic may be returned"
+        );
+        let mut cached = match self.compiler_diagnostic.lock() {
+            Ok(cached) => cached,
+            Err(poison) => {
+                let mut cached = poison.into_inner();
+                let blocking = cached.blocking.as_ref().map(|error| error.clone_ref(py));
+                if blocking.is_some() {
+                    cached.loaned = false;
+                }
+                drop(cached);
+                if let Some(error) = blocking {
+                    drop(family);
+                    return Err(error);
+                }
+                return Err(self.publish_compiler_failure(
+                    py, family, compiler_diagnostic_custody_refusal(),
+                ));
+            }
+        };
+        assert!(
+            cached.available.is_none() && cached.loaned,
+            "original compiler diagnostic was already returned"
+        );
+        cached.available = Some(family);
+        cached.loaned = false;
+        let previous = cached.blocking.take();
+        drop(cached);
+        // BaseException slots may retain arbitrary Python owners. Their last
+        // references must not be released while the cache mutex is held.
+        drop(previous);
+        Ok(())
+    }
+
+    pub(super) fn publish_compiler_failure(
+        &self,
+        py: Python<'_>,
+        family: PreparedDiagnosticHandoff,
+        error: xlog_core::XlogError,
+    ) -> PyErr {
+        let error = family.bind_failure(py, error);
+        let (mut cached, poisoned) = match self.compiler_diagnostic.lock() {
+            Ok(cached) => (cached, false),
+            // Preserve the original outcome even when custody is poisoned.
+            // Poison is not cleared: subsequent entry/return remain refused.
+            Err(poison) => (poison.into_inner(), true),
+        };
+        if !poisoned {
+            assert!(
+                cached.available.is_none() && cached.loaned,
+                "compiler failure requires its original loaned family"
+            );
+        }
+        let previous = cached.blocking.replace(error.clone_ref(py));
+        cached.loaned = false;
+        drop(cached);
+        drop(previous);
+        error
+    }
+
     pub(super) fn retain_process_owner_metadata(
         &self,
         metadata: xlog_cuda::SemanticReplayMaterialReservation,
@@ -374,31 +592,100 @@ impl MaterialSourceRegistry {
                 "material source requires its original retained resolver",
             ));
         }
+        self.compiler_diagnostic_acquiring
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                invalid("original material source capacity admission is already in progress")
+            })?;
+        let _admission = CompilerDiagnosticAcquisition {
+            acquiring: &self.compiler_diagnostic_acquiring,
+        };
+        let require_original = |original: Option<&OriginalMaterialSource>| -> PyResult<()> {
+            if let Some(original) = original {
+                if original.metadata.store != store
+                    || original.metadata.item_cap != item_cap
+                    || original.metadata.store_cap != store_cap
+                    || original.metadata.resolved_cap != resolved_cap
+                    || original
+                        .resolver
+                        .as_ref()
+                        .is_some_and(|resolver| !resolver.bind(py).is(&fields[2]))
+                {
+                    return Err(invalid(
+                        "material source changed its original store, caps or cached resolver",
+                    ));
+                }
+            }
+            Ok(())
+        };
+        let (original_metadata, original_resolver, original_budget) = {
+            let retained = self
+                .original
+                .lock()
+                .map_err(|_| invalid("material source registry is poisoned"))?;
+            require_original(retained.as_ref())?;
+            (
+                retained
+                    .as_ref()
+                    .map(|original| Arc::clone(&original.metadata)),
+                retained
+                    .as_ref()
+                    .and_then(|original| original.resolver.as_ref())
+                    .map(|resolver| resolver.as_ptr()),
+                retained
+                    .as_ref()
+                    .and_then(|original| original.budget.clone()),
+            )
+        };
+        let budget = match original_budget.as_ref() {
+            Some(budget) => budget.clone(),
+            None => xlog_cuda::SemanticReplayMaterialBudget::new(resolved_cap).map_err(xlog_err)?,
+        };
+        // The first error family precedes all roster, payload and compiler
+        // allocations in this original pool. Its Python construction can run
+        // GC callbacks, so neither original nor cache mutex is held here.
+        let diagnostic_handoff = if original_budget.is_none() {
+            Some(
+                crate::types::prepare_owned_diagnostic_handoff(py, &budget)
+                    .map_err(|error| error.into_bootstrap_error())?,
+            )
+        } else {
+            None
+        };
+        // These guards are declared after the local family so all failure exits
+        // unlock before dropping its Python objects or original budget receipt.
         let mut retained = self
             .original
             .lock()
             .map_err(|_| invalid("material source registry is poisoned"))?;
-        if let Some(original) = retained.as_ref() {
-            if original.metadata.store != store
-                || original.metadata.item_cap != item_cap
-                || original.metadata.store_cap != store_cap
-                || original.metadata.resolved_cap != resolved_cap
-                || original
-                    .resolver
-                    .as_ref()
-                    .is_some_and(|resolver| !resolver.bind(py).is(&fields[2]))
-            {
-                return Err(invalid(
-                    "material source changed its original store, caps or cached resolver",
-                ));
+        require_original(retained.as_ref())?;
+        let unchanged = match (original_metadata.as_ref(), retained.as_ref()) {
+            (None, None) => true,
+            (Some(metadata), Some(original)) => {
+                Arc::ptr_eq(metadata, &original.metadata)
+                    && original_resolver
+                        == original.resolver.as_ref().map(|resolver| resolver.as_ptr())
+                    && match (original_budget.as_ref(), original.budget.as_ref()) {
+                        (None, None) => true,
+                        (Some(previous), Some(current)) => previous.same_pool(current),
+                        _ => false,
+                    }
             }
+            _ => false,
+        };
+        if !unchanged || !fields[2].is_callable() {
+            return Err(invalid(
+                "material source changed during its original capacity admission",
+            ));
         }
-        let budget = match retained
-            .as_ref()
-            .and_then(|original| original.budget.as_ref())
-        {
-            Some(budget) => budget.clone(),
-            None => xlog_cuda::SemanticReplayMaterialBudget::new(resolved_cap).map_err(xlog_err)?,
+        let mut diagnostic_cache = if diagnostic_handoff.is_some() {
+            Some(
+                self.compiler_diagnostic
+                    .lock()
+                    .map_err(|_| invalid("original compiler diagnostic cache is poisoned"))?,
+            )
+        } else {
+            None
         };
         let count = fields[1].cast::<PyTuple>()?.len();
         let reservation = reserve_roster(&budget, count)?;
@@ -518,6 +805,16 @@ impl MaterialSourceRegistry {
                 }),
                 resolver: Some(fields[2].clone().unbind()),
             });
+        }
+        if let Some(family) = diagnostic_handoff {
+            let cached = diagnostic_cache
+                .as_mut()
+                .expect("original diagnostic cache admission");
+            assert!(
+                cached.available.is_none() && cached.blocking.is_none() && !cached.loaned,
+                "original diagnostic family was already admitted"
+            );
+            cached.available = Some(family);
         }
         Ok(())
     }
@@ -791,6 +1088,8 @@ impl MaterialSourceRegistry {
                 budget: None,
             })),
             native_bindings: Mutex::new(NativeReplayBindings::default()),
+            compiler_diagnostic: Mutex::new(CompilerDiagnosticCache::default()),
+            compiler_diagnostic_acquiring: AtomicBool::new(false),
             owner_metadata: Mutex::new(None),
         })
     }

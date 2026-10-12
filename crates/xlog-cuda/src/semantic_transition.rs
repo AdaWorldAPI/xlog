@@ -6044,16 +6044,48 @@ impl SemanticReplayMaterialBudget {
         payload_bytes: u64,
         charged_bytes: u64,
     ) -> Result<SemanticReplayMaterialReservation, SemanticTransitionError> {
+        self.reserve_owned_classified(payload_bytes, charged_bytes)
+            .map_err(|reason| match reason {
+                xlog_core::error::AllocationRefusal::Poisoned => SemanticTransitionError::Poisoned,
+                reason => SemanticTransitionError::MaterialAllocationRefused { reason },
+            })
+    }
+
+    /// Acquire canonical compiler storage from this same original pool. The
+    /// first refusal remains inline even before a compiler scope owner exists.
+    pub fn reserve_compiler_allocation(
+        &self,
+        bytes: u64,
+    ) -> XlogResult<Arc<SemanticReplayMaterialReservation>> {
+        let charged_bytes = bytes
+            .checked_add(size_of::<SemanticReplayMaterialReservation>() as u64)
+            .and_then(|bytes| bytes.checked_add(2 * size_of::<usize>() as u64))
+            .ok_or_else(|| XlogError::allocation_extent_overflow("compiler allocation receipt"))?;
+        self.reserve_owned_classified(bytes, charged_bytes)
+            .map(Arc::new)
+            .map_err(|reason| XlogError::AllocationRefused {
+                operation: "original replay material compiler allocation",
+                reason,
+            })
+    }
+
+    fn reserve_owned_classified(
+        &self,
+        payload_bytes: u64,
+        charged_bytes: u64,
+    ) -> Result<SemanticReplayMaterialReservation, xlog_core::error::AllocationRefusal> {
         let mut used = self
             .owner
             .used
             .lock()
-            .map_err(|_| SemanticTransitionError::Poisoned)?;
+            .map_err(|_| xlog_core::error::AllocationRefusal::Poisoned)?;
         let next = used
             .checked_add(charged_bytes)
             .filter(|&next| next <= self.owner.capacity)
-            .ok_or_else(|| {
-                publication_input_error("original replay material byte capacity is exhausted")
+            .ok_or(xlog_core::error::AllocationRefusal::Capacity {
+                requested: charged_bytes,
+                used: *used,
+                capacity: self.owner.capacity,
             })?;
         *used = next;
         Ok(SemanticReplayMaterialReservation {
@@ -19592,6 +19624,9 @@ pub struct SemanticPreparedSegmentTransfers {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SemanticTransitionError {
     CatalogueMismatch,
+    MaterialAllocationRefused {
+        reason: xlog_core::error::AllocationRefusal,
+    },
     InvalidInput {
         detail: String,
     },

@@ -18,6 +18,7 @@ enum OriginalMaterialReadOwner {
     },
     Source {
         _source: Arc<material_source::MaterialSourceRegistry>,
+        _projection: Option<Py<PyAny>>,
     },
 }
 
@@ -74,6 +75,30 @@ pub(crate) struct PySemanticMaterialSource {
 }
 
 impl PySemanticMaterialSource {
+    pub(crate) fn reserve_diagnostic_projection(
+        &self,
+        py: Python<'_>,
+        original_budget: &xlog_cuda::SemanticReplayMaterialBudget,
+        allocation_bytes: u64,
+        original_payload: Py<PyAny>,
+    ) -> PyResult<Py<PySemanticMaterialReadWorkspace>> {
+        self.require_creator()?;
+        if !original_budget.same_pool(&self.registry.native_budget()?) {
+            return Err(invalid(
+                "diagnostic projection changed its original material capacity owner",
+            ));
+        }
+        prepare_read_workspace(
+            py,
+            OriginalMaterialReadOwner::Source {
+                _source: Arc::clone(&self.registry),
+                _projection: Some(original_payload),
+            },
+            original_budget,
+            allocation_bytes,
+        )
+    }
+
     fn require_creator(&self) -> PyResult<()> {
         if self.owner_thread != std::thread::current().id() {
             return Err(invalid(
@@ -186,6 +211,7 @@ impl PySemanticMaterialSource {
             py,
             OriginalMaterialReadOwner::Source {
                 _source: Arc::clone(&self.registry),
+                _projection: None,
             },
             &self.registry.native_budget()?,
             allocation_bytes,

@@ -143,7 +143,7 @@ pub struct Schema {
 impl Schema {
     /// Owned clone geometry of this original schema, including sort labels.
     pub fn owned_allocation_bytes(&self) -> crate::Result<u64> {
-        let overflow = || crate::XlogError::Compilation("schema allocation extent overflow".into());
+        let overflow = || crate::XlogError::allocation_extent_overflow("schema");
         let columns = self
             .columns
             .len()

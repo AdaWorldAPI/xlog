@@ -54,274 +54,22 @@ pub struct Compiler {
     lowerer: Lowerer,
 }
 
+struct CompilerPlanOutput {
+    plan: ExecutionPlan,
+    allocation_owner: Arc<dyn Send + Sync>,
+}
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use xlog_core::{RelId, Schema};
 
-/// Original allocation receipts for one canonical compilation. The caller's
-/// callback is the capacity authority; this scope neither chooses a budget nor
-/// grants parsing, admission, or execution rights.
-pub struct CompilationAllocationScope<'a> {
-    reserve: &'a mut dyn FnMut(u64) -> Result<Arc<dyn Send + Sync>>,
-    receipts: Vec<Arc<dyn Send + Sync>>,
-    planner_threshold: Option<f64>,
-    receipt_storage: Option<Arc<dyn Send + Sync>>,
-    owner_metadata: Option<Arc<dyn Send + Sync>>,
-}
-
-struct CompilationAllocationReceipts {
-    _receipts: Vec<Arc<dyn Send + Sync>>,
-    _receipt_storage: Option<Arc<dyn Send + Sync>>,
-    _metadata: Arc<dyn Send + Sync>,
-}
+pub use xlog_core::{
+    btree_insert_allocation_bytes, hash_allocation_bytes, push_vector_allocation_bytes,
+    CompilationAllocationScope,
+};
 
 pub fn formatted_text_allocation_bytes(arguments: std::fmt::Arguments<'_>) -> Result<u64> {
-    struct Extent(u64);
-    impl std::fmt::Write for Extent {
-        fn write_str(&mut self, text: &str) -> std::fmt::Result {
-            self.0 = self
-                .0
-                .checked_add(u64::try_from(text.len()).map_err(|_| std::fmt::Error)?)
-                .ok_or(std::fmt::Error)?;
-            Ok(())
-        }
-    }
-    let overflow = || XlogError::Compilation("compiler text allocation extent overflow".into());
-    let mut extent = Extent(0);
-    std::fmt::write(&mut extent, arguments).map_err(|_| overflow())?;
-    // The canonical formatter grows a byte vector. Initial literal estimation
-    // and geometric growth need at most twice the actual formatted extent;
-    // old and replacement buffers can coexist during a growth operation.
-    extent
-        .0
-        .checked_mul(2)
-        .and_then(|n| n.checked_add(8))
-        .and_then(|n| n.checked_mul(3))
-        .ok_or_else(overflow)
-}
-
-pub fn hash_allocation_bytes<K, V>(count: usize) -> Result<u64> {
-    if count == 0 {
-        return Ok(0);
-    }
-    let overflow = || XlogError::Compilation("compiler table allocation extent overflow".into());
-    // Swiss-table storage has one control byte per bucket, a trailing control
-    // group, and a seven-eighths maximum load factor. Eight buckets also cover
-    // the original small-table special cases.
-    let buckets = count
-        .checked_mul(8)
-        .and_then(|n| n.checked_add(6))
-        .map(|n| n / 7)
-        .and_then(|n| n.max(8).checked_next_power_of_two())
-        .ok_or_else(overflow)?;
-    buckets
-        .checked_mul(
-            std::mem::size_of::<(K, V)>()
-                .checked_add(1)
-                .ok_or_else(overflow)?,
-        )
-        .and_then(|n| n.checked_add(16))
-        .and_then(|n| u64::try_from(n).ok())
-        .ok_or_else(overflow)
-}
-
-pub fn push_vector_allocation_bytes<T>(count: usize) -> Result<u64> {
-    let width = std::mem::size_of::<T>();
-    if count == 0 || width == 0 {
-        return Ok(0);
-    }
-    let minimum = if width == 1 {
-        8
-    } else if width <= 1024 {
-        4
-    } else {
-        1
-    };
-    // Capacity of the actual push-built vector, including its old buffer at a
-    // geometric growth operation. This does not allocate a counting vector.
-    count
-        .checked_mul(2)
-        .map(|n| n.max(minimum))
-        .and_then(|n| n.checked_mul(3))
-        .and_then(|n| n.checked_mul(width))
-        .and_then(|n| u64::try_from(n).ok())
-        .ok_or_else(|| XlogError::Compilation("compiler vector allocation extent overflow".into()))
-}
-
-pub fn btree_insert_allocation_bytes<K, V>(length: usize) -> Result<u64> {
-    let overflow = || XlogError::Compilation("compiler tree allocation extent overflow".into());
-    let mut height = 1usize;
-    let mut entries = length;
-    while entries >= 6 {
-        entries /= 6;
-        height = height.checked_add(1).ok_or_else(overflow)?;
-    }
-    let node = (2 * std::mem::size_of::<usize>())
-        .checked_add(2 * std::mem::size_of::<u16>())
-        .and_then(|n| n.checked_add(11usize.checked_mul(std::mem::size_of::<(K, V)>())?))
-        .and_then(|n| n.checked_add(12 * std::mem::size_of::<usize>()))
-        .ok_or_else(overflow)?;
-    let alignment = std::mem::align_of::<(K, V)>().max(std::mem::align_of::<usize>());
-    let node = node
-        .checked_add(alignment - 1)
-        .map(|bytes| bytes / alignment * alignment)
-        .ok_or_else(overflow)?;
-    node.checked_mul(height.checked_add(1).ok_or_else(overflow)?)
-        .and_then(|n| u64::try_from(n).ok())
-        .ok_or_else(overflow)
-}
-
-impl<'a> CompilationAllocationScope<'a> {
-    /// Start an empty scope without allocating receipt storage.
-    pub fn new(reserve: &'a mut dyn FnMut(u64) -> Result<Arc<dyn Send + Sync>>) -> Self {
-        Self {
-            reserve,
-            receipts: Vec::new(),
-            planner_threshold: None,
-            receipt_storage: None,
-            owner_metadata: None,
-        }
-    }
-
-    /// A stage-local receipt scope under the exact same reservation authority
-    /// and captured planner configuration. It creates no pool or receipt until
-    /// an actual stage allocation is acquired.
-    pub fn child_scope(&mut self) -> CompilationAllocationScope<'_> {
-        CompilationAllocationScope {
-            reserve: &mut *self.reserve,
-            receipts: Vec::new(),
-            planner_threshold: self.planner_threshold,
-            receipt_storage: None,
-            owner_metadata: None,
-        }
-    }
-
-    /// Attach the caller's original parsed planner configuration. Owned
-    /// planning never reads or substitutes an environment value.
-    pub fn with_planner_threshold(mut self, threshold: f64) -> Result<Self> {
-        if !threshold.is_finite() || threshold <= 0.0 {
-            return Err(XlogError::Compilation(
-                "original planner threshold must be finite and positive".into(),
-            ));
-        }
-        self.planner_threshold = Some(threshold);
-        Ok(self)
-    }
-
-    pub(crate) fn planner_threshold(&self) -> Option<f64> {
-        self.planner_threshold
-    }
-
-    /// Receipt boundary for a genuine attempt. The caller may retire the
-    /// suffix only after all of that failed attempt's actual data has dropped.
-    pub fn receipt_checkpoint(&self) -> usize {
-        self.receipts.len()
-    }
-
-    /// Retire a known-discarded attempt; retained receipt-vector capacity keeps
-    /// its separate original owner and cannot be released by this operation.
-    pub fn retire_since(&mut self, checkpoint: usize) -> Result<()> {
-        if checkpoint > self.receipts.len() {
-            return Err(XlogError::Compilation(
-                "compiler receipt boundary is not original".into(),
-            ));
-        }
-        self.receipts.truncate(checkpoint);
-        Ok(())
-    }
-
-    fn reserve_receipt_storage(&mut self) -> Result<()> {
-        if self.receipts.len() == self.receipts.capacity() {
-            let capacity = self
-                .receipts
-                .len()
-                .checked_add(1)
-                .and_then(|n| n.max(4).checked_next_power_of_two())
-                .ok_or_else(|| {
-                    XlogError::Compilation("compiler receipt allocation extent overflow".into())
-                })?;
-            let bytes = capacity
-                .checked_mul(std::mem::size_of::<Arc<dyn Send + Sync>>())
-                .and_then(|n| u64::try_from(n).ok())
-                .ok_or_else(|| {
-                    XlogError::Compilation("compiler receipt allocation extent overflow".into())
-                })?;
-            let owner = (self.reserve)(bytes)?;
-            self.receipts.reserve_exact(capacity - self.receipts.len());
-            self.receipt_storage = Some(owner);
-        }
-        Ok(())
-    }
-
-    /// Acquire custody for an actual temporary owner. Unlike `acquire`, the
-    /// caller retains this receipt in that owner and retires it with its data.
-    pub fn reserve_allocation(&mut self, bytes: u64) -> Result<Arc<dyn Send + Sync>> {
-        (self.reserve)(bytes)
-    }
-
-    /// Acquire the returned owner's own metadata before the result's data is
-    /// constructed. Final transfer then cannot refuse capacity after that data
-    /// has already outlived this scope's receipts.
-    pub fn prepare_owner(&mut self) -> Result<()> {
-        if self.owner_metadata.is_none() {
-            let bytes = std::mem::size_of::<CompilationAllocationReceipts>()
-                .checked_add(2 * std::mem::size_of::<usize>())
-                .and_then(|n| n.checked_add(xlog_core::error::OwnedDiagnostic::allocation_bytes()))
-                .and_then(|n| u64::try_from(n).ok())
-                .ok_or_else(|| {
-                    XlogError::Compilation("compiler owner allocation extent overflow".into())
-                })?;
-            self.owner_metadata = Some((self.reserve)(bytes)?);
-        }
-        Ok(())
-    }
-
-    /// Retain the already-acquired receipt of an actual returned allocation.
-    pub fn retain(&mut self, receipt: Arc<dyn Send + Sync>) -> Result<()> {
-        self.reserve_receipt_storage()?;
-        self.receipts.push(receipt);
-        Ok(())
-    }
-
-    /// Acquire a receipt before its actual allocation. The receipt collection
-    /// itself is charged before growth and retained by the same original scope.
-    pub fn acquire(&mut self, bytes: u64) -> Result<Arc<dyn Send + Sync>> {
-        self.reserve_receipt_storage()?;
-        let receipt = (self.reserve)(bytes)?;
-        self.receipts.push(receipt.clone());
-        Ok(receipt)
-    }
-
-    /// Transfer all receipts into the original returned compiler owner. Its
-    /// metadata is acquired before the owning Arc is allocated.
-    pub fn into_owner(mut self) -> Result<Arc<dyn Send + Sync>> {
-        self.prepare_owner()?;
-        let metadata = self
-            .owner_metadata
-            .take()
-            .expect("prepared compiler owner metadata");
-        Ok(Arc::new(CompilationAllocationReceipts {
-            _receipts: self.receipts,
-            _receipt_storage: self.receipt_storage,
-            _metadata: metadata,
-        }))
-    }
-
-    /// Preserve a prepared failed attempt's diagnostic and original receipts.
-    /// The two carrier allocations were acquired by `prepare_owner` before
-    /// the attempt. No new reservation can replace the original failure here.
-    pub fn into_failure(mut self, error: XlogError) -> XlogError {
-        let metadata = self
-            .owner_metadata
-            .take()
-            .expect("failed compiler attempt requires its prepared original owner");
-        let allocations = Arc::new(CompilationAllocationReceipts {
-            _receipts: self.receipts,
-            _receipt_storage: self.receipt_storage,
-            _metadata: Arc::clone(&metadata),
-        });
-        error.with_diagnostic_owner(allocations, metadata)
-    }
+    xlog_core::error::formatted_text_allocation_bytes(arguments)
 }
 
 /// Capacity of the original compiler's scalar binary subset, before owned
@@ -332,7 +80,7 @@ pub fn positive_binary_compiler_allocation_bound(program: &Program) -> Result<u6
     use crate::ast::{Atom, PredColumn, PredDecl, TypeRef};
     use crate::stratify::{DepEdge, DependencyGraph, Stratum};
     use std::mem::size_of;
-    let overflow = || XlogError::Compilation("binary compiler allocation extent overflow".into());
+    let overflow = || XlogError::allocation_extent_overflow("binary compiler");
     let add = |a: usize, b: usize| a.checked_add(b).ok_or_else(overflow);
     let mul = |a: usize, b: usize| a.checked_mul(b).ok_or_else(overflow);
     let vector = |count: usize, width: usize| mul(add(mul(count, 2)?, 4)?, width);
@@ -709,11 +457,17 @@ impl Compiler {
         program: &Program,
         scope: &mut CompilationAllocationScope<'_>,
     ) -> Result<()> {
-        program.validate_prepared_authored_constraint_identity()?;
-        scope.acquire(program.owned_allocation_bytes()?)?;
-        let program = run_frontend_passes_with_owner(program.clone(), &mut Some(&mut *scope))?;
-        self.lowerer
-            .validate_program_without_plan_with_allocation_owner(&program, scope)
+        let mut stage = scope.child_scope();
+        let result = (|| {
+            program.validate_prepared_authored_constraint_identity_with_allocation_owner(
+                &mut |bytes| stage.reserve_allocation(bytes),
+            )?;
+            stage.acquire(program.owned_allocation_bytes()?)?;
+            let program = run_frontend_passes_with_owner(program.clone(), &mut Some(&mut stage))?;
+            self.lowerer
+                .validate_program_without_plan_with_allocation_owner(&program, &mut stage)
+        })();
+        finish_compiler_stage(result, stage)
     }
 
     /// Composable program-level entry point.
@@ -768,20 +522,22 @@ impl Compiler {
         )
     }
 
-    /// Compile through the original complete pipeline, retaining each original
-    /// allocation receipt in the caller's compilation scope.
+    /// Compile through the original complete pipeline. Persistent lowerer state
+    /// owns its receipts; discarded compiler data retires with its local stage.
     pub fn compile_prepared_program_with_allocation_owner(
         &mut self,
         program: &Program,
         scope: &mut CompilationAllocationScope<'_>,
     ) -> Result<ExecutionPlan> {
-        scope.acquire(program.owned_allocation_bytes()?)?;
-        self.compile_prepared_owned_program_core(
-            program.clone(),
-            &CompilerConfig::default(),
-            None,
-            &mut Some(scope),
-        )
+        self.compile_with_allocation_stage(scope, |compiler, stage| {
+            stage.acquire(program.owned_allocation_bytes()?)?;
+            compiler.compile_prepared_owned_program_core(
+                program.clone(),
+                &CompilerConfig::default(),
+                None,
+                &mut Some(stage),
+            )
+        })
     }
 
     /// Statistics-aware form using the same original compilation owner.
@@ -791,13 +547,15 @@ impl Compiler {
         stats_snapshot: Option<&StatsSnapshot>,
         scope: &mut CompilationAllocationScope<'_>,
     ) -> Result<ExecutionPlan> {
-        scope.acquire(program.owned_allocation_bytes()?)?;
-        self.compile_prepared_owned_program_core(
-            program.clone(),
-            &CompilerConfig::default(),
-            stats_snapshot,
-            &mut Some(scope),
-        )
+        self.compile_with_allocation_stage(scope, |compiler, stage| {
+            stage.acquire(program.owned_allocation_bytes()?)?;
+            compiler.compile_prepared_owned_program_core(
+                program.clone(),
+                &CompilerConfig::default(),
+                stats_snapshot,
+                &mut Some(stage),
+            )
+        })
     }
 
     /// Owned-AST form of the same allocation-aware compilation pipeline.
@@ -806,12 +564,48 @@ impl Compiler {
         program: Program,
         scope: &mut CompilationAllocationScope<'_>,
     ) -> Result<ExecutionPlan> {
-        self.compile_prepared_owned_program_core(
-            program,
-            &CompilerConfig::default(),
-            None,
-            &mut Some(scope),
-        )
+        self.compile_with_allocation_stage(scope, |compiler, stage| {
+            compiler.compile_prepared_owned_program_core(
+                program,
+                &CompilerConfig::default(),
+                None,
+                &mut Some(stage),
+            )
+        })
+    }
+
+    fn compile_with_allocation_stage<F>(
+        &mut self,
+        scope: &mut CompilationAllocationScope<'_>,
+        compile: F,
+    ) -> Result<ExecutionPlan>
+    where
+        F: FnOnce(&mut Self, &mut CompilationAllocationScope<'_>) -> Result<ExecutionPlan>,
+    {
+        let output = {
+            let mut stage = scope.child_scope();
+            let result = (|| {
+                let plan = compile(self, &mut stage)?;
+                // Canonical lowering and optimization currently mix returned
+                // buffers with discarded scratch. A guarded final copy gives
+                // the surviving plan its own real allocation lifetime.
+                let mut output_scope = stage.child_scope();
+                output_scope.prepare_owner()?;
+                output_scope.acquire(plan.owned_allocation_bytes()?)?;
+                let copy = plan.clone();
+                let allocation_owner = output_scope.into_owner()?;
+                drop(plan);
+                Ok(CompilerPlanOutput {
+                    plan: copy,
+                    allocation_owner,
+                })
+            })();
+            finish_compiler_stage(result, stage)?
+        };
+        // Keep the temporary carrier alive if receipt-storage acquisition
+        // declines: its plan drops before its original allocation owner.
+        scope.retain(Arc::clone(&output.allocation_owner))?;
+        Ok(output.plan)
     }
 
     /// [`Self::compile_prepared_program_with_config_and_stats_snapshot`] for a
@@ -836,23 +630,18 @@ impl Compiler {
         stats_snapshot: Option<&StatsSnapshot>,
         scope: &mut Option<&mut CompilationAllocationScope<'_>>,
     ) -> Result<ExecutionPlan> {
-        program.validate_prepared_authored_constraint_identity()?;
+        match scope.as_deref_mut() {
+            Some(scope) => program
+                .validate_prepared_authored_constraint_identity_with_allocation_owner(
+                    &mut |bytes| scope.reserve_allocation(bytes),
+                ),
+            None => program.validate_prepared_authored_constraint_identity(),
+        }?;
         let generated_query_heads = generated_query_heads_for_program_with_owner(&program, scope)?;
         let program = run_frontend_passes_with_owner(program, scope)?;
 
-        // Phase 2: Stratify (analyze dependencies, detect cycles)
-        let strata = match scope.as_deref_mut() {
-            Some(scope) => crate::stratify::stratify_with_allocation_owner(&program, scope),
-            None => stratify(&program),
-        }
-        .map_err(map_stratification_to_naf_error)?;
-
-        // Convert strata to the format expected by the lowerer
-        acquire_frontend_vector::<Vec<String>>(scope, strata.len())?;
-        let strata_preds: Vec<Vec<String>> = strata.into_iter().map(|s| s.predicates).collect();
-
-        // Phase 3: Lower AST to execution plan
-        self.lowerer.set_strata(strata_preds);
+        // Analyze dependencies and retain only the original lowerer state.
+        self.prepare_strata_with_owner(&program, scope)?;
 
         // If we have predicate names for the snapshot, use them to seed lowering-time
         // join ordering with better cardinality estimates.
@@ -886,9 +675,7 @@ impl Compiler {
                             acquire_frontend(
                                 scope,
                                 u64::try_from(name.len()).map_err(|_| {
-                                    XlogError::Compilation(
-                                        "cardinality name extent overflow".into(),
-                                    )
+                                    XlogError::allocation_extent_overflow("cardinality name")
                                 })?,
                             )?;
                         }
@@ -897,7 +684,12 @@ impl Compiler {
                 }
             }
         }
-        self.lowerer.set_cardinality_hints(cardinality_hints);
+        match scope.as_deref_mut() {
+            Some(scope) => self
+                .lowerer
+                .set_cardinality_hints_with_allocation_owner(cardinality_hints, scope)?,
+            None => self.lowerer.set_cardinality_hints(cardinality_hints),
+        }
 
         let mut plan = match scope.as_deref_mut() {
             Some(scope) => self
@@ -1149,10 +941,13 @@ impl Compiler {
                     .rules_by_scc
                     .iter()
                     .try_fold(0usize, |n, rules| n.checked_add(rules.len()))
-                    .ok_or_else(|| {
-                        XlogError::Compilation("query provenance allocation extent overflow".into())
-                    })?;
-                acquire_frontend_vector::<(usize, usize)>(scope, count)?;
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("query provenance"))?;
+                let _positions_receipt = match scope.as_deref_mut() {
+                    Some(scope) => Some(scope.reserve_allocation(
+                        push_vector_allocation_bytes::<(usize, usize)>(count)?,
+                    )?),
+                    None => None,
+                };
                 let positions = plan
                     .rules_by_scc
                     .iter()
@@ -1167,14 +962,13 @@ impl Compiler {
                     })
                     .collect::<Vec<_>>();
                 let [(scc_index, rule_index)] = positions.as_slice() else {
-                    acquire_frontend_format(scope, format_args!(
+                    return Err(frontend_compilation_error(
+                        format_args!(
                         "generated query head {head} must have exactly one compiled rule, found {}",
                         positions.len()
-                    ))?;
-                    return Err(XlogError::Compilation(format!(
-                        "generated query head {head} must have exactly one compiled rule, found {}",
-                        positions.len()
-                    )));
+                    ),
+                        scope,
+                    ));
                 };
                 Ok(GeneratedQueryRuleProvenance {
                     query_index,
@@ -1185,6 +979,47 @@ impl Compiler {
             .collect::<Result<Vec<_>>>()?;
 
         Ok(plan)
+    }
+
+    fn prepare_strata_with_owner(
+        &mut self,
+        program: &Program,
+        scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+    ) -> Result<()> {
+        match scope.as_deref_mut() {
+            Some(scope) => {
+                let mut stage = scope.child_scope();
+                let result = self.prepare_strata_core(program, &mut Some(&mut stage));
+                finish_compiler_stage(result, stage)
+            }
+            None => self.prepare_strata_core(program, scope),
+        }
+    }
+
+    fn prepare_strata_core(
+        &mut self,
+        program: &Program,
+        scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+    ) -> Result<()> {
+        let strata = match scope.as_deref_mut() {
+            Some(scope) => crate::stratify::stratify_with_allocation_owner(program, scope),
+            None => stratify(program),
+        }
+        .map_err(|error| map_stratification_to_naf_error_with_owner(error, scope))?;
+        acquire_frontend_vector::<Vec<String>>(scope, strata.len())?;
+        let strata_preds = strata
+            .into_iter()
+            .map(|stratum| stratum.predicates)
+            .collect();
+        match scope.as_deref_mut() {
+            Some(scope) => self
+                .lowerer
+                .set_strata_with_allocation_owner(strata_preds, scope),
+            None => {
+                self.lowerer.set_strata(strata_preds);
+                Ok(())
+            }
+        }
     }
 
     /// Reset the compiler state for a fresh compilation.
@@ -1213,6 +1048,18 @@ impl Compiler {
 
 fn generated_query_heads_for_program(program: &Program) -> Result<Vec<String>> {
     generated_query_heads_for_program_with_owner(program, &mut None)
+}
+
+// Every reached caller returns either inline validation state or the guarded
+// plan carrier. Canonical error producers own their diagnostic payloads; the
+// stratification cycle is mapped before this boundary. No discarded scratch
+// is transferred into either successful output or a diagnostic.
+pub(crate) fn finish_compiler_stage<T>(
+    result: Result<T>,
+    stage: CompilationAllocationScope<'_>,
+) -> Result<T> {
+    drop(stage);
+    result
 }
 
 fn schemas_snapshot_with_owner(
@@ -1257,9 +1104,7 @@ fn reserve_stats_snapshot_merge(
         hash_allocation_bytes::<RelId, xlog_stats::RelationStats>(
             original_relations
                 .checked_add(snapshot.relations.len())
-                .ok_or_else(|| {
-                    XlogError::Compilation("statistics registry allocation extent overflow".into())
-                })?,
+                .ok_or_else(|| XlogError::allocation_extent_overflow("statistics registry"))?,
         )?,
     )?;
     acquire_frontend(
@@ -1312,15 +1157,12 @@ fn generated_query_heads_for_program_with_owner(
                     .iter()
                     .any(|rule| rule.head.predicate == generated_head);
             if authored_collision {
-                acquire_frontend_format(
-                    scope,
+                return Err(frontend_compilation_error(
                     format_args!(
                         "authored relation {generated_head} collides with generated query head"
                     ),
-                )?;
-                return Err(XlogError::Compilation(format!(
-                    "authored relation {generated_head} collides with generated query head"
-                )));
+                    scope,
+                ));
             }
             Ok(generated_head)
         })
@@ -1417,9 +1259,7 @@ fn acquire_frontend_variables(
         }
     });
     if overflow {
-        return Err(XlogError::Compilation(
-            "frontend variable allocation extent overflow".into(),
-        ));
+        return Err(XlogError::allocation_extent_overflow("frontend variable"));
     }
     acquire_frontend_vector::<&str>(scope, count)?;
     acquire_frontend(scope, text)?;
@@ -1436,10 +1276,15 @@ fn desugar_queries_and_constraints_with_owner(
         .len()
         .checked_add(out.constraints.len())
         .and_then(|n| n.checked_add(out.queries.len()))
-        .ok_or_else(|| XlogError::Compilation("frontend rule allocation extent overflow".into()))?;
+        .ok_or_else(|| XlogError::allocation_extent_overflow("frontend rule"))?;
     acquire_frontend_vector::<AstRule>(scope, final_rules)?;
     for constraint in &out.constraints {
-        let authored_index = constraint.require_authored_index()?;
+        let authored_index = match scope.as_deref_mut() {
+            Some(scope) => constraint.require_authored_index_with_allocation_owner(&mut |bytes| {
+                scope.reserve_allocation(bytes)
+            }),
+            None => constraint.require_authored_index(),
+        }?;
         acquire_frontend_format(scope, format_args!("__xlog_constraint_{authored_index}"))?;
         acquire_frontend_vector::<Term>(scope, 1)?;
         if scope.is_some() {
@@ -1466,9 +1311,8 @@ fn desugar_queries_and_constraints_with_owner(
             if scope.is_some() {
                 let mut count = Some(0usize);
                 term.visit_variables(&mut |_| count = count.and_then(|n| n.checked_add(1)));
-                let count = count.ok_or_else(|| {
-                    XlogError::Compilation("query variable allocation extent overflow".into())
-                })?;
+                let count =
+                    count.ok_or_else(|| XlogError::allocation_extent_overflow("query variable"))?;
                 acquire_frontend_vector::<&str>(scope, count)?;
             }
             for name in term.variables() {
@@ -1521,7 +1365,12 @@ fn validate_negation_safety_with_owner(
         )?;
     }
     for constraint in &program.constraints {
-        let index = constraint.require_authored_index()?;
+        let index = match scope.as_deref_mut() {
+            Some(scope) => constraint.require_authored_index_with_allocation_owner(&mut |bytes| {
+                scope.reserve_allocation(bytes)
+            }),
+            None => constraint.require_authored_index(),
+        }?;
         acquire_frontend_format(scope, format_args!("constraint {index}"))?;
         validate_body_naf_safety_with_owner(
             &constraint.body,
@@ -1541,6 +1390,21 @@ fn validate_body_naf_safety_with_owner(
     context: &str,
     scope: &mut Option<&mut CompilationAllocationScope<'_>>,
 ) -> Result<()> {
+    match scope.as_deref_mut() {
+        Some(scope) => {
+            let mut stage = scope.child_scope();
+            let result = validate_body_naf_safety_prepared(body, context, &mut Some(&mut stage));
+            finish_compiler_stage(result, stage)
+        }
+        None => validate_body_naf_safety(body, context),
+    }
+}
+
+fn validate_body_naf_safety_prepared(
+    body: &[BodyLiteral],
+    context: &str,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<()> {
     if scope.is_some() {
         let mut count = Some(0usize);
         for literal in body {
@@ -1553,15 +1417,22 @@ fn validate_body_naf_safety_with_owner(
                 _ => {}
             }
         }
-        let count = count.ok_or_else(|| {
-            XlogError::Compilation("negation variable allocation extent overflow".into())
-        })?;
+        let count =
+            count.ok_or_else(|| XlogError::allocation_extent_overflow("negation variable"))?;
         acquire_frontend(scope, hash_allocation_bytes::<String, ()>(count)?)?;
     }
-    validate_body_naf_safety(body, context)
+    validate_body_naf_safety_core(body, context, scope)
 }
 
 fn validate_body_naf_safety(body: &[BodyLiteral], context: &str) -> Result<()> {
+    validate_body_naf_safety_core(body, context, &mut None)
+}
+
+fn validate_body_naf_safety_core(
+    body: &[BodyLiteral],
+    context: &str,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<()> {
     let mut bound: HashSet<String> = HashSet::new();
     for lit in body {
         match lit {
@@ -1573,13 +1444,13 @@ fn validate_body_naf_safety(body: &[BodyLiteral], context: &str) -> Result<()> {
             BodyLiteral::Negated(atom) => {
                 for name in atom.variables() {
                     if !bound.contains(name) {
-                        return Err(naf_error(format!(
+                        return Err(naf_error_with_owner(format_args!(
                             "unbound variable {} in negated atom {}/{} in {}; bind it before not with a positive atom or deterministic is expression, or use '_' for existential positions",
                             name,
                             atom.predicate,
                             atom.arity(),
                             context
-                        )));
+                        ), scope));
                     }
                 }
             }
@@ -1600,6 +1471,91 @@ fn map_stratification_to_naf_error(err: XlogError) -> XlogError {
             cycle.join(" -> ")
         )),
         other => other,
+    }
+}
+
+fn map_stratification_to_naf_error_with_owner(
+    error: XlogError,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> XlogError {
+    if scope.is_none() {
+        return map_stratification_to_naf_error(error);
+    }
+    let XlogError::StratificationCycle(cycle) = error.unowned() else {
+        return error;
+    };
+    let bytes = cycle
+        .iter()
+        .try_fold(0u64, |bytes, name| bytes.checked_add(name.len() as u64))
+        .and_then(|bytes| {
+            bytes.checked_add((cycle.len().saturating_sub(1) as u64).checked_mul(4)?)
+        });
+    let receipt = match bytes
+        .ok_or_else(|| XlogError::allocation_extent_overflow("negation cycle"))
+        .and_then(|bytes| {
+            scope
+                .as_deref_mut()
+                .expect("original cycle scope")
+                .reserve_allocation(bytes)
+        }) {
+        Ok(receipt) => receipt,
+        Err(error) => return error,
+    };
+    let joined = cycle.join(" -> ");
+    let mapped = naf_error_with_owner(
+        format_args!(
+            "deterministic not atom must be stratified; cycle through negation or aggregation: {}",
+            joined
+        ),
+        scope,
+    );
+    drop(joined);
+    drop(receipt);
+    mapped
+}
+
+fn naf_error_with_owner(
+    message: std::fmt::Arguments<'_>,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> XlogError {
+    let _message_receipt = match scope.as_deref_mut() {
+        Some(scope) => match formatted_text_allocation_bytes(message)
+            .and_then(|bytes| scope.reserve_allocation(bytes))
+        {
+            Ok(receipt) => Some(receipt),
+            Err(error) => return error,
+        },
+        None => None,
+    };
+    let bytes = formatted_text_allocation_bytes(format_args!("negation safety error: {}", message));
+    let producer = match scope.as_deref_mut() {
+        Some(scope) => CompilationAllocationScope::prepare_diagnostic(
+            bytes,
+            Some(&mut |bytes| scope.reserve_allocation(bytes)),
+        ),
+        None => CompilationAllocationScope::prepare_diagnostic(bytes, None),
+    };
+    match producer {
+        Ok(producer) => producer.finish(|| naf_error(std::fmt::format(message))),
+        Err(error) => error,
+    }
+}
+
+fn frontend_compilation_error(
+    arguments: std::fmt::Arguments<'_>,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> XlogError {
+    let bytes = formatted_text_allocation_bytes(arguments);
+    let producer = match scope.as_deref_mut() {
+        Some(scope) => CompilationAllocationScope::prepare_diagnostic(
+            bytes,
+            Some(&mut |bytes| scope.reserve_allocation(bytes)),
+        ),
+        None => CompilationAllocationScope::prepare_diagnostic(bytes, None),
+    };
+    match producer {
+        Ok(producer) => producer.finish(|| XlogError::Compilation(std::fmt::format(arguments))),
+        Err(error) => error,
     }
 }
 

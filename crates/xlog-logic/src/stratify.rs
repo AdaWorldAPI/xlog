@@ -28,9 +28,7 @@ impl StratificationAllocations<'_, '_> {
                 crate::compile::hash_allocation_bytes::<K, V>(count)?
                     .checked_mul(2)
                     .ok_or_else(|| {
-                        XlogError::Compilation(
-                            "stratification table allocation extent overflow".into(),
-                        )
+                        XlogError::allocation_extent_overflow("stratification table")
                     })?,
             )?;
         }
@@ -208,7 +206,7 @@ fn acquire_edge(
             .checked_mul(3)
             .and_then(|n| n.checked_add((to.len() as u64).checked_mul(2)?))
             .ok_or_else(|| {
-                XlogError::Compilation("dependency text allocation extent overflow".into())
+                XlogError::allocation_extent_overflow("dependency text")
             })?;
         allocations.acquire(text)?;
         if graph.predicates.capacity() - graph.predicates.len() < 2 {
@@ -251,10 +249,10 @@ fn find_sccs_with_owner(
         for name in &graph.predicates {
             text = text
                 .checked_add((name.len() as u64).checked_mul(4).ok_or_else(|| {
-                    XlogError::Compilation("SCC text allocation extent overflow".into())
+                    XlogError::allocation_extent_overflow("SCC text")
                 })?)
                 .ok_or_else(|| {
-                    XlogError::Compilation("SCC text allocation extent overflow".into())
+                    XlogError::allocation_extent_overflow("SCC text")
                 })?;
         }
         for edge in &graph.edges {
@@ -262,7 +260,7 @@ fn find_sccs_with_owner(
                 .checked_add(edge.to.len() as u64)
                 .and_then(|n| n.checked_add(edge.from.len() as u64))
                 .ok_or_else(|| {
-                    XlogError::Compilation("SCC text allocation extent overflow".into())
+                    XlogError::allocation_extent_overflow("SCC text")
                 })?;
         }
         allocations.acquire(text)?;
@@ -469,7 +467,7 @@ fn stratify_with_owner(
     allocations.vector::<Stratum>(
         max_stratum
             .checked_add(1)
-            .ok_or_else(|| XlogError::Compilation("stratum extent overflow".into()))?,
+            .ok_or_else(|| XlogError::allocation_extent_overflow("stratum"))?,
     )?;
     allocations.vector::<String>(graph.predicates.len())?;
     let mut strata: Vec<Stratum> = (0..=max_stratum)
@@ -581,7 +579,7 @@ fn acquire_scc_observations(
             for name in scc {
                 text = text
                     .checked_add(name.len() as u64)
-                    .ok_or_else(|| XlogError::Compilation("SCC copy extent overflow".into()))?;
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("SCC copy"))?;
             }
         }
         allocations.acquire(text)?;
@@ -599,11 +597,11 @@ fn acquire_stratum_map(
         for scc in sccs {
             count = count
                 .checked_add(scc.len())
-                .ok_or_else(|| XlogError::Compilation("stratum extent overflow".into()))?;
+                .ok_or_else(|| XlogError::allocation_extent_overflow("stratum"))?;
             for name in scc {
                 text = text
                     .checked_add(name.len() as u64)
-                    .ok_or_else(|| XlogError::Compilation("stratum copy extent overflow".into()))?;
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("stratum copy"))?;
             }
         }
         allocations.hash::<String, usize>(count)?;

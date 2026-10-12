@@ -40,8 +40,143 @@ struct LoweringAllocations<'a, 'b> {
     scope: Option<&'a mut crate::compile::CompilationAllocationScope<'b>>,
 }
 
+struct LoweringSymbolOutput {
+    text: String,
+    allocation_owner: Arc<dyn Send + Sync>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LowererAllocationKind {
+    SchemaTable,
+    SchemaKey,
+    SchemaValue,
+    RelationTable,
+    RelationKey,
+    Strata,
+    CardinalityHints,
+    EstimateTable,
+    EstimateKey,
+    ComponentTable,
+    ComponentValue,
+    ComponentIndexTable,
+    ComponentIndexKey,
+}
+
+struct LowererAllocationRecord {
+    kind: LowererAllocationKind,
+    // String heap addresses identify existing stored keys without a second
+    // allocating name map. They are compared only, never dereferenced; map
+    // growth moves String headers but not their live UTF-8 allocations.
+    identity: usize,
+    receipt: Option<Arc<dyn Send + Sync>>,
+    pending: bool,
+}
+
+#[derive(Default)]
+struct LowererAllocationOwners {
+    records: Vec<LowererAllocationRecord>,
+    storage: Option<Arc<dyn Send + Sync>>,
+}
+
+struct PendingLowererAllocation {
+    slot: usize,
+    receipt: Arc<dyn Send + Sync>,
+}
+
+impl LowererAllocationOwners {
+    fn reserve(
+        &mut self,
+        kind: LowererAllocationKind,
+        identity: usize,
+        bytes: u64,
+        allocations: &mut LoweringAllocations<'_, '_>,
+    ) -> Result<Option<PendingLowererAllocation>> {
+        let Some(scope) = allocations.scope.as_deref_mut() else {
+            return Ok(None);
+        };
+        let slot = self
+            .records
+            .iter()
+            .position(|record| {
+                record.kind == kind
+                    && record.identity == identity
+                    && record.receipt.is_some()
+                    && !record.pending
+            })
+            .or_else(|| {
+                self.records
+                    .iter()
+                    .position(|record| record.receipt.is_none() && !record.pending)
+            });
+        let slot = match slot {
+            Some(slot) => slot,
+            None => {
+                if self.records.len() == self.records.capacity() {
+                    let count = self.records.len().checked_add(1).ok_or_else(|| {
+                        XlogError::allocation_extent_overflow("lowerer receipt storage")
+                    })?;
+                    let storage = scope.reserve_allocation(
+                        crate::compile::push_vector_allocation_bytes::<LowererAllocationRecord>(
+                            count,
+                        )?,
+                    )?;
+                    self.records.reserve(1);
+                    // The previous real vector buffer has now dropped.
+                    self.storage = Some(storage);
+                }
+                self.records.push(LowererAllocationRecord {
+                    kind,
+                    identity,
+                    receipt: None,
+                    pending: false,
+                });
+                self.records.len() - 1
+            }
+        };
+        let receipt = scope.reserve_allocation(bytes)?;
+        if self.records[slot].receipt.is_none() {
+            self.records[slot].kind = kind;
+            self.records[slot].identity = identity;
+        }
+        self.records[slot].pending = true;
+        Ok(Some(PendingLowererAllocation { slot, receipt }))
+    }
+
+    // Called only after the previous corresponding data has actually dropped.
+    fn commit(&mut self, pending: Option<PendingLowererAllocation>, identity: usize) {
+        if let Some(pending) = pending {
+            self.records[pending.slot].identity = identity;
+            self.records[pending.slot].receipt = Some(pending.receipt);
+            self.records[pending.slot].pending = false;
+        }
+    }
+
+    fn retire(&mut self, kind: LowererAllocationKind) {
+        for record in &mut self.records {
+            if record.kind == kind {
+                record.receipt = None;
+            }
+        }
+    }
+
+    fn finish_attempt(&mut self) {
+        // Pending guards belong to the completed stack frame, not this ledger.
+        for record in &mut self.records {
+            record.pending = false;
+        }
+    }
+}
+
+/// The original constant-data acquisition. Prepared storage borrows the live
+/// leaf/atom receipt; empty data and ordinary unowned compilation need no receipt.
+/// Both cases still acquire diagnostic text through the same lowering scope.
+enum ConstantDataAllocation<'a> {
+    Scope,
+    Prepared(&'a Option<Arc<dyn Send + Sync>>),
+}
+
 fn arithmetic_expression_nodes(expression: &ArithExpr) -> Result<usize> {
-    let overflow = || XlogError::Compilation("arithmetic allocation extent overflow".into());
+    let overflow = || XlogError::allocation_extent_overflow("arithmetic expression");
     let children = match expression {
         ArithExpr::Variable(_) | ArithExpr::Integer(_) | ArithExpr::Float(_) => 0,
         ArithExpr::Add(a, b)
@@ -85,20 +220,26 @@ impl LoweringAllocations<'_, '_> {
             return Ok(());
         }
         let nodes = arithmetic_expression_nodes(expression)?;
-        self.vector::<ArithmeticTypeTask<'_>>(nodes.checked_mul(2).ok_or_else(|| {
-            XlogError::Compilation("arithmetic task allocation extent overflow".into())
-        })?)?;
+        self.vector::<ArithmeticTypeTask<'_>>(
+            nodes
+                .checked_mul(2)
+                .ok_or_else(|| XlogError::allocation_extent_overflow("arithmetic type tasks"))?,
+        )?;
         self.vector::<Option<ScalarType>>(nodes)?;
         Ok(())
     }
 
     fn acquire(&mut self, bytes: u64) -> Result<()> {
+        self.acquire_receipt(bytes).map(|_| ())
+    }
+
+    fn acquire_receipt(&mut self, bytes: u64) -> Result<Option<Arc<dyn Send + Sync>>> {
         if bytes != 0 {
             if let Some(scope) = self.scope.as_deref_mut() {
-                scope.acquire(bytes)?;
+                return scope.acquire(bytes).map(Some);
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     fn vector<T>(&mut self, count: usize) -> Result<()> {
@@ -123,16 +264,29 @@ impl LoweringAllocations<'_, '_> {
     }
 
     fn compilation_error(&mut self, arguments: std::fmt::Arguments<'_>) -> XlogError {
-        match self.formatted(arguments) {
-            Ok(()) => XlogError::Compilation(std::fmt::format(arguments)),
+        match self.prepare_diagnostic(crate::compile::formatted_text_allocation_bytes(arguments)) {
+            Ok(producer) => producer.finish(|| XlogError::Compilation(std::fmt::format(arguments))),
             Err(error) => error,
         }
     }
 
     fn unsafe_variable(&mut self, name: &str) -> XlogError {
-        match self.acquire(name.len() as u64) {
-            Ok(()) => XlogError::UnsafeVariable(name.to_owned()),
+        match self.prepare_diagnostic(Ok(name.len() as u64)) {
+            Ok(producer) => producer.finish(|| XlogError::UnsafeVariable(name.to_owned())),
             Err(error) => error,
+        }
+    }
+
+    fn prepare_diagnostic(
+        &mut self,
+        bytes: Result<u64>,
+    ) -> Result<xlog_core::compilation_allocation::CompilationDiagnosticProducer> {
+        match self.scope.as_deref_mut() {
+            Some(scope) => crate::compile::CompilationAllocationScope::prepare_diagnostic(
+                bytes,
+                Some(&mut |bytes| scope.reserve_allocation(bytes)),
+            ),
+            None => crate::compile::CompilationAllocationScope::prepare_diagnostic(bytes, None),
         }
     }
 
@@ -140,12 +294,17 @@ impl LoweringAllocations<'_, '_> {
         match self.scope.as_deref_mut() {
             Some(scope) => {
                 let (text, receipt) = symbol::resolve_with_allocation_owner(id, &mut |bytes| {
-                    scope.reserve_allocation(u64::try_from(bytes).map_err(|_| {
-                        XlogError::Compilation("symbol allocation extent exceeds this host".into())
-                    })?)
+                    scope.reserve_allocation(
+                        u64::try_from(bytes)
+                            .map_err(|_| XlogError::allocation_extent_overflow("symbol storage"))?,
+                    )
                 })?;
-                scope.retain(receipt)?;
-                Ok(text)
+                let output = LoweringSymbolOutput {
+                    text,
+                    allocation_owner: receipt,
+                };
+                scope.retain(Arc::clone(&output.allocation_owner))?;
+                Ok(output.text)
             }
             None => Ok(symbol::resolve(id)),
         }
@@ -193,16 +352,6 @@ impl LoweringAllocations<'_, '_> {
         Ok(())
     }
 
-    fn schema_table_entry(&mut self, lowerer: &Lowerer, name: &str) -> Result<()> {
-        self.acquire(name.len() as u64)?;
-        if !lowerer.schemas.contains_key(name)
-            && lowerer.schemas.len() == lowerer.schemas.capacity()
-        {
-            self.hash::<String, Schema>(lowerer.schemas.len() + 1)?;
-        }
-        Ok(())
-    }
-
     fn temporary(&mut self, bytes: u64) -> Result<Option<Arc<dyn Send + Sync>>> {
         self.scope
             .as_deref_mut()
@@ -210,12 +359,12 @@ impl LoweringAllocations<'_, '_> {
             .transpose()
     }
 
-    fn finish<'a>(&mut self, mut plan: JoinPlan<'a>) -> Result<(RirNode, Vec<&'a Atom>)> {
-        if let Some(receipt) = plan.allocation_receipt.take() {
+    fn finish<'a>(&mut self, plan: JoinPlan<'a>) -> Result<(RirNode, Vec<&'a Atom>)> {
+        if let Some(receipt) = plan.allocation_receipt.as_ref() {
             self.scope
                 .as_deref_mut()
                 .expect("original owned join scope")
-                .retain(receipt)?;
+                .retain(Arc::clone(receipt))?;
         }
         Ok((plan.node, plan.leaf_order))
     }
@@ -228,8 +377,7 @@ impl LoweringAllocations<'_, '_> {
         if self.scope.is_none() {
             return Ok(None);
         }
-        let overflow =
-            || XlogError::Compilation("join candidate allocation extent overflow".into());
+        let overflow = || XlogError::allocation_extent_overflow("join candidate");
         let count = left
             .leaf_order
             .len()
@@ -298,7 +446,7 @@ pub(crate) fn positive_binary_lowering_allocation_bound(
     max_name: usize,
 ) -> Result<usize> {
     use std::mem::size_of;
-    let overflow = || XlogError::Compilation("binary lowering allocation extent overflow".into());
+    let overflow = || XlogError::allocation_extent_overflow("binary lowering");
     let add = |a: usize, b: usize| a.checked_add(b).ok_or_else(overflow);
     let mul = |a: usize, b: usize| a.checked_mul(b).ok_or_else(overflow);
     let rules = add(program.rules.len(), program.queries.len())?;
@@ -436,8 +584,12 @@ fn validate_lowerable_terms(
         validate_atom_terms(&rule.head, "rule head", allocations)?;
         for lit in &rule.body {
             match lit {
-                BodyLiteral::Positive(atom) => validate_atom_terms(atom, "positive body atom", allocations)?,
-                BodyLiteral::Negated(atom) => validate_atom_terms(atom, "negated body atom", allocations)?,
+                BodyLiteral::Positive(atom) => {
+                    validate_atom_terms(atom, "positive body atom", allocations)?
+                }
+                BodyLiteral::Negated(atom) => {
+                    validate_atom_terms(atom, "negated body atom", allocations)?
+                }
                 BodyLiteral::Epistemic(_) => {}
                 BodyLiteral::Comparison(cmp) => {
                     validate_term_lowerable(&cmp.left, "comparison left operand", allocations)?;
@@ -455,14 +607,24 @@ fn validate_lowerable_terms(
     for constraint in &program.constraints {
         for lit in &constraint.body {
             match lit {
-                BodyLiteral::Positive(atom) => validate_atom_terms(atom, "constraint body atom", allocations)?,
+                BodyLiteral::Positive(atom) => {
+                    validate_atom_terms(atom, "constraint body atom", allocations)?
+                }
                 BodyLiteral::Negated(atom) => {
                     validate_atom_terms(atom, "constraint negated body atom", allocations)?
                 }
                 BodyLiteral::Epistemic(_) => {}
                 BodyLiteral::Comparison(cmp) => {
-                    validate_term_lowerable(&cmp.left, "constraint comparison left operand", allocations)?;
-                    validate_term_lowerable(&cmp.right, "constraint comparison right operand", allocations)?;
+                    validate_term_lowerable(
+                        &cmp.left,
+                        "constraint comparison left operand",
+                        allocations,
+                    )?;
+                    validate_term_lowerable(
+                        &cmp.right,
+                        "constraint comparison right operand",
+                        allocations,
+                    )?;
                 }
                 BodyLiteral::IsExpr(_) => {}
                 BodyLiteral::Univ(_) => {
@@ -524,7 +686,7 @@ pub(crate) fn positive_body_bound_variables_with_allocation_owner(
     body: &[BodyLiteral],
     scope: &mut crate::compile::CompilationAllocationScope<'_>,
 ) -> Result<BTreeSet<String>> {
-    let overflow = || XlogError::Compilation("bound variable allocation extent overflow".into());
+    let overflow = || XlogError::allocation_extent_overflow("bound variable set");
     let mut count = 0usize;
     let mut bytes = 0u64;
     for literal in body {
@@ -605,8 +767,8 @@ fn validate_is_expression_bindings(
                         None => invalid = true,
                     });
                 if invalid {
-                    return Err(XlogError::Compilation(
-                        "arithmetic variable extent overflow".into(),
+                    return Err(XlogError::allocation_extent_overflow(
+                        "arithmetic variables",
                     ));
                 }
                 allocations.vector::<&str>(count)?;
@@ -711,6 +873,8 @@ pub struct Lowerer {
     /// belongs to exactly one SCC, so lookups replace the linear scan that
     /// made `find_scc_for_predicate` O(rules x SCCs).
     scc_by_pred: std::collections::HashMap<String, u32>,
+    // Persistent state drops before its genuine original allocation receipts.
+    allocation_owners: LowererAllocationOwners,
 }
 
 impl Default for Lowerer {
@@ -732,6 +896,7 @@ impl Lowerer {
             sccs: Vec::new(),
             max_active_rules: 32,
             scc_by_pred: std::collections::HashMap::new(),
+            allocation_owners: LowererAllocationOwners::default(),
         }
     }
 
@@ -743,6 +908,7 @@ impl Lowerer {
     /// Set the stratification result for ordering
     pub(crate) fn set_strata(&mut self, strata: Vec<Vec<String>>) {
         self.strata = strata;
+        self.allocation_owners.retire(LowererAllocationKind::Strata);
     }
 
     /// Set cardinality hints (typically sourced from runtime statistics snapshots).
@@ -750,6 +916,130 @@ impl Lowerer {
     /// These hints are used by lowering-time join ordering when available.
     pub(crate) fn set_cardinality_hints(&mut self, hints: HashMap<String, u64>) {
         self.cardinality_hints = hints;
+        self.allocation_owners
+            .retire(LowererAllocationKind::CardinalityHints);
+    }
+
+    pub(crate) fn set_strata_with_allocation_owner(
+        &mut self,
+        strata: Vec<Vec<String>>,
+        scope: &mut crate::compile::CompilationAllocationScope<'_>,
+    ) -> Result<()> {
+        self.allocation_owners.finish_attempt();
+        let mut bytes = crate::compile::push_vector_allocation_bytes::<Vec<String>>(strata.len())?;
+        for predicates in &strata {
+            bytes = bytes
+                .checked_add(crate::compile::push_vector_allocation_bytes::<String>(
+                    predicates.len(),
+                )?)
+                .ok_or_else(|| XlogError::allocation_extent_overflow("lowerer strata"))?;
+            for predicate in predicates {
+                bytes = bytes
+                    .checked_add(predicate.len() as u64)
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("lowerer strata"))?;
+            }
+        }
+        let pending = self.allocation_owners.reserve(
+            LowererAllocationKind::Strata,
+            0,
+            bytes,
+            &mut LoweringAllocations { scope: Some(scope) },
+        )?;
+        self.strata = strata.clone();
+        self.allocation_owners.commit(pending, 0);
+        Ok(())
+    }
+
+    pub(crate) fn set_cardinality_hints_with_allocation_owner(
+        &mut self,
+        hints: HashMap<String, u64>,
+        scope: &mut crate::compile::CompilationAllocationScope<'_>,
+    ) -> Result<()> {
+        self.allocation_owners.finish_attempt();
+        let mut bytes = crate::compile::hash_allocation_bytes::<String, u64>(hints.len())?;
+        for name in hints.keys() {
+            bytes = bytes.checked_add(name.len() as u64).ok_or_else(|| {
+                XlogError::allocation_extent_overflow("lowerer cardinality hints")
+            })?;
+        }
+        let pending = self.allocation_owners.reserve(
+            LowererAllocationKind::CardinalityHints,
+            0,
+            bytes,
+            &mut LoweringAllocations { scope: Some(scope) },
+        )?;
+        self.cardinality_hints = hints.clone();
+        self.allocation_owners.commit(pending, 0);
+        Ok(())
+    }
+
+    fn insert_schema_with_owner(
+        &mut self,
+        name: &str,
+        schema: Schema,
+        allocations: &mut LoweringAllocations<'_, '_>,
+    ) -> Result<()> {
+        if allocations.scope.is_none() {
+            if let Some((key, _)) = self.schemas.get_key_value(name) {
+                let identity = key.as_ptr() as usize;
+                self.schemas.insert(name.to_owned(), schema);
+                for record in &mut self.allocation_owners.records {
+                    if record.kind == LowererAllocationKind::SchemaValue
+                        && record.identity == identity
+                    {
+                        record.receipt = None;
+                    }
+                }
+            } else {
+                self.schemas.insert(name.to_owned(), schema);
+            }
+            return Ok(());
+        }
+        let identity = self
+            .schemas
+            .get_key_value(name)
+            .map(|(key, _)| key.as_ptr() as usize);
+        let table = if identity.is_none() && self.schemas.len() == self.schemas.capacity() {
+            self.allocation_owners.reserve(
+                LowererAllocationKind::SchemaTable,
+                0,
+                crate::compile::hash_allocation_bytes::<String, Schema>(self.schemas.len() + 1)?,
+                allocations,
+            )?
+        } else {
+            None
+        };
+        let key = if identity.is_none() {
+            self.allocation_owners.reserve(
+                LowererAllocationKind::SchemaKey,
+                name.as_ptr() as usize,
+                name.len() as u64,
+                allocations,
+            )?
+        } else {
+            // HashMap::insert drops the newly supplied duplicate key.
+            allocations.acquire(name.len() as u64)?;
+            None
+        };
+        let value = self.allocation_owners.reserve(
+            LowererAllocationKind::SchemaValue,
+            identity.unwrap_or(name.as_ptr() as usize),
+            schema.owned_allocation_bytes()?,
+            allocations,
+        )?;
+        // Schema construction also has discarded inference scratch. The one
+        // guarded copy isolates the actual surviving state from that scratch.
+        self.schemas.insert(name.to_owned(), schema.clone());
+        let identity = self
+            .schemas
+            .get_key_value(name)
+            .expect("inserted schema")
+            .0
+            .as_ptr() as usize;
+        self.allocation_owners.commit(table, 0);
+        self.allocation_owners.commit(key, identity);
+        self.allocation_owners.commit(value, identity);
+        Ok(())
     }
 
     /// Get the mapping from predicate names to relation IDs
@@ -774,12 +1064,12 @@ impl Lowerer {
         schema: Schema,
         scope: &mut crate::compile::CompilationAllocationScope<'_>,
     ) -> Result<(String, RelId)> {
+        self.allocation_owners.finish_attempt();
         let mut allocations = LoweringAllocations { scope: Some(scope) };
         allocations.formatted(format_args!("__kclique_helper_{}", self.next_rel_id))?;
         let name = format!("__kclique_helper_{}", self.next_rel_id);
         let rel_id = self.get_or_create_rel_id_with_owner(&name, &mut allocations)?;
-        allocations.schema_table_entry(self, &name)?;
-        self.schemas.insert(name.clone(), schema);
+        self.insert_schema_with_owner(&name, schema, &mut allocations)?;
         Ok((name, rel_id))
     }
 
@@ -801,10 +1091,32 @@ impl Lowerer {
         allocations: &mut LoweringAllocations<'_, '_>,
     ) -> Result<RelId> {
         if !self.rel_ids.contains_key(name) {
-            allocations.acquire(name.len() as u64)?;
-            if self.rel_ids.len() == self.rel_ids.capacity() {
-                allocations.hash::<String, RelId>(self.rel_ids.len() + 1)?;
-            }
+            let table = if self.rel_ids.len() == self.rel_ids.capacity() {
+                self.allocation_owners.reserve(
+                    LowererAllocationKind::RelationTable,
+                    0,
+                    crate::compile::hash_allocation_bytes::<String, RelId>(self.rel_ids.len() + 1)?,
+                    allocations,
+                )?
+            } else {
+                None
+            };
+            let key = self.allocation_owners.reserve(
+                LowererAllocationKind::RelationKey,
+                name.as_ptr() as usize,
+                name.len() as u64,
+                allocations,
+            )?;
+            let id = self.get_or_create_rel_id(name);
+            let identity = self
+                .rel_ids
+                .get_key_value(name)
+                .expect("inserted relation id")
+                .0
+                .as_ptr() as usize;
+            self.allocation_owners.commit(table, 0);
+            self.allocation_owners.commit(key, identity);
+            return Ok(id);
         }
         Ok(self.get_or_create_rel_id(name))
     }
@@ -868,11 +1180,13 @@ impl Lowerer {
                     }
                     Term::Anonymous => {}
                     Term::Aggregate(aggregate) => {
-                        let aggregate_ty =
-                            Self::infer_aggregate_result_type(rule, aggregate, &var_types, allocations)?
-                                .ok_or_else(|| {
-                                    allocations.unsafe_variable(&aggregate.variable)
-                                })?;
+                        let aggregate_ty = Self::infer_aggregate_result_type(
+                            rule,
+                            aggregate,
+                            &var_types,
+                            allocations,
+                        )?
+                        .ok_or_else(|| allocations.unsafe_variable(&aggregate.variable))?;
                         if aggregate_ty != *head_ty {
                             return Err(allocations.compilation_error(format_args!(
                                 "Type mismatch in rule for '{}': aggregate {:?} over {} produces \
@@ -890,6 +1204,14 @@ impl Lowerer {
                         if declared_predicates.contains(rule.head.predicate.as_str()) {
                             term_to_typed_const_value_with_owner(term, *head_ty, allocations)
                                 .map_err(|error| {
+                                    if allocations.scope.is_some()
+                                        && matches!(
+                                            error.unowned(),
+                                            XlogError::AllocationRefused { .. }
+                                        )
+                                    {
+                                        return error;
+                                    }
                                     allocations.compilation_error(format_args!(
                                     "Type mismatch in rule for '{}': head term at position {} is \
                                      not compatible with {:?}: {}",
@@ -964,13 +1286,12 @@ impl Lowerer {
         allocations: &mut LoweringAllocations<'_, '_>,
     ) -> Result<()> {
         match variable_types.get(variable) {
-            Some((existing, existing_source)) if *existing != typ => {
-                Err(allocations.compilation_error(format_args!(
+            Some((existing, existing_source)) if *existing != typ => Err(allocations
+                .compilation_error(format_args!(
                     "Type mismatch in rule for '{}': variable {} is {:?} (from {}) but {:?} \
                      is required by {}",
                     rule.head.predicate, variable, existing, existing_source, typ, source
-                )))
-            }
+                ))),
             Some(_) => Ok(()),
             None => {
                 variable_types.insert(variable.to_string(), (typ, source));
@@ -1211,7 +1532,15 @@ impl Lowerer {
         program: &Program,
         scope: &mut crate::compile::CompilationAllocationScope<'_>,
     ) -> Result<()> {
-        self.infer_schemas_with_owner(program, &mut LoweringAllocations { scope: Some(scope) })
+        let mut stage = scope.child_scope();
+        let result = self.infer_schemas_with_owner(
+            program,
+            &mut LoweringAllocations {
+                scope: Some(&mut stage),
+            },
+        );
+        self.allocation_owners.finish_attempt();
+        crate::compile::finish_compiler_stage(result, stage)
     }
 
     fn infer_schemas_with_owner(
@@ -1219,6 +1548,7 @@ impl Lowerer {
         program: &Program,
         allocations: &mut LoweringAllocations<'_, '_>,
     ) -> Result<()> {
+        self.allocation_owners.finish_attempt();
         allocations.hash::<String, ScalarType>(program.domains.len())?;
         for domain in &program.domains {
             allocations.acquire(domain.name.len() as u64)?;
@@ -1250,13 +1580,11 @@ impl Lowerer {
                 allocations.vector::<String>(pred_decl.arity())?;
                 for (index, column) in pred_decl.columns.iter().enumerate() {
                     match &column.name {
-                        Some(name) if !name.trim().is_empty() => allocations.acquire(
-                            (name.len() as u64).checked_mul(2).ok_or_else(|| {
-                                XlogError::Compilation(
-                                    "schema text allocation extent overflow".into(),
-                                )
-                            })?,
-                        )?,
+                        Some(name) if !name.trim().is_empty() => {
+                            allocations.acquire((name.len() as u64).checked_mul(2).ok_or_else(
+                                || XlogError::allocation_extent_overflow("schema text"),
+                            )?)?
+                        }
                         Some(name) => {
                             allocations.acquire(name.len() as u64)?;
                             allocations.formatted(format_args!("col{index}"))?;
@@ -1273,7 +1601,6 @@ impl Lowerer {
                         allocations.formatted(format_args!("c{index}"))?;
                     }
                 }
-                allocations.schema_table_entry(self, &pred_decl.name)?;
             }
             let declared_columns = pred_decl.schema_columns();
             let columns: Vec<(String, ScalarType)> = declared_columns
@@ -1285,8 +1612,7 @@ impl Lowerer {
                         .map(|ty| (name, ty))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            self.schemas
-                .insert(pred_decl.name.clone(), Schema::new(columns));
+            self.insert_schema_with_owner(&pred_decl.name, Schema::new(columns), allocations)?;
         }
 
         // Then, infer from facts (if no declaration exists)
@@ -1294,7 +1620,6 @@ impl Lowerer {
             let pred = &rule.head.predicate;
             if !self.schemas.contains_key(pred) {
                 allocations.generated_schema(rule.head.terms.len())?;
-                allocations.schema_table_entry(self, pred)?;
                 let columns: Vec<(String, ScalarType)> = rule
                     .head
                     .terms
@@ -1305,7 +1630,7 @@ impl Lowerer {
                         (format!("c{}", i), ty)
                     })
                     .collect();
-                self.schemas.insert(pred.clone(), Schema::new(columns));
+                self.insert_schema_with_owner(pred, Schema::new(columns), allocations)?;
             }
         }
 
@@ -1319,7 +1644,6 @@ impl Lowerer {
                 continue;
             }
             allocations.generated_schema(pf.atom.terms.len())?;
-            allocations.schema_table_entry(self, pred)?;
             let columns: Vec<(String, ScalarType)> = pf
                 .atom
                 .terms
@@ -1327,7 +1651,7 @@ impl Lowerer {
                 .enumerate()
                 .map(|(i, term)| (format!("c{}", i), term.inferred_scalar_type()))
                 .collect();
-            self.schemas.insert(pred.clone(), Schema::new(columns));
+            self.insert_schema_with_owner(pred, Schema::new(columns), allocations)?;
         }
 
         for ad in &program.annotated_disjunctions {
@@ -1337,7 +1661,6 @@ impl Lowerer {
                     continue;
                 }
                 allocations.generated_schema(choice.atom.terms.len())?;
-                allocations.schema_table_entry(self, pred)?;
                 let columns: Vec<(String, ScalarType)> = choice
                     .atom
                     .terms
@@ -1345,7 +1668,7 @@ impl Lowerer {
                     .enumerate()
                     .map(|(i, term)| (format!("c{}", i), term.inferred_scalar_type()))
                     .collect();
-                self.schemas.insert(pred.clone(), Schema::new(columns));
+                self.insert_schema_with_owner(pred, Schema::new(columns), allocations)?;
             }
         }
 
@@ -1375,7 +1698,6 @@ impl Lowerer {
                 }
                 allocations.generated_schema(atom.terms.len())?;
                 allocations.sort_labels(&atom.terms)?;
-                allocations.schema_table_entry(self, pred)?;
                 let columns: Vec<(String, ScalarType)> = atom
                     .terms
                     .iter()
@@ -1385,7 +1707,7 @@ impl Lowerer {
                 let schema = Schema::new(columns)
                     .with_sort_labels(sort_labels_from_terms(&atom.terms))
                     .expect("body sort labels match inferred schema arity");
-                self.schemas.insert(pred.clone(), schema);
+                self.insert_schema_with_owner(pred, schema, allocations)?;
             }
         }
 
@@ -1477,7 +1799,6 @@ impl Lowerer {
             if !self.schemas.contains_key(pred) {
                 allocations.generated_schema(rule.head.terms.len())?;
                 allocations.sort_labels(&rule.head.terms)?;
-                allocations.schema_table_entry(self, pred)?;
                 let inferred_columns = inferred_rule_columns
                     .get(pred)
                     .expect("undeclared rule head has an inference entry");
@@ -1497,7 +1818,7 @@ impl Lowerer {
                 let schema = Schema::new(columns)
                     .with_sort_labels(sort_labels_from_terms(&rule.head.terms))
                     .expect("rule head sort labels match inferred schema arity");
-                self.schemas.insert(pred.clone(), schema);
+                self.insert_schema_with_owner(pred, schema, allocations)?;
             }
         }
 
@@ -1515,8 +1836,18 @@ impl Lowerer {
         self.validate_rule_types(program)
     }
 
-    fn infer_cardinalities(&mut self, program: &Program) {
+    fn infer_cardinalities_with_owner(
+        &mut self,
+        program: &Program,
+        allocations: &mut LoweringAllocations<'_, '_>,
+    ) -> Result<()> {
+        allocations.hash::<String, u64>(program.rules.len())?;
+        for fact in program.facts() {
+            allocations.acquire(fact.head.predicate.len() as u64)?;
+        }
         self.est_cardinality.clear();
+        self.allocation_owners
+            .retire(LowererAllocationKind::EstimateKey);
 
         let mut fact_counts: HashMap<String, u64> = HashMap::new();
         for fact in program.facts() {
@@ -1531,8 +1862,35 @@ impl Lowerer {
                 .or_else(|| fact_counts.get(pred).copied())
                 .unwrap_or(1000)
                 .max(1);
+            let table = if self.est_cardinality.len() == self.est_cardinality.capacity() {
+                self.allocation_owners.reserve(
+                    LowererAllocationKind::EstimateTable,
+                    0,
+                    crate::compile::hash_allocation_bytes::<String, u64>(
+                        self.est_cardinality.len() + 1,
+                    )?,
+                    allocations,
+                )?
+            } else {
+                None
+            };
+            let key = self.allocation_owners.reserve(
+                LowererAllocationKind::EstimateKey,
+                pred.as_ptr() as usize,
+                pred.len() as u64,
+                allocations,
+            )?;
             self.est_cardinality.insert(pred.clone(), est);
+            let identity = self
+                .est_cardinality
+                .get_key_value(pred)
+                .expect("inserted cardinality")
+                .0
+                .as_ptr() as usize;
+            self.allocation_owners.commit(table, 0);
+            self.allocation_owners.commit(key, identity);
         }
+        Ok(())
     }
 
     /// Build SCCs from the dependency graph
@@ -1542,6 +1900,27 @@ impl Lowerer {
     }
 
     fn build_sccs_with_owner(
+        &mut self,
+        program: &Program,
+        allocations: &mut LoweringAllocations<'_, '_>,
+    ) -> Result<()> {
+        match allocations.scope.as_deref_mut() {
+            Some(scope) => {
+                let mut stage = scope.child_scope();
+                let result = self.build_sccs_core(
+                    program,
+                    &mut LoweringAllocations {
+                        scope: Some(&mut stage),
+                    },
+                );
+                self.allocation_owners.finish_attempt();
+                crate::compile::finish_compiler_stage(result, stage)
+            }
+            None => self.build_sccs_core(program, allocations),
+        }
+    }
+
+    fn build_sccs_core(
         &mut self,
         program: &Program,
         allocations: &mut LoweringAllocations<'_, '_>,
@@ -1561,12 +1940,35 @@ impl Lowerer {
 
         self.sccs.clear();
         self.scc_by_pred.clear();
+        self.allocation_owners
+            .retire(LowererAllocationKind::ComponentValue);
+        self.allocation_owners
+            .retire(LowererAllocationKind::ComponentIndexKey);
         for (id, predicates) in scc_groups.iter().enumerate() {
-            allocations.vector::<String>(predicates.len())?;
-            allocations.vector::<&crate::stratify::DepEdge>(graph.outgoing_len(&predicates[0]))?;
-            if self.sccs.len() == self.sccs.capacity() {
-                allocations.vector::<Scc>(self.sccs.len() + 1)?;
+            let mut bytes =
+                crate::compile::push_vector_allocation_bytes::<String>(predicates.len())?;
+            for predicate in predicates {
+                bytes = bytes.checked_add(predicate.len() as u64).ok_or_else(|| {
+                    XlogError::allocation_extent_overflow("strongly connected component names")
+                })?;
             }
+            let value = self.allocation_owners.reserve(
+                LowererAllocationKind::ComponentValue,
+                id,
+                bytes,
+                allocations,
+            )?;
+            allocations.vector::<&crate::stratify::DepEdge>(graph.outgoing_len(&predicates[0]))?;
+            let table = if self.sccs.len() == self.sccs.capacity() {
+                self.allocation_owners.reserve(
+                    LowererAllocationKind::ComponentTable,
+                    0,
+                    crate::compile::push_vector_allocation_bytes::<Scc>(self.sccs.len() + 1)?,
+                    allocations,
+                )?
+            } else {
+                None
+            };
             // An SCC is recursive if it has more than one predicate
             // or if a single predicate depends on itself positively
             let is_recursive = if predicates.len() > 1 {
@@ -1580,19 +1982,41 @@ impl Lowerer {
             };
 
             for p in predicates {
-                allocations.acquire((p.len() as u64).checked_mul(2).ok_or_else(|| {
-                    XlogError::Compilation("SCC name allocation extent overflow".into())
-                })?)?;
-                if self.scc_by_pred.len() == self.scc_by_pred.capacity() {
-                    allocations.hash::<String, u32>(self.scc_by_pred.len() + 1)?;
-                }
+                let index_table = if self.scc_by_pred.len() == self.scc_by_pred.capacity() {
+                    self.allocation_owners.reserve(
+                        LowererAllocationKind::ComponentIndexTable,
+                        0,
+                        crate::compile::hash_allocation_bytes::<String, u32>(
+                            self.scc_by_pred.len() + 1,
+                        )?,
+                        allocations,
+                    )?
+                } else {
+                    None
+                };
+                let key = self.allocation_owners.reserve(
+                    LowererAllocationKind::ComponentIndexKey,
+                    p.as_ptr() as usize,
+                    p.len() as u64,
+                    allocations,
+                )?;
                 self.scc_by_pred.insert(p.clone(), id as u32);
+                let identity = self
+                    .scc_by_pred
+                    .get_key_value(p)
+                    .expect("inserted component index")
+                    .0
+                    .as_ptr() as usize;
+                self.allocation_owners.commit(index_table, 0);
+                self.allocation_owners.commit(key, identity);
             }
             self.sccs.push(Scc {
                 id: id as u32,
                 predicates: predicates.clone(),
                 is_recursive,
             });
+            self.allocation_owners.commit(table, 0);
+            self.allocation_owners.commit(value, id);
         }
         Ok(())
     }
@@ -1609,19 +2033,32 @@ impl Lowerer {
         program: &Program,
         allocations: &mut LoweringAllocations<'_, '_>,
     ) -> Result<()> {
+        match allocations.scope.as_deref_mut() {
+            Some(scope) => {
+                let mut stage = scope.child_scope();
+                let result = self.prepare_program_for_lowering_core(
+                    program,
+                    &mut LoweringAllocations {
+                        scope: Some(&mut stage),
+                    },
+                );
+                self.allocation_owners.finish_attempt();
+                crate::compile::finish_compiler_stage(result, stage)
+            }
+            None => self.prepare_program_for_lowering_core(program, allocations),
+        }
+    }
+
+    fn prepare_program_for_lowering_core(
+        &mut self,
+        program: &Program,
+        allocations: &mut LoweringAllocations<'_, '_>,
+    ) -> Result<()> {
         validate_lowerable_terms(program, allocations)?;
         validate_is_expression_bindings(program, allocations)?;
         self.infer_schemas_with_owner(program, allocations)?;
         self.validate_rule_types_with_owner(program, allocations)?;
-        allocations.hash::<String, u64>(program.rules.len())?;
-        allocations.hash::<String, u64>(self.schemas.len())?;
-        for fact in program.facts() {
-            allocations.acquire(fact.head.predicate.len() as u64)?;
-        }
-        for predicate in self.schemas.keys() {
-            allocations.acquire(predicate.len() as u64)?;
-        }
-        self.infer_cardinalities(program);
+        self.infer_cardinalities_with_owner(program, allocations)?;
 
         // Pre-allocate RelIds for declared predicates so schema-only programs
         // can populate relation stores before any facts or executable rules
@@ -1659,10 +2096,12 @@ impl Lowerer {
         program: &Program,
         scope: &mut crate::compile::CompilationAllocationScope<'_>,
     ) -> Result<()> {
-        self.validate_program_without_plan_with_owner(
+        let result = self.validate_program_without_plan_with_owner(
             program,
             &mut LoweringAllocations { scope: Some(scope) },
-        )
+        );
+        self.allocation_owners.finish_attempt();
+        result
     }
 
     fn validate_program_without_plan_with_owner(
@@ -1704,7 +2143,10 @@ impl Lowerer {
         program: &Program,
         scope: &mut crate::compile::CompilationAllocationScope<'_>,
     ) -> Result<ExecutionPlan> {
-        self.lower_program_with_owner(program, &mut LoweringAllocations { scope: Some(scope) })
+        let result =
+            self.lower_program_with_owner(program, &mut LoweringAllocations { scope: Some(scope) });
+        self.allocation_owners.finish_attempt();
+        result
     }
 
     fn lower_program_with_owner(
@@ -1734,9 +2176,7 @@ impl Lowerer {
                         .filter(|rule| scc.predicates.contains(&rule.head.predicate))
                         .count(),
                 )
-                .ok_or_else(|| {
-                    XlogError::Compilation("compiled rule allocation extent overflow".into())
-                })?;
+                .ok_or_else(|| XlogError::allocation_extent_overflow("compiled rules"))?;
             allocations.vector::<CompiledRule>(count)?;
         }
 
@@ -1955,9 +2395,7 @@ impl Lowerer {
                 .terms
                 .len()
                 .checked_mul(rule.body[1].atom().unwrap().terms.len())
-                .ok_or_else(|| {
-                    XlogError::Compilation("learnable key allocation extent overflow".into())
-                })?,
+                .ok_or_else(|| XlogError::allocation_extent_overflow("learnable join keys"))?,
         )?;
         allocations.vector::<usize>(
             rule.body[0]
@@ -1966,9 +2404,7 @@ impl Lowerer {
                 .terms
                 .len()
                 .checked_mul(rule.body[1].atom().unwrap().terms.len())
-                .ok_or_else(|| {
-                    XlogError::Compilation("learnable key allocation extent overflow".into())
-                })?,
+                .ok_or_else(|| XlogError::allocation_extent_overflow("learnable join keys"))?,
         )?;
         let mut rel_index: Vec<(RelId, String)> = self
             .rel_ids()
@@ -2084,12 +2520,12 @@ impl Lowerer {
         right: &BodyLiteral,
         allocations: &mut LoweringAllocations<'_, '_>,
     ) -> Result<(Vec<usize>, Vec<usize>)> {
-        let left_atom = left
-            .atom()
-            .ok_or_else(|| allocations.compilation_error(format_args!("Learnable body[0] is not an atom")))?;
-        let right_atom = right
-            .atom()
-            .ok_or_else(|| allocations.compilation_error(format_args!("Learnable body[1] is not an atom")))?;
+        let left_atom = left.atom().ok_or_else(|| {
+            allocations.compilation_error(format_args!("Learnable body[0] is not an atom"))
+        })?;
+        let right_atom = right.atom().ok_or_else(|| {
+            allocations.compilation_error(format_args!("Learnable body[1] is not an atom"))
+        })?;
 
         let mut left_keys = Vec::new();
         let mut right_keys = Vec::new();
@@ -2125,7 +2561,12 @@ impl Lowerer {
             _ => None,
         }) {
             allocations.acquire("RIR lowering boundary".len() as u64)?;
-            allocations.formatted(format_args!("{:?} {}({})", lit.op, lit.atom.predicate, lit.atom.arity()))?;
+            allocations.formatted(format_args!(
+                "{:?} {}({})",
+                lit.op,
+                lit.atom.predicate,
+                lit.atom.arity()
+            ))?;
             return Err(XlogError::UnsupportedEpistemicConstruct {
                 construct: "RIR lowering boundary".to_string(),
                 context: format!("{:?} {}({})", lit.op, lit.atom.predicate, lit.atom.arity()),
@@ -2181,9 +2622,7 @@ impl Lowerer {
                             .checked_mul(2)
                             .and_then(|n| n.checked_add(atom.predicate.len() as u64))
                             .ok_or_else(|| {
-                                XlogError::Compilation(
-                                    "variable environment allocation extent overflow".into(),
-                                )
+                                XlogError::allocation_extent_overflow("variable environment")
                             })?,
                     )?;
                     if !var_env.occurrences.contains_key(name)
@@ -2362,7 +2801,7 @@ impl Lowerer {
         allocations: &mut LoweringAllocations<'_, '_>,
     ) -> Result<JoinPlan<'a>> {
         let allocation_receipt = if allocations.scope.is_some() {
-            let overflow = || XlogError::Compilation("join leaf allocation extent overflow".into());
+            let overflow = || XlogError::allocation_extent_overflow("join leaf");
             let count = atom.terms.len();
             let mut bytes = crate::compile::hash_allocation_bytes::<String, usize>(count)?;
             bytes = bytes
@@ -2404,7 +2843,7 @@ impl Lowerer {
         };
         let rel_id = self.get_or_create_rel_id_with_owner(&atom.predicate, allocations)?;
         let scan = RirNode::Scan { rel: rel_id };
-        let node = self.apply_constant_filters(scan, atom, 0)?;
+        let node = self.apply_constant_filters(scan, atom, 0, allocations, &allocation_receipt)?;
 
         let mut var_pos: HashMap<String, usize> = HashMap::new();
         for (i, term) in atom.terms.iter().enumerate() {
@@ -2728,8 +3167,7 @@ impl Lowerer {
         let mut variable_bytes = 0u64;
         let mut comparator_bytes = 0u64;
         if allocations.scope.is_some() {
-            let overflow =
-                || XlogError::Compilation("greedy variable allocation extent overflow".into());
+            let overflow = || XlogError::allocation_extent_overflow("greedy join variables");
             for atom in atoms {
                 let mut count = 0usize;
                 let mut bytes = 0u64;
@@ -2886,9 +3324,9 @@ impl Lowerer {
         let rel_id = self.get_or_create_rel_id_with_owner(&first_atom.predicate, allocations)?;
         let mut result = RirNode::Scan { rel: rel_id };
         let variable_count = atoms.iter().try_fold(0usize, |count, atom| {
-            count.checked_add(atom.terms.len()).ok_or_else(|| {
-                XlogError::Compilation("join variable allocation extent overflow".into())
-            })
+            count
+                .checked_add(atom.terms.len())
+                .ok_or_else(|| XlogError::allocation_extent_overflow("join variables"))
         })?;
         allocations.vector::<(String, usize)>(variable_count)?;
         for atom in atoms {
@@ -2902,8 +3340,8 @@ impl Lowerer {
         let mut result_width = first_atom.terms.len();
 
         // Apply constant filters if any
-        self.acquire_atom_filters(first_atom, allocations)?;
-        result = self.apply_constant_filters(result, first_atom, 0)?;
+        let constant_data = self.acquire_atom_filters(first_atom, allocations)?;
+        result = self.apply_constant_filters(result, first_atom, 0, allocations, &constant_data)?;
 
         // Join with remaining atoms (left-deep)
         for atom in atoms.iter().skip(1) {
@@ -2912,8 +3350,9 @@ impl Lowerer {
             let right_scan = RirNode::Scan { rel: right_rel_id };
 
             // Apply constant filters to the right side
-            self.acquire_atom_filters(atom, allocations)?;
-            let right_filtered = self.apply_constant_filters(right_scan, atom, 0)?;
+            let constant_data = self.acquire_atom_filters(atom, allocations)?;
+            let right_filtered =
+                self.apply_constant_filters(right_scan, atom, 0, allocations, &constant_data)?;
 
             // Compute join keys based on shared variables
             allocations.vector::<usize>(atom.terms.len())?;
@@ -3001,21 +3440,27 @@ impl Lowerer {
         &self,
         atom: &Atom,
         allocations: &mut LoweringAllocations<'_, '_>,
-    ) -> Result<()> {
+    ) -> Result<Option<Arc<dyn Send + Sync>>> {
         allocations.hash::<&str, usize>(atom.terms.len())?;
         allocations.vector::<Expr>(atom.terms.len())?;
         allocations.acquire(std::mem::size_of::<RirNode>() as u64)?;
+        let mut text_bytes = 0u64;
         for term in &atom.terms {
             allocations.acquire(2 * std::mem::size_of::<Expr>() as u64)?;
-            match term {
-                Term::String(text) => allocations.acquire(text.len() as u64)?,
+            let bytes = match term {
+                Term::String(text) => text.len() as u64,
                 Term::Symbol(id) if allocations.scope.is_some() => {
-                    allocations.acquire(symbol::resolved_allocation_bytes(*id)? as u64)?
+                    symbol::resolved_allocation_bytes(*id)? as u64
                 }
-                _ => {}
-            }
+                _ => 0,
+            };
+            text_bytes = text_bytes
+                .checked_add(bytes)
+                .ok_or_else(|| XlogError::allocation_extent_overflow("constant filter text"))?;
         }
-        Ok(())
+        // The same scope retains this original receipt after the temporary
+        // borrow ends. It covers precisely the existing constant text copies.
+        allocations.acquire_receipt(text_bytes)
     }
 
     fn apply_constant_filters(
@@ -3023,11 +3468,16 @@ impl Lowerer {
         input: RirNode,
         atom: &Atom,
         _base_col: usize,
+        allocations: &mut LoweringAllocations<'_, '_>,
+        constant_data: &Option<Arc<dyn Send + Sync>>,
     ) -> Result<RirNode> {
         let mut filters = Vec::new();
         let mut first_var_col: HashMap<&str, usize> = HashMap::new();
         let schema = self.schemas.get(&atom.predicate).ok_or_else(|| {
-            XlogError::Compilation(format!("Missing schema for predicate {}", atom.predicate))
+            allocations.compilation_error(format_args!(
+                "Missing schema for predicate {}",
+                atom.predicate
+            ))
         })?;
 
         for (i, term) in atom.terms.iter().enumerate() {
@@ -3046,12 +3496,17 @@ impl Lowerer {
             }
 
             let col_type = schema.column_type(i).ok_or_else(|| {
-                XlogError::Compilation(format!(
+                allocations.compilation_error(format_args!(
                     "Missing column type for {} column {}",
                     atom.predicate, i
                 ))
             })?;
-            if let Some(const_val) = term_to_typed_const_value(term, col_type)? {
+            if let Some(const_val) = term_to_typed_const_value_core(
+                term,
+                col_type,
+                allocations,
+                ConstantDataAllocation::Prepared(constant_data),
+            )? {
                 filters.push(Expr::Compare {
                     left: Box::new(Expr::Column(i)),
                     op: CompareOp::Eq,
@@ -3103,10 +3558,14 @@ impl Lowerer {
         let (left_expr, right_expr) = match (&cmp.left, &cmp.right) {
             (Term::Variable(name), term) => {
                 let col = var_env.get_column(name).ok_or_else(|| {
-                    XlogError::Compilation(format!("Variable {} not found in environment", name))
+                    allocations.compilation_error(format_args!(
+                        "Variable {} not found in environment",
+                        name
+                    ))
                 })?;
                 let typ = var_env.get_type(name).ok_or_else(|| {
-                    XlogError::Compilation(format!("Missing type for variable {}", name))
+                    allocations
+                        .compilation_error(format_args!("Missing type for variable {}", name))
                 })?;
                 if let Some(const_val) =
                     term_to_typed_const_value_with_owner(term, typ, allocations)?
@@ -3121,10 +3580,14 @@ impl Lowerer {
             }
             (term, Term::Variable(name)) => {
                 let col = var_env.get_column(name).ok_or_else(|| {
-                    XlogError::Compilation(format!("Variable {} not found in environment", name))
+                    allocations.compilation_error(format_args!(
+                        "Variable {} not found in environment",
+                        name
+                    ))
                 })?;
                 let typ = var_env.get_type(name).ok_or_else(|| {
-                    XlogError::Compilation(format!("Missing type for variable {}", name))
+                    allocations
+                        .compilation_error(format_args!("Missing type for variable {}", name))
                 })?;
                 if let Some(const_val) =
                     term_to_typed_const_value_with_owner(term, typ, allocations)?
@@ -3178,15 +3641,15 @@ impl Lowerer {
                 if let Some(col) = var_env.get_column(name) {
                     Ok(Expr::Column(col))
                 } else {
-                    Err(XlogError::Compilation(format!(
+                    Err(allocations.compilation_error(format_args!(
                         "Variable {} not found in environment",
                         name
                     )))
                 }
             }
-            Term::Anonymous => Err(XlogError::Compilation(
-                "Anonymous wildcard '_' not allowed in comparisons".to_string(),
-            )),
+            Term::Anonymous => Err(allocations.compilation_error(format_args!(
+                "Anonymous wildcard '_' not allowed in comparisons"
+            ))),
             Term::Integer(i) => Ok(Expr::Const(ConstValue::I64(*i))),
             Term::Float(f) => Ok(Expr::Const(ConstValue::F64(*f))),
             Term::String(s) => {
@@ -3194,12 +3657,15 @@ impl Lowerer {
                 Ok(Expr::Const(ConstValue::Symbol(s.clone())))
             }
             Term::Symbol(id) => Ok(Expr::Const(ConstValue::Symbol(allocations.symbol(*id)?))),
-            Term::Aggregate(_) => Err(XlogError::Compilation(
-                "Aggregates not allowed in comparisons".to_string(),
-            )),
-            Term::List(_) | Term::Cons { .. } | Term::Compound { .. } | Term::PredRef(_) => Err(
-                term_not_lowerable_error("comparison", term_kind_for_lowering_error(term), allocations),
-            ),
+            Term::Aggregate(_) => Err(allocations
+                .compilation_error(format_args!("Aggregates not allowed in comparisons"))),
+            Term::List(_) | Term::Cons { .. } | Term::Compound { .. } | Term::PredRef(_) => {
+                Err(term_not_lowerable_error(
+                    "comparison",
+                    term_kind_for_lowering_error(term),
+                    allocations,
+                ))
+            }
         }
     }
 
@@ -3226,11 +3692,12 @@ impl Lowerer {
         allocations: &mut LoweringAllocations<'_, '_>,
     ) -> Result<RirNode> {
         let rel_id = self.get_or_create_rel_id_with_owner(&neg_atom.predicate, allocations)?;
-        self.acquire_atom_filters(neg_atom, allocations)?;
+        let constant_data = self.acquire_atom_filters(neg_atom, allocations)?;
         let neg_scan = RirNode::Scan { rel: rel_id };
 
         // Apply constant filters to the negated atom
-        let neg_filtered = self.apply_constant_filters(neg_scan, neg_atom, 0)?;
+        let neg_filtered =
+            self.apply_constant_filters(neg_scan, neg_atom, 0, allocations, &constant_data)?;
 
         // Find which columns from the input correspond to variables in the negated atom
         allocations.vector::<usize>(neg_atom.terms.len())?;
@@ -3256,9 +3723,11 @@ impl Lowerer {
             // arbitrary input schemas, including the zero-arity unit used by
             // negation-only rules.
             let input_width = var_env.column_count();
-            allocations.vector::<ProjectExpr>(input_width.checked_add(1).ok_or_else(|| {
-                XlogError::Compilation("negation projection extent overflow".into())
-            })?)?;
+            allocations.vector::<ProjectExpr>(
+                input_width
+                    .checked_add(1)
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("negation projection"))?,
+            )?;
             allocations.vector::<ProjectExpr>(input_width)?;
             allocations.vector::<ProjectExpr>(1)?;
             allocations.vector::<usize>(1)?;
@@ -3384,18 +3853,18 @@ impl Lowerer {
                 Term::Variable(name) => {
                     let col = var_env
                         .get_column(name)
-                        .ok_or_else(|| XlogError::UnsafeVariable(name.clone()))?;
+                        .ok_or_else(|| allocations.unsafe_variable(name))?;
                     cols.push(ProjectExpr::Column(col));
                 }
                 Term::Anonymous => {
-                    return Err(XlogError::Compilation(
-                        "Anonymous wildcard '_' not allowed in rule head".to_string(),
-                    ));
+                    return Err(allocations.compilation_error(format_args!(
+                        "Anonymous wildcard '_' not allowed in rule head"
+                    )));
                 }
                 Term::Aggregate(_) => {
-                    return Err(XlogError::Compilation(
-                        "Aggregate term in non-aggregate rule head".to_string(),
-                    ));
+                    return Err(allocations.compilation_error(format_args!(
+                        "Aggregate term in non-aggregate rule head"
+                    )));
                 }
                 Term::Integer(_) | Term::Float(_) | Term::String(_) | Term::Symbol(_) => {
                     let typ = self
@@ -3403,14 +3872,14 @@ impl Lowerer {
                         .get(&head.predicate)
                         .and_then(|schema| schema.column_type(index))
                         .ok_or_else(|| {
-                            XlogError::Compilation(format!(
+                            allocations.compilation_error(format_args!(
                                 "Missing schema type for '{}' column {}",
                                 head.predicate, index
                             ))
                         })?;
                     let value = term_to_typed_const_value_with_owner(term, typ, allocations)?
                         .ok_or_else(|| {
-                            XlogError::Compilation("Expected constant term".to_string())
+                            allocations.compilation_error(format_args!("Expected constant term"))
                         })?;
                     cols.push(ProjectExpr::Computed(Expr::Const(value), typ));
                 }
@@ -3464,9 +3933,7 @@ impl Lowerer {
                 Term::Aggregate(aggregate) => (aggregate.variable.len() as u64).checked_mul(5),
                 _ => Some(0),
             }
-            .ok_or_else(|| {
-                XlogError::Compilation("aggregate variable allocation extent overflow".into())
-            })?;
+            .ok_or_else(|| XlogError::allocation_extent_overflow("aggregate variables"))?;
             allocations.acquire(extent)?;
         }
         // Collect unique group keys in head order.
@@ -3487,7 +3954,7 @@ impl Lowerer {
                     if !key_var_to_pos.contains_key(name) {
                         let col = var_env
                             .get_column(name)
-                            .ok_or_else(|| XlogError::UnsafeVariable(name.clone()))?;
+                            .ok_or_else(|| allocations.unsafe_variable(name))?;
                         let pos = key_vars.len();
                         key_vars.push(name.clone());
                         key_var_to_pos.insert(name.clone(), pos);
@@ -3501,7 +3968,7 @@ impl Lowerer {
                         // Ensure the aggregated variable is bound.
                         let col = var_env
                             .get_column(&agg.variable)
-                            .ok_or_else(|| XlogError::UnsafeVariable(agg.variable.clone()))?;
+                            .ok_or_else(|| allocations.unsafe_variable(&agg.variable))?;
 
                         // Ensure the value variable exists in the groupby input.
                         let value_pos = *value_var_to_pos
@@ -3522,9 +3989,9 @@ impl Lowerer {
                     }
                 }
                 Term::Anonymous => {
-                    return Err(XlogError::Compilation(
-                        "Anonymous wildcard '_' not allowed in rule head".to_string(),
-                    ));
+                    return Err(allocations.compilation_error(format_args!(
+                        "Anonymous wildcard '_' not allowed in rule head"
+                    )));
                 }
                 Term::Integer(_) | Term::Float(_) | Term::String(_) | Term::Symbol(_) => {
                     // Constants are allowed in the head; they are projected after aggregation.
@@ -3540,9 +4007,9 @@ impl Lowerer {
         }
 
         if agg_specs.is_empty() {
-            return Err(XlogError::Compilation(
-                "Rule marked as aggregate but no aggregate terms found".to_string(),
-            ));
+            return Err(allocations.compilation_error(format_args!(
+                "Rule marked as aggregate but no aggregate terms found"
+            )));
         }
 
         // Build groupby input: [keys..., values...]. For global aggregates (no keys),
@@ -3552,9 +4019,7 @@ impl Lowerer {
                 .len()
                 .max(1)
                 .checked_add(value_src_cols.len())
-                .ok_or_else(|| {
-                    XlogError::Compilation("aggregate projection allocation extent overflow".into())
-                })?,
+                .ok_or_else(|| XlogError::allocation_extent_overflow("aggregate projection"))?,
         )?;
         allocations.vector::<usize>(key_src_cols.len().max(1))?;
         allocations.vector::<(usize, CoreAggOp)>(agg_specs.len())?;
@@ -3591,7 +4056,7 @@ impl Lowerer {
         for (op, var) in &agg_specs {
             let value_pos = *value_var_to_pos
                 .get(var)
-                .ok_or_else(|| XlogError::UnsafeVariable(var.clone()))?;
+                .ok_or_else(|| allocations.unsafe_variable(var))?;
             let value_col = value_offset + value_pos;
             aggs.push((value_col, convert_agg_op(op)));
         }
@@ -3619,24 +4084,24 @@ impl Lowerer {
                     let idx = if key_src_cols.is_empty() {
                         // Global aggregates have no key vars in the output; binding a variable in the head
                         // is a semantic error because it would be unbound.
-                        return Err(XlogError::UnsafeVariable(name.clone()));
+                        return Err(allocations.unsafe_variable(name));
                     } else {
                         *key_var_to_pos
                             .get(name)
-                            .ok_or_else(|| XlogError::UnsafeVariable(name.clone()))?
+                            .ok_or_else(|| allocations.unsafe_variable(name))?
                     };
                     final_proj.push(ProjectExpr::Column(idx));
                 }
                 Term::Aggregate(agg) => {
                     let pos = *agg_to_pos
                         .get(&(agg.op, agg.variable.clone()))
-                        .ok_or_else(|| XlogError::UnsafeVariable(agg.variable.clone()))?;
+                        .ok_or_else(|| allocations.unsafe_variable(&agg.variable))?;
                     final_proj.push(ProjectExpr::Column(key_count + pos));
                 }
                 Term::Anonymous => {
-                    return Err(XlogError::Compilation(
-                        "Anonymous wildcard '_' not allowed in rule head".to_string(),
-                    ));
+                    return Err(allocations.compilation_error(format_args!(
+                        "Anonymous wildcard '_' not allowed in rule head"
+                    )));
                 }
                 Term::Integer(_) | Term::Float(_) | Term::String(_) | Term::Symbol(_) => {
                     let typ = self
@@ -3644,14 +4109,14 @@ impl Lowerer {
                         .get(&head.predicate)
                         .and_then(|schema| schema.column_type(index))
                         .ok_or_else(|| {
-                            XlogError::Compilation(format!(
+                            allocations.compilation_error(format_args!(
                                 "Missing schema type for '{}' column {}",
                                 head.predicate, index
                             ))
                         })?;
                     let value = term_to_typed_const_value_with_owner(term, typ, allocations)?
                         .ok_or_else(|| {
-                            XlogError::Compilation("Expected constant term".to_string())
+                            allocations.compilation_error(format_args!("Expected constant term"))
                         })?;
                     final_proj.push(ProjectExpr::Computed(Expr::Const(value), typ));
                 }
@@ -3666,9 +4131,9 @@ impl Lowerer {
         }
 
         if final_proj.is_empty() {
-            return Err(XlogError::Compilation(
-                "Aggregate rule produced empty head projection".to_string(),
-            ));
+            return Err(allocations.compilation_error(format_args!(
+                "Aggregate rule produced empty head projection"
+            )));
         }
 
         Ok(RirNode::Project {
@@ -3762,7 +4227,12 @@ impl Lowerer {
                 ArithmeticTypeTask::FinishBinary(operation) => {
                     let right = values.pop().expect("right arithmetic type is inferred");
                     let left = values.pop().expect("left arithmetic type is inferred");
-                    values.push(Self::finish_binary_arithmetic_type(operation, left, right, allocations)?);
+                    values.push(Self::finish_binary_arithmetic_type(
+                        operation,
+                        left,
+                        right,
+                        allocations,
+                    )?);
                 }
                 ArithmeticTypeTask::FinishAbs => {
                     let inferred = values.pop().expect("absolute-value type is inferred");
@@ -3820,7 +4290,9 @@ impl Lowerer {
         right: Option<ScalarType>,
         allocations: &mut LoweringAllocations<'_, '_>,
     ) -> Result<Option<ScalarType>> {
-        let matching_numeric_type = |context: &str, allocations: &mut LoweringAllocations<'_, '_>| -> Result<Option<ScalarType>> {
+        let matching_numeric_type = |context: &str,
+                                     allocations: &mut LoweringAllocations<'_, '_>|
+         -> Result<Option<ScalarType>> {
             if let (Some(left), Some(right)) = (left, right) {
                 if left != right {
                     return Err(allocations.compilation_error(format_args!(
@@ -3942,15 +4414,27 @@ impl Lowerer {
             return Ok(typ);
         }
 
+        if allocations.scope.is_some() {
+            let mut count = 0usize;
+            let mut invalid = false;
+            expr.visit_variables(&mut |_| match count.checked_add(1) {
+                Some(value) => count = value,
+                None => invalid = true,
+            });
+            if invalid {
+                return Err(XlogError::allocation_extent_overflow(
+                    "arithmetic diagnostic variables",
+                ));
+            }
+            allocations.vector::<&str>(count)?;
+        }
         let variable = expr
             .variables()
             .into_iter()
             .find(|variable| var_env.get_type(variable).is_none())
             .unwrap_or("<unknown>");
-        Err(allocations.compilation_error(format_args!(
-            "Unknown variable {} in arithmetic",
-            variable
-        )))
+        Err(allocations
+            .compilation_error(format_args!("Unknown variable {} in arithmetic", variable)))
     }
 
     fn is_numeric_type(t: &ScalarType) -> bool {
@@ -3966,7 +4450,12 @@ impl Lowerer {
     }
 
     /// Convert ArithExpr to IR Expr
-    fn arith_to_expr(&self, arith: &ArithExpr, var_env: &VariableEnv) -> Result<Expr> {
+    fn arith_to_expr(
+        &self,
+        arith: &ArithExpr,
+        var_env: &VariableEnv,
+        allocations: &mut LoweringAllocations<'_, '_>,
+    ) -> Result<Expr> {
         let mut tasks = vec![ArithmeticExpressionTask::Visit(arith)];
         let mut values = Vec::new();
         while let Some(task) = tasks.pop() {
@@ -3974,7 +4463,7 @@ impl Lowerer {
                 ArithmeticExpressionTask::Visit(expression) => match expression {
                     ArithExpr::Variable(name) => {
                         let column = var_env.get_column(name).ok_or_else(|| {
-                            XlogError::Compilation(format!(
+                            allocations.compilation_error(format_args!(
                                 "Variable {} not bound before use in arithmetic",
                                 name
                             ))
@@ -4044,7 +4533,7 @@ impl Lowerer {
                         tasks.push(ArithmeticExpressionTask::Visit(inner));
                     }
                     ArithExpr::FuncCall { name, .. } => {
-                        return Err(XlogError::Compilation(format!(
+                        return Err(allocations.compilation_error(format_args!(
                             "User-defined function '{}' must be inlined before lowering",
                             name
                         )));
@@ -4171,17 +4660,15 @@ impl Lowerer {
         if allocations.scope.is_some() {
             let nodes = arithmetic_expression_nodes(&is_expr.expr)?;
             allocations.vector::<ArithmeticExpressionTask<'_>>(
-                nodes.checked_mul(2).ok_or_else(|| {
-                    XlogError::Compilation("arithmetic task allocation extent overflow".into())
-                })?,
+                nodes
+                    .checked_mul(2)
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("arithmetic IR tasks"))?,
             )?;
             allocations.vector::<Expr>(nodes)?;
             allocations.acquire(
                 (nodes as u64)
                     .checked_mul(2 * std::mem::size_of::<Expr>() as u64)
-                    .ok_or_else(|| {
-                        XlogError::Compilation("arithmetic IR allocation extent overflow".into())
-                    })?,
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("arithmetic IR"))?,
             )?;
         }
         // Binding freshness and source order are validated once for the full
@@ -4189,13 +4676,15 @@ impl Lowerer {
         let result_type = self.infer_arith_type_with_owner(&is_expr.expr, var_env, allocations)?;
 
         // Convert expression to IR.
-        let ir_expr = self.arith_to_expr(&is_expr.expr, var_env)?;
+        let ir_expr = self.arith_to_expr(&is_expr.expr, var_env, allocations)?;
 
         // Build projection: pass through all existing columns + add computed column.
         let num_cols = var_env.column_count();
-        allocations.vector::<ProjectExpr>(num_cols.checked_add(1).ok_or_else(|| {
-            XlogError::Compilation("arithmetic projection allocation extent overflow".into())
-        })?)?;
+        allocations.vector::<ProjectExpr>(
+            num_cols
+                .checked_add(1)
+                .ok_or_else(|| XlogError::allocation_extent_overflow("arithmetic projection"))?,
+        )?;
         allocations.acquire(std::mem::size_of::<RirNode>() as u64)?;
         let mut proj_exprs: Vec<ProjectExpr> = (0..num_cols).map(ProjectExpr::Column).collect();
         proj_exprs.push(ProjectExpr::Computed(ir_expr, result_type));
@@ -4204,9 +4693,7 @@ impl Lowerer {
         allocations.acquire(
             (is_expr.target.len() as u64)
                 .checked_mul(2)
-                .ok_or_else(|| {
-                    XlogError::Compilation("arithmetic variable allocation extent overflow".into())
-                })?,
+                .ok_or_else(|| XlogError::allocation_extent_overflow("arithmetic variables"))?,
         )?;
         if var_env.types.len() == var_env.types.capacity() {
             allocations.hash::<String, ScalarType>(var_env.types.len() + 1)?;
@@ -4312,13 +4799,22 @@ fn term_to_typed_const_value_with_owner(
     expected: ScalarType,
     allocations: &mut LoweringAllocations<'_, '_>,
 ) -> Result<Option<ConstValue>> {
+    term_to_typed_const_value_core(term, expected, allocations, ConstantDataAllocation::Scope)
+}
+
+fn term_to_typed_const_value_core(
+    term: &Term,
+    expected: ScalarType,
+    allocations: &mut LoweringAllocations<'_, '_>,
+    data: ConstantDataAllocation<'_>,
+) -> Result<Option<ConstValue>> {
     let const_val = match term {
         Term::Integer(i) => match expected {
             ScalarType::U32 => {
                 if *i >= 0 && *i <= u32::MAX as i64 {
                     ConstValue::U32(*i as u32)
                 } else {
-                    return Err(XlogError::Compilation(format!(
+                    return Err(allocations.compilation_error(format_args!(
                         "Integer literal {} out of range for {:?}",
                         i, expected
                     )));
@@ -4328,7 +4824,7 @@ fn term_to_typed_const_value_with_owner(
                 if *i >= 0 {
                     ConstValue::U64(*i as u64)
                 } else {
-                    return Err(XlogError::Compilation(format!(
+                    return Err(allocations.compilation_error(format_args!(
                         "Integer literal {} out of range for {:?}",
                         i, expected
                     )));
@@ -4338,7 +4834,7 @@ fn term_to_typed_const_value_with_owner(
                 if *i >= i32::MIN as i64 && *i <= i32::MAX as i64 {
                     ConstValue::I32(*i as i32)
                 } else {
-                    return Err(XlogError::Compilation(format!(
+                    return Err(allocations.compilation_error(format_args!(
                         "Integer literal {} out of range for {:?}",
                         i, expected
                     )));
@@ -4348,7 +4844,7 @@ fn term_to_typed_const_value_with_owner(
             ScalarType::F32 => {
                 let value = *i as f64;
                 if value < f32::MIN as f64 || value > f32::MAX as f64 {
-                    return Err(XlogError::Compilation(format!(
+                    return Err(allocations.compilation_error(format_args!(
                         "Integer literal {} out of range for {:?}",
                         i, expected
                     )));
@@ -4360,14 +4856,14 @@ fn term_to_typed_const_value_with_owner(
                 if *i == 0 || *i == 1 {
                     ConstValue::Bool(*i == 1)
                 } else {
-                    return Err(XlogError::Compilation(format!(
+                    return Err(allocations.compilation_error(format_args!(
                         "Integer literal {} not valid for {:?}",
                         i, expected
                     )));
                 }
             }
             ScalarType::Symbol => {
-                return Err(XlogError::Compilation(format!(
+                return Err(allocations.compilation_error(format_args!(
                     "Integer literal {} not valid for {:?}",
                     i, expected
                 )));
@@ -4376,13 +4872,13 @@ fn term_to_typed_const_value_with_owner(
         Term::Float(f) => match expected {
             ScalarType::F32 => {
                 if !f.is_finite() {
-                    return Err(XlogError::Compilation(format!(
+                    return Err(allocations.compilation_error(format_args!(
                         "Float literal {} not valid for {:?}",
                         f, expected
                     )));
                 }
                 if *f < f32::MIN as f64 || *f > f32::MAX as f64 {
-                    return Err(XlogError::Compilation(format!(
+                    return Err(allocations.compilation_error(format_args!(
                         "Float literal {} out of range for {:?}",
                         f, expected
                     )));
@@ -4396,7 +4892,7 @@ fn term_to_typed_const_value_with_owner(
             | ScalarType::I64
             | ScalarType::Bool
             | ScalarType::Symbol => {
-                return Err(XlogError::Compilation(format!(
+                return Err(allocations.compilation_error(format_args!(
                     "Float literal {} not valid for {:?}",
                     f, expected
                 )));
@@ -4404,24 +4900,32 @@ fn term_to_typed_const_value_with_owner(
         },
         Term::String(s) => {
             if expected == ScalarType::Symbol {
-                allocations.acquire(s.len() as u64)?;
+                match data {
+                    ConstantDataAllocation::Scope => allocations.acquire(s.len() as u64)?,
+                    ConstantDataAllocation::Prepared(_receipt) => {}
+                }
                 ConstValue::Symbol(s.clone())
             } else {
-                return Err(XlogError::Compilation(format!(
+                return Err(allocations.compilation_error(format_args!(
                     "String literal {} not valid for {:?}",
                     s, expected
                 )));
             }
         }
         Term::Symbol(id) => {
-            let value = allocations.symbol(*id)?;
+            let value = match data {
+                ConstantDataAllocation::Scope => allocations.symbol(*id)?,
+                // This private borrow names the actual leaf/atom allocation
+                // already acquired above; it creates no replacement receipt.
+                ConstantDataAllocation::Prepared(_receipt) => symbol::resolve(*id),
+            };
             match expected {
                 ScalarType::Symbol => ConstValue::Symbol(value),
                 ScalarType::Bool if matches!(value.as_str(), "true" | "false") => {
                     ConstValue::Bool(value == "true")
                 }
                 _ => {
-                    return Err(XlogError::Compilation(format!(
+                    return Err(allocations.compilation_error(format_args!(
                         "Symbol literal {} not valid for {:?}",
                         value, expected
                     )));

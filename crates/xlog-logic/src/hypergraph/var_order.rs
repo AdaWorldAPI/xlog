@@ -362,9 +362,20 @@ fn plan_kclique_var_order_core<S: StatsSource>(
     {
         return Ok(None);
     }
-    let threshold=match scope.as_deref_mut() {
-        Some(scope)=>Some(scope.planner_threshold().ok_or_else(||xlog_core::XlogError::Compilation("complete owned planner statistics require the original parsed threshold configuration".into()))?),
-        None=>None,
+    let threshold = match scope.as_deref_mut() {
+        Some(scope) => {
+            let Some(threshold) = scope.planner_threshold() else {
+                let message = "complete owned planner statistics require the original parsed threshold configuration";
+                let mut reserve = |bytes| scope.reserve_allocation(bytes);
+                let producer = xlog_core::CompilationAllocationScope::prepare_diagnostic(
+                    Ok(message.len() as u64),
+                    Some(&mut reserve),
+                )?;
+                return Err(producer.finish(|| xlog_core::XlogError::Compilation(message.into())));
+            };
+            Some(threshold)
+        }
+        None => None,
     };
 
     let variables = usize::from(shape.variable_count());

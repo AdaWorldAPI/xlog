@@ -1297,10 +1297,7 @@ fn multiply(count: usize, bytes: usize) -> PyResult<usize> {
 }
 
 pub(super) fn integer_extent(py: Python<'_>) -> PyResult<usize> {
-    add(
-        material_bytes::python_instance_extent::<PyInt>(py)?,
-        std::mem::size_of::<u64>() * std::mem::size_of::<u32>(),
-    )
+    material_bytes::python_integer_extent(py)
 }
 
 fn projection_extent(py: Python<'_>, value: &ColdValue) -> PyResult<usize> {
@@ -1480,6 +1477,28 @@ pub(super) fn source_content_geometry_seed(
     source: &Arc<VerifiedCheckpointSource>,
     material: xlog_cuda::SemanticReplayMaterial,
 ) -> PyResult<xlog_cuda::SemanticSourceContentGeometrySeed> {
+    let needs_compiler = source
+        .task_geometry
+        .lock()
+        .map_err(|_| invalid("original source task geometry custody is poisoned"))?
+        .is_none();
+    if needs_compiler {
+        // Replacement Python construction and previous-error retirement may
+        // execute GC callbacks. Complete both before the geometry cache lock.
+        if let Err(blocking) = Python::attach(|py| {
+            source.seed.material_sources.ensure_compiler_diagnostic(py)
+        }) {
+            // A reentrant callback may have completed this exact cached task.
+            // Reuse that known result; a separate blocking report is not a veto.
+            let ready = source.task_geometry.lock()
+                .map_err(|_| invalid("original source task geometry custody is poisoned"))?
+                .is_some();
+            if !ready {
+                return Err(blocking);
+            }
+            drop(blocking);
+        }
+    }
     let mut cached = source
         .task_geometry
         .lock()
@@ -1495,16 +1514,11 @@ pub(super) fn source_content_geometry_seed(
             .get(9)
             .ok_or_else(|| invalid("original source has no task priority roster"))?;
         let levels = priorities.sequence()?;
-        let mut extent = add(
-            std::mem::size_of::<SourceTaskGeometry>(),
-            2 * std::mem::size_of::<usize>(),
-        )?;
-        extent = add(
-            extent,
-            multiply(
-                levels.len(),
-                std::mem::size_of::<xlog_cuda::SemanticTaskPriorityLevel>(),
-            )?,
+        // The cache value is inline in the already-paid verified source.
+        // Only the actual transported priority buffers allocate here.
+        let mut extent = multiply(
+            levels.len(),
+            std::mem::size_of::<xlog_cuda::SemanticTaskPriorityLevel>(),
         )?;
         for level in levels {
             extent = add(
@@ -1516,14 +1530,12 @@ pub(super) fn source_content_geometry_seed(
             )?;
         }
         let budget = source.seed.material_sources.native_budget()?;
-        let metadata: Arc<dyn Send + Sync> = Arc::new(
-            budget
-                .reserve_auxiliary(
-                    u64::try_from(extent)
-                        .map_err(|_| invalid("original task geometry exceeds u64"))?,
-                )
-                .map_err(xlog_err)?,
-        );
+        let metadata: Arc<dyn Send + Sync> = budget
+            .reserve_compiler_allocation(
+                u64::try_from(extent)
+                    .map_err(|_| invalid("original task geometry exceeds u64"))?,
+            )
+            .map_err(xlog_err)?;
         let observer = source
             .seed
             .evaluation
@@ -1545,7 +1557,7 @@ pub(super) fn source_content_geometry_seed(
             Some(Arc::clone(&cold.program)),
             &source.seed.training_domain,
             Some(&cold.initial_source),
-            &budget,
+            &source.seed.material_sources,
         )?;
         *cached = Some(SourceTaskGeometry {
             task: Arc::new(task),

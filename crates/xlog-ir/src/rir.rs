@@ -540,8 +540,7 @@ pub enum RirNode {
 }
 
 fn expression_owned_extent(expr: &Expr) -> xlog_core::Result<usize> {
-    let overflow =
-        || XlogError::Compilation("resident expression allocation extent overflow".into());
+    let overflow = || XlogError::allocation_extent_overflow("resident expression");
     let add = |a: usize, b: usize| a.checked_add(b).ok_or_else(overflow);
     let mut bytes = std::mem::size_of::<Expr>();
     match expr {
@@ -596,13 +595,12 @@ impl Expr {
     /// Checked owned clone geometry of this exact expression.
     pub fn owned_allocation_bytes(&self) -> xlog_core::Result<u64> {
         u64::try_from(expression_owned_extent(self)?)
-            .map_err(|_| XlogError::Compilation("expression allocation extent overflow".into()))
+            .map_err(|_| XlogError::allocation_extent_overflow("expression"))
     }
 }
 
 fn clique_owned_extent(plan: &KCliqueVariableOrder) -> xlog_core::Result<usize> {
-    let overflow =
-        || XlogError::Compilation("resident variable-order allocation extent overflow".into());
+    let overflow = || XlogError::allocation_extent_overflow("resident variable-order");
     let mut bytes = plan
         .column_swaps
         .len()
@@ -628,7 +626,7 @@ impl KCliqueVariableOrder {
     /// Checked owned clone geometry of this original variable-order record.
     pub fn owned_allocation_bytes(&self) -> xlog_core::Result<u64> {
         u64::try_from(clique_owned_extent(self)?)
-            .map_err(|_| XlogError::Compilation("variable-order allocation extent overflow".into()))
+            .map_err(|_| XlogError::allocation_extent_overflow("variable-order"))
     }
 }
 
@@ -637,24 +635,20 @@ impl RirNode {
     /// does not validate, optimize, admit, or execute the relational plan.
     pub fn owned_allocation_extent(&self) -> xlog_core::Result<(usize, usize, usize)> {
         let node = self;
-        let overflow = || XlogError::Compilation("resident plan allocation extent overflow".into());
+        let overflow = || XlogError::allocation_extent_overflow("resident plan");
         let add = |a: usize, b: usize| a.checked_add(b).ok_or_else(overflow);
         let mul = |a: usize, b: usize| a.checked_mul(b).ok_or_else(overflow);
         fn columns_extent(columns: &[ProjectExpr]) -> xlog_core::Result<usize> {
             let mut bytes = columns
                 .len()
                 .checked_mul(std::mem::size_of::<ProjectExpr>())
-                .ok_or_else(|| {
-                    XlogError::Compilation("resident projection allocation extent overflow".into())
-                })?;
+                .ok_or_else(|| XlogError::allocation_extent_overflow("resident projection"))?;
             for column in columns {
                 if let ProjectExpr::Computed(expr, _) = column {
                     bytes = bytes
                         .checked_add(expression_owned_extent(expr)?)
                         .ok_or_else(|| {
-                            XlogError::Compilation(
-                                "resident projection allocation extent overflow".into(),
-                            )
+                            XlogError::allocation_extent_overflow("resident projection")
                         })?;
                 }
             }
@@ -827,7 +821,7 @@ impl RirNode {
     /// Checked owned clone geometry of this exact relational plan.
     pub fn owned_allocation_bytes(&self) -> xlog_core::Result<u64> {
         u64::try_from(self.owned_allocation_extent()?.0)
-            .map_err(|_| XlogError::Compilation("plan allocation extent overflow".into()))
+            .map_err(|_| XlogError::allocation_extent_overflow("plan"))
     }
     /// Check if this node is a leaf (Scan)
     pub fn is_leaf(&self) -> bool {
@@ -837,30 +831,31 @@ impl RirNode {
     /// Get all relation IDs referenced in this subtree
     pub fn referenced_relations(&self) -> Vec<RelId> {
         let mut rels = Vec::new();
-        self.collect_relations(&mut rels);
+        self.visit_referenced_relations(&mut |rel| rels.push(rel));
         rels
     }
 
-    fn collect_relations(&self, rels: &mut Vec<RelId>) {
+    /// Visit the original relation roster without allocating a second roster.
+    pub fn visit_referenced_relations(&self, visit: &mut dyn FnMut(RelId)) {
         match self {
             RirNode::Unit => {}
-            RirNode::Scan { rel } => rels.push(*rel),
+            RirNode::Scan { rel } => visit(*rel),
             RirNode::Filter { input, .. } | RirNode::Project { input, .. } => {
-                input.collect_relations(rels);
+                input.visit_referenced_relations(visit);
             }
             RirNode::Join { left, right, .. }
             | RirNode::ChainJoin { left, right, .. }
             | RirNode::Diff { left, right } => {
-                left.collect_relations(rels);
-                right.collect_relations(rels);
+                left.visit_referenced_relations(visit);
+                right.visit_referenced_relations(visit);
             }
             RirNode::Union { inputs } => {
                 for input in inputs {
-                    input.collect_relations(rels);
+                    input.visit_referenced_relations(visit);
                 }
             }
             RirNode::GroupBy { input, .. } | RirNode::Distinct { input, .. } => {
-                input.collect_relations(rels);
+                input.visit_referenced_relations(visit);
             }
             RirNode::Fixpoint {
                 base,
@@ -869,14 +864,14 @@ impl RirNode {
                 full_rel,
                 ..
             } => {
-                base.collect_relations(rels);
-                recursive.collect_relations(rels);
-                rels.push(*delta_rel);
-                rels.push(*full_rel);
+                base.visit_referenced_relations(visit);
+                recursive.visit_referenced_relations(visit);
+                visit(*delta_rel);
+                visit(*full_rel);
             }
             RirNode::TensorMaskedJoin { rel_index, .. } => {
                 for (rel_id, _) in rel_index {
-                    rels.push(*rel_id);
+                    visit(*rel_id);
                 }
             }
             RirNode::MultiWayJoin { inputs, .. } => {
@@ -884,7 +879,7 @@ impl RirNode {
                 // the same set by promoter invariant; walking both would
                 // double-count.
                 for input in inputs {
-                    input.collect_relations(rels);
+                    input.visit_referenced_relations(visit);
                 }
             }
         }

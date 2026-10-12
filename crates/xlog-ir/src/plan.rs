@@ -2,7 +2,64 @@
 
 use crate::metadata::RirMeta;
 use crate::rir::RirNode;
-use xlog_core::RelId;
+use xlog_core::{CompilationAllocationScope, RelId, Result};
+
+fn reserve_plan_vector<T>(
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+    count: usize,
+) -> Result<Option<std::sync::Arc<dyn Send + Sync>>> {
+    scope
+        .as_deref_mut()
+        .map(|scope| scope.reserve_allocation(xlog_core::push_vector_allocation_bytes::<T>(count)?))
+        .transpose()
+}
+
+fn acquire_plan_vector<T>(
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+    count: usize,
+) -> Result<()> {
+    if let Some(scope) = scope.as_deref_mut() {
+        scope.acquire(xlog_core::push_vector_allocation_bytes::<T>(count)?)?;
+    }
+    Ok(())
+}
+
+fn acquire_plan_clone(
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+    rule: &CompiledRule,
+) -> Result<()> {
+    if let Some(scope) = scope.as_deref_mut() {
+        scope.acquire(rule.owned_allocation_bytes()?)?;
+    }
+    Ok(())
+}
+
+impl CompiledRule {
+    /// Heap storage of a clone of this exact original rule.
+    pub fn owned_allocation_bytes(&self) -> Result<u64> {
+        let rule = self;
+        let skew_bytes = rule
+            .meta
+            .skew
+            .as_ref()
+            .map_or(Some(0), |skew| {
+                (skew.hot_keys.len() as u64).checked_mul(std::mem::size_of::<u64>() as u64)
+            })
+            .ok_or_else(|| {
+                xlog_core::XlogError::allocation_extent_overflow("dependency rule clone")
+            })?;
+        let bytes = rule
+            .body
+            .owned_allocation_bytes()?
+            .checked_add(rule.meta.schema.owned_allocation_bytes()?)
+            .and_then(|bytes| bytes.checked_add(rule.head.len() as u64))
+            .and_then(|bytes| bytes.checked_add(skew_bytes))
+            .ok_or_else(|| {
+                xlog_core::XlogError::allocation_extent_overflow("dependency rule clone")
+            })?;
+        Ok(bytes)
+    }
+}
 
 /// Strongly Connected Component in the dependency graph
 #[derive(Debug, Clone)]
@@ -69,6 +126,70 @@ pub struct ExecutionPlan {
 }
 
 impl ExecutionPlan {
+    /// Heap storage of a clone of this exact original execution plan.
+    pub fn owned_allocation_bytes(&self) -> Result<u64> {
+        let overflow = || xlog_core::XlogError::allocation_extent_overflow("execution plan clone");
+        let mut bytes = xlog_core::push_vector_allocation_bytes::<Scc>(self.sccs.len())?
+            .checked_add(xlog_core::push_vector_allocation_bytes::<Stratum>(
+                self.strata.len(),
+            )?)
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    xlog_core::push_vector_allocation_bytes::<Vec<CompiledRule>>(
+                        self.rules_by_scc.len(),
+                    )
+                    .ok()?,
+                )
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    xlog_core::push_vector_allocation_bytes::<GeneratedQueryRuleProvenance>(
+                        self.generated_query_rules.len(),
+                    )
+                    .ok()?,
+                )
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    xlog_core::hash_allocation_bytes::<RelId, usize>(self.rel_arities.len())
+                        .ok()?,
+                )
+            })
+            .ok_or_else(overflow)?;
+        for scc in &self.sccs {
+            bytes = bytes
+                .checked_add(xlog_core::push_vector_allocation_bytes::<String>(
+                    scc.predicates.len(),
+                )?)
+                .ok_or_else(overflow)?;
+            for predicate in &scc.predicates {
+                bytes = bytes
+                    .checked_add(predicate.len() as u64)
+                    .ok_or_else(overflow)?;
+            }
+        }
+        for stratum in &self.strata {
+            bytes = bytes
+                .checked_add(xlog_core::push_vector_allocation_bytes::<u32>(
+                    stratum.sccs.len(),
+                )?)
+                .ok_or_else(overflow)?;
+        }
+        for rules in &self.rules_by_scc {
+            bytes = bytes
+                .checked_add(xlog_core::push_vector_allocation_bytes::<CompiledRule>(
+                    rules.len(),
+                )?)
+                .ok_or_else(overflow)?;
+            for rule in rules {
+                bytes = bytes
+                    .checked_add(rule.owned_allocation_bytes()?)
+                    .ok_or_else(overflow)?;
+            }
+        }
+        Ok(bytes)
+    }
+
     /// Create a new execution plan from SCCs
     pub fn new(sccs: Vec<Scc>) -> Self {
         Self {
@@ -104,119 +225,284 @@ impl ExecutionPlan {
         root_sccs: &[usize],
         defining_sccs: &std::collections::HashMap<RelId, usize>,
     ) -> Option<Self> {
-        let scc_count = self.sccs.len();
-        if root_sccs.is_empty()
-            || self.rules_by_scc.len() != scc_count
-            || self
-                .sccs
-                .iter()
-                .enumerate()
-                .any(|(index, scc)| u32::try_from(index).ok() != Some(scc.id))
-            || self
-                .strata
-                .iter()
-                .enumerate()
-                .any(|(index, stratum)| u32::try_from(index).ok() != Some(stratum.id))
-            || root_sccs.iter().any(|root| *root >= scc_count)
-            || defining_sccs.values().any(|scc| *scc >= scc_count)
-        {
-            return None;
-        }
+        self.dependency_closed_subplan_core(root_sccs, defining_sccs, &mut None)
+            .expect("ordinary dependency closure has no allocation callback")
+    }
 
-        let mut stratum_membership = vec![0_u8; scc_count];
-        for stratum in &self.strata {
-            for scc in &stratum.sccs {
-                let scc_index = usize::try_from(*scc).ok()?;
-                let membership = stratum_membership.get_mut(scc_index)?;
-                *membership = membership.checked_add(1)?;
-                if *membership != 1 {
+    /// Produce the same dependency closure using the original allocation scope.
+    /// Structural inconsistency remains `None`; allocation refusal remains an error.
+    pub fn dependency_closed_subplan_with_allocation_owner(
+        &self,
+        root_sccs: &[usize],
+        defining_sccs: &std::collections::HashMap<RelId, usize>,
+        scope: &mut CompilationAllocationScope<'_>,
+    ) -> Result<Option<Self>> {
+        self.dependency_closed_subplan_core(root_sccs, defining_sccs, &mut Some(scope))
+    }
+
+    fn dependency_closed_subplan_core(
+        &self,
+        root_sccs: &[usize],
+        defining_sccs: &std::collections::HashMap<RelId, usize>,
+        scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+    ) -> Result<Option<Self>> {
+        let mut failure = None;
+        macro_rules! allocate {
+            ($allocation:expr) => {
+                if let Err(error) = $allocation {
+                    failure = Some(error);
                     return None;
                 }
-            }
+            };
         }
-        if stratum_membership.iter().any(|membership| *membership != 1) {
-            return None;
-        }
-
-        for query in &self.generated_query_rules {
-            self.rules_by_scc
-                .get(query.scc_index)?
-                .get(query.rule_index)?;
-        }
-
-        let mut retained = std::collections::BTreeSet::new();
-        let mut pending = root_sccs.to_vec();
-        while let Some(scc_index) = pending.pop() {
-            if !retained.insert(scc_index) {
-                continue;
-            }
-            for rule in &self.rules_by_scc[scc_index] {
-                for relation in rule.body.referenced_relations() {
-                    let Some(dependency) = defining_sccs.get(&relation).copied() else {
-                        continue;
-                    };
-                    if dependency >= scc_count {
+        macro_rules! allocation_value {
+            ($allocation:expr) => {
+                match $allocation {
+                    Ok(value) => value,
+                    Err(error) => {
+                        failure = Some(error);
                         return None;
                     }
-                    if !retained.contains(&dependency) {
-                        pending.push(dependency);
+                }
+            };
+        }
+        let result = (|| -> Option<Self> {
+            let scc_count = self.sccs.len();
+            if root_sccs.is_empty()
+                || self.rules_by_scc.len() != scc_count
+                || self
+                    .sccs
+                    .iter()
+                    .enumerate()
+                    .any(|(index, scc)| u32::try_from(index).ok() != Some(scc.id))
+                || self
+                    .strata
+                    .iter()
+                    .enumerate()
+                    .any(|(index, stratum)| u32::try_from(index).ok() != Some(stratum.id))
+                || root_sccs.iter().any(|root| *root >= scc_count)
+                || defining_sccs.values().any(|scc| *scc >= scc_count)
+            {
+                return None;
+            }
+
+            let _membership_receipt =
+                allocation_value!(reserve_plan_vector::<u8>(scope, scc_count));
+            let mut stratum_membership = vec![0_u8; scc_count];
+            for stratum in &self.strata {
+                for scc in &stratum.sccs {
+                    let scc_index = usize::try_from(*scc).ok()?;
+                    let membership = stratum_membership.get_mut(scc_index)?;
+                    *membership = membership.checked_add(1)?;
+                    if *membership != 1 {
+                        return None;
                     }
                 }
             }
-        }
-        let mut remapped_sccs = vec![None; scc_count];
-        let mut sccs = Vec::with_capacity(retained.len());
-        let mut rules_by_scc = Vec::with_capacity(retained.len());
-        for (old_index, remapped_scc) in remapped_sccs.iter_mut().enumerate() {
-            if !retained.contains(&old_index) {
-                continue;
+            if stratum_membership.iter().any(|membership| *membership != 1) {
+                return None;
             }
-            let new_index = u32::try_from(sccs.len()).ok()?;
-            *remapped_scc = Some(new_index);
-            let mut scc = self.sccs[old_index].clone();
-            scc.id = new_index;
-            sccs.push(scc);
-            rules_by_scc.push(self.rules_by_scc[old_index].clone());
-        }
 
-        let mut strata = Vec::new();
-        for original in &self.strata {
-            let mut remapped = Vec::new();
-            for scc in &original.sccs {
-                let old_index = usize::try_from(*scc).ok()?;
-                if let Some(new_index) = remapped_sccs.get(old_index).copied().flatten() {
-                    remapped.push(new_index);
+            for query in &self.generated_query_rules {
+                self.rules_by_scc
+                    .get(query.scc_index)?
+                    .get(query.rule_index)?;
+            }
+
+            let mut retained_scope = scope
+                .as_deref_mut()
+                .map(CompilationAllocationScope::child_scope);
+            if let Some(retained_scope) = retained_scope.as_mut() {
+                allocate!(retained_scope.prepare_owner());
+            }
+            let mut retained = std::collections::BTreeSet::new();
+            let mut pending_receipt = allocation_value!(reserve_plan_vector::<usize>(
+                &mut retained_scope.as_mut(),
+                root_sccs.len()
+            ));
+            let mut pending = root_sccs.to_vec();
+            while let Some(scc_index) = pending.pop() {
+                if !retained.contains(&scc_index) {
+                    if let Some(scope) = retained_scope.as_mut() {
+                        allocate!(xlog_core::btree_insert_allocation_bytes::<usize, ()>(
+                            retained.len()
+                        )
+                        .and_then(|bytes| scope.acquire(bytes)));
+                    }
+                }
+                if !retained.insert(scc_index) {
+                    continue;
+                }
+                for rule in &self.rules_by_scc[scc_index] {
+                    let _relations_receipt = match retained_scope.as_mut() {
+                        Some(scope) => {
+                            let mut count = Some(0usize);
+                            rule.body.visit_referenced_relations(&mut |_| {
+                                count = count.and_then(|count| count.checked_add(1));
+                            });
+                            let count = match count {
+                                Some(count) => count,
+                                None => {
+                                    failure =
+                                        Some(xlog_core::XlogError::allocation_extent_overflow(
+                                            "dependency relation roster",
+                                        ));
+                                    return None;
+                                }
+                            };
+                            match xlog_core::push_vector_allocation_bytes::<RelId>(count)
+                                .and_then(|bytes| scope.reserve_allocation(bytes))
+                            {
+                                Ok(receipt) => Some(receipt),
+                                Err(error) => {
+                                    failure = Some(error);
+                                    return None;
+                                }
+                            }
+                        }
+                        None => None,
+                    };
+                    for relation in rule.body.referenced_relations() {
+                        let Some(dependency) = defining_sccs.get(&relation).copied() else {
+                            continue;
+                        };
+                        if dependency >= scc_count {
+                            return None;
+                        }
+                        if !retained.contains(&dependency) {
+                            if pending.len() == pending.capacity() {
+                                let count =
+                                    allocation_value!(pending.len().checked_add(1).ok_or_else(
+                                        || xlog_core::XlogError::allocation_extent_overflow(
+                                            "dependency pending roster"
+                                        )
+                                    ));
+                                let next_receipt = allocation_value!(reserve_plan_vector::<usize>(
+                                    &mut retained_scope.as_mut(),
+                                    count
+                                ));
+                                pending.reserve(1);
+                                pending_receipt = next_receipt;
+                            }
+                            pending.push(dependency);
+                        }
+                    }
                 }
             }
-            if remapped.is_empty() {
-                continue;
+            drop(pending);
+            drop(pending_receipt);
+            let retained_receipt = match retained_scope {
+                Some(retained_scope) => Some(allocation_value!(retained_scope.into_owner())),
+                None => None,
+            };
+            let retained_state = (retained, retained_receipt);
+            let retained = &retained_state.0;
+            let _remapping_receipt =
+                allocation_value!(reserve_plan_vector::<Option<u32>>(scope, scc_count));
+            allocate!(acquire_plan_vector::<Scc>(scope, retained.len()));
+            allocate!(acquire_plan_vector::<Vec<CompiledRule>>(
+                scope,
+                retained.len()
+            ));
+            let mut remapped_sccs = vec![None; scc_count];
+            let mut sccs = Vec::with_capacity(retained.len());
+            let mut rules_by_scc = Vec::with_capacity(retained.len());
+            for (old_index, remapped_scc) in remapped_sccs.iter_mut().enumerate() {
+                if !retained.contains(&old_index) {
+                    continue;
+                }
+                let new_index = u32::try_from(sccs.len()).ok()?;
+                *remapped_scc = Some(new_index);
+                if let Some(scope) = scope.as_deref_mut() {
+                    allocate!(xlog_core::push_vector_allocation_bytes::<String>(
+                        self.sccs[old_index].predicates.len()
+                    )
+                    .and_then(|bytes| scope.acquire(bytes)));
+                    for predicate in &self.sccs[old_index].predicates {
+                        allocate!(scope.acquire(predicate.len() as u64));
+                    }
+                }
+                allocate!(acquire_plan_vector::<CompiledRule>(
+                    scope,
+                    self.rules_by_scc[old_index].len()
+                ));
+                for rule in &self.rules_by_scc[old_index] {
+                    allocate!(acquire_plan_clone(scope, rule));
+                }
+                let mut scc = self.sccs[old_index].clone();
+                scc.id = new_index;
+                sccs.push(scc);
+                rules_by_scc.push(self.rules_by_scc[old_index].clone());
             }
-            strata.push(Stratum {
-                id: u32::try_from(strata.len()).ok()?,
-                sccs: remapped,
-            });
-        }
 
-        let generated_query_rules = self
-            .generated_query_rules
-            .iter()
-            .map(|query| {
-                Some(GeneratedQueryRuleProvenance {
-                    query_index: query.query_index,
-                    scc_index: remapped_sccs[query.scc_index]? as usize,
-                    rule_index: query.rule_index,
+            let mut strata = Vec::new();
+            for original in &self.strata {
+                let remapped_receipt =
+                    allocation_value!(reserve_plan_vector::<u32>(scope, original.sccs.len()));
+                let mut remapped = Vec::new();
+                for scc in &original.sccs {
+                    let old_index = usize::try_from(*scc).ok()?;
+                    if let Some(new_index) = remapped_sccs.get(old_index).copied().flatten() {
+                        remapped.push(new_index);
+                    }
+                }
+                if remapped.is_empty() {
+                    continue;
+                }
+                if strata.len() == strata.capacity() {
+                    allocate!(acquire_plan_vector::<Stratum>(
+                        scope,
+                        allocation_value!(strata.len().checked_add(1).ok_or_else(|| {
+                            xlog_core::XlogError::allocation_extent_overflow("dependency strata")
+                        }))
+                    ));
+                }
+                if let (Some(scope), Some(receipt)) =
+                    (scope.as_deref_mut(), remapped_receipt.as_ref())
+                {
+                    allocate!(scope.retain(std::sync::Arc::clone(receipt)));
+                }
+                strata.push(Stratum {
+                    id: u32::try_from(strata.len()).ok()?,
+                    sccs: remapped,
+                });
+            }
+
+            allocate!(acquire_plan_vector::<GeneratedQueryRuleProvenance>(
+                scope,
+                self.generated_query_rules.len()
+            ));
+            let generated_query_rules = self
+                .generated_query_rules
+                .iter()
+                .map(|query| {
+                    Some(GeneratedQueryRuleProvenance {
+                        query_index: query.query_index,
+                        scc_index: remapped_sccs[query.scc_index]? as usize,
+                        rule_index: query.rule_index,
+                    })
                 })
-            })
-            .collect::<Option<Vec<_>>>()?;
+                .collect::<Option<Vec<_>>>()?;
 
-        Some(Self {
-            sccs,
-            strata,
-            rules_by_scc,
-            generated_query_rules,
-            est_memory_peak: self.est_memory_peak,
-            rel_arities: self.rel_arities.clone(),
-        })
+            if let Some(scope) = scope.as_deref_mut() {
+                allocate!(
+                    xlog_core::hash_allocation_bytes::<RelId, usize>(self.rel_arities.len())
+                        .and_then(|bytes| scope.acquire(bytes))
+                );
+            }
+            Some(Self {
+                sccs,
+                strata,
+                rules_by_scc,
+                generated_query_rules,
+                est_memory_peak: self.est_memory_peak,
+                rel_arities: self.rel_arities.clone(),
+            })
+        })();
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(result),
+        }
     }
 
     /// Check if this plan has any recursion

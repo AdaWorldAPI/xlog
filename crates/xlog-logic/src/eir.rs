@@ -30,9 +30,12 @@ fn acquire(
     bytes: usize,
 ) -> Result<()> {
     if let Some(scope) = scope.as_deref_mut() {
-        scope.acquire(u64::try_from(bytes).map_err(|_| {
-            XlogError::Compilation("epistemic representation allocation overflow".into())
-        })?)?;
+        scope.acquire(
+            u64::try_from(bytes).map_err(|_| XlogError::AllocationRefused {
+                operation: "epistemic representation allocation overflow",
+                reason: xlog_core::error::AllocationRefusal::ExtentOverflow,
+            })?,
+        )?;
     }
     Ok(())
 }
@@ -152,40 +155,7 @@ pub(crate) fn convert_term_with_allocation_owner(
 
 /// Heap geometry of an existing EIR term before the original term clone.
 pub fn term_clone_allocation_bytes(term: &EirTerm) -> Result<u64> {
-    let overflow = || XlogError::Compilation("epistemic term clone allocation overflow".into());
-    let text = |text: &str| u64::try_from(text.len()).map_err(|_| overflow());
-    let terms = |terms: &[EirTerm]| -> Result<u64> {
-        let mut bytes = u64::try_from(
-            terms
-                .len()
-                .checked_mul(std::mem::size_of::<EirTerm>())
-                .ok_or_else(overflow)?,
-        )
-        .map_err(|_| overflow())?;
-        for term in terms {
-            bytes = bytes
-                .checked_add(term_clone_allocation_bytes(term)?)
-                .ok_or_else(overflow)?;
-        }
-        Ok(bytes)
-    };
-    match term {
-        EirTerm::Variable(value) | EirTerm::String(value) | EirTerm::PredRef(value) => text(value),
-        EirTerm::List(items) => terms(items),
-        EirTerm::Cons { head, tail } => (2 * std::mem::size_of::<EirTerm>() as u64)
-            .checked_add(term_clone_allocation_bytes(head)?)
-            .and_then(|bytes| bytes.checked_add(term_clone_allocation_bytes(tail).ok()?))
-            .ok_or_else(overflow),
-        EirTerm::Compound { functor, args } => text(functor)?
-            .checked_add(terms(args)?)
-            .ok_or_else(overflow),
-        EirTerm::Aggregate { op, variable } => {
-            text(op)?.checked_add(text(variable)?).ok_or_else(overflow)
-        }
-        EirTerm::Anonymous | EirTerm::Integer(_) | EirTerm::FloatBits(_) | EirTerm::Symbol(_) => {
-            Ok(0)
-        }
-    }
+    term.owned_allocation_bytes()
 }
 
 fn convert_term_core(

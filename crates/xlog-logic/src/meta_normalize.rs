@@ -123,9 +123,10 @@ impl<'a> MetaNormalizer<'a> {
         match self.allocation_owner.as_deref_mut() {
             Some(reserve) => {
                 let (text, _) = symbol::resolve_with_allocation_owner(id, &mut |bytes| {
-                    reserve(u64::try_from(bytes).map_err(|_| {
-                        XlogError::Compilation("meta symbol allocation extent overflow".into())
-                    })?)
+                    reserve(
+                        u64::try_from(bytes)
+                            .map_err(|_| XlogError::allocation_extent_overflow("meta symbol"))?,
+                    )
                 })?;
                 Ok(text)
             }
@@ -136,9 +137,10 @@ impl<'a> MetaNormalizer<'a> {
     fn intern_symbol(&mut self, text: &str) -> Result<u32> {
         match self.allocation_owner.as_deref_mut() {
             Some(reserve) => symbol::intern_with_allocation_owner(text, &mut |bytes| {
-                reserve(u64::try_from(bytes).map_err(|_| {
-                    XlogError::Compilation("meta symbol allocation extent overflow".into())
-                })?)
+                reserve(
+                    u64::try_from(bytes)
+                        .map_err(|_| XlogError::allocation_extent_overflow("meta symbol"))?,
+                )
             }),
             None => Ok(symbol::intern(text)),
         }
@@ -157,14 +159,12 @@ impl<'a> MetaNormalizer<'a> {
 
     fn acquire_hash_growth<K, V>(&mut self, length: usize, capacity: usize) -> Result<()> {
         if self.allocation_owner.is_some() && length == capacity {
-            let count = length.checked_add(1).ok_or_else(|| {
-                XlogError::Compilation("meta table allocation extent overflow".into())
-            })?;
+            let count = length
+                .checked_add(1)
+                .ok_or_else(|| XlogError::allocation_extent_overflow("meta table"))?;
             let bytes = crate::compile::hash_allocation_bytes::<K, V>(count)?
                 .checked_mul(2)
-                .ok_or_else(|| {
-                    XlogError::Compilation("meta table allocation extent overflow".into())
-                })?;
+                .ok_or_else(|| XlogError::allocation_extent_overflow("meta table"))?;
             self.acquire(bytes)?;
         }
         Ok(())
@@ -173,9 +173,9 @@ impl<'a> MetaNormalizer<'a> {
     fn acquire_vector_growth<T>(&mut self, length: usize, capacity: usize) -> Result<()> {
         if self.allocation_owner.is_some() && length == capacity {
             self.acquire(crate::compile::push_vector_allocation_bytes::<T>(
-                length.checked_add(1).ok_or_else(|| {
-                    XlogError::Compilation("meta vector allocation extent overflow".into())
-                })?,
+                length
+                    .checked_add(1)
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("meta vector"))?,
             )?)?;
         }
         Ok(())
@@ -223,7 +223,7 @@ impl<'a> MetaNormalizer<'a> {
             for fact in self.source_facts.get(predicate).into_iter().flatten() {
                 bytes = bytes
                     .checked_add(fact.owned_allocation_bytes()?)
-                    .ok_or_else(|| meta_error("finite fact clone allocation extent overflow"))?;
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("finite fact clone"))?;
             }
             self.acquire(bytes)?;
         }
@@ -250,7 +250,7 @@ impl<'a> MetaNormalizer<'a> {
                 + 12 * std::mem::size_of::<usize>()) as u64;
             self.acquire(
                 node.checked_mul(height + 1)
-                    .ok_or_else(|| meta_error("finite tree allocation extent overflow"))?,
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("finite tree"))?,
             )?;
         }
         Ok(())
@@ -262,9 +262,7 @@ impl<'a> MetaNormalizer<'a> {
     ) -> Result<Self> {
         if let Some(reserve) = allocation_owner.as_deref_mut() {
             use crate::compile::hash_allocation_bytes;
-            let overflow = || {
-                XlogError::Compilation("finite meta environment allocation extent overflow".into())
-            };
+            let overflow = || XlogError::allocation_extent_overflow("finite meta environment");
             let add = |left: u64, right: u64| left.checked_add(right).ok_or_else(overflow);
             let vector = |count: usize, width: usize| {
                 count
@@ -514,7 +512,7 @@ impl<'a> MetaNormalizer<'a> {
                     .checked_add(crate::compile::push_vector_allocation_bytes::<TypeRef>(
                         predicate.types.len(),
                     )?)
-                    .ok_or_else(|| meta_error("meta type allocation extent overflow"))?;
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("meta type"))?;
                 for typ in predicate
                     .types
                     .iter()
@@ -522,7 +520,7 @@ impl<'a> MetaNormalizer<'a> {
                 {
                     bytes = bytes
                         .checked_add(typ.owned_allocation_bytes()?)
-                        .ok_or_else(|| meta_error("meta type allocation extent overflow"))?;
+                        .ok_or_else(|| XlogError::allocation_extent_overflow("meta type"))?;
                 }
             }
             self.acquire(bytes)?;
@@ -555,9 +553,8 @@ impl<'a> MetaNormalizer<'a> {
                     });
                 });
             }
-            let (count, bytes) = variables.ok_or_else(|| {
-                XlogError::Compilation("finite meta binding allocation extent overflow".into())
-            })?;
+            let (count, bytes) = variables
+                .ok_or_else(|| XlogError::allocation_extent_overflow("finite meta binding"))?;
             self.acquire(crate::compile::hash_allocation_bytes::<String, ScalarType>(
                 count,
             )?)?;
@@ -577,9 +574,7 @@ impl<'a> MetaNormalizer<'a> {
                     if is_meta_predicate(&atom.predicate)
                         || is_blocked_dynamic_predicate(&atom.predicate)
                     {
-                        return Err(meta_error(
-                            "safe meta-predicates are not supported under negation in the finite meta normalization subset",
-                        ));
+                        return Err(meta_error(format_args!("{}", "safe meta-predicates are not supported under negation in the finite meta normalization subset"), &mut self.allocation_owner));
                     }
                     out.push(BodyLiteral::Negated(self.normalize_atom_values(atom)?));
                 }
@@ -617,7 +612,10 @@ impl<'a> MetaNormalizer<'a> {
     ) -> Result<Vec<BodyLiteral>> {
         self.acquire_vector::<BodyLiteral>(1)?;
         if is_blocked_dynamic_predicate(&atom.predicate) {
-            return Err(dynamic_predicate_error(&atom.predicate));
+            return Err(dynamic_predicate_error(
+                &atom.predicate,
+                &mut self.allocation_owner,
+            ));
         }
 
         match atom.predicate.as_str() {
@@ -725,7 +723,11 @@ impl<'a> MetaNormalizer<'a> {
                 Ok(term.clone())
             }
             _ => Err(meta_error(
-                "list<T> column expects a finite list literal, list id, or variable",
+                format_args!(
+                    "{}",
+                    "list<T> column expects a finite list literal, list id, or variable"
+                ),
+                &mut self.allocation_owner,
             )),
         }
     }
@@ -736,7 +738,7 @@ impl<'a> MetaNormalizer<'a> {
         bound: &HashMap<String, ScalarType>,
         kind: MetaTruthKind,
     ) -> Result<Vec<BodyLiteral>> {
-        require_arity(atom, 1)?;
+        require_arity(atom, 1, &mut self.allocation_owner)?;
         let truth = match kind {
             MetaTruthKind::Ground => self.is_ground(&atom.terms[0], bound),
             MetaTruthKind::Var => self.is_var(&atom.terms[0], bound),
@@ -754,7 +756,7 @@ impl<'a> MetaNormalizer<'a> {
         atom: &Atom,
         bound: &HashMap<String, ScalarType>,
     ) -> Result<Vec<BodyLiteral>> {
-        require_arity(atom, 3)?;
+        require_arity(atom, 3, &mut self.allocation_owner)?;
         let term = self.term_id_or_bound_variable(&atom.terms[0], bound, "functor/3")?;
         let name = self.normalize_symbol_argument(&atom.terms[1], "functor/3 name")?;
         let arity = self.normalize_u32_argument(&atom.terms[2], "functor/3 arity")?;
@@ -794,16 +796,14 @@ impl<'a> MetaNormalizer<'a> {
         atom: &Atom,
         bound: &HashMap<String, ScalarType>,
     ) -> Result<Vec<BodyLiteral>> {
-        require_arity(atom, 3)?;
+        require_arity(atom, 3, &mut self.allocation_owner)?;
         let template = &atom.terms[0];
         self.acquire_term_clone(&atom.terms[1])?;
-        let goal = compound_goal_atom(&atom.terms[1], "findall/3")?;
+        let goal = compound_goal_atom(&atom.terms[1], "findall/3", &mut self.allocation_owner)?;
         self.acquire_term_clone(&atom.terms[2])?;
         let out_list = atom.terms[2].clone();
         if self.derived_predicates.contains(&goal.predicate) {
-            return Err(meta_error(
-                "findall/3 is limited to finite source facts; derived goals are reserved for a later aggregate-backed collection path",
-            ));
+            return Err(meta_error(format_args!("{}", "findall/3 is limited to finite source facts; derived goals are reserved for a later aggregate-backed collection path"), &mut self.allocation_owner));
         }
 
         if self.allocation_owner.is_some() {
@@ -813,7 +813,7 @@ impl<'a> MetaNormalizer<'a> {
                     .and_then(|(n, b)| Some((n.checked_add(1)?, b.checked_add(name.len() as u64)?)))
             });
             let (count, text) = variables
-                .ok_or_else(|| meta_error("finite variable allocation extent overflow"))?;
+                .ok_or_else(|| XlogError::allocation_extent_overflow("finite variable"))?;
             self.acquire_vector::<&str>(count)?;
             self.acquire(crate::compile::hash_allocation_bytes::<String, ()>(count)?)?;
             self.acquire(text)?;
@@ -834,7 +834,7 @@ impl<'a> MetaNormalizer<'a> {
                 .try_fold(0u64, |total, n| {
                     total
                         .checked_add(n)
-                        .ok_or_else(|| meta_error("finite variable allocation extent overflow"))
+                        .ok_or_else(|| XlogError::allocation_extent_overflow("finite variable"))
                 })?;
             self.acquire(text)?;
         }
@@ -849,9 +849,7 @@ impl<'a> MetaNormalizer<'a> {
                 if bound.contains_key(name) {
                     group_positions.push((idx, name.clone()));
                 } else if !template_vars.contains(name) {
-                    return Err(meta_error(
-                        "unsafe findall/3 goal variable is neither bound before findall nor collected by the template",
-                    ));
+                    return Err(meta_error(format_args!("{}", "unsafe findall/3 goal variable is neither bound before findall nor collected by the template"), &mut self.allocation_owner));
                 }
             }
         }
@@ -955,10 +953,13 @@ impl<'a> MetaNormalizer<'a> {
 
     fn expand_maplist(&mut self, atom: &Atom) -> Result<Vec<BodyLiteral>> {
         if atom.terms.len() != 2 && atom.terms.len() != 3 {
-            return Err(meta_error(format!(
-                "maplist expects unary or binary form, got {} arguments",
-                atom.terms.len()
-            )));
+            return Err(meta_error(
+                format_args!(
+                    "maplist expects unary or binary form, got {} arguments",
+                    atom.terms.len()
+                ),
+                &mut self.allocation_owner,
+            ));
         }
         let pred = match &atom.terms[0] {
             Term::Symbol(id) => self.resolve_symbol(*id)?,
@@ -966,14 +967,19 @@ impl<'a> MetaNormalizer<'a> {
                 self.acquire(name.len() as u64)?;
                 name.clone()
             }
-            term => static_pred_name(term)?,
+            term => static_pred_name(term, &mut self.allocation_owner)?,
         };
         if self.derived_predicates.contains(&pred) {
             return Err(meta_error(
-                "maplist is limited to finite source facts or literal empty lists",
+                format_args!(
+                    "{}",
+                    "maplist is limited to finite source facts or literal empty lists"
+                ),
+                &mut self.allocation_owner,
             ));
         }
-        let input_items = finite_list_items(&atom.terms[1], "maplist input")?;
+        let input_items =
+            finite_list_items(&atom.terms[1], "maplist input", &mut self.allocation_owner)?;
         let input_type = self
             .cloned_column_type(&pred, 0)?
             .unwrap_or_else(|| infer_type_ref_from_terms(input_items));
@@ -1053,7 +1059,8 @@ impl<'a> MetaNormalizer<'a> {
     fn maplist_unary_holds(&mut self, pred: &str, input: &Term) -> Result<bool> {
         let Term::List(items) = input else {
             return Err(meta_error(
-                "maplist input did not normalize to a finite list",
+                format_args!("{}", "maplist input did not normalize to a finite list"),
+                &mut self.allocation_owner,
             ));
         };
         let facts = self.cloned_source_facts(pred)?;
@@ -1080,7 +1087,8 @@ impl<'a> MetaNormalizer<'a> {
     ) -> Result<Vec<Vec<Term>>> {
         let Term::List(items) = input else {
             return Err(meta_error(
-                "maplist input did not normalize to a finite list",
+                format_args!("{}", "maplist input did not normalize to a finite list"),
+                &mut self.allocation_owner,
             ));
         };
         if items.is_empty() {
@@ -1122,7 +1130,7 @@ impl<'a> MetaNormalizer<'a> {
                     bytes = bytes
                         .checked_add(name.len() as u64)
                         .and_then(|n| n.checked_add(term_bytes))
-                        .ok_or_else(|| meta_error("finite binding allocation extent overflow"))?;
+                        .ok_or_else(|| XlogError::allocation_extent_overflow("finite binding"))?;
                 }
             }
             self.acquire(bytes)?;
@@ -1159,17 +1167,21 @@ impl<'a> MetaNormalizer<'a> {
         let value = match template {
             Term::Variable(name) => {
                 let value = bindings.get(name).ok_or_else(|| {
-                    meta_error(format!(
-                        "findall/3 template variable '{}' is not bound by goal",
-                        name
-                    ))
+                    meta_error(
+                        format_args!(
+                            "findall/3 template variable '{}' is not bound by goal",
+                            name
+                        ),
+                        &mut self.allocation_owner,
+                    )
                 })?;
                 self.acquire_term_clone(value)?;
                 value.clone()
             }
             Term::Anonymous => {
                 return Err(meta_error(
-                    "findall/3 template cannot be the anonymous wildcard",
+                    format_args!("{}", "findall/3 template cannot be the anonymous wildcard"),
+                    &mut self.allocation_owner,
                 ))
             }
             Term::List(items) => {
@@ -1210,10 +1222,13 @@ impl<'a> MetaNormalizer<'a> {
                             .unwrap_or(TypeRef::Scalar(ScalarType::U64)));
                     }
                 }
-                Err(meta_error(format!(
-                    "findall/3 template variable '{}' is not bound by the goal",
-                    name
-                )))
+                Err(meta_error(
+                    format_args!(
+                        "findall/3 template variable '{}' is not bound by the goal",
+                        name
+                    ),
+                    &mut self.allocation_owner,
+                ))
             }
             Term::Integer(_) => Ok(TypeRef::Scalar(ScalarType::U32)),
             Term::Float(_) => Ok(TypeRef::Scalar(ScalarType::F64)),
@@ -1222,7 +1237,11 @@ impl<'a> MetaNormalizer<'a> {
                 Ok(TypeRef::Term)
             }
             Term::Anonymous | Term::Aggregate(_) => Err(meta_error(
-                "findall/3 template must be a finite scalar or term expression",
+                format_args!(
+                    "{}",
+                    "findall/3 template must be a finite scalar or term expression"
+                ),
+                &mut self.allocation_owner,
             )),
         }
     }
@@ -1238,9 +1257,10 @@ impl<'a> MetaNormalizer<'a> {
                 self.acquire_term_clone(term)?;
                 Ok(term.clone())
             }
-            Term::Variable(_) | Term::Anonymous => Err(meta_error(format!(
-                "{context} requires a known finite term before runtime inspection"
-            ))),
+            Term::Variable(_) | Term::Anonymous => Err(meta_error(
+                format_args!("{context} requires a known finite term before runtime inspection"),
+                &mut self.allocation_owner,
+            )),
             _ => Ok(Term::Integer(
                 self.register_term(term, ExpectedTerm::Any)? as i64
             )),
@@ -1267,7 +1287,11 @@ impl<'a> MetaNormalizer<'a> {
                 ))
             }
             _ => Err(meta_error(
-                "univ parts must be a finite list literal or a list variable",
+                format_args!(
+                    "{}",
+                    "univ parts must be a finite list literal or a list variable"
+                ),
+                &mut self.allocation_owner,
             )),
         }
     }
@@ -1277,9 +1301,10 @@ impl<'a> MetaNormalizer<'a> {
         match term {
             Term::Variable(_) | Term::Anonymous => Ok(term.clone()),
             Term::Symbol(_) | Term::String(_) => Ok(term.clone()),
-            _ => Err(meta_error(format!(
-                "{context} must be a symbol or variable"
-            ))),
+            _ => Err(meta_error(
+                format_args!("{context} must be a symbol or variable"),
+                &mut self.allocation_owner,
+            )),
         }
     }
 
@@ -1288,9 +1313,10 @@ impl<'a> MetaNormalizer<'a> {
         match term {
             Term::Variable(_) | Term::Anonymous => Ok(term.clone()),
             Term::Integer(value) if *value >= 0 && *value <= u32::MAX as i64 => Ok(term.clone()),
-            _ => Err(meta_error(format!(
-                "{context} must be a u32 integer or variable"
-            ))),
+            _ => Err(meta_error(
+                format_args!("{context} must be a u32 integer or variable"),
+                &mut self.allocation_owner,
+            )),
         }
     }
 
@@ -1334,7 +1360,7 @@ impl<'a> MetaNormalizer<'a> {
             if let Term::Variable(name) = term {
                 let typ = self
                     .column_type(&atom.predicate, idx)
-                    .and_then(|typ| self.storage_type_for_type_ref(typ).ok())
+                    .and_then(|typ| self.storage_type_for_type_ref(typ))
                     .unwrap_or(ScalarType::U64);
                 bound.insert(name.clone(), typ);
             }
@@ -1383,7 +1409,7 @@ impl<'a> MetaNormalizer<'a> {
                 let functor_id = self.register_term(&Term::Symbol(symbol_id), ExpectedTerm::Any)?;
                 if self.allocation_owner.is_some() {
                     let count = args.len().checked_add(1).ok_or_else(|| {
-                        XlogError::Compilation("meta term parts allocation extent overflow".into())
+                        XlogError::allocation_extent_overflow("meta term parts")
                     })?;
                     self.acquire(crate::compile::push_vector_allocation_bytes::<u64>(count)?)?;
                     self.acquire(functor.len() as u64)?;
@@ -1392,7 +1418,7 @@ impl<'a> MetaNormalizer<'a> {
                     for id in &arg_ids {
                         text_bytes = text_bytes
                             .checked_add(crate::compile::formatted_text_allocation_bytes(format_args!("{id}"))?)
-                            .ok_or_else(|| XlogError::Compilation("meta term text allocation extent overflow".into()))?;
+                            .ok_or_else(|| XlogError::allocation_extent_overflow("meta term text"))?;
                     }
                     self.acquire_vector::<String>(arg_ids.len())?;
                     self.acquire(text_bytes)?;
@@ -1410,40 +1436,32 @@ impl<'a> MetaNormalizer<'a> {
                 )
             }
             Term::List(_) | Term::Cons { .. } => {
-                return Err(meta_error(
-                    "finite list terms inside term values are reserved for a later term-value encoding path",
-                ))
+                return Err(meta_error(format_args!("{}", "finite list terms inside term values are reserved for a later term-value encoding path"), &mut self.allocation_owner))
             }
             Term::Variable(_) | Term::Anonymous => {
-                return Err(meta_error(
-                    "finite term registration requires a ground source term",
-                ))
+                return Err(meta_error(format_args!("{}", "finite term registration requires a ground source term"), &mut self.allocation_owner))
             }
             Term::Aggregate(_) => {
-                return Err(meta_error(
-                    "aggregate terms cannot be registered as finite meta terms",
-                ))
+                return Err(meta_error(format_args!("{}", "aggregate terms cannot be registered as finite meta terms"), &mut self.allocation_owner))
             }
             Term::Compound { .. } => {
-                return Err(meta_error(
-                    "predref columns require a static predicate reference, not a compound term",
-                ))
+                return Err(meta_error(format_args!("{}", "predref columns require a static predicate reference, not a compound term"), &mut self.allocation_owner))
             }
             Term::Integer(_) | Term::Float(_) | Term::String(_) => {
-                return Err(meta_error(
-                    "predref columns require a static predicate reference",
-                ))
+                return Err(meta_error(format_args!("{}", "predref columns require a static predicate reference"), &mut self.allocation_owner))
             }
         };
 
         if expected == ExpectedTerm::Compound && !matches!(kind, RegisteredTerm::Compound { .. }) {
             return Err(meta_error(
-                "compound column requires a finite compound term",
+                format_args!("{}", "compound column requires a finite compound term"),
+                &mut self.allocation_owner,
             ));
         }
         if expected == ExpectedTerm::PredRef && !matches!(kind, RegisteredTerm::PredRef) {
             return Err(meta_error(
-                "predref column requires a static predicate reference",
+                format_args!("{}", "predref column requires a static predicate reference"),
+                &mut self.allocation_owner,
             ));
         }
 
@@ -1466,8 +1484,7 @@ impl<'a> MetaNormalizer<'a> {
         self.append_term_helper_facts()?;
 
         if self.allocation_owner.is_some() {
-            let overflow =
-                || XlogError::Compilation("meta helper output allocation extent overflow".into());
+            let overflow = || XlogError::allocation_extent_overflow("meta helper output");
             let mut bytes =
                 crate::compile::hash_allocation_bytes::<String, ()>(program.predicates.len())?;
             for predicate in &program.predicates {
@@ -1578,11 +1595,7 @@ impl<'a> MetaNormalizer<'a> {
                                     .checked_mul(std::mem::size_of::<u64>() as u64)?,
                             )
                         })
-                        .ok_or_else(|| {
-                            XlogError::Compilation(
-                                "meta term record allocation extent overflow".into(),
-                            )
-                        })?;
+                        .ok_or_else(|| XlogError::allocation_extent_overflow("meta term record"))?;
                 }
             }
             self.acquire(bytes)?;
@@ -1638,9 +1651,11 @@ impl<'a> MetaNormalizer<'a> {
     fn register_helper_decl(&mut self, name: &str, columns: Vec<PredColumn>) -> Result<()> {
         self.acquire(name.len() as u64)?;
         if self.allocation_owner.is_some() && !self.helper_decls.contains_key(name) {
-            let mut entries = self.helper_decls.len().checked_add(1).ok_or_else(|| {
-                XlogError::Compilation("meta declaration allocation extent overflow".into())
-            })?;
+            let mut entries = self
+                .helper_decls
+                .len()
+                .checked_add(1)
+                .ok_or_else(|| XlogError::allocation_extent_overflow("meta declaration"))?;
             let mut height = 1u64;
             while entries >= 6 {
                 entries /= 6;
@@ -1652,9 +1667,11 @@ impl<'a> MetaNormalizer<'a> {
                 + 2 * std::mem::size_of::<u16>()
                 + 11 * std::mem::size_of::<(String, Vec<PredColumn>)>()
                 + 12 * std::mem::size_of::<usize>();
-            self.acquire((node as u64).checked_mul(height + 1).ok_or_else(|| {
-                XlogError::Compilation("meta declaration allocation extent overflow".into())
-            })?)?;
+            self.acquire(
+                (node as u64)
+                    .checked_mul(height + 1)
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("meta declaration"))?,
+            )?;
         }
         self.helper_decls.entry(name.to_string()).or_insert(columns);
         Ok(())
@@ -1695,16 +1712,12 @@ impl<'a> MetaNormalizer<'a> {
         })
     }
 
-    fn storage_type_for_type_ref(&self, typ: &TypeRef) -> Result<ScalarType> {
+    fn storage_type_for_type_ref(&self, typ: &TypeRef) -> Option<ScalarType> {
         match typ {
-            TypeRef::Scalar(ty) => Ok(*ty),
-            TypeRef::Domain(name) => self
-                .domains
-                .get(name)
-                .copied()
-                .ok_or_else(|| meta_error(format!("unknown domain alias '{name}'"))),
+            TypeRef::Scalar(ty) => Some(*ty),
+            TypeRef::Domain(name) => self.domains.get(name).copied(),
             TypeRef::List(_) | TypeRef::Term | TypeRef::Compound | TypeRef::PredRef => {
-                Ok(TERM_ID_TYPE)
+                Some(TERM_ID_TYPE)
             }
         }
     }
@@ -1717,50 +1730,66 @@ enum MetaTruthKind {
     NonVar,
 }
 
-fn require_arity(atom: &Atom, expected: usize) -> Result<()> {
+fn require_arity(
+    atom: &Atom,
+    expected: usize,
+    owner: &mut Option<&mut dyn FnMut(u64) -> Result<Arc<dyn Send + Sync>>>,
+) -> Result<()> {
     if atom.terms.len() == expected {
         Ok(())
     } else {
-        Err(meta_error(format!(
-            "{} expects {} arguments, got {}",
-            atom.predicate,
-            expected,
-            atom.terms.len()
-        )))
+        Err(meta_error(
+            format_args!(
+                "{} expects {} arguments, got {}",
+                atom.predicate,
+                expected,
+                atom.terms.len()
+            ),
+            owner,
+        ))
     }
 }
 
-fn compound_goal_atom(term: &Term, context: &str) -> Result<Atom> {
+fn compound_goal_atom(
+    term: &Term,
+    context: &str,
+    owner: &mut Option<&mut dyn FnMut(u64) -> Result<Arc<dyn Send + Sync>>>,
+) -> Result<Atom> {
     match term {
         Term::Compound { functor, args } => Ok(Atom {
             predicate: functor.clone(),
             terms: args.clone(),
         }),
-        _ => Err(meta_error(format!(
-            "{context} goal must be a finite atom expression"
-        ))),
+        _ => Err(meta_error(
+            format_args!("{context} goal must be a finite atom expression"),
+            owner,
+        )),
     }
 }
 
-fn finite_list_items<'a>(term: &'a Term, context: &str) -> Result<&'a [Term]> {
+fn finite_list_items<'a>(
+    term: &'a Term,
+    context: &str,
+    owner: &mut Option<&mut dyn FnMut(u64) -> Result<Arc<dyn Send + Sync>>>,
+) -> Result<&'a [Term]> {
     match term {
         Term::List(items) => Ok(items),
-        _ => Err(meta_error(format!(
-            "{context} requires a finite list literal in the safe meta subset"
-        ))),
+        _ => Err(meta_error(
+            format_args!("{context} requires a finite list literal in the safe meta subset"),
+            owner,
+        )),
     }
 }
 
-fn static_pred_name(term: &Term) -> Result<String> {
+fn static_pred_name(
+    term: &Term,
+    owner: &mut Option<&mut dyn FnMut(u64) -> Result<Arc<dyn Send + Sync>>>,
+) -> Result<String> {
     match term {
         Term::Symbol(id) => Ok(symbol::resolve(*id)),
         Term::String(name) | Term::PredRef(name) => Ok(name.clone()),
-        Term::Variable(_) | Term::Anonymous => Err(meta_error(
-            "maplist requires a static predicate reference; runtime-variable predicate names are rejected",
-        )),
-        _ => Err(meta_error(
-            "maplist predicate argument must be a static predicate reference",
-        )),
+        Term::Variable(_) | Term::Anonymous => Err(meta_error(format_args!("{}", "maplist requires a static predicate reference; runtime-variable predicate names are rejected"), owner)),
+        _ => Err(meta_error(format_args!("{}", "maplist predicate argument must be a static predicate reference"), owner)),
     }
 }
 
@@ -1773,12 +1802,12 @@ pub(crate) fn static_meta_predicate_dependency(atom: &Atom) -> Option<String> {
         "findall" => atom
             .terms
             .get(1)
-            .and_then(|term| compound_goal_atom(term, "findall/3").ok())
+            .and_then(|term| compound_goal_atom(term, "findall/3", &mut None).ok())
             .map(|goal| goal.predicate),
         "maplist" => atom
             .terms
             .first()
-            .and_then(|term| static_pred_name(term).ok()),
+            .and_then(|term| static_pred_name(term, &mut None).ok()),
         _ => None,
     }
 }
@@ -1814,8 +1843,7 @@ fn cartesian_product(
     let mut rows: Vec<Vec<Term>> = vec![Vec::new()];
     for choice in choices {
         if let Some(allocate) = allocate.as_deref_mut() {
-            let overflow =
-                || XlogError::Compilation("finite meta product allocation extent overflow".into());
+            let overflow = || XlogError::allocation_extent_overflow("finite meta product");
             let next_rows = rows.len().checked_mul(choice.len()).ok_or_else(overflow)?;
             // The actual push-built outer vector can grow geometrically; its
             // old and replacement buffers coexist at growth. Every row clone
@@ -1867,7 +1895,7 @@ fn cartesian_product(
 }
 
 fn joined_text_bytes(items: &[String], separator: &str) -> Result<u64> {
-    let overflow = || XlogError::Compilation("meta joined text allocation extent overflow".into());
+    let overflow = || XlogError::allocation_extent_overflow("meta joined text");
     let mut bytes = items
         .len()
         .saturating_sub(1)
@@ -1901,17 +1929,18 @@ fn term_match_key(
         Term::Float(value) => format_owned(format_args!("f:{}", value.to_bits()), owner),
         Term::String(value) => format_owned(format_args!("s:{value}"), owner),
         Term::Symbol(id) => {
-            let text = match owner.as_deref_mut() {
-                Some(reserve) => {
-                    symbol::resolve_with_allocation_owner(*id, &mut |bytes| {
-                        reserve(u64::try_from(bytes).map_err(|_| {
-                            XlogError::Compilation("meta symbol allocation extent overflow".into())
-                        })?)
-                    })?
-                    .0
-                }
-                None => symbol::resolve(*id),
-            };
+            let text =
+                match owner.as_deref_mut() {
+                    Some(reserve) => {
+                        symbol::resolve_with_allocation_owner(*id, &mut |bytes| {
+                            reserve(u64::try_from(bytes).map_err(|_| {
+                                XlogError::allocation_extent_overflow("meta symbol")
+                            })?)
+                        })?
+                        .0
+                    }
+                    None => symbol::resolve(*id),
+                };
             format_owned(format_args!("sym:{text}"), owner)
         }
         Term::List(items) => {
@@ -1919,11 +1948,7 @@ fn term_match_key(
                 reserve(
                     (items.len() as u64)
                         .checked_mul(std::mem::size_of::<String>() as u64)
-                        .ok_or_else(|| {
-                            XlogError::Compilation(
-                                "meta key vector allocation extent overflow".into(),
-                            )
-                        })?,
+                        .ok_or_else(|| XlogError::allocation_extent_overflow("meta key vector"))?,
                 )?;
             }
             let keys = items
@@ -1946,11 +1971,7 @@ fn term_match_key(
                 reserve(
                     (args.len() as u64)
                         .checked_mul(std::mem::size_of::<String>() as u64)
-                        .ok_or_else(|| {
-                            XlogError::Compilation(
-                                "meta key vector allocation extent overflow".into(),
-                            )
-                        })?,
+                        .ok_or_else(|| XlogError::allocation_extent_overflow("meta key vector"))?,
                 )?;
             }
             let keys = args
@@ -2033,13 +2054,26 @@ fn is_blocked_dynamic_predicate(name: &str) -> bool {
     matches!(name, "call" | "assert" | "asserta" | "assertz" | "retract")
 }
 
-fn dynamic_predicate_error(name: &str) -> XlogError {
+fn dynamic_predicate_error(
+    name: &str,
+    owner: &mut Option<&mut dyn FnMut(u64) -> Result<Arc<dyn Send + Sync>>>,
+) -> XlogError {
     match name {
-        "call" => meta_error("dynamic call/N is outside the safe meta subset"),
-        "assert" | "asserta" | "assertz" | "retract" => {
-            meta_error("dynamic database mutation is outside the safe meta subset")
-        }
-        _ => meta_error("unsupported dynamic meta predicate"),
+        "call" => meta_error(
+            format_args!("{}", "dynamic call/N is outside the safe meta subset"),
+            owner,
+        ),
+        "assert" | "asserta" | "assertz" | "retract" => meta_error(
+            format_args!(
+                "{}",
+                "dynamic database mutation is outside the safe meta subset"
+            ),
+            owner,
+        ),
+        _ => meta_error(
+            format_args!("{}", "unsupported dynamic meta predicate"),
+            owner,
+        ),
     }
 }
 
@@ -2059,6 +2093,18 @@ fn fail_pred() -> &'static str {
     "__xlog_meta_fail"
 }
 
-fn meta_error(message: impl Into<String>) -> XlogError {
-    XlogError::Compilation(format!("meta normalization error: {}", message.into()))
+fn meta_error(
+    message: std::fmt::Arguments<'_>,
+    owner: &mut Option<&mut dyn FnMut(u64) -> Result<Arc<dyn Send + Sync>>>,
+) -> XlogError {
+    match xlog_core::CompilationAllocationScope::prepare_diagnostic(
+        xlog_core::error::formatted_text_allocation_bytes(format_args!(
+            "meta normalization error: {message}"
+        )),
+        owner.as_deref_mut(),
+    ) {
+        Ok(producer) => producer
+            .finish(|| XlogError::Compilation(format!("meta normalization error: {message}"))),
+        Err(error) => error,
+    }
 }

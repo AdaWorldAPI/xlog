@@ -2,6 +2,32 @@
 
 use xlog_core::{Result, ScalarType, XlogError};
 
+type AuthoredIdentityAllocationOwner<'a> =
+    Option<&'a mut dyn FnMut(u64) -> Result<std::sync::Arc<dyn Send + Sync>>>;
+
+fn authored_identity_error(
+    context: std::fmt::Arguments<'_>,
+    reserve: &mut AuthoredIdentityAllocationOwner<'_>,
+) -> Result<XlogError> {
+    let owners = match reserve.as_deref_mut() {
+        Some(reserve) => {
+            let allocations = reserve(xlog_core::error::formatted_text_allocation_bytes(context)?)?;
+            let metadata = reserve(
+                u64::try_from(xlog_core::error::OwnedDiagnostic::allocation_bytes()).map_err(
+                    |_| XlogError::allocation_extent_overflow("authored identity diagnostic"),
+                )?,
+            )?;
+            Some((allocations, metadata))
+        }
+        None => None,
+    };
+    let error = XlogError::Compilation(format!("{context}"));
+    Ok(match owners {
+        Some((allocations, metadata)) => error.with_diagnostic_owner(allocations, metadata),
+        None => error,
+    })
+}
+
 /// A term in an atom
 #[derive(Debug, Clone, PartialEq)]
 pub enum Term {
@@ -578,11 +604,28 @@ pub struct Constraint {
 impl Constraint {
     /// Return the authored identity required by prepared compilation paths.
     pub fn require_authored_index(&self) -> Result<usize> {
-        self.authored_index.ok_or_else(|| {
-            XlogError::Compilation(
-                "prepared constraint compilation requires authored identities".to_string(),
-            )
-        })
+        self.require_authored_index_core(&mut None)
+    }
+
+    /// Require the same original identity with diagnostic allocation custody.
+    pub fn require_authored_index_with_allocation_owner(
+        &self,
+        reserve: &mut dyn FnMut(u64) -> Result<std::sync::Arc<dyn Send + Sync>>,
+    ) -> Result<usize> {
+        self.require_authored_index_core(&mut Some(reserve))
+    }
+
+    fn require_authored_index_core(
+        &self,
+        reserve: &mut AuthoredIdentityAllocationOwner<'_>,
+    ) -> Result<usize> {
+        match self.authored_index {
+            Some(index) => Ok(index),
+            None => Err(authored_identity_error(
+                format_args!("prepared constraint compilation requires authored identities"),
+                reserve,
+            )?),
+        }
     }
 }
 
@@ -1032,7 +1075,7 @@ struct AstAllocationSize(usize);
 
 impl AstAllocationSize {
     fn overflow() -> XlogError {
-        XlogError::Compilation("AST allocation extent overflow".into())
+        XlogError::allocation_extent_overflow("AST")
     }
 
     fn add(&mut self, bytes: usize) -> Result<()> {
@@ -1378,11 +1421,20 @@ impl Program {
         &mut self,
         authored_source_constraint_count: usize,
     ) -> Result<()> {
+        self.prepare_authored_constraint_identity_core(authored_source_constraint_count, &mut None)
+    }
+
+    fn prepare_authored_constraint_identity_core(
+        &mut self,
+        authored_source_constraint_count: usize,
+        reserve: &mut AuthoredIdentityAllocationOwner<'_>,
+    ) -> Result<()> {
         if let Some(existing_bound) = self.authored_constraint_source_bound {
             if existing_bound != authored_source_constraint_count {
-                return Err(XlogError::Compilation(format!(
-                    "authored constraint source bound {existing_bound} does not match requested bound {authored_source_constraint_count}"
-                )));
+                return Err(authored_identity_error(
+                    format_args!("authored constraint source bound {existing_bound} does not match requested bound {authored_source_constraint_count}"),
+                    reserve,
+                )?);
             }
         }
 
@@ -1394,11 +1446,14 @@ impl Program {
 
         if assigned == 0 {
             if self.constraints.len() != authored_source_constraint_count {
-                return Err(XlogError::Compilation(format!(
-                    "unassigned constraint count {} does not match authored source bound {}",
-                    self.constraints.len(),
-                    authored_source_constraint_count
-                )));
+                return Err(authored_identity_error(
+                    format_args!(
+                        "unassigned constraint count {} does not match authored source bound {}",
+                        self.constraints.len(),
+                        authored_source_constraint_count
+                    ),
+                    reserve,
+                )?);
             }
             for (authored_index, constraint) in self.constraints.iter_mut().enumerate() {
                 constraint.authored_index = Some(authored_index);
@@ -1408,25 +1463,34 @@ impl Program {
         }
 
         if assigned != self.constraints.len() {
-            return Err(XlogError::Compilation(
-                "mixed assigned and unassigned authored constraint identities".to_string(),
-            ));
+            return Err(authored_identity_error(
+                format_args!("mixed assigned and unassigned authored constraint identities"),
+                reserve,
+            )?);
         }
 
+        let _seen_receipt = match reserve.as_deref_mut() {
+            Some(reserve) if !self.constraints.is_empty() => Some(reserve(
+                crate::compile::hash_allocation_bytes::<usize, ()>(self.constraints.len())?,
+            )?),
+            _ => None,
+        };
         let mut seen = std::collections::HashSet::with_capacity(self.constraints.len());
         for constraint in &self.constraints {
             let authored_index = constraint
                 .authored_index
                 .expect("all constraint identities were checked as assigned");
             if authored_index >= authored_source_constraint_count {
-                return Err(XlogError::Compilation(format!(
-                    "authored constraint index {authored_index} is outside source bound {authored_source_constraint_count}"
-                )));
+                return Err(authored_identity_error(
+                    format_args!("authored constraint index {authored_index} is outside source bound {authored_source_constraint_count}"),
+                    reserve,
+                )?);
             }
             if !seen.insert(authored_index) {
-                return Err(XlogError::Compilation(format!(
-                    "duplicate authored constraint index {authored_index}"
-                )));
+                return Err(authored_identity_error(
+                    format_args!("duplicate authored constraint index {authored_index}"),
+                    reserve,
+                )?);
             }
         }
         self.authored_constraint_source_bound = Some(authored_source_constraint_count);
@@ -1439,42 +1503,78 @@ impl Program {
         self.prepare_authored_constraint_identity(authored_source_constraint_count)
     }
 
+    /// Prepare the same root identities with original temporary allocation custody.
+    pub fn prepare_authored_constraint_identity_at_root_with_allocation_owner(
+        &mut self,
+        reserve: &mut dyn FnMut(u64) -> Result<std::sync::Arc<dyn Send + Sync>>,
+    ) -> Result<()> {
+        let authored_source_constraint_count = self.constraints.len();
+        self.prepare_authored_constraint_identity_core(
+            authored_source_constraint_count,
+            &mut Some(reserve),
+        )
+    }
+
     /// Validate identities on a program already prepared at the outer boundary.
     pub fn validate_prepared_authored_constraint_identity(&self) -> Result<()> {
+        self.validate_prepared_authored_constraint_identity_core(&mut None)
+    }
+
+    /// Validate the same original identities with temporary allocation custody.
+    pub fn validate_prepared_authored_constraint_identity_with_allocation_owner(
+        &self,
+        reserve: &mut dyn FnMut(u64) -> Result<std::sync::Arc<dyn Send + Sync>>,
+    ) -> Result<()> {
+        self.validate_prepared_authored_constraint_identity_core(&mut Some(reserve))
+    }
+
+    fn validate_prepared_authored_constraint_identity_core(
+        &self,
+        reserve: &mut AuthoredIdentityAllocationOwner<'_>,
+    ) -> Result<()> {
         if self.constraints.is_empty() && self.authored_constraint_source_bound.is_none() {
             return Ok(());
         }
-        let authored_source_constraint_count =
-            self.authored_constraint_source_bound.ok_or_else(|| {
-                XlogError::Compilation(
-                "prepared constraint compilation requires authored identities and a source bound"
-                    .to_string(),
-            )
-            })?;
+        let authored_source_constraint_count = match self.authored_constraint_source_bound {
+            Some(count) => count,
+            None => return Err(authored_identity_error(
+                format_args!("prepared constraint compilation requires authored identities and a source bound"),
+                reserve,
+            )?),
+        };
         if self
             .constraints
             .iter()
             .any(|constraint| constraint.authored_index.is_none())
         {
-            return Err(XlogError::Compilation(
-                "prepared constraint compilation requires authored identities".to_string(),
-            ));
+            return Err(authored_identity_error(
+                format_args!("prepared constraint compilation requires authored identities"),
+                reserve,
+            )?);
         }
 
+        let _seen_receipt = match reserve.as_deref_mut() {
+            Some(reserve) if !self.constraints.is_empty() => Some(reserve(
+                crate::compile::hash_allocation_bytes::<usize, ()>(self.constraints.len())?,
+            )?),
+            _ => None,
+        };
         let mut seen = std::collections::HashSet::with_capacity(self.constraints.len());
         for constraint in &self.constraints {
             let authored_index = constraint
                 .authored_index
                 .expect("all prepared constraint identities were checked as assigned");
             if authored_index >= authored_source_constraint_count {
-                return Err(XlogError::Compilation(format!(
-                    "authored constraint index {authored_index} is outside source bound {authored_source_constraint_count}"
-                )));
+                return Err(authored_identity_error(
+                    format_args!("authored constraint index {authored_index} is outside source bound {authored_source_constraint_count}"),
+                    reserve,
+                )?);
             }
             if !seen.insert(authored_index) {
-                return Err(XlogError::Compilation(format!(
-                    "duplicate authored constraint index {authored_index}"
-                )));
+                return Err(authored_identity_error(
+                    format_args!("duplicate authored constraint index {authored_index}"),
+                    reserve,
+                )?);
             }
         }
         Ok(())

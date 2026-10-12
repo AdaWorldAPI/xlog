@@ -150,7 +150,7 @@ struct OriginalMaterialBytes {
     _metadata: xlog_cuda::SemanticReplayMaterialReservation,
 }
 
-pub(super) fn python_instance_extent<T: pyo3::PyTypeInfo>(py: Python<'_>) -> PyResult<usize> {
+pub(crate) fn python_instance_extent<T: pyo3::PyTypeInfo>(py: Python<'_>) -> PyResult<usize> {
     let class = T::type_object_raw(py);
     // SAFETY: PyTypeInfo supplies the live original type object while attached
     // to Python. Its fixed instance size includes the entire Rust pyclass.
@@ -166,6 +166,12 @@ pub(super) fn python_instance_extent<T: pyo3::PyTypeInfo>(py: Python<'_>) -> PyR
         })
         .ok_or_else(|| invalid("material instance metadata extent overflow"))?;
     Ok(extent)
+}
+
+pub(crate) fn python_integer_extent(py: Python<'_>) -> PyResult<usize> {
+    python_instance_extent::<pyo3::types::PyInt>(py)?
+        .checked_add(std::mem::size_of::<u64>() * std::mem::size_of::<u32>())
+        .ok_or_else(|| invalid("original integer metadata extent overflow"))
 }
 
 pub(super) fn reserve_python_material<T: pyo3::PyTypeInfo>(

@@ -1,7 +1,13 @@
+use pyo3::PyErr;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::PyAnyMethods;
-use pyo3::PyErr;
 use xlog_core::ScalarType;
+
+mod owned_diagnostic;
+
+pub(crate) use owned_diagnostic::{
+    initialize_owned_diagnostic_types, prepare_owned_diagnostic_handoff, PreparedDiagnosticHandoff,
+};
 
 /// Convert XlogError to PyErr (PyRuntimeError).
 ///

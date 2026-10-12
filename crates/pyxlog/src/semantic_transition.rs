@@ -3106,12 +3106,13 @@ impl PySemanticTransitionSession {
         let editable_program = editable_source
             .as_ref()
             .map(|source| Arc::clone(&source.program));
-        let spec = task_evaluation_spec(
+        let spec = task_evaluation_spec_with_allocation_owner(
             &seed.evaluation,
             authority.priority_levels.clone(),
             editable_program.clone(),
             &seed.training_domain,
             initial_program_source,
+            &seed.material_sources,
         )?;
         let (selection, selected_material) =
             decode_selected_replay(&authority.replay, &seed.replay_selection)?;
@@ -3579,7 +3580,7 @@ enum ColdValue {
     Stored(material_source::StoredMaterial),
 }
 
-fn python_metadata_tuple_extent(py: Python<'_>, count: usize) -> PyResult<usize> {
+pub(crate) fn python_metadata_tuple_extent(py: Python<'_>, count: usize) -> PyResult<usize> {
     let slots = count.checked_mul(std::mem::size_of::<usize>())
         .ok_or_else(|| invalid("Python metadata tuple extent overflow"))?;
     let collection = if count == 0 { 0 } else {
@@ -7704,17 +7705,15 @@ fn read_training_domain(value: &ColdValue) -> PyResult<Option<SemanticTrainingDo
         return Ok(None);
     }
     let fields = value.fields(2)?;
-    let manifests = fields[0]
-        .sequence()?
-        .iter()
-        .map(|manifest| {
-            let manifest = manifest.fields(2)?;
-            Ok(SemanticTrainingManifest {
-                identity: replay_digest_identity(manifest[0].text()?)?,
-                caps: unsigned_array(&manifest[1])?,
-            })
-        })
-        .collect::<PyResult<Vec<_>>>()?;
+    let manifest_values = fields[0].sequence()?;
+    let mut manifests = Vec::with_capacity(manifest_values.len());
+    for manifest in manifest_values {
+        let manifest = manifest.fields(2)?;
+        manifests.push(SemanticTrainingManifest {
+            identity: replay_digest_identity(manifest[0].text()?)?,
+            caps: unsigned_array(&manifest[1])?,
+        });
+    }
     let loader = fields[1].fields(5)?;
     let batch = unsigned_array::<4>(&loader[0])?;
     let ColdValue::Integer(training_seed) = &loader[3] else {
@@ -9289,9 +9288,8 @@ fn task_ground_value(value: &ColdValue) -> PyResult<xlog_cuda::SemanticTaskGroun
                 u32::try_from(value.unsigned()?)
                     .map_err(|_| invalid("task verification index exceeds u32"))
             };
-            let bindings = bindings
-                .iter()
-                .map(|binding| {
+            let mut original_bindings = Vec::with_capacity(bindings.len());
+            for binding in bindings {
                     let row = binding.fields(8)?;
                     let receipt_family = match row[6].text()? {
                         "build" => SemanticTaskReceiptFamily::Build,
@@ -9319,7 +9317,7 @@ fn task_ground_value(value: &ColdValue) -> PyResult<xlog_cuda::SemanticTaskGroun
                             "task measurement binding differs from its original family",
                         ));
                     }
-                    Ok(SemanticTaskVerificationBinding {
+                    original_bindings.push(SemanticTaskVerificationBinding {
                         query: index(&row[0])?,
                         observation_record: index(&row[1])?,
                         obligation_identity: identity(&row[2])?,
@@ -9328,10 +9326,9 @@ fn task_ground_value(value: &ColdValue) -> PyResult<xlog_cuda::SemanticTaskGroun
                         acceptance_condition_identity: identity(&row[5])?,
                         receipt_family,
                         measurement,
-                    })
-                })
-                .collect::<PyResult<Vec<_>>>()?;
-            Ok(SemanticTaskGround::Coding(bindings))
+                    });
+            }
+            Ok(SemanticTaskGround::Coding(original_bindings))
         }
         _ => Err(invalid(
             "task ground must be logical with no bindings or coding with its original roster",
@@ -9356,10 +9353,10 @@ fn task_evaluation_spec_with_allocation_owner(
     editable_program: Option<Arc<SemanticProgramAdmission>>,
     training_domain: &ColdValue,
     initial_program_source: Option<&str>,
-    budget: &xlog_cuda::SemanticReplayMaterialBudget,
+    material_sources: &material_source::MaterialSourceRegistry,
 ) -> PyResult<xlog_cuda::SemanticTaskEvaluationSpec> {
     task_evaluation_spec_owned(values, priority_levels, editable_program,
-        training_domain, initial_program_source, Some(budget))
+        training_domain, initial_program_source, Some(material_sources))
 }
 
 fn task_evaluation_spec_owned(
@@ -9368,7 +9365,32 @@ fn task_evaluation_spec_owned(
     editable_program: Option<Arc<SemanticProgramAdmission>>,
     training_domain: &ColdValue,
     initial_program_source: Option<&str>,
+    material_sources: Option<&material_source::MaterialSourceRegistry>,
+) -> PyResult<xlog_cuda::SemanticTaskEvaluationSpec> {
+    let material_budget = material_sources.map(|sources| sources.native_budget()).transpose()?;
+    let mut diagnostic_handoff = None;
+    let result = task_evaluation_spec_core(values, priority_levels, editable_program,
+        training_domain, initial_program_source, material_budget.as_ref(),
+        material_sources, &mut diagnostic_handoff);
+    if let Some(family) = diagnostic_handoff {
+        // Known success or a known validation exit before compiler failure.
+        // A published family has already been consumed and can never return.
+        Python::attach(|py| material_sources
+            .expect("owned diagnostic loan retains its original registry")
+            .return_compiler_diagnostic(py, family))?;
+    }
+    result
+}
+
+fn task_evaluation_spec_core(
+    values: &[ColdValue],
+    priority_levels: Vec<xlog_cuda::SemanticTaskPriorityLevel>,
+    editable_program: Option<Arc<SemanticProgramAdmission>>,
+    training_domain: &ColdValue,
+    initial_program_source: Option<&str>,
     material_budget: Option<&xlog_cuda::SemanticReplayMaterialBudget>,
+    material_sources: Option<&material_source::MaterialSourceRegistry>,
+    diagnostic_handoff: &mut Option<crate::types::PreparedDiagnosticHandoff>,
 ) -> PyResult<xlog_cuda::SemanticTaskEvaluationSpec> {
     if values.len() != 8 {
         return Err(invalid("incorrect task evaluation input count"));
@@ -9376,6 +9398,8 @@ fn task_evaluation_spec_owned(
     let input_owner = material_budget.map(|budget| -> PyResult<Arc<dyn Send + Sync>> {
         let overflow = || invalid("task evaluator metadata allocation extent overflow");
         let mut extent = std::mem::size_of::<xlog_cuda::SemanticTaskEvaluationSpec>()
+            .checked_add(std::mem::size_of::<xlog_gpu::logic::SemanticLogicTaskProgram>())
+            .ok_or_else(overflow)?
             .checked_add(4 * std::mem::size_of::<usize>()).ok_or_else(overflow)?;
         for (count, width) in [
             (values[0].sequence()?.len(), std::mem::size_of::<u32>()),
@@ -9404,10 +9428,16 @@ fn task_evaluation_spec_owned(
             };
             extent = extent.checked_add(seed.len()).ok_or_else(overflow)?;
         }
-        let reservation = budget.reserve_auxiliary(u64::try_from(extent)
+        let reservation = budget.reserve_compiler_allocation(u64::try_from(extent)
             .map_err(|_| invalid("task evaluator metadata allocation exceeds u64"))?)
-            .map_err(xlog_err)?;
-        Ok(Arc::new(reservation))
+            .map_err(|error| Python::attach(|py| {
+                let sources = material_sources.expect("owned inputs retain their original registry");
+                match sources.take_compiler_diagnostic(py) {
+                    Ok(family) => sources.publish_compiler_failure(py, family, error),
+                    Err(blocking) => blocking,
+                }
+            }))?;
+        Ok(reservation)
     }).transpose()?;
     let statements = &values[0];
     let statements = statements.sequence()?;
@@ -9418,15 +9448,15 @@ fn task_evaluation_spec_owned(
         u32::try_from(value.unsigned()?)
             .map_err(|_| invalid("native admitted record index exceeds u32"))
     };
-    let statement_records = statements
-        .iter()
-        .map(record_index)
-        .collect::<PyResult<Vec<_>>>()?;
-    let allowed_support_records = values[1]
-        .sequence()?
-        .iter()
-        .map(record_index)
-        .collect::<PyResult<Vec<_>>>()?;
+    let mut statement_records = Vec::with_capacity(statements.len());
+    for statement in statements {
+        statement_records.push(record_index(statement)?);
+    }
+    let supports = values[1].sequence()?;
+    let mut allowed_support_records = Vec::with_capacity(supports.len());
+    for support in supports {
+        allowed_support_records.push(record_index(support)?);
+    }
     let task_ground = task_ground_value(&values[7])?;
     let source = match (&task_ground, &values[2]) {
         (xlog_cuda::SemanticTaskGround::Logical, source) => source.text()?.to_owned(),
@@ -9443,10 +9473,10 @@ fn task_evaluation_spec_owned(
         usize::try_from(value.unsigned()?)
             .map_err(|_| invalid("native task query ordinal exceeds host address space"))
     };
-    let query_ordinals = queries
-        .iter()
-        .map(query_ordinal)
-        .collect::<PyResult<Vec<_>>>()?;
+    let mut query_ordinals = Vec::with_capacity(queries.len());
+    for query in queries {
+        query_ordinals.push(query_ordinal(query)?);
+    }
     if query_ordinals.len() != statement_records.len() {
         return Err(invalid(
             "task queries differ from the original statement roster",
@@ -9491,17 +9521,40 @@ fn task_evaluation_spec_owned(
     let mask = |value: &ColdValue| {
         u8::try_from(value.unsigned()?).map_err(|_| invalid("native task truth mask exceeds u8"))
     };
-    let admissible_truth_masks = masks.iter().map(mask).collect::<PyResult<Vec<_>>>()?;
+    let mut admissible_truth_masks = Vec::with_capacity(masks.len());
+    for original_mask in masks {
+        admissible_truth_masks.push(mask(original_mask)?);
+    }
     let actor_eligible = values[6].boolean()?;
     let mut program = match material_budget {
-        Some(budget) => xlog_gpu::logic::SemanticLogicTaskProgram::compile_with_allocation_owner(
-            source, query_ordinals, &mut |extent| {
-                budget.reserve_auxiliary(extent)
-                    .map(|reservation| Arc::new(reservation) as Arc<dyn Send + Sync>)
-                    .map_err(|error| xlog_core::XlogError::Execution(error.to_string()))
-            }),
-        None => xlog_gpu::logic::SemanticLogicTaskProgram::compile(source, query_ordinals),
-    }.map_err(xlog_err)?;
+        Some(budget) => {
+            let sources = material_sources.expect("owned compiler retains its original registry");
+            *diagnostic_handoff = Some(Python::attach(|py| sources.take_compiler_diagnostic(py))?);
+            let result = xlog_gpu::logic::SemanticLogicTaskProgram::compile_with_allocation_owner(
+                source, query_ordinals, &mut |extent| {
+                    budget.reserve_compiler_allocation(extent)
+                        .map(|reservation| reservation as Arc<dyn Send + Sync>)
+                },
+            );
+            match result {
+                Ok(program) => {
+                    Python::attach(|py| sources.return_compiler_diagnostic(py,
+                        diagnostic_handoff.take()
+                            .expect("successful compiler retains its unbound diagnostic family")))?;
+                    program
+                }
+                Err(error) => return Err(Python::attach(|py| {
+                    let family = diagnostic_handoff
+                        .take()
+                        .expect("owned compiler has its original pre-acquired diagnostic family");
+                    material_sources.expect("owned compiler retains its original registry")
+                        .publish_compiler_failure(py, family, error)
+                })),
+            }
+        }
+        None => xlog_gpu::logic::SemanticLogicTaskProgram::compile(source, query_ordinals)
+            .map_err(xlog_err)?,
+    };
     if let Some(owner) = input_owner {
         program = program.retain_allocation_owner(owner);
     }
@@ -9523,28 +9576,25 @@ fn task_evaluation_spec_owned(
 }
 
 fn task_priority_levels(value: &ColdValue) -> PyResult<Vec<xlog_cuda::SemanticTaskPriorityLevel>> {
-    value
-        .sequence()?
-        .iter()
-        .map(|level| {
-            let goals = level
-                .sequence()?
-                .iter()
-                .map(|goal| {
-                    let fields = goal.fields(3)?;
-                    Ok(xlog_cuda::SemanticTaskPriorityGoal {
-                        query: u32::try_from(fields[0].unsigned()?)
-                            .map_err(|_| invalid("task priority query exceeds u32"))?,
-                        target_truth: u8::try_from(fields[1].unsigned()?)
-                            .map_err(|_| invalid("task priority truth exceeds u8"))?,
-                        weight: u32::try_from(fields[2].unsigned()?)
-                            .map_err(|_| invalid("task priority weight exceeds u32"))?,
-                    })
-                })
-                .collect::<PyResult<Vec<_>>>()?;
-            Ok(xlog_cuda::SemanticTaskPriorityLevel { goals })
-        })
-        .collect()
+    let level_values = value.sequence()?;
+    let mut levels = Vec::with_capacity(level_values.len());
+    for level in level_values {
+        let goal_values = level.sequence()?;
+        let mut goals = Vec::with_capacity(goal_values.len());
+        for goal in goal_values {
+            let fields = goal.fields(3)?;
+            goals.push(xlog_cuda::SemanticTaskPriorityGoal {
+                query: u32::try_from(fields[0].unsigned()?)
+                    .map_err(|_| invalid("task priority query exceeds u32"))?,
+                target_truth: u8::try_from(fields[1].unsigned()?)
+                    .map_err(|_| invalid("task priority truth exceeds u8"))?,
+                weight: u32::try_from(fields[2].unsigned()?)
+                    .map_err(|_| invalid("task priority weight exceeds u32"))?,
+            });
+        }
+        levels.push(xlog_cuda::SemanticTaskPriorityLevel { goals });
+    }
+    Ok(levels)
 }
 
 fn task_priority_levels_tuple(
@@ -22283,13 +22333,6 @@ impl PySemanticTransitionController {
         } else if session.editable_program.is_some() && evaluation[2] != ColdValue::None {
             return Err(invalid("coding task has no independent observer reference"));
         }
-        let spec = task_evaluation_spec(
-            &evaluation,
-            Vec::new(),
-            session.editable_program.as_ref().map(|owner| Arc::clone(&owner.program)),
-            &ColdValue::None,
-            session.editable_initial_source.as_deref(),
-        )?;
         bind_material_source(
             py,
             &session,
@@ -22297,6 +22340,14 @@ impl PySemanticTransitionController {
             material_limit,
             total_material_limit,
             max_resolved_material_bytes,
+        )?;
+        let spec = task_evaluation_spec_with_allocation_owner(
+            &evaluation,
+            Vec::new(),
+            session.editable_program.as_ref().map(|owner| Arc::clone(&owner.program)),
+            &ColdValue::None,
+            session.editable_initial_source.as_deref(),
+            &session.material_sources,
         )?;
         let rows = read_replay_rows(
             replay_rows,
@@ -22744,12 +22795,13 @@ impl PySemanticTransitionController {
         } else if session.editable_program.is_some() && evaluation[2] != ColdValue::None {
             return Err(invalid("coding task has no independent observer reference"));
         }
-        let spec = task_evaluation_spec(
+        let spec = task_evaluation_spec_with_allocation_owner(
             &evaluation,
             authority.priority_levels.clone(),
             session.editable_program.as_ref().map(|owner| Arc::clone(&owner.program)),
             &training_domain_value,
             session.editable_initial_source.as_deref(),
+            &session.material_sources,
         )?;
         let inherited_checkpoint_registration = if source_checkpoint.is_some()
             && resolve_checkpoint.is_none()

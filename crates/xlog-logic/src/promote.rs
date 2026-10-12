@@ -108,15 +108,14 @@ fn promotion_allocation_bytes(
     shape: PromotionShape,
 ) -> xlog_core::Result<u64> {
     use crate::compile::{hash_allocation_bytes as hash, push_vector_allocation_bytes as vector};
-    let overflow =
-        || xlog_core::XlogError::Compilation("promotion allocation extent overflow".into());
+    let overflow = || xlog_core::XlogError::allocation_extent_overflow("promotion");
     fn graph(
         node: &RirNode,
         arities: &HashMap<RelId, usize>,
         binary: bool,
     ) -> xlog_core::Result<(usize, usize, usize)> {
         let overflow = || {
-            xlog_core::XlogError::Compilation("promotion graph allocation extent overflow".into())
+            xlog_core::XlogError::allocation_extent_overflow("promotion graph")
         };
         match node {
             RirNode::Scan { rel } => Ok((
@@ -306,7 +305,7 @@ fn aggregate_allocation_bytes(
         return Ok(0);
     };
     let overflow = || {
-        xlog_core::XlogError::Compilation("aggregate promotion allocation extent overflow".into())
+        xlog_core::XlogError::allocation_extent_overflow("aggregate promotion")
     };
     let mut bytes = promotion_allocation_bytes(inner, arities, shape)?;
     // Canonical synthetic input is cloned from this real inner tree. The
@@ -2337,8 +2336,8 @@ fn try_promote_clique_k_with_owner(
                         for helper in &full_order.helper_split_specs {
                             bytes = bytes.checked_add(helper.edge_slots.len() as u64).or_else(
                                 || {
-                                    failure = Some(xlog_core::XlogError::Compilation(
-                                        "helper-split clone allocation extent overflow".into(),
+                                    failure = Some(xlog_core::XlogError::allocation_extent_overflow(
+                                        "helper-split clone",
                                     ));
                                     None
                                 },

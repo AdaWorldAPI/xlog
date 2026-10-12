@@ -6,6 +6,53 @@ mod diagnostic_owner;
 
 pub use diagnostic_owner::OwnedDiagnostic;
 
+/// A capacity-owner refusal whose representation allocates no diagnostic text.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum AllocationRefusal {
+    /// The exact request would exceed the original owner's capacity.
+    #[error("requested {requested} bytes with {used} live bytes and capacity {capacity} bytes")]
+    Capacity {
+        requested: u64,
+        used: u64,
+        capacity: u64,
+    },
+    /// An allocation extent cannot be represented on this host.
+    #[error("allocation extent overflow")]
+    ExtentOverflow,
+    /// The original allocation owner's state cannot be read safely.
+    #[error("allocation owner is poisoned")]
+    Poisoned,
+}
+
+/// Count the original formatter's UTF-8 bytes without constructing a string.
+pub fn formatted_text_extent(arguments: std::fmt::Arguments<'_>) -> crate::Result<u64> {
+    struct Extent(u64);
+    impl std::fmt::Write for Extent {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            self.0 = self
+                .0
+                .checked_add(u64::try_from(text.len()).map_err(|_| std::fmt::Error)?)
+                .ok_or(std::fmt::Error)?;
+            Ok(())
+        }
+    }
+    let mut extent = Extent(0);
+    std::fmt::write(&mut extent, arguments)
+        .map_err(|_| XlogError::allocation_extent_overflow("formatted text"))?;
+    Ok(extent.0)
+}
+
+/// Bound the canonical growable formatter, including an overlapping old buffer.
+pub fn formatted_text_allocation_bytes(arguments: std::fmt::Arguments<'_>) -> crate::Result<u64> {
+    // Initial literal estimation and geometric growth need at most twice the
+    // final extent; old and replacement byte buffers may coexist during growth.
+    formatted_text_extent(arguments)?
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(8))
+        .and_then(|n| n.checked_mul(3))
+        .ok_or_else(|| XlogError::allocation_extent_overflow("formatted text"))
+}
+
 /// Primary error type for XLOG operations
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -15,6 +62,14 @@ pub enum XlogError {
     /// Its displayed message and underlying classification are unchanged.
     #[error(transparent)]
     OwnedDiagnostic(std::sync::Arc<OwnedDiagnostic>),
+
+    /// A refusal before diagnostic storage has been acquired. The operation
+    /// name and structured reason are inline; rendering belongs to its owner.
+    #[error("Allocation refused: {operation}: {reason}")]
+    AllocationRefused {
+        operation: &'static str,
+        reason: AllocationRefusal,
+    },
 
     /// Parse error from the Datalog frontend.
     #[error("Parse error: {0}")]
@@ -147,6 +202,14 @@ pub enum XlogError {
 }
 
 impl XlogError {
+    /// Report allocation geometry overflow without first allocating its text.
+    pub fn allocation_extent_overflow(operation: &'static str) -> Self {
+        Self::AllocationRefused {
+            operation,
+            reason: AllocationRefusal::ExtentOverflow,
+        }
+    }
+
     /// Return the original classified error without discarding its owner.
     pub fn unowned(&self) -> &Self {
         match self {
