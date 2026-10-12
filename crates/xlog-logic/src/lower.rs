@@ -1888,17 +1888,20 @@ impl Lowerer {
         program: &Program,
         allocations: &mut LoweringAllocations<'_, '_>,
     ) -> Result<()> {
-        allocations.hash::<String, u64>(program.rules.len())?;
-        for fact in program.facts() {
-            allocations.acquire(fact.head.predicate.len() as u64)?;
-        }
+        let fact_count = program.facts().count();
+        let _counts_owner = match allocations.scope.as_deref_mut() {
+            Some(scope) => Some(scope.reserve_allocation(
+                crate::compile::hash_allocation_bytes::<&str, u64>(fact_count)?,
+            )?),
+            None => None,
+        };
         self.est_cardinality.clear();
         self.allocation_owners
             .retire(LowererAllocationKind::EstimateKey);
 
-        let mut fact_counts: HashMap<String, u64> = HashMap::new();
+        let mut fact_counts: HashMap<&str, u64> = HashMap::with_capacity(fact_count);
         for fact in program.facts() {
-            *fact_counts.entry(fact.head.predicate.clone()).or_insert(0) += 1;
+            *fact_counts.entry(fact.head.predicate.as_str()).or_insert(0) += 1;
         }
 
         for pred in self.schemas.keys() {
@@ -1906,7 +1909,7 @@ impl Lowerer {
                 .cardinality_hints
                 .get(pred)
                 .copied()
-                .or_else(|| fact_counts.get(pred).copied())
+                .or_else(|| fact_counts.get(pred.as_str()).copied())
                 .unwrap_or(1000)
                 .max(1);
             let table = if self.est_cardinality.len() == self.est_cardinality.capacity() {
