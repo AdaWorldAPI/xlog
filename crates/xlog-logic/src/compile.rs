@@ -1459,10 +1459,13 @@ impl FrontendPass {
                     }
                     None => rewrite_magic_sets_owned(program)?,
                 };
-                // Disabled rewriting returns the exact consumed input and an
-                // empty report; this is the original core's identity branch.
-                let identity =
-                    rewritten.report.status == crate::magic_sets::MagicSetStatus::Disabled;
+                // Disabled and declined rewriting return the exact consumed
+                // input. The report drops before this pass's scratch scope.
+                let identity = matches!(
+                    rewritten.report.status,
+                    crate::magic_sets::MagicSetStatus::Disabled
+                        | crate::magic_sets::MagicSetStatus::Declined
+                );
                 Ok((rewritten.program, identity))
             }
         }

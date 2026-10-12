@@ -163,11 +163,7 @@ impl std::fmt::Display for AdornmentText<'_> {
 
 /// Rewrite supported bound recursive queries with magic predicates.
 pub fn rewrite_magic_sets(program: &Program) -> Result<MagicSetRewrite> {
-    let mode = program.directives.magic_sets;
-    if mode.is_none() || mode == Some(MagicSetsMode::Off) {
-        return Ok(with_status(program.clone(), MagicSetStatus::Disabled));
-    }
-    rewrite_enabled(program)
+    rewrite_magic_sets_owned(program.clone())
 }
 
 /// [`rewrite_magic_sets`] taking the program by value: when magic sets are
@@ -177,7 +173,7 @@ pub fn rewrite_magic_sets_owned(program: Program) -> Result<MagicSetRewrite> {
     if mode.is_none() || mode == Some(MagicSetsMode::Off) {
         return Ok(with_status(program, MagicSetStatus::Disabled));
     }
-    rewrite_enabled(&program)
+    rewrite_enabled(program)
 }
 
 /// Rewrite through the original reachable-adornment closure with custody.
@@ -189,22 +185,22 @@ pub fn rewrite_magic_sets_owned_with_allocation_owner(
     if mode.is_none() || mode == Some(MagicSetsMode::Off) {
         return Ok(with_status(program, MagicSetStatus::Disabled));
     }
-    rewrite_enabled_with_owner(&program, &mut MagicAllocations { scope: Some(scope) })
+    rewrite_enabled_with_owner(program, &mut MagicAllocations { scope: Some(scope) })
 }
 
-fn rewrite_enabled(program: &Program) -> Result<MagicSetRewrite> {
+fn rewrite_enabled(program: Program) -> Result<MagicSetRewrite> {
     rewrite_enabled_with_owner(program, &mut MagicAllocations { scope: None })
 }
 
 fn rewrite_enabled_with_owner(
-    program: &Program,
+    mut program: Program,
     allocations: &mut MagicAllocations<'_, '_>,
 ) -> Result<MagicSetRewrite> {
     let mode = program.directives.magic_sets;
     let mode = mode.expect("checked above");
 
-    let recursive = recursive_predicates(program, allocations)?;
-    let seeds = collect_query_seeds(program, &recursive, allocations)?;
+    let recursive = recursive_predicates(&program, allocations)?;
+    let seeds = collect_query_seeds(&program, &recursive, allocations)?;
     if seeds.is_empty() {
         let reason = "no bound recursive query eligible for magic_sets";
         allocations.vector::<String>(1)?;
@@ -236,13 +232,13 @@ fn rewrite_enabled_with_owner(
         target_preds.insert(seed.pred.clone());
     }
     let unsafe_reasons =
-        unsupported_target_reasons(program, &target_preds, &recursive, allocations)?;
+        unsupported_target_reasons(&program, &target_preds, &recursive, allocations)?;
     if !unsafe_reasons.is_empty() {
         return decline_or_error(program, mode, unsafe_reasons, allocations);
     }
 
     let mut adornments = initial_adornments(&seeds, allocations)?;
-    expand_adornments(program, &target_preds, &mut adornments, allocations)?;
+    expand_adornments(&program, &target_preds, &mut adornments, allocations)?;
 
     let mut generated_predicates: BTreeSet<String> = BTreeSet::new();
     let mut adorned_predicates: BTreeSet<String> = BTreeSet::new();
@@ -269,16 +265,12 @@ fn rewrite_enabled_with_owner(
         ));
     }
 
-    if allocations.scope.is_some() {
-        allocations.acquire(program.owned_allocation_bytes()?)?;
-    }
-    let mut rewritten = program.clone();
-    rewritten.rules = rewrite_rules(program, &target_preds, &adornments, &seeds, allocations)?;
+    program.rules = rewrite_rules(&program, &target_preds, &adornments, &seeds, allocations)?;
     allocations.vector::<String>(generated_predicates.len())?;
     allocations.vector::<String>(adorned_predicates.len())?;
 
     Ok(MagicSetRewrite {
-        program: rewritten,
+        program,
         report: MagicSetReport {
             status: MagicSetStatus::Applied,
             generated_predicates: generated_predicates.into_iter().collect(),
@@ -301,7 +293,7 @@ fn with_status(program: Program, status: MagicSetStatus) -> MagicSetRewrite {
 }
 
 fn decline_or_error(
-    program: &Program,
+    program: Program,
     mode: MagicSetsMode,
     reasons: Vec<String>,
     allocations: &mut MagicAllocations<'_, '_>,
@@ -312,11 +304,8 @@ fn decline_or_error(
             allocations,
         ));
     }
-    if allocations.scope.is_some() {
-        allocations.acquire(program.owned_allocation_bytes()?)?;
-    }
     Ok(MagicSetRewrite {
-        program: program.clone(),
+        program,
         report: MagicSetReport {
             status: MagicSetStatus::Declined,
             generated_predicates: Vec::new(),
