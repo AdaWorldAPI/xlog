@@ -1607,7 +1607,7 @@ pub mod selectivity_pass {
     //! dispatch the WCOJ kernel correctly.
     use std::collections::HashMap;
     use xlog_core::RelId;
-    use xlog_ir::ExecutionPlan;
+    use xlog_ir::{ExecutionPlan, RirNode};
     use xlog_stats::StatsManager;
 
     /// Selectivity-driven join reordering for canonical triangle and 4-cycle

@@ -6378,7 +6378,7 @@ fn build_epistemic_dependency_graph_core(
         .into_iter()
         .map(|(root, (predicates, mut rule_indices))| {
             rule_indices.sort_unstable();
-            let merge_reasons = reasons_by_root
+            let merge_reasons: Vec<EpistemicComponentMergeReason> = reasons_by_root
                 .remove(&root)
                 .map(|reasons| reasons.into_iter().collect())
                 .unwrap_or_default();

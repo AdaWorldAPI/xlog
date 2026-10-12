@@ -1364,8 +1364,9 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         }
 
         let elem_type_ref = self.infer_template_type(template, &goal)?;
-        self.acquire_format(format_args!("__xlog_meta_findall_{}", self.findall_counter))?;
-        let helper = format!("__xlog_meta_findall_{}", self.findall_counter);
+        let findall_counter = self.findall_counter;
+        self.acquire_format(format_args!("__xlog_meta_findall_{}", findall_counter))?;
+        let helper = format!("__xlog_meta_findall_{}", findall_counter);
         self.findall_counter += 1;
 
         let mut columns = self.helper_columns(
@@ -1600,11 +1601,12 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
                 })
                 .collect::<Result<Vec<_>>>()?,
         );
+        let maplist_counter = self.maplist_counter;
         self.acquire_format(format_args!(
             "__xlog_meta_maplist_{}_{}",
-            pred_name, self.maplist_counter
+            pred_name, maplist_counter
         ))?;
-        let helper = format!("__xlog_meta_maplist_{}_{}", pred_name, self.maplist_counter);
+        let helper = format!("__xlog_meta_maplist_{}_{}", pred_name, maplist_counter);
         self.maplist_counter += 1;
 
         if atom.terms.len() == 2 {

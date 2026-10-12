@@ -2218,11 +2218,12 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
     fn fresh_var(&mut self, prefix: &str, payload: &mut PayloadCustody) -> Result<String> {
         let uppercase_owner = self.reserve_temporary(prefix.len() as u64)?;
         let uppercase = prefix.to_ascii_uppercase();
+        let fresh_counter = self.fresh_counter;
         self.acquire_format(
             payload,
-            format_args!("__XLOG_{prefix}_{}", self.fresh_counter),
+            format_args!("__XLOG_{prefix}_{}", fresh_counter),
         )?;
-        let var = format!("__XLOG_{}_{}", uppercase, self.fresh_counter);
+        let var = format!("__XLOG_{}_{}", uppercase, fresh_counter);
         drop(uppercase);
         drop(uppercase_owner);
         self.fresh_counter += 1;

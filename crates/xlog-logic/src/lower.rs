@@ -2540,7 +2540,6 @@ impl Lowerer {
         // The head's column types come from the projected join columns.
         if !self.schemas.contains_key(&head_rel_name) {
             allocations.generated_schema(head_projection.len())?;
-            allocations.schema_table_entry(self, &head_rel_name)?;
             let columns: Vec<(String, ScalarType)> = head_projection
                 .iter()
                 .enumerate()
@@ -2560,8 +2559,7 @@ impl Lowerer {
                     (format!("c{}", i), ty)
                 })
                 .collect();
-            self.schemas
-                .insert(head_rel_name.clone(), Schema::new(columns));
+            self.insert_schema_with_owner(&head_rel_name, Schema::new(columns), allocations)?;
         }
 
         allocations.acquire(rule.mask_name.len() as u64)?;
