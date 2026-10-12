@@ -158,29 +158,36 @@ impl SemanticTaskGround {
 impl SemanticTaskVerificationBinding {
     /// Exact fixed-width device representation of the original eight fields.
     /// The presence word distinguishes an absent measurement from any identity.
-    pub(super) fn words(&self) -> Vec<u64> {
-        let mut words = vec![u64::from(self.query), u64::from(self.observation_record)];
-        for identity in [
+    pub(super) fn words(&self) -> [u64; 36] {
+        let mut words = [0; 36];
+        words[..2].copy_from_slice(&[u64::from(self.query), u64::from(self.observation_record)]);
+        for (index, identity) in [
             self.obligation_identity,
             self.requirement_identity,
             self.verifier_plan_identity,
             self.acceptance_condition_identity,
-        ] {
-            words.extend(super::identity_words(*identity.as_bytes()));
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            words[2 + 4 * index..6 + 4 * index]
+                .copy_from_slice(&super::identity_words(*identity.as_bytes()));
         }
-        words.push(self.receipt_family.code());
-        words.push(u64::from(self.measurement.is_some()));
+        words[18] = self.receipt_family.code();
+        words[19] = u64::from(self.measurement.is_some());
         if let Some(measurement) = &self.measurement {
-            for identity in [
+            for (index, identity) in [
                 measurement.metric_identity,
                 measurement.comparator_identity,
                 measurement.tolerance_identity,
                 measurement.environment_identity,
-            ] {
-                words.extend(super::identity_words(*identity.as_bytes()));
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                words[20 + 4 * index..24 + 4 * index]
+                    .copy_from_slice(&super::identity_words(*identity.as_bytes()));
             }
-        } else {
-            words.extend([0; 16]);
         }
         words
     }

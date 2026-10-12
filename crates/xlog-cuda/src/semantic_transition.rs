@@ -594,6 +594,81 @@ pub struct SemanticTaskObservationRoots {
     )>,
 }
 
+/// The original observation output and the same-pool storage acquired before it.
+pub struct SemanticTaskObservationRootsOwner {
+    roots: SemanticTaskObservationRoots,
+    allocation: SemanticReplayMaterialReservation,
+}
+
+impl SemanticTaskObservationRootsOwner {
+    pub fn roots(&self) -> &SemanticTaskObservationRoots {
+        &self.roots
+    }
+
+    pub fn material_budget(&self) -> &SemanticReplayMaterialBudget {
+        self.allocation.budget()
+    }
+
+    fn reserve_lineage(
+        admission: &SemanticAdmission,
+        insertions: usize,
+        budget: &SemanticReplayMaterialBudget,
+    ) -> Result<
+        (
+            SemanticReplayMaterialReservation,
+            SemanticReplayMaterialReservation,
+            SemanticReplayMaterialReservation,
+            SemanticReplayMaterialReservation,
+        ),
+        SemanticTransitionError,
+    > {
+        let records = budget.reserve_admission_records(admission.records())?;
+        let symbol_bytes =
+            crate::semantic_hypergraph::semantic_material_symbols_allocation_bound(admission)
+                .map_err(SemanticTransitionError::Semantic)?;
+        let symbols = budget.reserve_auxiliary(
+            u64::try_from(symbol_bytes).map_err(|_| SemanticTransitionError::GenerationExhausted)?,
+        )?;
+        let heads = budget.reserve_ordered_index::<[u8; 32], ([u8; 32], u64)>(insertions)?;
+        let supports = budget.reserve_ordered_index::<([u8; 32], [u8; 32]), ()>(insertions)?;
+        Ok((records, symbols, heads, supports))
+    }
+
+    fn observe(
+        material: &crate::semantic_hypergraph::SemanticRootMaterial,
+        admission: &SemanticAdmission,
+        queries: &[u32],
+        budget: &SemanticReplayMaterialBudget,
+    ) -> Result<Self, SemanticTransitionError> {
+        let lineage = Self::reserve_lineage(admission, material.insertions.len(), budget)?;
+        let (roots, allocation) = material.task_observation_roots_with_allocations(
+            admission,
+            queries,
+            lineage,
+            |contributors, queries| {
+                let output_bytes = contributors
+                    .checked_mul(size_of::<(
+                        u32,
+                        Option<u32>,
+                        crate::semantic_hypergraph::SemanticRootSupport,
+                    )>())
+                    .and_then(|bytes| {
+                        queries
+                            .checked_mul(size_of::<u32>())
+                            .and_then(|queries| bytes.checked_add(queries))
+                    })
+                    .ok_or(SemanticTransitionError::GenerationExhausted)?;
+                budget.reserve_auxiliary(
+                    u64::try_from(output_bytes)
+                        .map_err(|_| SemanticTransitionError::GenerationExhausted)?,
+                )
+            },
+            SemanticTransitionError::Semantic,
+        )?;
+        Ok(Self { roots, allocation })
+    }
+}
+
 /// Native seal of the independently validated goal authority carried by the
 /// controller. The semantic root is the exact XLOG root inspected for the task;
 /// the remaining roots bind the complete mandatory dependency and constraint
@@ -40081,7 +40156,7 @@ impl SemanticTransitionSession {
         &mut self,
         spec: &SemanticTaskEvaluationSpec,
         replay: Option<&SemanticReplayMaterial>,
-    ) -> Result<SemanticTaskObservationRoots, SemanticTransitionError> {
+    ) -> Result<SemanticTaskObservationRootsOwner, SemanticTransitionError> {
         self.ensure_rebindable()?;
         if self.publication.is_some() || self.captured.is_some() {
             return Err(publication_input_error(
@@ -40092,25 +40167,134 @@ impl SemanticTransitionSession {
             .graph
             .admission()
             .ok_or(SemanticTransitionError::NotBound)?;
+        let budget = self
+            .replay_material_budget
+            .as_ref()
+            .ok_or_else(|| {
+                publication_input_error("task observation requires its original shared material pool")
+            })?
+            .clone();
+        let query_validation = budget.reserve_auxiliary(
+            u64::try_from(spec.statement_records.len())
+                .map_err(|_| SemanticTransitionError::GenerationExhausted)?,
+        )?;
+        let coding_validation = if spec.task_ground.bindings().is_empty() {
+            None
+        } else {
+            Some(budget.reserve_ordered_index::<[u64; 36], ()>(spec.task_ground.bindings().len())?)
+        };
         spec.validate_records(admission.records())?;
+        drop(coding_validation);
+        drop(query_validation);
         if let Some(replay) = replay {
-            return replay
-                .predecessor
-                .graph
-                .task_observation_roots(admission, &spec.statement_records)
-                .map_err(SemanticTransitionError::Semantic);
+            if replay
+                .budget
+                .as_ref()
+                .is_none_or(|original| !budget.same_pool(original))
+                || replay
+                    ._compact_reservation
+                    .as_ref()
+                    .is_none_or(|original| !budget.same_pool(original.budget()))
+            {
+                return Err(publication_input_error(
+                    "task replay observation changed its original retained material pool",
+                ));
+            }
+            return SemanticTaskObservationRootsOwner::observe(
+                &replay.predecessor.graph,
+                admission,
+                &spec.statement_records,
+                &budget,
+            );
         }
-        let material = self
+        let export_bytes = self
             .graph
-            .export_transition_root(self.root)
+            .transition_root_read_working_allocation_bound()
+            .map_err(SemanticTransitionError::Semantic)?
+            .checked_add(size_of::<SemanticReplayMaterialReservation>() + 2 * size_of::<usize>())
+            .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        let mut export_allocation = Some(Arc::new(budget.reserve_auxiliary(
+            u64::try_from(export_bytes).map_err(|_| SemanticTransitionError::GenerationExhausted)?,
+        )?));
+        let mut original = self
+            .graph
+            .prepare_transition_root_export_with_owner(
+                self.root,
+                Some(
+                    export_allocation
+                        .as_ref()
+                        .expect("original readback allocation")
+                        .clone() as Arc<dyn Send + Sync>,
+                ),
+            )
             .map_err(SemanticTransitionError::Semantic)?;
+        let material = self.graph.resolve_transition_root_export_with_allocations(
+            &mut original,
+            |admission, insertions| {
+                let bytes = crate::semantic_hypergraph::semantic_material_allocation_bound(
+                    admission, insertions,
+                )
+                .map_err(SemanticTransitionError::Semantic)?;
+                budget.reserve_auxiliary(
+                    u64::try_from(bytes).map_err(|_| SemanticTransitionError::GenerationExhausted)?,
+                )
+            },
+            |admission, insertions| {
+                let bytes = crate::semantic_hypergraph::semantic_material_allocation_bound(
+                    admission, insertions,
+                )
+                .map_err(SemanticTransitionError::Semantic)?
+                .checked_add(size_of::<SemanticReplayMaterialReservation>() + 2 * size_of::<usize>())
+                .ok_or(SemanticTransitionError::GenerationExhausted)?;
+                let allocation = budget.reserve_auxiliary(
+                    u64::try_from(bytes).map_err(|_| SemanticTransitionError::GenerationExhausted)?,
+                )?;
+                Ok(Some(Arc::new(allocation)))
+            },
+            |admission, insertions| {
+                SemanticTaskObservationRootsOwner::reserve_lineage(admission, insertions, &budget)
+            },
+            |capacities, _| {
+                let versions = capacities.versions as usize;
+                let supports = capacities.supports as usize;
+                let seen_versions = budget.reserve_ordered_index::<usize, ()>(versions)?;
+                let seen_supports = budget.reserve_ordered_index::<usize, ()>(supports)?;
+                // A corrupt extent can force Vec growth up to the native version
+                // capacity before reconciliation rejects it. The old and new
+                // allocations then coexist at at most three capacity extents.
+                let ordered_bytes = versions
+                    .checked_mul(3)
+                    .and_then(|count| count.checked_add(4))
+                    .and_then(|count| {
+                        count.checked_mul(size_of::<(
+                            u64,
+                            crate::semantic_hypergraph::SemanticRootInsertion,
+                        )>())
+                    })
+                    .ok_or(SemanticTransitionError::GenerationExhausted)?;
+                let ordered = budget.reserve_auxiliary(
+                    u64::try_from(ordered_bytes)
+                        .map_err(|_| SemanticTransitionError::GenerationExhausted)?,
+                )?;
+                Ok(((seen_versions, seen_supports), ordered))
+            },
+            || drop(export_allocation.take()),
+            SemanticTransitionError::Semantic,
+        )?;
+        drop(original);
+        drop(export_allocation);
         let admission = self
             .graph
             .admission()
             .ok_or(SemanticTransitionError::NotBound)?;
-        material
-            .task_observation_roots(admission, &spec.statement_records)
-            .map_err(SemanticTransitionError::Semantic)
+        let roots = SemanticTaskObservationRootsOwner::observe(
+            &material.material,
+            admission,
+            &spec.statement_records,
+            &budget,
+        )?;
+        drop(material);
+        Ok(roots)
     }
 
     /// Execute the supplied native observer and bind its outputs to this admission.
@@ -40391,6 +40575,9 @@ impl SemanticTransitionSession {
                 "goal authority is immutable after publication or capture",
             ));
         }
+        let budget = self.replay_material_budget.as_ref().ok_or_else(|| {
+            publication_input_error("goal authority requires its original material pool")
+        })?;
         if witness.mandatory_link_count == 0
             || witness.constraint_count == 0
             || witness
@@ -40430,6 +40617,51 @@ impl SemanticTransitionSession {
                 "goal authority can be bound only once",
             ));
         }
+        let program_words = binding
+            .spec
+            .program
+            .editable_program()
+            .map(|program| {
+                program
+                    .queries
+                    .len()
+                    .checked_add(program.initial_facts.len())
+                    .and_then(|facts| facts.checked_mul(3))
+                    .and_then(|facts| {
+                        program
+                            .initial_rules
+                            .len()
+                            .checked_mul(10)
+                            .and_then(|rules| facts.checked_add(rules))
+                    })
+                    .and_then(|words| words.checked_add(4))
+                    .ok_or(SemanticTransitionError::GenerationExhausted)
+            })
+            .transpose()?
+            .unwrap_or(0);
+        // A growing vector can retain its old allocation alongside its new
+        // capacity: three logical extents bound that overlap. The serialized
+        // program also survives while the bank is built and its identity hashes
+        // one further program vector. These are this task's actual word rosters.
+        let program_capacity = program_words
+            .checked_mul(2)
+            .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        let bank_peak = device
+            .len()
+            .checked_mul(3)
+            .and_then(|words| words.checked_add(program_capacity))
+            .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        let identity_peak = program_words
+            .checked_mul(5)
+            .and_then(|words| words.checked_add(2))
+            .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        let word_bytes = bank_peak
+            .max(identity_peak)
+            .checked_mul(size_of::<u64>())
+            .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        let word_allocation = budget.reserve_auxiliary(
+            u64::try_from(word_bytes).map_err(|_| SemanticTransitionError::GenerationExhausted)?,
+        )?;
         binding.goal_witness = Some(witness);
         let identity = binding.identity();
         let words = binding.words(self.graph.transition_arena()[1]);
@@ -40439,6 +40671,8 @@ impl SemanticTransitionSession {
                 self.poisoned = true;
                 runtime_error("private goal-authority upload", error)
             })?;
+        drop(words);
+        drop(word_allocation);
         let mut recorder = self.domain.new_strict_recorder();
         recorder.read_write(device);
         enqueue_recorded(&self.domain, &mut self.poisoned, recorder, |_| {

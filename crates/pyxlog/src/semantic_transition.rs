@@ -3272,12 +3272,13 @@ impl PySemanticTransitionSession {
                     selected_material.as_ref().map(|binding| &binding.material),
                 )
                 .map_err(xlog_err)?;
-            authority.bind_native_reads(
+            authority.bind_owned_native_reads(
                 &observations,
                 &spec.allowed_support_records,
                 &spec.task_ground,
             )?;
-            let goal_witness = authority.goal_witness(&observations);
+            let goal_witness = authority.goal_witness(observations.roots());
+            drop(observations);
             owner.bind_task_evaluation(spec).map_err(xlog_err)?;
             owner
                 .bind_task_goal_witness(goal_witness)
@@ -9661,7 +9662,18 @@ struct TaskAuthority {
     corpus_sources: BTreeSet<String>,
     // Structural obligations only. Native archived-material authentication
     // under the current receiver must discharge these before execution.
-    external_reads: Vec<(u64, xlog_cuda::SemanticTaskVerificationBinding, [u64; 18])>,
+    external_reads: Option<Arc<OriginalNativeTaskReads>>,
+}
+
+struct OriginalNativeTaskReads {
+    reads: Vec<(u64, xlog_cuda::SemanticTaskVerificationBinding, [u64; 18])>,
+    _allocation: xlog_cuda::SemanticReplayMaterialReservation,
+}
+
+impl std::fmt::Debug for OriginalNativeTaskReads {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_list().entries(&self.reads).finish()
+    }
 }
 
 fn parse_live_authorities(value: &ColdValue, scope: &[String]) -> PyResult<Vec<LiveAuthority>> {
@@ -9789,7 +9801,7 @@ impl TaskAuthority {
             sources_allow_learning: true,
             source_partitions: Vec::new(),
             corpus_sources: BTreeSet::new(),
-            external_reads: Vec::new(),
+            external_reads: None,
         };
         result.validate_lineage()?;
         Ok(result)
@@ -10261,33 +10273,97 @@ impl TaskAuthority {
         Ok(())
     }
 
+    fn bind_owned_native_reads(
+        &mut self,
+        observations: &xlog_cuda::SemanticTaskObservationRootsOwner,
+        supports: &[u32],
+        ground: &xlog_cuda::SemanticTaskGround,
+    ) -> PyResult<()> {
+        let roots = observations.roots();
+        let budget = observations.material_budget();
+        let overflow = || invalid("native task read allocation extent overflow");
+        let entries = roots
+            .query_records
+            .len()
+            .checked_add(supports.len())
+            .and_then(|count| count.checked_add(ground.bindings().len()))
+            .and_then(|count| {
+                roots
+                    .contributors
+                    .len()
+                    .checked_mul(2)
+                    .and_then(|contributors| count.checked_add(contributors))
+            })
+            .and_then(|count| count.checked_add(1))
+            .ok_or_else(overflow)?;
+        let expected_index = budget
+            .reserve_ordered_index::<(&str, u32), ()>(entries)
+            .map_err(xlog_err)?;
+        let distinct_index = budget
+            .reserve_ordered_index::<(&str, u32), ()>(self.dependencies.len())
+            .map_err(xlog_err)?;
+        let scratch_bytes = self
+            .dependencies
+            .len()
+            .checked_mul(std::mem::size_of::<(&str, u32)>())
+            .ok_or_else(overflow)?;
+        let scratch = budget
+            .reserve_auxiliary(u64::try_from(scratch_bytes).map_err(|_| overflow())?)
+            .map_err(xlog_err)?;
+        let output_bytes = roots
+            .contributors
+            .len()
+            .checked_mul(std::mem::size_of::<(
+                u64,
+                xlog_cuda::SemanticTaskVerificationBinding,
+                [u64; 18],
+            )>())
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    std::mem::size_of::<OriginalNativeTaskReads>() + 2 * std::mem::size_of::<usize>(),
+                )
+            })
+            .ok_or_else(overflow)?;
+        let allocation = budget
+            .reserve_auxiliary(u64::try_from(output_bytes).map_err(|_| overflow())?)
+            .map_err(xlog_err)?;
+        let reads = self.bind_native_reads(roots, supports, ground)?;
+        drop(scratch);
+        drop(distinct_index);
+        drop(expected_index);
+        self.external_reads = Some(Arc::new(OriginalNativeTaskReads {
+            reads,
+            _allocation: allocation,
+        }));
+        Ok(())
+    }
+
     fn bind_native_reads(
         &mut self,
         observations: &xlog_cuda::SemanticTaskObservationRoots,
         supports: &[u32],
         ground: &xlog_cuda::SemanticTaskGround,
-    ) -> PyResult<()> {
+    ) -> PyResult<Vec<(u64, xlog_cuda::SemanticTaskVerificationBinding, [u64; 18])>> {
         let mut expected = observations
             .query_records
             .iter()
-            .map(|&index| ("statement".to_owned(), index))
-            .chain(supports.iter().map(|&index| ("support".to_owned(), index)))
+            .map(|&index| ("statement", index))
+            .chain(supports.iter().map(|&index| ("support", index)))
             .chain(
                 ground
                     .bindings()
                     .iter()
-                    .map(|binding| ("statement".to_owned(), binding.observation_record)),
+                    .map(|binding| ("statement", binding.observation_record)),
             )
             .chain(std::iter::once((
                 match ground {
                     xlog_cuda::SemanticTaskGround::Logical => "observer",
                     xlog_cuda::SemanticTaskGround::Coding(_) => "program",
-                }
-                .to_owned(),
+                },
                 0,
             )))
             .collect::<BTreeSet<_>>();
-        let mut external_reads = Vec::new();
+        let mut external_reads = Vec::with_capacity(observations.contributors.len());
         for &(query, statement, support) in &observations.contributors {
             if query >= observations.query_records.len() as u32 {
                 return Err(invalid(
@@ -10296,18 +10372,23 @@ impl TaskAuthority {
             }
             let statement = statement.ok_or_else(|| invalid(
                 "native feedback contributor has a derived target without an original admitted statement"))?;
-            expected.insert(("statement".to_owned(), statement));
+            expected.insert(("statement", statement));
             match support {
                 xlog_cuda::SemanticRootSupport::Admitted(record) => {
-                    expected.insert(("support".to_owned(), record));
+                    expected.insert(("support", record));
                 }
                 xlog_cuda::SemanticRootSupport::Authenticated {
                     binding_ordinal,
                     observation,
                 } => {
-                    let binding = usize::try_from(binding_ordinal).ok()
+                    let binding = usize::try_from(binding_ordinal)
+                        .ok()
                         .and_then(|ordinal| ground.bindings().get(ordinal))
-                        .ok_or_else(|| invalid("external contributor names an absent original verification binding"))?;
+                        .ok_or_else(|| {
+                            invalid(
+                                "external contributor names an absent original verification binding",
+                            )
+                        })?;
                     if binding.observation_record != statement
                         || observation[0] != 1
                         || !matches!(observation[1], 1 | 2)
@@ -10321,17 +10402,17 @@ impl TaskAuthority {
                 }
             }
         }
-        let actual = self
-            .dependencies
-            .iter()
-            .filter_map(|node| node.native_record.clone())
-            .collect::<Vec<_>>();
-        let distinct = actual.iter().cloned().collect::<BTreeSet<_>>();
+        let mut actual = Vec::with_capacity(self.dependencies.len());
+        actual.extend(self.dependencies.iter().filter_map(|node| {
+            node.native_record
+                .as_ref()
+                .map(|(kind, record)| (kind.as_str(), *record))
+        }));
+        let distinct = actual.iter().copied().collect::<BTreeSet<_>>();
         if actual.len() != distinct.len() || distinct != expected {
             return Err(invalid("dependency closure must bind the original task-type-specific program, statements and admitted support reads exactly once"));
         }
-        self.external_reads = external_reads;
-        Ok(())
+        Ok(external_reads)
     }
 
     fn authority_root(&self) -> Identity256 {
@@ -22365,8 +22446,10 @@ impl PySemanticTransitionController {
             .task_observation_roots(&spec, selected.as_ref().map(|binding| &binding.material))
             .map_err(xlog_err)?;
         let contributors = roots
+            .roots()
             .contributors
-            .into_iter()
+            .iter()
+            .copied()
             .map(|(query, statement, support)| {
                 let support = match support {
                     xlog_cuda::SemanticRootSupport::Admitted(record) => {
@@ -22387,9 +22470,9 @@ impl PySemanticTransitionController {
             })
             .collect::<PyResult<Vec<_>>>()?;
         Ok((
-            PyBytes::new(py, roots.root_digest.as_bytes()),
-            PyTuple::new(py, roots.root_extents)?,
-            PyTuple::new(py, roots.query_records)?,
+            PyBytes::new(py, roots.roots().root_digest.as_bytes()),
+            PyTuple::new(py, roots.roots().root_extents)?,
+            PyTuple::new(py, roots.roots().query_records.iter().copied())?,
             PyTuple::new(py, contributors)?,
         )
             .into_pyobject(py)?
@@ -22888,12 +22971,13 @@ impl PySemanticTransitionController {
                 }
             })
             .map_err(xlog_err)?;
-        authority.bind_native_reads(
+        authority.bind_owned_native_reads(
             &observations,
             &spec.allowed_support_records,
             &spec.task_ground,
         )?;
-        let goal_witness = authority.goal_witness(&observations);
+        let goal_witness = authority.goal_witness(observations.roots());
+        drop(observations);
         let operation = ColdValue::read(replay_operation, &mut budget, 0)?;
         let (phase, transition) = if let Some(material) = &selected_material {
             let operation = operation.text()?.to_owned();
