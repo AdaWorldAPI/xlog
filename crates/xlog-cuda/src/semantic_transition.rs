@@ -40272,8 +40272,11 @@ impl SemanticTransitionSession {
                 SemanticTaskObservationRootsOwner::reserve_lineage(admission, insertions, &budget)
             },
             |capacities, _| {
-                let versions = capacities.versions as usize;
-                let supports = capacities.supports as usize;
+                let ([_, _, supports, versions], _) = capacities
+                    .native_work_geometry()
+                    .map_err(SemanticTransitionError::Semantic)?;
+                let versions = versions as usize;
+                let supports = supports as usize;
                 let seen_versions = budget.reserve_ordered_index::<usize, ()>(versions)?;
                 let seen_supports = budget.reserve_ordered_index::<usize, ()>(supports)?;
                 // A corrupt extent can force Vec growth up to the native version

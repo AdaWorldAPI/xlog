@@ -2458,7 +2458,6 @@ pub struct SemanticHypergraphCapacities {
 }
 
 impl SemanticHypergraphCapacities {
-    #[cfg(feature = "semantic-policy")]
     pub(crate) fn native_work_geometry(self) -> Result<([u64; 4], u64), SemanticHypergraphError> {
         Ok((
             [
