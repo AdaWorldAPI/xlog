@@ -244,12 +244,19 @@ impl<'a> CompilationAllocationScope<'a> {
     }
 
     fn reserve_receipt_storage(&mut self) -> Result<()> {
-        if self.receipts.len() == self.receipts.capacity() {
-            let capacity = self
-                .receipts
-                .len()
-                .checked_add(1)
-                .and_then(|n| n.max(4).checked_next_power_of_two())
+        self.reserve_receipt_storage_for(1)
+    }
+
+    fn reserve_receipt_storage_for(&mut self, additional: usize) -> Result<()> {
+        let count = self
+            .receipts
+            .len()
+            .checked_add(additional)
+            .ok_or_else(|| XlogError::allocation_extent_overflow("compiler receipt"))?;
+        if count > self.receipts.capacity() {
+            let capacity = count
+                .max(4)
+                .checked_next_power_of_two()
                 .ok_or_else(|| XlogError::allocation_extent_overflow("compiler receipt"))?;
             let bytes = capacity
                 .checked_mul(std::mem::size_of::<Arc<dyn Send + Sync>>())
@@ -315,6 +322,19 @@ impl<'a> CompilationAllocationScope<'a> {
     pub fn retain(&mut self, receipt: Arc<dyn Send + Sync>) -> Result<()> {
         self.reserve_receipt_storage()?;
         self.receipts.push(receipt);
+        Ok(())
+    }
+
+    /// Prepare one original receipt roster before transferring an actual
+    /// surviving allocation group. On refusal no receipt is retained; callers
+    /// keep their data-first owners until the original data has dropped.
+    pub fn retain_allocations<const N: usize>(
+        &mut self,
+        receipts: [Option<Arc<dyn Send + Sync>>; N],
+    ) -> Result<()> {
+        let count = receipts.iter().filter(|receipt| receipt.is_some()).count();
+        self.reserve_receipt_storage_for(count)?;
+        self.receipts.extend(receipts.into_iter().flatten());
         Ok(())
     }
 

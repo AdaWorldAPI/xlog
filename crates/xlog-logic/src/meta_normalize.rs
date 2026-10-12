@@ -95,6 +95,8 @@ struct RetainedBindings {
 struct RetainedTermRow {
     values: Vec<Term>,
     allocation_owner: Option<Arc<dyn Send + Sync>>,
+    storage_owner: Option<Arc<dyn Send + Sync>>,
+    nested_storage_owner: Option<Arc<dyn Send + Sync>>,
 }
 
 struct RetainedTermValue {
@@ -272,17 +274,6 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
             return self.reserve_temporary(xlog_core::push_vector_storage_bytes::<T>(count)?);
         }
         Ok(None)
-    }
-
-    fn acquire_vector_growth<T>(&mut self, length: usize, capacity: usize) -> Result<()> {
-        if self.allocation_owner.is_some() && length == capacity {
-            self.acquire(crate::compile::push_vector_allocation_bytes::<T>(
-                length
-                    .checked_add(1)
-                    .ok_or_else(|| XlogError::allocation_extent_overflow("meta vector"))?,
-            )?)?;
-        }
-        Ok(())
     }
 
     fn scalar_columns(&mut self, columns: &[(&str, ScalarType)]) -> Result<Vec<PredColumn>> {
@@ -1136,7 +1127,12 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
                 bytes = bytes
                     .checked_add(xlog_core::btree_insert_allocation_bytes::<
                         String,
-                        (RetainedTermRow, Vec<Term>, Option<Arc<dyn Send + Sync>>),
+                        (
+                            RetainedTermRow,
+                            Vec<Term>,
+                            Option<Arc<dyn Send + Sync>>,
+                            Option<Arc<dyn Send + Sync>>,
+                        ),
                     >(length)?)
                     .ok_or_else(|| {
                         XlogError::allocation_extent_overflow("finite findall groups")
@@ -1148,7 +1144,12 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         };
         let mut groups: BTreeMap<
             String,
-            (RetainedTermRow, Vec<Term>, Option<Arc<dyn Send + Sync>>),
+            (
+                RetainedTermRow,
+                Vec<Term>,
+                Option<Arc<dyn Send + Sync>>,
+                Option<Arc<dyn Send + Sync>>,
+            ),
         > = BTreeMap::new();
         let mut source_facts = self.cloned_source_facts(&goal.predicate)?;
         for fact in std::mem::take(&mut source_facts.facts) {
@@ -1162,11 +1163,24 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
                 let mut bytes = 0u64;
                 for (idx, _) in &group_positions {
                     bytes = bytes
-                        .checked_add(fact.terms[*idx].owned_allocation_bytes()?)
+                        .checked_add(
+                            fact.terms[*idx].owned_allocation_bytes()?
+                                - std::mem::size_of::<Term>() as u64,
+                        )
                         .ok_or_else(|| {
                             XlogError::allocation_extent_overflow("finite findall group")
                         })?;
                 }
+                self.reserve_temporary(bytes)?
+            } else {
+                None
+            };
+            let storage_owner = if self.allocation_owner.is_some() {
+                let bytes = group_positions
+                    .len()
+                    .checked_mul(std::mem::size_of::<Term>())
+                    .and_then(|bytes| u64::try_from(bytes).ok())
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("finite findall group"))?;
                 self.reserve_temporary(bytes)?
             } else {
                 None
@@ -1178,6 +1192,8 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
             let group_terms = RetainedTermRow {
                 values: group_terms,
                 allocation_owner,
+                storage_owner,
+                nested_storage_owner: None,
             };
             let _keys_owner = if self.allocation_owner.is_some() {
                 self.reserve_temporary(crate::compile::push_vector_allocation_bytes::<
@@ -1196,14 +1212,16 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
                 self.substitute_template(template, &bindings.values, &elem_type_ref)?;
             let (length, capacity) = groups
                 .get(&key.text)
-                .map(|(_, values, _)| (values.len(), values.capacity()))
+                .map(|(_, values, _, _)| (values.len(), values.capacity()))
                 .unwrap_or((0, 0));
-            self.acquire_vector_growth::<Term>(length, capacity)?;
-            groups
+            let values_storage = self.reserve_vector_growth::<Term>(length, capacity)?;
+            let group = groups
                 .entry(key.text)
-                .or_insert_with(|| (group_terms, Vec::new(), key._allocation_owner))
-                .1
-                .push(template_value);
+                .or_insert_with(|| (group_terms, Vec::new(), key._allocation_owner, None));
+            group.1.push(template_value);
+            if values_storage.is_some() {
+                group.3 = values_storage;
+            }
         }
         drop(source_facts);
 
@@ -1214,20 +1232,27 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
                     RetainedTermRow {
                         values: Vec::new(),
                         allocation_owner: None,
+                        storage_owner: None,
+                        nested_storage_owner: None,
                     },
                     Vec::new(),
+                    None,
                     None,
                 ),
             );
         }
 
-        for (_, (mut group_terms, values, _key_owner)) in groups {
+        for (_, (mut group_terms, values, _key_owner, values_storage)) in groups {
             let list = Term::List(values);
-            self.acquire_vector_growth::<Term>(
+            let row_storage = self.reserve_vector_growth::<Term>(
                 group_terms.values.len(),
                 group_terms.values.capacity(),
             )?;
             group_terms.values.push(list);
+            if row_storage.is_some() {
+                group_terms.storage_owner = row_storage;
+            }
+            group_terms.nested_storage_owner = values_storage;
             self.add_helper_fact_retained(&helper, group_terms)?;
         }
         drop(_groups_owner);
@@ -1368,6 +1393,8 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
                 RetainedTermRow {
                     values: vec![input_list.clone(), Term::List(output.values)],
                     allocation_owner: output.allocation_owner,
+                    storage_owner: None,
+                    nested_storage_owner: None,
                 },
             )?;
         }
@@ -1425,6 +1452,8 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
                 rows: vec![RetainedTermRow {
                     values: Vec::new(),
                     allocation_owner: None,
+                    storage_owner: None,
+                    nested_storage_owner: None,
                 }],
                 _allocation_owner: allocation_owner,
             });
@@ -2154,6 +2183,8 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
             RetainedTermRow {
                 values: terms,
                 allocation_owner: None,
+                storage_owner: None,
+                nested_storage_owner: None,
             },
         )
     }
@@ -2177,7 +2208,13 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         self.acquire(pred.len() as u64)?;
         let facts_storage =
             self.reserve_vector_growth::<Rule>(self.helper_facts.len(), self.helper_facts.capacity())?;
-        self.retain_temporary(terms.allocation_owner.clone())?;
+        if let Some(scope) = self.allocation_owner.as_deref_mut() {
+            scope.retain_allocations([
+                terms.allocation_owner.clone(),
+                terms.storage_owner.clone(),
+                terms.nested_storage_owner.clone(),
+            ])?;
+        }
         self.helper_facts.push(Rule {
             head: Atom {
                 predicate: pred.to_string(),
@@ -2430,6 +2467,8 @@ fn cartesian_product(
     let mut rows = vec![RetainedTermRow {
         values: Vec::new(),
         allocation_owner: None,
+        storage_owner: None,
+        nested_storage_owner: None,
     }];
     for choice in choices {
         let next_owner =
@@ -2468,6 +2507,8 @@ fn cartesian_product(
                 next.push(RetainedTermRow {
                     values,
                     allocation_owner,
+                    storage_owner: None,
+                    nested_storage_owner: None,
                 });
             }
         }
