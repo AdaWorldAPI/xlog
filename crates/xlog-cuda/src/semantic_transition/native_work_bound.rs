@@ -1495,7 +1495,6 @@ pub(super) fn feedback_geometry_native_work_ceiling(
             0,
             0,
             0,
-            0,
             ceiling_sum([
                 ceiling_product(slots, ceiling_sum([receipt, 16])?)?,
                 8,
@@ -2803,7 +2802,7 @@ pub(super) fn step_input_producer_geometry_native_work_ceiling(
     let s = u64::try_from(allocation_count).map_err(|_| native_work_ceiling_overflow())?;
     let d = contract
         .window_capacity
-        .checked_add(storage.contract_value.feedback_capacity)
+        .checked_add(contract.feedback_capacity)
         .ok_or_else(native_work_ceiling_overflow)?;
     let sum = |a: u64, b: u64| a.checked_add(b).ok_or_else(native_work_ceiling_overflow);
     let product = |a: u64, b: u64| a.checked_mul(b).ok_or_else(native_work_ceiling_overflow);

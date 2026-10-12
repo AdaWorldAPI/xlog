@@ -12957,7 +12957,7 @@ impl PreparedStepInputs {
                         .map_err(|_| {
                             publication_input_error("original step input allowance is poisoned")
                         })?
-                        .record_submitted_dma(bytes)?;
+                        .record_submitted_dma(bytes, &mut original.recorded[index])?;
                 }
                 original.recorded[index] = true;
             }
@@ -23876,13 +23876,14 @@ impl SemanticTransitionSession {
         let policy_work_capacity = training_view.as_ref().map_or(Ok(0usize), |arena| {
             arena.policy_work_capacity(
                 transitions
-                    .clone()
+                    .iter()
+                    .copied()
                     .filter(|kind| *kind == SemanticTransitionKind::Proposal)
                     .count(),
             )
         })?.checked_add(1).ok_or(SemanticTransitionError::GenerationExhausted)?;
         #[cfg(feature = "semantic-policy")]
-        let other_model_count = transitions.clone().filter(|kind| !matches!(kind,
+        let other_model_count = transitions.iter().copied().filter(|kind| !matches!(kind,
             SemanticTransitionKind::Update | SemanticTransitionKind::Drain)).count();
         #[cfg(feature = "semantic-policy")]
         let policy_work_bytes = u64::try_from(
@@ -29336,7 +29337,8 @@ impl SemanticTransitionSession {
             let presence_layout = material
                 .predecessor
                 .layouts
-                .get(&(presence.range.role, presence.range.index))
+                .iter()
+                .find(|layout| (layout.role, layout.index) == (presence.range.role, presence.range.index))
                 .ok_or(SemanticTransitionError::ObservationMismatch)?;
             if presence_layout.element_bytes != 1
                 || presence_layout.scalar_type != 8

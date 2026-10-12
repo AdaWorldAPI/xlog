@@ -991,6 +991,7 @@ impl SemanticTransitionSession {
                     } else {
                         allowance.claim_source_resident_guard(original, ceiling)?;
                     }
+                    drop(allowance);
                     activation.guard_claimed = true;
                 }
             }

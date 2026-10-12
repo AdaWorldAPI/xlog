@@ -1387,7 +1387,16 @@ impl SemanticTransitionSession {
             || self.steps[&handle.token]
                 .evaluation_preparation
                 .as_ref()
-                .is_some_and(|preparation| !preparation.complete)
+                .map(|preparation| {
+                    preparation
+                        .lock()
+                        .map(|preparation| !preparation.complete)
+                        .map_err(|_| {
+                            publication_input_error("evaluation preparation owner is poisoned")
+                        })
+                })
+                .transpose()?
+                .unwrap_or(false)
         {
             return Err(publication_input_error(
                 "evaluation counter extent requires its original known initialized plan",

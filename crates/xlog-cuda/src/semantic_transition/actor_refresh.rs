@@ -313,7 +313,7 @@ impl ActorRefreshWork {
             allocate_publication(provider, members.len())?,
         ];
         let empty = vec![ActorRefreshWorkEntry::default(); members.len()];
-        let stage = |bank| {
+        let stage = |bank: usize| {
             Ok::<_, SemanticTransitionError>(ActorRefreshMetadataUploads {
                 entries: state_restoration::OriginalDeviceWrite::new_with_owner(
                     stream,
