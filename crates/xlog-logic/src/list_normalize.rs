@@ -6,8 +6,7 @@ use std::sync::Arc;
 use xlog_core::{Result, ScalarType, XlogError};
 
 use crate::ast::{
-    Atom, BodyLiteral, Comparison, DomainDecl, PredColumn, PredDecl, Program, Query, Rule, Term,
-    TypeRef,
+    Atom, BodyLiteral, Comparison, PredColumn, PredDecl, Program, Query, Rule, Term, TypeRef,
 };
 
 const LIST_ID_TYPE: ScalarType = ScalarType::U64;
@@ -275,83 +274,135 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
         program: &Program,
         mut allocation_owner: Option<&'a mut crate::compile::CompilationAllocationScope<'pool>>,
     ) -> Result<Self> {
-        let environment_owner = if let Some(allocate) = allocation_owner.as_deref_mut() {
-            let mut bytes =
-                crate::compile::hash_allocation_bytes::<String, ScalarType>(program.domains.len())?;
-            bytes = bytes
-                .checked_add(crate::compile::hash_allocation_bytes::<
-                    String,
-                    Vec<(usize, ListColumn)>,
-                >(program.predicates.len())?)
-                .ok_or_else(|| XlogError::allocation_extent_overflow("list declaration"))?;
-            for domain in &program.domains {
-                bytes = bytes
-                    .checked_add(domain.name.len() as u64)
-                    .ok_or_else(|| XlogError::allocation_extent_overflow("list declaration"))?;
+        use crate::compile::hash_allocation_bytes;
+        let overflow = || XlogError::allocation_extent_overflow("list declaration");
+        let add = |left: u64, right: u64| left.checked_add(right).ok_or_else(overflow);
+        let vector = |count: usize, width: usize| {
+            count
+                .checked_mul(width)
+                .and_then(|n| u64::try_from(n).ok())
+                .ok_or_else(overflow)
+        };
+        let _rosters_owner = if let Some(allocate) = allocation_owner.as_deref_mut() {
+            let bytes = add(
+                hash_allocation_bytes::<&str, ScalarType>(program.domains.len())?,
+                hash_allocation_bytes::<&str, usize>(program.predicates.len())?,
+            )?;
+            if bytes == 0 {
+                None
+            } else {
+                Some(allocate.reserve_allocation(bytes)?)
             }
-            for predicate in &program.predicates {
-                let count = if predicate.columns.is_empty() {
-                    predicate.types.len()
-                } else {
-                    predicate.columns.len()
-                };
-                bytes = bytes
-                    .checked_add(crate::compile::push_vector_allocation_bytes::<(
-                        usize,
-                        ListColumn,
-                    )>(count)?)
-                    .and_then(|n| {
-                        n.checked_add(
-                            crate::compile::push_vector_allocation_bytes::<PredColumn>(count)
-                                .ok()?,
-                        )
-                    })
-                    .and_then(|n| {
-                        n.checked_add((predicate.name.len() as u64).checked_mul(count as u64)?)
-                    })
-                    .ok_or_else(|| XlogError::allocation_extent_overflow("list declaration"))?;
-                for typ in predicate
-                    .types
-                    .iter()
-                    .chain(predicate.columns.iter().map(|column| &column.typ))
-                {
-                    bytes = bytes
-                        .checked_add(typ.owned_allocation_bytes()?)
-                        .ok_or_else(|| XlogError::allocation_extent_overflow("list type"))?;
-                }
-                for column in &predicate.columns {
-                    if let Some(name) = &column.name {
-                        bytes = bytes
-                            .checked_add(name.len() as u64)
-                            .ok_or_else(|| XlogError::allocation_extent_overflow("list name"))?;
-                    }
-                }
-            }
-            Some(
-                allocate.reserve_allocation(
-                    bytes
-                        .checked_mul(2)
-                        .ok_or_else(|| XlogError::allocation_extent_overflow("list declaration"))?,
-                )?,
-            )
         } else {
             None
         };
-        let domains: HashMap<String, ScalarType> = program
-            .domains
-            .iter()
-            .map(|DomainDecl { name, typ }| (name.clone(), *typ))
-            .collect();
-
-        let mut list_columns: HashMap<String, Vec<(usize, ListColumn)>> = HashMap::new();
+        let mut domain_roster: HashMap<&str, ScalarType> =
+            HashMap::with_capacity(program.domains.len());
+        for domain in &program.domains {
+            domain_roster.insert(domain.name.as_str(), domain.typ);
+        }
+        let mut column_counts: HashMap<&str, usize> =
+            HashMap::with_capacity(program.predicates.len());
         for pred in &program.predicates {
-            for (idx, col) in pred.schema_columns().iter().enumerate() {
+            let count = if pred.columns.is_empty() {
+                pred.types
+                    .iter()
+                    .filter(|typ| matches!(typ, TypeRef::List(_)))
+                    .count()
+            } else {
+                pred.columns
+                    .iter()
+                    .filter(|column| matches!(&column.typ, TypeRef::List(_)))
+                    .count()
+            };
+            if count != 0 {
+                let total = column_counts.entry(pred.name.as_str()).or_default();
+                *total = total.checked_add(count).ok_or_else(overflow)?;
+            }
+        }
+        let _domains_owner = if let Some(allocate) = allocation_owner.as_deref_mut() {
+            let mut bytes = hash_allocation_bytes::<String, ScalarType>(domain_roster.len())?;
+            for name in domain_roster.keys() {
+                bytes = add(bytes, name.len() as u64)?;
+            }
+            if bytes == 0 {
+                None
+            } else {
+                Some(allocate.reserve_allocation(bytes)?)
+            }
+        } else {
+            None
+        };
+        let mut domains: HashMap<String, ScalarType> = HashMap::with_capacity(domain_roster.len());
+        for (name, typ) in domain_roster {
+            domains.insert(name.to_string(), typ);
+        }
+        let environment_owner = if let Some(allocate) = allocation_owner.as_deref_mut() {
+            let mut bytes =
+                hash_allocation_bytes::<String, Vec<(usize, ListColumn)>>(column_counts.len())?;
+            for (name, count) in &column_counts {
+                bytes = add(bytes, name.len() as u64)?;
+                bytes = add(
+                    bytes,
+                    vector(*count, std::mem::size_of::<(usize, ListColumn)>())?,
+                )?;
+            }
+            if bytes == 0 {
+                None
+            } else {
+                Some(allocate.reserve_allocation(bytes)?)
+            }
+        } else {
+            None
+        };
+        let mut list_columns: HashMap<String, Vec<(usize, ListColumn)>> =
+            HashMap::with_capacity(column_counts.len());
+        for (name, count) in column_counts {
+            list_columns.insert(name.to_string(), Vec::with_capacity(count));
+        }
+        for pred in &program.predicates {
+            let _schema_owner = if let Some(allocate) = allocation_owner.as_deref_mut() {
+                let count = if pred.columns.is_empty() {
+                    pred.types.len()
+                } else {
+                    pred.columns.len()
+                };
+                let mut bytes = vector(count, std::mem::size_of::<PredColumn>())?;
+                if pred.columns.is_empty() {
+                    for typ in &pred.types {
+                        bytes = add(
+                            bytes,
+                            typ.owned_allocation_bytes()? - std::mem::size_of::<TypeRef>() as u64,
+                        )?;
+                    }
+                } else {
+                    for column in &pred.columns {
+                        bytes = add(
+                            bytes,
+                            column.typ.owned_allocation_bytes()?
+                                - std::mem::size_of::<TypeRef>() as u64,
+                        )?;
+                        if let Some(name) = &column.name {
+                            bytes = add(bytes, name.len() as u64)?;
+                        }
+                    }
+                }
+                if bytes == 0 {
+                    None
+                } else {
+                    Some(allocate.reserve_allocation(bytes)?)
+                }
+            } else {
+                None
+            };
+            let schema = pred.schema_columns();
+            for (idx, col) in schema.iter().enumerate() {
                 if let TypeRef::List(inner) = &col.typ {
                     let elem_type =
                         Self::storage_type_for_type_ref(inner, &domains, &mut allocation_owner)?;
                     list_columns
-                        .entry(pred.name.clone())
-                        .or_default()
+                        .get_mut(pred.name.as_str())
+                        .expect("original list column roster")
                         .push((idx, ListColumn { elem_type }));
                 }
             }

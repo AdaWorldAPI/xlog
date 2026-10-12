@@ -6,8 +6,8 @@ use std::sync::Arc;
 use xlog_core::{symbol, Result, ScalarType, XlogError};
 
 use crate::ast::{
-    Atom, BodyLiteral, Comparison, Constraint, DomainDecl, PredColumn, PredDecl, Program, Query,
-    Rule, Term, TypeRef, Univ,
+    Atom, BodyLiteral, Comparison, Constraint, PredColumn, PredDecl, Program, Query, Rule, Term,
+    TypeRef, Univ,
 };
 
 const TERM_ID_TYPE: ScalarType = ScalarType::U64;
@@ -89,6 +89,11 @@ struct RetainedBindings {
 struct RetainedTermRow {
     values: Vec<Term>,
     allocation_owner: Option<Arc<dyn Send + Sync>>,
+}
+
+struct RetainedTermValue {
+    value: Term,
+    _allocation_owner: Option<Arc<dyn Send + Sync>>,
 }
 
 struct RetainedTermRows {
@@ -316,132 +321,205 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         program: &Program,
         mut allocation_owner: Option<&'a mut crate::compile::CompilationAllocationScope<'pool>>,
     ) -> Result<Self> {
-        let environment_owner = if let Some(reserve) = allocation_owner.as_deref_mut() {
-            use crate::compile::hash_allocation_bytes;
-            let overflow = || XlogError::allocation_extent_overflow("finite meta environment");
-            let add = |left: u64, right: u64| left.checked_add(right).ok_or_else(overflow);
-            let vector = |count: usize, width: usize| {
-                count
-                    .checked_mul(width)
-                    .and_then(|n| u64::try_from(n).ok())
-                    .ok_or_else(overflow)
-            };
-            let needs_source_facts = program_uses_meta_predicates(program);
-            let fact_count = program.rules.iter().filter(|rule| rule.is_fact()).count();
-            let derived_count = program.rules.len() - fact_count;
-            let mut bytes = hash_allocation_bytes::<String, ScalarType>(program.domains.len())?;
+        use crate::compile::hash_allocation_bytes;
+        let overflow = || XlogError::allocation_extent_overflow("finite meta environment");
+        let add = |left: u64, right: u64| left.checked_add(right).ok_or_else(overflow);
+        let vector = |count: usize, width: usize| {
+            count
+                .checked_mul(width)
+                .and_then(|n| u64::try_from(n).ok())
+                .ok_or_else(overflow)
+        };
+        let needs_source_facts = program_uses_meta_predicates(program);
+        let fact_count = program.rules.iter().filter(|rule| rule.is_fact()).count();
+        let derived_count = program.rules.len() - fact_count;
+        let _rosters_owner = if let Some(reserve) = allocation_owner.as_deref_mut() {
+            let mut bytes = hash_allocation_bytes::<&str, ScalarType>(program.domains.len())?;
             bytes = add(
                 bytes,
-                hash_allocation_bytes::<String, Vec<TypeRef>>(program.predicates.len())?,
+                hash_allocation_bytes::<&str, (&PredDecl, bool)>(program.predicates.len())?,
             )?;
-            bytes = add(
-                bytes,
-                hash_allocation_bytes::<String, ()>(program.predicates.len())?,
-            )?;
-            bytes = add(bytes, hash_allocation_bytes::<String, ()>(derived_count)?)?;
-            for domain in &program.domains {
-                bytes = add(bytes, domain.name.len() as u64)?;
-            }
-            for predicate in &program.predicates {
-                // Name keys in the column map and possible term-valued set are
-                // distinct original copies. schema_columns also owns a column
-                // vector before its types are moved into the result vector.
-                bytes = add(
-                    bytes,
-                    (predicate.name.len() as u64)
-                        .checked_mul(2)
-                        .ok_or_else(overflow)?,
-                )?;
-                let columns = if predicate.columns.is_empty() {
-                    predicate.types.len()
-                } else {
-                    predicate.columns.len()
-                };
-                bytes = add(bytes, vector(columns, std::mem::size_of::<PredColumn>())?)?;
-                bytes = add(bytes, vector(columns, std::mem::size_of::<TypeRef>())?)?;
-                if predicate.columns.is_empty() {
-                    for typ in &predicate.types {
-                        bytes = add(bytes, typ.owned_allocation_bytes()?)?;
-                    }
-                } else {
-                    for column in &predicate.columns {
-                        if let Some(name) = &column.name {
-                            bytes = add(bytes, name.len() as u64)?;
-                        }
-                        bytes = add(bytes, column.typ.owned_allocation_bytes()?)?;
-                    }
-                }
-            }
-            for rule in &program.rules {
-                if !rule.is_fact() {
-                    bytes = add(bytes, rule.head.predicate.len() as u64)?;
-                }
-            }
+            bytes = add(bytes, hash_allocation_bytes::<&str, ()>(derived_count)?)?;
             if needs_source_facts {
-                bytes = add(
-                    bytes,
-                    hash_allocation_bytes::<String, Vec<Atom>>(fact_count)?,
-                )?;
-                // Group vectors have total capacity <= 2*F + 4*G, G<=F;
-                // one old buffer of at most F slots can coexist at growth.
-                bytes = add(
-                    bytes,
-                    vector(
-                        fact_count.checked_mul(7).ok_or_else(overflow)?,
-                        std::mem::size_of::<Atom>(),
-                    )?,
-                )?;
-                for rule in program.rules.iter().filter(|rule| rule.is_fact()) {
-                    bytes = add(bytes, rule.head.predicate.len() as u64)?;
-                    bytes = add(bytes, rule.head.owned_allocation_bytes()?)?;
-                }
+                bytes = add(bytes, hash_allocation_bytes::<&str, usize>(fact_count)?)?;
             }
-            // Hash-table collection can temporarily hold both original and
-            // replacement buffers during growth; payload clones are included
-            // above and the reached rosters, not source length, set the sizes.
-            Some(reserve.reserve_allocation(bytes.checked_mul(2).ok_or_else(overflow)?)?)
+            if bytes == 0 {
+                None
+            } else {
+                Some(reserve.reserve_allocation(bytes)?)
+            }
         } else {
             None
         };
-        let domains: HashMap<String, ScalarType> = program
-            .domains
-            .iter()
-            .map(|DomainDecl { name, typ }| (name.clone(), *typ))
-            .collect();
-
-        let mut pred_columns: HashMap<String, Vec<TypeRef>> = HashMap::new();
-        let mut term_valued_preds = HashSet::new();
+        let mut domain_roster: HashMap<&str, ScalarType> =
+            HashMap::with_capacity(program.domains.len());
+        for domain in &program.domains {
+            domain_roster.insert(domain.name.as_str(), domain.typ);
+        }
+        let mut predicate_roster: HashMap<&str, (&PredDecl, bool)> =
+            HashMap::with_capacity(program.predicates.len());
         for pred in &program.predicates {
-            let columns: Vec<TypeRef> = pred
-                .schema_columns()
-                .into_iter()
-                .map(|col| col.typ)
-                .collect();
-            if columns.iter().any(|typ| {
+            let term_valued = |typ: &TypeRef| {
                 matches!(
                     typ,
                     TypeRef::Term | TypeRef::Compound | TypeRef::PredRef | TypeRef::List(_)
                 )
-            }) {
-                term_valued_preds.insert(pred.name.clone());
-            }
-            pred_columns.insert(pred.name.clone(), columns);
+            };
+            let has_terms = if pred.columns.is_empty() {
+                pred.types.iter().any(term_valued)
+            } else {
+                pred.columns.iter().any(|column| term_valued(&column.typ))
+            };
+            predicate_roster
+                .entry(pred.name.as_str())
+                .and_modify(|(last, any_terms)| {
+                    *last = pred;
+                    *any_terms |= has_terms;
+                })
+                .or_insert((pred, has_terms));
         }
-
-        let needs_source_facts = program_uses_meta_predicates(program);
-        let mut source_facts: HashMap<String, Vec<Atom>> = HashMap::new();
-        let mut derived_predicates = HashSet::new();
+        let mut fact_roster: HashMap<&str, usize> =
+            HashMap::with_capacity(if needs_source_facts { fact_count } else { 0 });
+        let mut derived_roster: HashSet<&str> = HashSet::with_capacity(derived_count);
         for rule in &program.rules {
             if rule.is_fact() {
                 if needs_source_facts {
-                    source_facts
-                        .entry(rule.head.predicate.clone())
-                        .or_default()
-                        .push(rule.head.clone());
+                    let count = fact_roster.entry(rule.head.predicate.as_str()).or_default();
+                    *count = count.checked_add(1).ok_or_else(overflow)?;
                 }
             } else {
-                derived_predicates.insert(rule.head.predicate.clone());
+                derived_roster.insert(rule.head.predicate.as_str());
             }
+        }
+        let term_predicates = predicate_roster
+            .values()
+            .filter(|(_, has_terms)| *has_terms)
+            .count();
+        let environment_owner = if let Some(reserve) = allocation_owner.as_deref_mut() {
+            let mut bytes = hash_allocation_bytes::<String, ScalarType>(domain_roster.len())?;
+            bytes = add(
+                bytes,
+                hash_allocation_bytes::<String, Vec<TypeRef>>(predicate_roster.len())?,
+            )?;
+            bytes = add(bytes, hash_allocation_bytes::<String, ()>(term_predicates)?)?;
+            bytes = add(
+                bytes,
+                hash_allocation_bytes::<String, ()>(derived_roster.len())?,
+            )?;
+            bytes = add(
+                bytes,
+                hash_allocation_bytes::<String, Vec<Atom>>(fact_roster.len())?,
+            )?;
+            for name in domain_roster
+                .keys()
+                .chain(derived_roster.iter())
+                .chain(fact_roster.keys())
+            {
+                bytes = add(bytes, name.len() as u64)?;
+            }
+            for (name, (pred, has_terms)) in &predicate_roster {
+                bytes = add(bytes, name.len() as u64)?;
+                if *has_terms {
+                    bytes = add(bytes, name.len() as u64)?;
+                }
+                let count = if pred.columns.is_empty() {
+                    pred.types.len()
+                } else {
+                    pred.columns.len()
+                };
+                bytes = add(bytes, vector(count, std::mem::size_of::<TypeRef>())?)?;
+                if pred.columns.is_empty() {
+                    for typ in &pred.types {
+                        bytes = add(
+                            bytes,
+                            typ.owned_allocation_bytes()? - std::mem::size_of::<TypeRef>() as u64,
+                        )?;
+                    }
+                } else {
+                    for column in &pred.columns {
+                        bytes = add(
+                            bytes,
+                            column.typ.owned_allocation_bytes()?
+                                - std::mem::size_of::<TypeRef>() as u64,
+                        )?;
+                    }
+                }
+            }
+            for count in fact_roster.values() {
+                bytes = add(bytes, vector(*count, std::mem::size_of::<Atom>())?)?;
+            }
+            if needs_source_facts {
+                for rule in program.rules.iter().filter(|rule| rule.is_fact()) {
+                    bytes = add(
+                        bytes,
+                        rule.head.owned_allocation_bytes()? - std::mem::size_of::<Atom>() as u64,
+                    )?;
+                }
+            }
+            if bytes == 0 {
+                None
+            } else {
+                Some(reserve.reserve_allocation(bytes)?)
+            }
+        } else {
+            None
+        };
+        let mut domains: HashMap<String, ScalarType> = HashMap::with_capacity(domain_roster.len());
+        for (name, typ) in domain_roster {
+            domains.insert(name.to_string(), typ);
+        }
+        let mut pred_columns: HashMap<String, Vec<TypeRef>> =
+            HashMap::with_capacity(predicate_roster.len());
+        let mut term_valued_preds: HashSet<String> = HashSet::with_capacity(term_predicates);
+        for (name, (pred, has_terms)) in predicate_roster {
+            let count = if pred.columns.is_empty() {
+                pred.types.len()
+            } else {
+                pred.columns.len()
+            };
+            let _schema_owner = if let Some(reserve) = allocation_owner.as_deref_mut() {
+                let mut bytes = vector(count, std::mem::size_of::<PredColumn>())?;
+                for column in &pred.columns {
+                    if let Some(name) = &column.name {
+                        bytes = add(bytes, name.len() as u64)?;
+                    }
+                }
+                if bytes == 0 {
+                    None
+                } else {
+                    Some(reserve.reserve_allocation(bytes)?)
+                }
+            } else {
+                None
+            };
+            let schema = pred.schema_columns();
+            // This destination has its own original allocation. Type payloads
+            // move under the context receipt; the schema vector cannot become
+            // the surviving type vector through an in-place collection.
+            let mut columns = Vec::with_capacity(count);
+            for column in schema {
+                columns.push(column.typ);
+            }
+            if has_terms {
+                term_valued_preds.insert(name.to_string());
+            }
+            pred_columns.insert(name.to_string(), columns);
+        }
+        let mut source_facts: HashMap<String, Vec<Atom>> = HashMap::with_capacity(fact_roster.len());
+        for (name, count) in fact_roster {
+            source_facts.insert(name.to_string(), Vec::with_capacity(count));
+        }
+        if needs_source_facts {
+            for rule in program.rules.iter().filter(|rule| rule.is_fact()) {
+                source_facts
+                    .get_mut(rule.head.predicate.as_str())
+                    .expect("original finite source fact roster")
+                    .push(rule.head.clone());
+            }
+        }
+        let mut derived_predicates: HashSet<String> = HashSet::with_capacity(derived_roster.len());
+        for name in derived_roster {
+            derived_predicates.insert(name.to_string());
         }
 
         Ok(Self {
@@ -694,80 +772,154 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
     }
 
     fn normalize_value_term(&mut self, term: &Term, expected: Option<&TypeRef>) -> Result<Term> {
+        self.normalize_value_term_with_receipt(term, expected, None)
+    }
+
+    fn normalize_value_term_retained(
+        &mut self,
+        term: &Term,
+        expected: Option<&TypeRef>,
+    ) -> Result<RetainedTermValue> {
+        let allocation_owner = if self.allocation_owner.is_some() {
+            self.reserve_temporary(normalized_value_allocation_bytes(term, expected)?)?
+        } else {
+            None
+        };
+        let value =
+            self.normalize_value_term_with_receipt(term, expected, allocation_owner.as_ref())?;
+        Ok(RetainedTermValue {
+            value,
+            _allocation_owner: allocation_owner,
+        })
+    }
+
+    fn normalize_value_term_with_receipt(
+        &mut self,
+        term: &Term,
+        expected: Option<&TypeRef>,
+        temporary_receipt: Option<&Arc<dyn Send + Sync>>,
+    ) -> Result<Term> {
         match expected {
             Some(TypeRef::Term) if term.is_any_variable() => {
-                self.acquire_term_clone(term)?;
+                if temporary_receipt.is_none() {
+                    self.acquire_term_clone(term)?;
+                }
                 Ok(term.clone())
             }
             Some(TypeRef::Term) => Ok(Term::Integer(
                 self.register_term(term, ExpectedTerm::Any)? as i64
             )),
             Some(TypeRef::Compound) if term.is_any_variable() => {
-                self.acquire_term_clone(term)?;
+                if temporary_receipt.is_none() {
+                    self.acquire_term_clone(term)?;
+                }
                 Ok(term.clone())
             }
             Some(TypeRef::Compound) => Ok(Term::Integer(
                 self.register_term(term, ExpectedTerm::Compound)? as i64,
             )),
             Some(TypeRef::PredRef) if term.is_any_variable() => {
-                self.acquire_term_clone(term)?;
+                if temporary_receipt.is_none() {
+                    self.acquire_term_clone(term)?;
+                }
                 Ok(term.clone())
             }
             Some(TypeRef::PredRef) => Ok(Term::Integer(
                 self.register_term(term, ExpectedTerm::PredRef)? as i64,
             )),
-            Some(TypeRef::List(inner)) => self.normalize_list_value(term, inner),
+            Some(TypeRef::List(inner)) => self.normalize_list_value(term, inner, temporary_receipt),
             Some(TypeRef::Scalar(_)) | Some(TypeRef::Domain(_)) | None => {
-                self.normalize_untyped_value(term)
+                self.normalize_untyped_value_with_receipt(term, temporary_receipt)
             }
         }
     }
 
     fn normalize_untyped_value(&mut self, term: &Term) -> Result<Term> {
+        self.normalize_untyped_value_with_receipt(term, None)
+    }
+
+    fn normalize_untyped_value_with_receipt(
+        &mut self,
+        term: &Term,
+        temporary_receipt: Option<&Arc<dyn Send + Sync>>,
+    ) -> Result<Term> {
         match term {
             Term::List(items) => {
-                self.acquire_vector::<Term>(items.len())?;
+                if temporary_receipt.is_none() {
+                    self.acquire_vector::<Term>(items.len())?;
+                }
                 Ok(Term::List(
                     items
                         .iter()
-                        .map(|item| self.normalize_untyped_value(item))
+                        .map(|item| {
+                            self.normalize_untyped_value_with_receipt(item, temporary_receipt)
+                        })
                         .collect::<Result<Vec<_>>>()?,
                 ))
             }
             Term::Cons { head, tail } => {
-                self.acquire_vector::<Term>(2)?;
+                if temporary_receipt.is_none() {
+                    self.acquire_vector::<Term>(2)?;
+                }
                 Ok(Term::Cons {
-                    head: Box::new(self.normalize_untyped_value(head)?),
-                    tail: Box::new(self.normalize_untyped_value(tail)?),
+                    head: Box::new(
+                        self.normalize_untyped_value_with_receipt(head, temporary_receipt)?,
+                    ),
+                    tail: Box::new(
+                        self.normalize_untyped_value_with_receipt(tail, temporary_receipt)?,
+                    ),
                 })
             }
             _ => {
-                self.acquire_term_clone(term)?;
+                if temporary_receipt.is_none() {
+                    self.acquire_term_clone(term)?;
+                }
                 Ok(term.clone())
             }
         }
     }
 
-    fn normalize_list_value(&mut self, term: &Term, inner: &TypeRef) -> Result<Term> {
+    fn normalize_list_value(
+        &mut self,
+        term: &Term,
+        inner: &TypeRef,
+        temporary_receipt: Option<&Arc<dyn Send + Sync>>,
+    ) -> Result<Term> {
         match term {
             Term::List(items) => {
-                self.acquire_vector::<Term>(items.len())?;
+                if temporary_receipt.is_none() {
+                    self.acquire_vector::<Term>(items.len())?;
+                }
                 Ok(Term::List(
                     items
                         .iter()
-                        .map(|item| self.normalize_value_term(item, Some(inner)))
+                        .map(|item| {
+                            self.normalize_value_term_with_receipt(
+                                item,
+                                Some(inner),
+                                temporary_receipt,
+                            )
+                        })
                         .collect::<Result<Vec<_>>>()?,
                 ))
             }
             Term::Cons { head, tail } => {
-                self.acquire_vector::<Term>(2)?;
+                if temporary_receipt.is_none() {
+                    self.acquire_vector::<Term>(2)?;
+                }
                 Ok(Term::Cons {
-                    head: Box::new(self.normalize_value_term(head, Some(inner))?),
-                    tail: Box::new(self.normalize_list_value(tail, inner)?),
+                    head: Box::new(self.normalize_value_term_with_receipt(
+                        head,
+                        Some(inner),
+                        temporary_receipt,
+                    )?),
+                    tail: Box::new(self.normalize_list_value(tail, inner, temporary_receipt)?),
                 })
             }
             Term::Variable(_) | Term::Anonymous | Term::Integer(_) => {
-                self.acquire_term_clone(term)?;
+                if temporary_receipt.is_none() {
+                    self.acquire_term_clone(term)?;
+                }
                 Ok(term.clone())
             }
             _ => Err(meta_error(
@@ -1100,11 +1252,28 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         let input_type = self
             .cloned_column_type(&pred, 0)?
             .unwrap_or_else(|| infer_type_ref_from_terms(input_items));
-        self.acquire_vector::<Term>(input_items.len())?;
+        let _input_owner = if self.allocation_owner.is_some() {
+            let mut bytes =
+                crate::compile::push_vector_allocation_bytes::<Term>(input_items.len())?;
+            for item in input_items {
+                bytes = bytes
+                    .checked_add(normalized_value_allocation_bytes(item, Some(&input_type))?)
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("finite maplist input"))?;
+            }
+            self.reserve_temporary(bytes)?
+        } else {
+            None
+        };
         let input_list = Term::List(
             input_items
                 .iter()
-                .map(|item| self.normalize_value_term(item, Some(&input_type)))
+                .map(|item| {
+                    self.normalize_value_term_with_receipt(
+                        item,
+                        Some(&input_type),
+                        _input_owner.as_ref(),
+                    )
+                })
                 .collect::<Result<Vec<_>>>()?,
         );
         self.acquire_format(format_args!(
@@ -1129,6 +1298,8 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
                 self.acquire_term_clone(&input_list)?;
                 self.add_helper_fact(&helper, vec![input_list.clone()])?;
             }
+            drop(input_list);
+            drop(_input_owner);
             self.acquire_vector::<Term>(1)?;
             self.acquire_term_clone(&atom.terms[1])?;
             return Ok(vec![BodyLiteral::Positive(Atom {
@@ -1172,6 +1343,8 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
             )?;
         }
         drop(outputs);
+        drop(input_list);
+        drop(_input_owner);
         self.acquire_vector::<Term>(2)?;
         self.acquire_term_clone(&atom.terms[1])?;
         self.acquire_term_clone(&atom.terms[2])?;
@@ -1229,8 +1402,12 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         }
         let facts = self.cloned_source_facts(pred)?;
         let _choices_owner = if self.allocation_owner.is_some() {
-            let outer = crate::compile::push_vector_allocation_bytes::<Vec<Term>>(items.len())?;
-            let inner = crate::compile::push_vector_allocation_bytes::<Term>(facts.facts.len())?;
+            let outer = crate::compile::push_vector_allocation_bytes::<Vec<RetainedTermValue>>(
+                items.len(),
+            )?;
+            let inner = crate::compile::push_vector_allocation_bytes::<RetainedTermValue>(
+                facts.facts.len(),
+            )?;
             let bytes = inner
                 .checked_mul(items.len() as u64)
                 .and_then(|bytes| bytes.checked_add(outer))
@@ -1239,12 +1416,14 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         } else {
             None
         };
-        let mut choices: Vec<Vec<Term>> = Vec::new();
+        let mut choices: Vec<Vec<RetainedTermValue>> = Vec::new();
         for item in items {
             let mut outs = Vec::new();
             for fact in &facts.facts {
                 if fact.terms.len() == 2 && self.term_keys_equal(&fact.terms[0], item)? {
-                    outs.push(self.normalize_value_term(&fact.terms[1], Some(output_type))?);
+                    outs.push(
+                        self.normalize_value_term_retained(&fact.terms[1], Some(output_type))?,
+                    );
                 }
             }
             if outs.is_empty() {
@@ -1300,6 +1479,53 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         bindings: &HashMap<String, Term>,
         elem_type: &TypeRef,
     ) -> Result<Term> {
+        let construction_owner = if self.allocation_owner.is_some() {
+            // Completed children and one active child's constructed/normalized
+            // copies can coexist. The checked shape includes vector growth;
+            // two extents cover those concurrent original scratch allocations.
+            let bytes = template_construction_allocation_bytes(template, bindings, elem_type)?
+                .checked_mul(2)
+                .ok_or_else(|| {
+                    XlogError::allocation_extent_overflow("finite template construction")
+                })?;
+            self.reserve_temporary(bytes)?
+        } else {
+            None
+        };
+        let value = self.substitute_template_value(
+            template,
+            bindings,
+            elem_type,
+            construction_owner.as_ref(),
+        )?;
+        // Only this final value survives in the helper fact. Nested normalized
+        // values and the constructed template remain under the scratch receipt;
+        // registrations made by either normalization keep their original scope.
+        let output = self.normalize_value_term(&value, Some(elem_type));
+        drop(value);
+        drop(construction_owner);
+        output
+    }
+
+    fn substitute_template_nested(
+        &mut self,
+        template: &Term,
+        bindings: &HashMap<String, Term>,
+        elem_type: &TypeRef,
+        temporary_receipt: Option<&Arc<dyn Send + Sync>>,
+    ) -> Result<Term> {
+        let value =
+            self.substitute_template_value(template, bindings, elem_type, temporary_receipt)?;
+        self.normalize_value_term_with_receipt(&value, Some(elem_type), temporary_receipt)
+    }
+
+    fn substitute_template_value(
+        &mut self,
+        template: &Term,
+        bindings: &HashMap<String, Term>,
+        elem_type: &TypeRef,
+        temporary_receipt: Option<&Arc<dyn Send + Sync>>,
+    ) -> Result<Term> {
         let value = match template {
             Term::Variable(name) => {
                 let value = bindings.get(name).ok_or_else(|| {
@@ -1311,7 +1537,9 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
                         &mut self.allocation_owner,
                     )
                 })?;
-                self.acquire_term_clone(value)?;
+                if temporary_receipt.is_none() {
+                    self.acquire_term_clone(value)?;
+                }
                 value.clone()
             }
             Term::Anonymous => {
@@ -1321,31 +1549,51 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
                 ))
             }
             Term::List(items) => {
-                self.acquire_vector::<Term>(items.len())?;
+                if temporary_receipt.is_none() {
+                    self.acquire_vector::<Term>(items.len())?;
+                }
                 Term::List(
                     items
                         .iter()
-                        .map(|item| self.substitute_template(item, bindings, elem_type))
+                        .map(|item| {
+                            self.substitute_template_nested(
+                                item,
+                                bindings,
+                                elem_type,
+                                temporary_receipt,
+                            )
+                        })
                         .collect::<Result<Vec<_>>>()?,
                 )
             }
             Term::Compound { functor, args } => {
-                self.acquire(functor.len() as u64)?;
-                self.acquire_vector::<Term>(args.len())?;
+                if temporary_receipt.is_none() {
+                    self.acquire(functor.len() as u64)?;
+                    self.acquire_vector::<Term>(args.len())?;
+                }
                 Term::Compound {
                     functor: functor.clone(),
                     args: args
                         .iter()
-                        .map(|arg| self.substitute_template(arg, bindings, elem_type))
+                        .map(|arg| {
+                            self.substitute_template_nested(
+                                arg,
+                                bindings,
+                                elem_type,
+                                temporary_receipt,
+                            )
+                        })
                         .collect::<Result<Vec<_>>>()?,
                 }
             }
             _ => {
-                self.acquire_term_clone(template)?;
+                if temporary_receipt.is_none() {
+                    self.acquire_term_clone(template)?;
+                }
                 template.clone()
             }
         };
-        self.normalize_value_term(&value, Some(elem_type))
+        Ok(value)
     }
 
     fn infer_template_type(&mut self, template: &Term, goal: &Atom) -> Result<TypeRef> {
@@ -2006,6 +2254,102 @@ pub(crate) fn static_meta_predicate_dependency(atom: &Atom) -> Option<String> {
     }
 }
 
+/// Heap storage of the same normalized value, excluding independent registry
+/// allocations. Push-built list buffers include their reached growth storage.
+fn normalized_value_allocation_bytes(term: &Term, expected: Option<&TypeRef>) -> Result<u64> {
+    let overflow = || XlogError::allocation_extent_overflow("finite meta value");
+    let add = |left: u64, right: u64| left.checked_add(right).ok_or_else(overflow);
+    let clone_bytes = |term: &Term| {
+        term.owned_allocation_bytes()
+            .map(|bytes| bytes - std::mem::size_of::<Term>() as u64)
+    };
+    let inner = match expected {
+        Some(TypeRef::Term | TypeRef::Compound | TypeRef::PredRef) => {
+            return if term.is_any_variable() {
+                clone_bytes(term)
+            } else {
+                Ok(0)
+            };
+        }
+        Some(TypeRef::List(inner)) => Some(inner.as_ref()),
+        _ => None,
+    };
+    match term {
+        Term::List(items) => {
+            let mut bytes = crate::compile::push_vector_allocation_bytes::<Term>(items.len())?;
+            for item in items {
+                bytes = add(bytes, normalized_value_allocation_bytes(item, inner)?)?;
+            }
+            Ok(bytes)
+        }
+        Term::Cons { head, tail } => {
+            let bytes = add(
+                2 * std::mem::size_of::<Term>() as u64,
+                normalized_value_allocation_bytes(head, inner)?,
+            )?;
+            add(
+                bytes,
+                normalized_value_allocation_bytes(
+                    tail,
+                    if inner.is_some() { expected } else { None },
+                )?,
+            )
+        }
+        Term::Variable(_) | Term::Anonymous | Term::Integer(_) => clone_bytes(term),
+        _ if inner.is_some() => Ok(0),
+        _ => clone_bytes(term),
+    }
+}
+
+/// Borrowed construction geometry for the original recursive substitution.
+/// Missing bindings and invalid nodes allocate no value; the shared producer
+/// remains responsible for their unchanged classified diagnostics.
+fn template_construction_allocation_bytes(
+    template: &Term,
+    bindings: &HashMap<String, Term>,
+    elem_type: &TypeRef,
+) -> Result<u64> {
+    let overflow = || XlogError::allocation_extent_overflow("finite template construction");
+    let add = |left: u64, right: u64| left.checked_add(right).ok_or_else(overflow);
+    match template {
+        Term::Variable(name) => match bindings.get(name) {
+            Some(value) => add(
+                value.owned_allocation_bytes()? - std::mem::size_of::<Term>() as u64,
+                normalized_value_allocation_bytes(value, Some(elem_type))?,
+            ),
+            None => Ok(0),
+        },
+        Term::Anonymous => Ok(0),
+        Term::List(items) => {
+            let mut bytes = crate::compile::push_vector_allocation_bytes::<Term>(items.len())?;
+            for item in items {
+                bytes = add(
+                    bytes,
+                    template_construction_allocation_bytes(item, bindings, elem_type)?,
+                )?;
+            }
+            Ok(bytes)
+        }
+        Term::Compound { functor, args } => {
+            let mut bytes = add(
+                functor.len() as u64,
+                crate::compile::push_vector_allocation_bytes::<Term>(args.len())?,
+            )?;
+            for arg in args {
+                bytes = add(
+                    bytes,
+                    template_construction_allocation_bytes(arg, bindings, elem_type)?,
+                )?;
+            }
+            Ok(bytes)
+        }
+        _ => add(
+            template.owned_allocation_bytes()? - std::mem::size_of::<Term>() as u64,
+            normalized_value_allocation_bytes(template, Some(elem_type))?,
+        ),
+    }
+}
+
 fn infer_type_ref_from_terms(items: &[Term]) -> TypeRef {
     if let Some(first) = items.first() {
         match first {
@@ -2028,7 +2372,7 @@ fn infer_type_ref_from_terms(items: &[Term]) -> TypeRef {
 }
 
 fn cartesian_product(
-    choices: &[Vec<Term>],
+    choices: &[Vec<RetainedTermValue>],
     allocate: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
 ) -> Result<RetainedTermRows> {
     let mut rows_owner = allocate
@@ -2062,7 +2406,7 @@ fn cartesian_product(
                     })?;
                     let count = row.values.len().checked_add(1).ok_or_else(overflow)?;
                     let replacement = crate::compile::push_vector_allocation_bytes::<Term>(count)?;
-                    let value_bytes = value.owned_allocation_bytes()?;
+                    let value_bytes = value.value.owned_allocation_bytes()?;
                     let bytes = clone_bytes
                         .checked_add(replacement)
                         .and_then(|bytes| bytes.checked_add(value_bytes))
@@ -2072,7 +2416,7 @@ fn cartesian_product(
                     None
                 };
                 let mut values = row.values.clone();
-                values.push(value.clone());
+                values.push(value.value.clone());
                 next.push(RetainedTermRow {
                     values,
                     allocation_owner,
