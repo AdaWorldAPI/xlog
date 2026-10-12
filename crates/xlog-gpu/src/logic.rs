@@ -1246,9 +1246,11 @@ impl SemanticLogicTaskProgram {
         query_ordinals: Vec<usize>,
         reserve: &mut Option<&mut dyn FnMut(u64) -> Result<Arc<dyn Send + Sync>>>,
     ) -> Result<Self> {
-        let mut scope = reserve
-            .as_deref_mut()
-            .map(xlog_logic::compile::CompilationAllocationScope::new);
+        let mut scope = reserve.as_deref_mut().map(|reserve| {
+            xlog_logic::compile::CompilationAllocationScope::new(
+                reserve as &mut dyn FnMut(u64) -> Result<Arc<dyn Send + Sync>>,
+            )
+        });
         if let Some(scope) = scope.as_mut() {
             scope.prepare_owner()?;
         }
