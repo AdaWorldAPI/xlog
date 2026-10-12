@@ -432,7 +432,7 @@ impl SemanticReplayMaterialBudget {
         Ok(SemanticReplayMaterialOutput {
             owner: Arc::clone(&original.bytes.owner),
             comparison: Some(Arc::new(MaterialOutputComparison {
-                original: original.clone(),
+                original: original.slice_payload(0..original.as_bytes().len())?,
                 budget: self.clone(),
                 ledger: Mutex::new(MaterialOutputLedger {
                     model_begin: 0,
@@ -878,10 +878,12 @@ impl SemanticReplayMaterialOutput {
         if !ledger.framed {
             ledger.full_published = true;
         }
-        Ok(self
-            .comparison
-            .as_ref()
-            .map_or_else(|| self.loaded(range), |original| original.original.clone()))
+        match &self.comparison {
+            Some(original) => original
+                .original
+                .slice_payload(0..original.original.as_bytes().len()),
+            None => Ok(self.loaded(range)),
+        }
     }
 
     /// Publish the initialized frame body while its disjoint suffix remains

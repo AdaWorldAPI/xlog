@@ -801,7 +801,7 @@ impl SemanticTransitionSession {
             .output
             .seal_prefix()?
             .slice_payload(frame_prefix.len()..encoded.cursor)?;
-        encoded.native = Some(native.clone());
+        encoded.native = Some(native.slice_payload(0..native.as_bytes().len())?);
         original.bank.read.retire_completed_values();
         if let Some(control) = &mut original.control {
             control.read.retire_completed_values();

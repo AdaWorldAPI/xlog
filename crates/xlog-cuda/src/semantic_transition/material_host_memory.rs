@@ -88,7 +88,7 @@ impl SemanticReplayMaterialBudget {
                 .ok_or(SemanticTransitionError::GenerationExhausted)?;
             let available = linux::headroom()?;
             if requested > available {
-                return Err(publication_input_error(format!(
+                return Err(publication_input_error(&format!(
                     "original host allocation requires {requested} additional/unbacked bytes but the current inherited envelope has {available} bytes"
                 )));
             }

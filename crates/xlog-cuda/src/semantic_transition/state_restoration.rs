@@ -499,7 +499,7 @@ impl SemanticTransitionSession {
                 .iter()
                 .find(|item| item.range.role == 16 && item.range.index == index as u64)
                 .ok_or(SemanticTransitionError::ObservationMismatch)?;
-            if saved.bytes != *statement {
+            if saved.bytes.as_slice() != *statement {
                 return Err(publication_input_error(
                     "restored feedback statement differs from the actual admitted task",
                 ));
