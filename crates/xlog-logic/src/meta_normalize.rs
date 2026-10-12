@@ -8,6 +8,7 @@ use xlog_core::{symbol, Result, ScalarType, XlogError};
 use crate::ast::{
     Atom, BodyLiteral, Comparison, PredColumn, PredDecl, Program, Rule, Term, TypeRef, Univ,
 };
+use crate::program_custody::{ColumnCustody, PayloadCustody, PredicateCustody, RetainedVectorCustody};
 
 const TERM_ID_TYPE: ScalarType = ScalarType::U64;
 
@@ -114,6 +115,80 @@ struct RetainedRegisteredTerm {
     allocation_owners: [Option<Arc<dyn Send + Sync>>; 2],
 }
 
+struct RetainedTypeRef {
+    value: TypeRef,
+    custody: PayloadCustody,
+}
+
+impl RetainedTypeRef {
+    fn scalar(typ: ScalarType) -> Self {
+        Self {
+            value: TypeRef::Scalar(typ),
+            custody: PayloadCustody::default(),
+        }
+    }
+
+    fn term() -> Self {
+        Self {
+            value: TypeRef::Term,
+            custody: PayloadCustody::default(),
+        }
+    }
+
+    fn clone_with_owner(
+        typ: &TypeRef,
+        scope: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
+    ) -> Result<Self> {
+        let custody = match scope.as_deref_mut() {
+            Some(scope) => PayloadCustody::for_type_clone(typ, scope)?,
+            None => PayloadCustody::default(),
+        };
+        Ok(Self {
+            value: typ.clone(),
+            custody,
+        })
+    }
+
+    fn into_list(
+        mut self,
+        scope: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
+    ) -> Result<Self> {
+        if let Some(scope) = scope.as_deref_mut() {
+            self.custody
+                .reserve_unit(std::mem::size_of::<TypeRef>() as u64, scope)?;
+        }
+        Ok(Self {
+            value: TypeRef::List(Box::new(self.value)),
+            custody: self.custody,
+        })
+    }
+}
+
+struct RetainedHelperColumns {
+    value: Vec<PredColumn>,
+    custody: Option<RetainedVectorCustody<ColumnCustody>>,
+}
+
+struct RegisteredHelperDeclaration {
+    columns: RetainedHelperColumns,
+    key_owner: Option<Arc<dyn Send + Sync>>,
+}
+
+struct RetainedHelperDeclarations {
+    values: BTreeMap<String, RegisteredHelperDeclaration>,
+    storage: PayloadCustody,
+}
+
+struct HelperDeclarationAllocation {
+    _custody: PredicateCustody,
+    _metadata_owner: Arc<dyn Send + Sync>,
+}
+
+struct RetainedHelperEmission {
+    value: PredDecl,
+    allocation_owner: Option<Arc<HelperDeclarationAllocation>>,
+}
+
 struct MetaNormalizer<'a, 'pool> {
     domains: HashMap<String, ScalarType>,
     /// Declared column types per predicate (index = column position).
@@ -129,7 +204,7 @@ struct MetaNormalizer<'a, 'pool> {
     term_ids: HashMap<String, RegisteredTermId>,
     term_records: Vec<TermRecord>,
     next_term_id: u64,
-    helper_decls: BTreeMap<String, Vec<PredColumn>>,
+    helper_decls: BTreeMap<String, RegisteredHelperDeclaration>,
     helper_facts: Vec<Rule>,
     helper_fact_keys: HashMap<String, Option<Arc<dyn Send + Sync>>>,
     findall_counter: usize,
@@ -139,6 +214,7 @@ struct MetaNormalizer<'a, 'pool> {
     _term_records_storage: Option<Arc<dyn Send + Sync>>,
     _helper_facts_storage: Option<Arc<dyn Send + Sync>>,
     _helper_fact_keys_storage: Option<Arc<dyn Send + Sync>>,
+    helper_decls_storage: PayloadCustody,
     _environment_owner: Option<Arc<dyn Send + Sync>>,
 }
 
@@ -275,40 +351,77 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         Ok(None)
     }
 
-    fn scalar_columns(&mut self, columns: &[(&str, ScalarType)]) -> Result<Vec<PredColumn>> {
-        self.acquire_vector::<PredColumn>(columns.len())?;
-        for (name, _) in columns {
-            self.acquire(name.len() as u64)?;
-        }
-        Ok(columns
-            .iter()
-            .map(|(name, typ)| scalar_col(name, *typ))
-            .collect())
+    fn helper_columns(&mut self, count: usize) -> Result<RetainedHelperColumns> {
+        let custody = match self.allocation_owner.as_deref_mut() {
+            Some(scope) => Some(RetainedVectorCustody::for_capacity::<PredColumn>(
+                count, scope,
+            )?),
+            None => None,
+        };
+        Ok(RetainedHelperColumns {
+            value: Vec::with_capacity(count),
+            custody,
+        })
     }
 
-    fn univ_columns(&mut self) -> Result<Vec<PredColumn>> {
-        self.acquire_vector::<PredColumn>(2)?;
-        self.acquire(("term_id".len() + "parts".len() + std::mem::size_of::<TypeRef>()) as u64)?;
-        Ok(vec![
-            scalar_col("term_id", TERM_ID_TYPE),
-            PredColumn {
-                name: Some("parts".to_string()),
-                typ: TypeRef::List(Box::new(TypeRef::Term)),
-            },
-        ])
+    fn push_helper_column(
+        &mut self,
+        columns: &mut RetainedHelperColumns,
+        name: &str,
+        typ: RetainedTypeRef,
+        lowercase_name: bool,
+    ) -> Result<()> {
+        let name_custody = match self.allocation_owner.as_deref_mut() {
+            Some(scope) => PayloadCustody::for_text_clone(name, scope)?,
+            None => PayloadCustody::default(),
+        };
+        let column = PredColumn {
+            name: Some(if lowercase_name {
+                name.to_ascii_lowercase()
+            } else {
+                name.to_string()
+            }),
+            typ: typ.value,
+        };
+        columns.value.push(column);
+        if let Some(custody) = columns.custody.as_mut() {
+            custody.elements.push(ColumnCustody {
+                name: name_custody,
+                typ: typ.custody,
+            });
+        }
+        Ok(())
     }
 
-    fn cloned_column_type(&mut self, predicate: &str, index: usize) -> Result<Option<TypeRef>> {
-        if self.allocation_owner.is_some() {
-            let bytes = self
-                .column_type(predicate, index)
-                .map(TypeRef::owned_allocation_bytes)
-                .transpose()?
-                .map(|n| n - std::mem::size_of::<TypeRef>() as u64)
-                .unwrap_or(0);
-            self.acquire(bytes)?;
+    fn scalar_columns(&mut self, columns: &[(&str, ScalarType)]) -> Result<RetainedHelperColumns> {
+        let mut retained = self.helper_columns(columns.len())?;
+        for (name, typ) in columns {
+            self.push_helper_column(&mut retained, name, RetainedTypeRef::scalar(*typ), false)?;
         }
-        Ok(self.column_type(predicate, index).cloned())
+        Ok(retained)
+    }
+
+    fn univ_columns(&mut self) -> Result<RetainedHelperColumns> {
+        let mut columns = self.helper_columns(2)?;
+        self.push_helper_column(
+            &mut columns,
+            "term_id",
+            RetainedTypeRef::scalar(TERM_ID_TYPE),
+            false,
+        )?;
+        let parts = RetainedTypeRef::term().into_list(&mut self.allocation_owner)?;
+        self.push_helper_column(&mut columns, "parts", parts, false)?;
+        Ok(columns)
+    }
+
+    fn cloned_column_type(
+        &mut self,
+        predicate: &str,
+        index: usize,
+    ) -> Result<Option<RetainedTypeRef>> {
+        Self::column_type(&self.pred_columns, predicate, index)
+            .map(|typ| RetainedTypeRef::clone_with_owner(typ, &mut self.allocation_owner))
+            .transpose()
     }
 
     fn cloned_source_facts(&mut self, predicate: &str) -> Result<RetainedSourceFacts> {
@@ -556,13 +669,18 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
             _term_records_storage: None,
             _helper_facts_storage: None,
             _helper_fact_keys_storage: None,
+            helper_decls_storage: PayloadCustody::default(),
             _environment_owner: environment_owner,
         })
     }
 
     /// Declared column type of `pred` at position `idx`, if any.
-    fn column_type(&self, pred: &str, idx: usize) -> Option<&TypeRef> {
-        self.pred_columns.get(pred).and_then(|cols| cols.get(idx))
+    fn column_type<'columns>(
+        columns: &'columns HashMap<String, Vec<TypeRef>>,
+        pred: &str,
+        idx: usize,
+    ) -> Option<&'columns TypeRef> {
+        columns.get(pred).and_then(|cols| cols.get(idx))
     }
 
     /// True when value normalization is the identity on this fact: its
@@ -614,26 +732,6 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         }
 
         self.append_helpers(&mut out)?;
-        if self.allocation_owner.is_some() {
-            let mut bytes = 0u64;
-            for predicate in &out.predicates {
-                bytes = bytes
-                    .checked_add(crate::compile::push_vector_allocation_bytes::<TypeRef>(
-                        predicate.types.len(),
-                    )?)
-                    .ok_or_else(|| XlogError::allocation_extent_overflow("meta type"))?;
-                for typ in predicate
-                    .types
-                    .iter()
-                    .chain(predicate.columns.iter().map(|column| &column.typ))
-                {
-                    bytes = bytes
-                        .checked_add(typ.owned_allocation_bytes()?)
-                        .ok_or_else(|| XlogError::allocation_extent_overflow("meta type"))?;
-                }
-            }
-            self.acquire(bytes)?;
-        }
         lower_meta_type_refs_in_predicates(&mut out);
         Ok(out)
     }
@@ -733,7 +831,7 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         let mut terms = Vec::with_capacity(atom.terms.len());
         for (idx, term) in atom.terms.iter().enumerate() {
             let expected = self.cloned_column_type(&atom.predicate, idx)?;
-            terms.push(self.normalize_value_term(term, expected.as_ref())?);
+            terms.push(self.normalize_value_term(term, expected.as_ref().map(|typ| &typ.value))?);
         }
         Ok(Atom {
             predicate: atom.predicate.clone(),
@@ -1043,27 +1141,24 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         let helper = format!("__xlog_meta_findall_{}", self.findall_counter);
         self.findall_counter += 1;
 
-        self.acquire(crate::compile::push_vector_allocation_bytes::<PredColumn>(
-            group_positions.len() + 1,
-        )?)?;
-        let mut columns = Vec::new();
+        let mut columns = self.helper_columns(
+            group_positions
+                .len()
+                .checked_add(1)
+                .ok_or_else(|| XlogError::allocation_extent_overflow("finite findall columns"))?,
+        )?;
         for (idx, name) in &group_positions {
-            self.acquire(name.len() as u64)?;
             let typ = self
                 .cloned_column_type(&goal.predicate, *idx)?
-                .unwrap_or(TypeRef::Scalar(
+                .unwrap_or(RetainedTypeRef::scalar(
                     bound.get(name).copied().unwrap_or(ScalarType::U64),
                 ));
-            columns.push(PredColumn {
-                name: Some(name.to_ascii_lowercase()),
-                typ,
-            });
+            self.push_helper_column(&mut columns, name, typ, true)?;
         }
-        self.acquire("results".len() as u64 + elem_type_ref.owned_allocation_bytes()?)?;
-        columns.push(PredColumn {
-            name: Some("results".to_string()),
-            typ: TypeRef::List(Box::new(elem_type_ref.clone())),
-        });
+        let results_type =
+            RetainedTypeRef::clone_with_owner(&elem_type_ref.value, &mut self.allocation_owner)?
+                .into_list(&mut self.allocation_owner)?;
+        self.push_helper_column(&mut columns, "results", results_type, false)?;
         self.register_helper_decl(&helper, columns)?;
 
         let _groups_owner = if self.allocation_owner.is_some() {
@@ -1159,7 +1254,7 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
                 .collect::<Result<Vec<_>>>()?;
             let key = retained_joined_keys(&keys, "|", &mut self.allocation_owner)?;
             let template_value =
-                self.substitute_template(template, &bindings.values, &elem_type_ref)?;
+                self.substitute_template(template, &bindings.values, &elem_type_ref.value)?;
             let (length, capacity) = groups
                 .get(&key.text)
                 .map(|(_, values, _, _)| (values.len(), values.capacity()))
@@ -1174,6 +1269,7 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
             }
         }
         drop(source_facts);
+        drop(elem_type_ref);
 
         if groups.is_empty() && group_positions.is_empty() {
             groups.insert(
@@ -1261,7 +1357,10 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
                 crate::compile::push_vector_allocation_bytes::<Term>(input_items.len())?;
             for item in input_items {
                 bytes = bytes
-                    .checked_add(normalized_value_allocation_bytes(item, Some(&input_type))?)
+                    .checked_add(normalized_value_allocation_bytes(
+                        item,
+                        Some(&input_type.value),
+                    )?)
                     .ok_or_else(|| XlogError::allocation_extent_overflow("finite maplist input"))?;
             }
             self.reserve_temporary(bytes)?
@@ -1274,7 +1373,7 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
                 .map(|item| {
                     self.normalize_value_term_with_receipt(
                         item,
-                        Some(&input_type),
+                        Some(&input_type.value),
                         _input_owner.as_ref(),
                     )
                 })
@@ -1288,15 +1387,10 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         self.maplist_counter += 1;
 
         if atom.terms.len() == 2 {
-            self.acquire_vector::<PredColumn>(1)?;
-            self.acquire("input".len() as u64 + std::mem::size_of::<TypeRef>() as u64)?;
-            self.register_helper_decl(
-                &helper,
-                vec![PredColumn {
-                    name: Some("input".to_string()),
-                    typ: TypeRef::List(Box::new(input_type)),
-                }],
-            )?;
+            let mut columns = self.helper_columns(1)?;
+            let input_type = input_type.into_list(&mut self.allocation_owner)?;
+            self.push_helper_column(&mut columns, "input", input_type, false)?;
+            self.register_helper_decl(&helper, columns)?;
             if self.maplist_unary_holds(&pred, &input_list)? {
                 self.acquire_vector::<Term>(1)?;
                 self.acquire_term_clone(&input_list)?;
@@ -1314,27 +1408,17 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
 
         let output_type = self
             .cloned_column_type(&pred, 1)?
-            .unwrap_or(TypeRef::Scalar(ScalarType::U64));
-        self.acquire_vector::<PredColumn>(2)?;
-        self.acquire(
-            "inputoutput".len() as u64
-                + std::mem::size_of::<TypeRef>() as u64
-                + output_type.owned_allocation_bytes()?,
-        )?;
-        self.register_helper_decl(
-            &helper,
-            vec![
-                PredColumn {
-                    name: Some("input".to_string()),
-                    typ: TypeRef::List(Box::new(input_type)),
-                },
-                PredColumn {
-                    name: Some("output".to_string()),
-                    typ: TypeRef::List(Box::new(output_type.clone())),
-                },
-            ],
-        )?;
-        let mut outputs = self.maplist_binary_outputs(&pred, &input_list, &output_type)?;
+            .unwrap_or(RetainedTypeRef::scalar(ScalarType::U64));
+        let mut columns = self.helper_columns(2)?;
+        let input_type = input_type.into_list(&mut self.allocation_owner)?;
+        self.push_helper_column(&mut columns, "input", input_type, false)?;
+        let helper_output_type =
+            RetainedTypeRef::clone_with_owner(&output_type.value, &mut self.allocation_owner)?
+                .into_list(&mut self.allocation_owner)?;
+        self.push_helper_column(&mut columns, "output", helper_output_type, false)?;
+        self.register_helper_decl(&helper, columns)?;
+        let mut outputs = self.maplist_binary_outputs(&pred, &input_list, &output_type.value)?;
+        drop(output_type);
         for output in std::mem::take(&mut outputs.rows) {
             self.acquire_vector::<Term>(2)?;
             self.acquire_term_clone(&input_list)?;
@@ -1604,14 +1688,14 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         Ok(value)
     }
 
-    fn infer_template_type(&mut self, template: &Term, goal: &Atom) -> Result<TypeRef> {
+    fn infer_template_type(&mut self, template: &Term, goal: &Atom) -> Result<RetainedTypeRef> {
         match template {
             Term::Variable(name) => {
                 for (idx, term) in goal.terms.iter().enumerate() {
                     if matches!(term, Term::Variable(var) if var == name) {
                         return Ok(self
                             .cloned_column_type(&goal.predicate, idx)?
-                            .unwrap_or(TypeRef::Scalar(ScalarType::U64)));
+                            .unwrap_or(RetainedTypeRef::scalar(ScalarType::U64)));
                     }
                 }
                 Err(meta_error(
@@ -1622,11 +1706,11 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
                     &mut self.allocation_owner,
                 ))
             }
-            Term::Integer(_) => Ok(TypeRef::Scalar(ScalarType::U32)),
-            Term::Float(_) => Ok(TypeRef::Scalar(ScalarType::F64)),
-            Term::String(_) | Term::Symbol(_) => Ok(TypeRef::Scalar(ScalarType::Symbol)),
+            Term::Integer(_) => Ok(RetainedTypeRef::scalar(ScalarType::U32)),
+            Term::Float(_) => Ok(RetainedTypeRef::scalar(ScalarType::F64)),
+            Term::String(_) | Term::Symbol(_) => Ok(RetainedTypeRef::scalar(ScalarType::Symbol)),
             Term::Compound { .. } | Term::PredRef(_) | Term::List(_) | Term::Cons { .. } => {
-                Ok(TypeRef::Term)
+                Ok(RetainedTypeRef::term())
             }
             Term::Anonymous | Term::Aggregate(_) => Err(meta_error(
                 format_args!(
@@ -1750,8 +1834,7 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         };
         for (idx, term) in atom.terms.iter().enumerate() {
             if let Term::Variable(name) = term {
-                let typ = self
-                    .column_type(&atom.predicate, idx)
+                let typ = Self::column_type(&self.pred_columns, &atom.predicate, idx)
                     .and_then(|typ| self.storage_type_for_type_ref(typ))
                     .unwrap_or(ScalarType::U64);
                 bound.insert(name.clone(), typ);
@@ -1969,46 +2052,31 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
             bytes = bytes
                 .checked_add(crate::compile::push_vector_allocation_bytes::<Rule>(rules)?)
                 .ok_or_else(overflow)?;
-            for (name, columns) in &self.helper_decls {
-                if existing.contains(name) {
-                    continue;
-                }
-                bytes = bytes.checked_add(name.len() as u64).ok_or_else(overflow)?;
-                bytes = bytes
-                    .checked_add(
-                        (columns.len() as u64)
-                            .checked_mul(
-                                (std::mem::size_of::<TypeRef>() + std::mem::size_of::<PredColumn>())
-                                    as u64,
-                            )
-                            .ok_or_else(overflow)?,
-                    )
-                    .ok_or_else(overflow)?;
-                for column in columns {
-                    let typ = column.typ.owned_allocation_bytes()?
-                        - std::mem::size_of::<TypeRef>() as u64;
-                    bytes = bytes
-                        .checked_add(typ.checked_mul(2).ok_or_else(overflow)?)
-                        .ok_or_else(overflow)?;
-                    if let Some(name) = &column.name {
-                        bytes = bytes.checked_add(name.len() as u64).ok_or_else(overflow)?;
-                    }
-                }
-            }
             self.acquire(bytes)?;
         }
 
-        for (name, columns) in &self.helper_decls {
-            if existing.contains(name) {
+        let declarations = RetainedHelperDeclarations {
+            values: std::mem::take(&mut self.helper_decls),
+            storage: std::mem::take(&mut self.helper_decls_storage),
+        };
+        for (name, mut declaration) in declarations.values {
+            let name = RetainedTermKey {
+                text: name,
+                _allocation_owner: declaration.key_owner.take(),
+            };
+            if existing.contains(&name.text) {
                 continue;
             }
-            program.predicates.push(PredDecl {
-                name: name.clone(),
-                types: columns.iter().map(|col| col.typ.clone()).collect(),
-                columns: columns.clone(),
-                is_private: true,
-            });
+            let emitted = self.helper_declaration(&name.text, declaration.columns)?;
+            if let (Some(scope), Some(owner)) = (
+                self.allocation_owner.as_deref_mut(),
+                emitted.allocation_owner.as_ref(),
+            ) {
+                scope.retain(Arc::clone(owner) as Arc<dyn Send + Sync>)?;
+            }
+            program.predicates.push(emitted.value);
         }
+        drop(declarations.storage);
         drop(existing);
         drop(existing_owner);
         program.rules.extend(std::mem::take(&mut self.helper_facts));
@@ -2112,33 +2180,80 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         Ok(())
     }
 
-    fn register_helper_decl(&mut self, name: &str, columns: Vec<PredColumn>) -> Result<()> {
-        self.acquire(name.len() as u64)?;
-        if self.allocation_owner.is_some() && !self.helper_decls.contains_key(name) {
-            let mut entries = self
-                .helper_decls
-                .len()
-                .checked_add(1)
-                .ok_or_else(|| XlogError::allocation_extent_overflow("meta declaration"))?;
-            let mut height = 1u64;
-            while entries >= 6 {
-                entries /= 6;
-                height += 1;
-            }
-            // One split per reached level plus a replacement root, using the
-            // original B-tree's eleven key/value slots and twelve child edges.
-            let node = 2 * std::mem::size_of::<usize>()
-                + 2 * std::mem::size_of::<u16>()
-                + 11 * std::mem::size_of::<(String, Vec<PredColumn>)>()
-                + 12 * std::mem::size_of::<usize>();
-            self.acquire(
-                (node as u64)
-                    .checked_mul(height + 1)
-                    .ok_or_else(|| XlogError::allocation_extent_overflow("meta declaration"))?,
+    fn register_helper_decl(&mut self, name: &str, columns: RetainedHelperColumns) -> Result<()> {
+        if self.helper_decls.contains_key(name) {
+            return Ok(());
+        }
+        let key_owner = self.reserve_temporary(name.len() as u64)?;
+        if let Some(scope) = self.allocation_owner.as_deref_mut() {
+            self.helper_decls_storage.reserve_unit(
+                xlog_core::btree_insert_allocation_bytes::<String, RegisteredHelperDeclaration>(
+                    self.helper_decls.len(),
+                )?,
+                scope,
             )?;
         }
-        self.helper_decls.entry(name.to_string()).or_insert(columns);
+        self.helper_decls.insert(
+            name.to_string(),
+            RegisteredHelperDeclaration { columns, key_owner },
+        );
         Ok(())
+    }
+
+    fn helper_declaration(
+        &mut self,
+        name: &str,
+        mut columns: RetainedHelperColumns,
+    ) -> Result<RetainedHelperEmission> {
+        let name_custody = match self.allocation_owner.as_deref_mut() {
+            Some(scope) => PayloadCustody::for_text_clone(name, scope)?,
+            None => PayloadCustody::default(),
+        };
+        let mut types_custody: Option<RetainedVectorCustody<PayloadCustody>> =
+            match self.allocation_owner.as_deref_mut() {
+                Some(scope) => Some(RetainedVectorCustody::for_capacity::<TypeRef>(
+                    columns.value.len(),
+                    scope,
+                )?),
+                None => None,
+            };
+        let mut types = Vec::with_capacity(columns.value.len());
+        for column in &columns.value {
+            let typ = RetainedTypeRef::clone_with_owner(&column.typ, &mut self.allocation_owner)?;
+            types.push(typ.value);
+            if let Some(custody) = types_custody.as_mut() {
+                custody.elements.push(typ.custody);
+            }
+        }
+        let allocation_owner = if let Some(scope) = self.allocation_owner.as_deref_mut() {
+            let bytes = std::mem::size_of::<HelperDeclarationAllocation>()
+                .checked_add(2 * std::mem::size_of::<usize>())
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .ok_or_else(|| XlogError::allocation_extent_overflow("meta declaration owner"))?;
+            let metadata_owner = scope.reserve_allocation(bytes)?;
+            Some(Arc::new(HelperDeclarationAllocation {
+                _custody: PredicateCustody {
+                    name: name_custody,
+                    types: types_custody.take().expect("original helper type custody"),
+                    columns: columns
+                        .custody
+                        .take()
+                        .expect("original helper column custody"),
+                },
+                _metadata_owner: metadata_owner,
+            }))
+        } else {
+            None
+        };
+        Ok(RetainedHelperEmission {
+            value: PredDecl {
+                name: name.to_string(),
+                types,
+                columns: columns.value,
+                is_private: true,
+            },
+            allocation_owner,
+        })
     }
 
     fn add_helper_fact(&mut self, pred: &str, terms: Vec<Term>) -> Result<()> {
@@ -2399,24 +2514,24 @@ fn template_construction_allocation_bytes(
     }
 }
 
-fn infer_type_ref_from_terms(items: &[Term]) -> TypeRef {
+fn infer_type_ref_from_terms(items: &[Term]) -> RetainedTypeRef {
     if let Some(first) = items.first() {
         match first {
             Term::Integer(value) if *value >= 0 && *value <= u32::MAX as i64 => {
-                TypeRef::Scalar(ScalarType::U32)
+                RetainedTypeRef::scalar(ScalarType::U32)
             }
-            Term::Integer(_) => TypeRef::Scalar(ScalarType::I64),
-            Term::Float(_) => TypeRef::Scalar(ScalarType::F64),
-            Term::String(_) | Term::Symbol(_) => TypeRef::Scalar(ScalarType::Symbol),
+            Term::Integer(_) => RetainedTypeRef::scalar(ScalarType::I64),
+            Term::Float(_) => RetainedTypeRef::scalar(ScalarType::F64),
+            Term::String(_) | Term::Symbol(_) => RetainedTypeRef::scalar(ScalarType::Symbol),
             Term::Compound { .. } | Term::PredRef(_) | Term::List(_) | Term::Cons { .. } => {
-                TypeRef::Term
+                RetainedTypeRef::term()
             }
             Term::Variable(_) | Term::Anonymous | Term::Aggregate(_) => {
-                TypeRef::Scalar(ScalarType::U64)
+                RetainedTypeRef::scalar(ScalarType::U64)
             }
         }
     } else {
-        TypeRef::Scalar(ScalarType::U64)
+        RetainedTypeRef::scalar(ScalarType::U64)
     }
 }
 
@@ -2733,29 +2848,24 @@ fn term_match_key(
     }
 }
 
-fn scalar_col(name: &str, typ: ScalarType) -> PredColumn {
-    PredColumn {
-        name: Some(name.to_string()),
-        typ: TypeRef::Scalar(typ),
-    }
-}
-
 fn lower_meta_type_refs_in_predicates(program: &mut Program) {
     for pred in &mut program.predicates {
         for typ in &mut pred.types {
-            *typ = lower_meta_type_ref(typ);
+            lower_meta_type_ref(typ);
         }
         for col in &mut pred.columns {
-            col.typ = lower_meta_type_ref(&col.typ);
+            lower_meta_type_ref(&mut col.typ);
         }
     }
 }
 
-fn lower_meta_type_ref(typ: &TypeRef) -> TypeRef {
+fn lower_meta_type_ref(typ: &mut TypeRef) {
     match typ {
-        TypeRef::List(inner) => TypeRef::List(Box::new(lower_meta_type_ref(inner))),
-        TypeRef::Term | TypeRef::Compound | TypeRef::PredRef => TypeRef::Scalar(TERM_ID_TYPE),
-        TypeRef::Scalar(_) | TypeRef::Domain(_) => typ.clone(),
+        TypeRef::List(inner) => lower_meta_type_ref(inner),
+        TypeRef::Term | TypeRef::Compound | TypeRef::PredRef => {
+            *typ = TypeRef::Scalar(TERM_ID_TYPE);
+        }
+        TypeRef::Scalar(_) | TypeRef::Domain(_) => {}
     }
 }
 

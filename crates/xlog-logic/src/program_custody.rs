@@ -116,6 +116,20 @@ impl PayloadCustody {
         Self::for_clone(ClonePayload::Atom(atom), scope)
     }
 
+    pub(crate) fn for_type_clone(
+        typ: &TypeRef,
+        scope: &mut CompilationAllocationScope<'_>,
+    ) -> Result<Self> {
+        Self::for_clone(ClonePayload::Type(typ), scope)
+    }
+
+    pub(crate) fn for_text_clone(
+        text: &str,
+        scope: &mut CompilationAllocationScope<'_>,
+    ) -> Result<Self> {
+        Self::for_clone(ClonePayload::Text(text), scope)
+    }
+
     fn for_clone(
         payload: ClonePayload<'_>,
         scope: &mut CompilationAllocationScope<'_>,
@@ -209,10 +223,17 @@ impl<C> Default for RetainedVectorCustody<C> {
 
 impl<C> RetainedVectorCustody<C> {
     fn for_clone<T>(items: &[T], scope: &mut CompilationAllocationScope<'_>) -> Result<Self> {
-        let backing_owner = reserve_storage::<T>(items.len(), scope)?;
-        let elements_storage_owner = reserve_storage::<C>(items.len(), scope)?;
+        Self::for_capacity::<T>(items.len(), scope)
+    }
+
+    pub(crate) fn for_capacity<T>(
+        count: usize,
+        scope: &mut CompilationAllocationScope<'_>,
+    ) -> Result<Self> {
+        let backing_owner = reserve_storage::<T>(count, scope)?;
+        let elements_storage_owner = reserve_storage::<C>(count, scope)?;
         Ok(Self {
-            elements: Vec::with_capacity(items.len()),
+            elements: Vec::with_capacity(count),
             backing_owner,
             elements_storage_owner,
         })
