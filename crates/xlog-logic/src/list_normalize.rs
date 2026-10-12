@@ -1,6 +1,6 @@
 //! Finite list normalization for the language-completeness surface.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use xlog_core::{Result, ScalarType, XlogError};
@@ -94,6 +94,17 @@ struct RetainedListDef {
 struct RetainedListId {
     id: u64,
     _key_owner: Option<Arc<dyn Send + Sync>>,
+}
+
+struct TemporaryListItems {
+    items: Vec<Term>,
+    storage_owner: Option<Arc<dyn Send + Sync>>,
+    payload_owners: [Option<Arc<dyn Send + Sync>>; 2],
+}
+
+struct RetainedHelperDeclaration {
+    value: PredDecl,
+    allocation_owner: Option<Arc<dyn Send + Sync>>,
 }
 
 #[derive(Debug, Clone)]
@@ -192,6 +203,59 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
             return self.reserve_temporary(bytes);
         }
         Ok(None)
+    }
+
+    fn clone_list_items(&mut self, id: u64) -> Result<TemporaryListItems> {
+        let (storage_bytes, payload_bytes) = if self.allocation_owner.is_some() {
+            let list = Self::list_by_id(&self.lists, id, &mut self.allocation_owner)?;
+            let storage_bytes = list
+                .items
+                .len()
+                .checked_mul(std::mem::size_of::<Term>())
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .ok_or_else(|| XlogError::allocation_extent_overflow("list input storage"))?;
+            (
+                storage_bytes,
+                Self::items_clone_bytes(&list.items)? - storage_bytes,
+            )
+        } else {
+            (0, 0)
+        };
+        let storage_owner = self.reserve_temporary(storage_bytes)?;
+        let payload_owner = self.reserve_temporary(payload_bytes)?;
+        let items = Self::list_by_id(&self.lists, id, &mut self.allocation_owner)?
+            .items
+            .clone();
+        Ok(TemporaryListItems {
+            items,
+            storage_owner,
+            payload_owners: [payload_owner, None],
+        })
+    }
+
+    fn extend_list_items(
+        &mut self,
+        items: &mut TemporaryListItems,
+        mut tail: TemporaryListItems,
+    ) -> Result<()> {
+        if self.allocation_owner.is_some()
+            && items.items.capacity() - items.items.len() < tail.items.len()
+        {
+            let bytes = items
+                .items
+                .len()
+                .checked_add(tail.items.len())
+                .and_then(|count| count.checked_mul(std::mem::size_of::<Term>()))
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .ok_or_else(|| XlogError::allocation_extent_overflow("list input growth"))?;
+            let next_owner = self.reserve_temporary(bytes)?;
+            items.items.reserve_exact(tail.items.len());
+            items.storage_owner = next_owner;
+        }
+        items.payload_owners[1] = tail.payload_owners[0].take();
+        items.items.extend(std::mem::take(&mut tail.items));
+        drop(tail);
+        Ok(())
     }
 
     fn reserve_lists_clone(&mut self) -> Result<Option<Arc<dyn Send + Sync>>> {
@@ -900,28 +964,24 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
                         &mut self.allocation_owner,
                     )
                 })?;
-                let items_owner = if self.allocation_owner.is_some() {
-                    let bytes = std::mem::size_of::<Term>() as u64;
-                    let bytes = if let Term::String(text) | Term::Variable(text) = &**head {
-                        bytes
-                            .checked_add(text.len() as u64)
-                            .ok_or_else(|| XlogError::allocation_extent_overflow("cons values"))?
-                    } else {
-                        bytes
-                    };
-                    self.reserve_temporary(bytes)?
+                let storage_owner = self.reserve_temporary(std::mem::size_of::<Term>() as u64)?;
+                let payload_owner = if let Term::String(text) | Term::Variable(text) = &**head {
+                    self.reserve_temporary(text.len() as u64)?
                 } else {
                     None
                 };
-                let _tail_owner;
-                let mut items = vec![
-                    self.normalize_scalar_term_with_receipt(
-                        head,
-                        Some(elem_type),
-                        items_owner.as_ref(),
-                    )?
-                    .1,
-                ];
+                let mut items = TemporaryListItems {
+                    items: vec![
+                        self.normalize_scalar_term_with_receipt(
+                            head,
+                            Some(elem_type),
+                            storage_owner.as_ref(),
+                        )?
+                        .1,
+                    ],
+                    storage_owner,
+                    payload_owners: [payload_owner, None],
+                };
                 let tail_arg =
                     self.normalize_list_arg_with_fresh_bindings(tail, Some(elem_type))?;
                 let tail_id = tail_arg.id.ok_or_else(|| {
@@ -930,21 +990,9 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
                         &mut self.allocation_owner,
                     )
                 })?;
-                _tail_owner = if self.allocation_owner.is_some() {
-                    let bytes = Self::items_clone_bytes(
-                        &Self::list_by_id(&self.lists, tail_id, &mut self.allocation_owner)?.items,
-                    )?;
-                    self.reserve_temporary(bytes)?
-                } else {
-                    None
-                };
-                let tail_items =
-                    Self::list_by_id(&self.lists, tail_id, &mut self.allocation_owner)?
-                        .items
-                        .clone();
-                self.reserve_vector(&mut items, tail_items.len())?;
-                items.extend(tail_items);
-                let id = self.register_list_terms(items, Some(elem_type))?;
+                let tail_items = self.clone_list_items(tail_id)?;
+                self.extend_list_items(&mut items, tail_items)?;
+                let id = self.register_list_terms(items.items, Some(elem_type))?;
                 Ok(Term::Integer(id as i64))
             }
             _ => {
@@ -1343,11 +1391,11 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
     }
 
     fn concat_lists(&mut self, left_id: u64, right_id: u64) -> Result<u64> {
-        let _left_owner = self.reserve_list_clone(left_id)?;
-        let left = Self::list_by_id(&self.lists, left_id, &mut self.allocation_owner)?.clone();
-        let _right_owner = self.reserve_list_clone(right_id)?;
-        let right = Self::list_by_id(&self.lists, right_id, &mut self.allocation_owner)?.clone();
-        if left.elem_type != right.elem_type {
+        let mut items = self.clone_list_items(left_id)?;
+        let left_type = Self::list_by_id(&self.lists, left_id, &mut self.allocation_owner)?.elem_type;
+        let right_items = self.clone_list_items(right_id)?;
+        let right_type = Self::list_by_id(&self.lists, right_id, &mut self.allocation_owner)?.elem_type;
+        if left_type != right_type {
             return Err(list_error(
                 format_args!(
                     "{}",
@@ -1356,10 +1404,8 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
                 &mut self.allocation_owner,
             ));
         }
-        let mut items = left.items;
-        self.reserve_vector(&mut items, right.items.len())?;
-        items.extend(right.items);
-        self.register_list_terms(items, Some(right.elem_type))
+        self.extend_list_items(&mut items, right_items)?;
+        self.register_list_terms(items.items, Some(right_type))
     }
 
     fn derived_ordered_list(&mut self, input_id: u64, op: ListOp) -> Result<u64> {
@@ -1614,71 +1660,103 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
     }
 
     fn append_helper_pred_decls(&mut self, program: &mut Program) -> Result<()> {
-        if self.allocation_owner.is_some() {
-            let count = program
-                .predicates
-                .len()
-                .checked_add(self.helper_preds.len())
-                .ok_or_else(|| XlogError::allocation_extent_overflow("list declarations"))?;
-            let mut bytes = crate::compile::hash_allocation_bytes::<String, ()>(count)?
-                .checked_mul(2)
-                .ok_or_else(|| XlogError::allocation_extent_overflow("list declarations"))?;
-            for predicate in &program.predicates {
-                bytes = bytes
-                    .checked_add(predicate.name.len() as u64)
-                    .ok_or_else(|| XlogError::allocation_extent_overflow("list declarations"))?;
-            }
-            for name in self.helper_preds.keys() {
-                bytes = bytes
-                    .checked_add((name.len() as u64).checked_mul(2).ok_or_else(|| {
-                        XlogError::allocation_extent_overflow("list declarations")
-                    })?)
-                    .and_then(|n| {
-                        n.checked_add(
-                            crate::compile::push_vector_allocation_bytes::<PredColumn>(3).ok()?,
-                        )
-                    })
-                    .and_then(|n| {
-                        n.checked_add(
-                            crate::compile::push_vector_allocation_bytes::<TypeRef>(3).ok()?,
-                        )
-                    })
-                    .and_then(|n| {
-                        n.checked_add("list_idindexvaluetailleft_idright_idout_id".len() as u64)
-                    })
-                    .ok_or_else(|| XlogError::allocation_extent_overflow("list declarations"))?;
-            }
-            bytes = bytes
-                .checked_add(crate::compile::push_vector_allocation_bytes::<&String>(
-                    self.helper_preds.len(),
-                )?)
-                .ok_or_else(|| XlogError::allocation_extent_overflow("list declarations"))?;
-            self.acquire(bytes)?;
-            self.reserve_vector(&mut program.predicates, self.helper_preds.len())?;
-        }
-        let mut existing: HashSet<String> = program
+        let count = program
             .predicates
-            .iter()
-            .map(|pred| pred.name.clone())
-            .collect();
+            .len()
+            .checked_add(self.helper_preds.len())
+            .ok_or_else(|| XlogError::allocation_extent_overflow("list declaration names"))?;
+        let _existing_owner = if self.allocation_owner.is_some() {
+            self.reserve_temporary(crate::compile::hash_allocation_bytes::<
+                String,
+                Option<Arc<dyn Send + Sync>>,
+            >(count)?)?
+        } else {
+            None
+        };
+        let mut existing = HashMap::with_capacity(count);
+        for predicate in &program.predicates {
+            if existing.contains_key(&predicate.name) {
+                continue;
+            }
+            let owner = self.reserve_temporary(predicate.name.len() as u64)?;
+            existing.insert(predicate.name.clone(), owner);
+        }
+        let additions = self
+            .helper_preds
+            .keys()
+            .filter(|name| !existing.contains_key(*name))
+            .count();
+        self.reserve_vector(&mut program.predicates, additions)?;
 
         // Sorted for a process-independent declaration order (see
         // `append_helper_declarations_and_facts`).
-        let mut helper_preds: Vec<&String> = self.helper_preds.keys().collect();
-        helper_preds.sort();
+        let _helper_preds_owner = if self.allocation_owner.is_some() {
+            let bytes = self
+                .helper_preds
+                .len()
+                .checked_mul(std::mem::size_of::<&String>())
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .ok_or_else(|| XlogError::allocation_extent_overflow("list declaration roster"))?;
+            self.reserve_temporary(bytes)?
+        } else {
+            None
+        };
+        let mut helper_preds = Vec::with_capacity(self.helper_preds.len());
+        helper_preds.extend(self.helper_preds.keys());
+        helper_preds.sort_unstable();
         for pred in helper_preds {
-            if existing.contains(pred) {
+            if existing.contains_key(pred) {
                 continue;
             }
-            let columns = helper_columns(pred);
-            program.predicates.push(PredDecl {
-                name: pred.clone(),
-                types: columns.iter().map(|col| col.typ.clone()).collect(),
-                columns,
-                is_private: true,
-            });
-            existing.insert(pred.clone());
+            let name_owner = self
+                .allocation_owner
+                .as_deref_mut()
+                .map(|scope| scope.reserve_allocation(pred.len() as u64))
+                .transpose()?;
+            let existing_name = pred.clone();
+            let schema = helper_column_schema(pred);
+            let column_count = schema.iter().flatten().count();
+            let declaration_owner = if let Some(scope) = self.allocation_owner.as_deref_mut() {
+                let overflow = || XlogError::allocation_extent_overflow("list declaration payload");
+                let mut bytes = column_count
+                    .checked_mul(std::mem::size_of::<PredColumn>() + std::mem::size_of::<TypeRef>())
+                    .and_then(|bytes| u64::try_from(bytes).ok())
+                    .and_then(|bytes| bytes.checked_add(pred.len() as u64))
+                    .ok_or_else(overflow)?;
+                for (name, _) in schema.iter().flatten() {
+                    bytes = bytes.checked_add(name.len() as u64).ok_or_else(overflow)?;
+                }
+                Some(scope.reserve_allocation(bytes)?)
+            } else {
+                None
+            };
+            let mut columns = Vec::with_capacity(column_count);
+            for (name, typ) in schema.into_iter().flatten() {
+                columns.push(PredColumn {
+                    name: Some(name.to_string()),
+                    typ: TypeRef::Scalar(typ),
+                });
+            }
+            let mut types = Vec::with_capacity(column_count);
+            types.extend(columns.iter().map(|column| column.typ.clone()));
+            let declaration = RetainedHelperDeclaration {
+                value: PredDecl {
+                    name: pred.clone(),
+                    types,
+                    columns,
+                    is_private: true,
+                },
+                allocation_owner: declaration_owner,
+            };
+            if let Some(scope) = self.allocation_owner.as_deref_mut() {
+                scope.retain_allocations([declaration.allocation_owner.clone()])?;
+            }
+            program.predicates.push(declaration.value);
+            existing.insert(existing_name, name_owner);
         }
+        drop(_helper_preds_owner);
+        drop(existing);
+        drop(_existing_owner);
         Ok(())
     }
 
@@ -1808,41 +1886,39 @@ fn literal_key_with_owner(
     })
 }
 
-fn helper_columns(pred: &str) -> Vec<PredColumn> {
-    let scalar = |name: &str, typ| PredColumn {
-        name: Some(name.to_string()),
-        typ: TypeRef::Scalar(typ),
-    };
+fn helper_column_schema(pred: &str) -> [Option<(&'static str, ScalarType)>; 3] {
     if pred == len_pred() {
-        return vec![
-            scalar("list_id", LIST_ID_TYPE),
-            scalar("len", ScalarType::U32),
+        return [
+            Some(("list_id", LIST_ID_TYPE)),
+            Some(("len", ScalarType::U32)),
+            None,
         ];
     }
     if let Some(elem_type) = helper_elem_type(pred, "__xlog_list_item_") {
-        return vec![
-            scalar("list_id", LIST_ID_TYPE),
-            scalar("idx", ScalarType::U32),
-            scalar("value", elem_type),
+        return [
+            Some(("list_id", LIST_ID_TYPE)),
+            Some(("idx", ScalarType::U32)),
+            Some(("value", elem_type)),
         ];
     }
     if let Some(elem_type) = helper_elem_type(pred, "__xlog_list_cons_") {
-        return vec![
-            scalar("list_id", LIST_ID_TYPE),
-            scalar("head", elem_type),
-            scalar("tail_id", LIST_ID_TYPE),
+        return [
+            Some(("list_id", LIST_ID_TYPE)),
+            Some(("head", elem_type)),
+            Some(("tail_id", LIST_ID_TYPE)),
         ];
     }
     if helper_elem_type(pred, "__xlog_list_append_").is_some() {
-        return vec![
-            scalar("left_id", LIST_ID_TYPE),
-            scalar("right_id", LIST_ID_TYPE),
-            scalar("out_id", LIST_ID_TYPE),
+        return [
+            Some(("left_id", LIST_ID_TYPE)),
+            Some(("right_id", LIST_ID_TYPE)),
+            Some(("out_id", LIST_ID_TYPE)),
         ];
     }
-    vec![
-        scalar("input_id", LIST_ID_TYPE),
-        scalar("out_id", LIST_ID_TYPE),
+    [
+        Some(("input_id", LIST_ID_TYPE)),
+        Some(("out_id", LIST_ID_TYPE)),
+        None,
     ]
 }
 
