@@ -35,6 +35,38 @@ use xlog_core::{RelId, Schema};
 use xlog_ir::{CompareOp, Expr, JoinType, RirNode};
 use xlog_stats::StatsManager;
 
+/// Run one original in-place pass while keeping its input custody separate
+/// from the pass's temporary and rewritten allocations.
+pub(crate) fn run_guarded_plan_stage<F>(
+    input: crate::compile::CompilationOutput<xlog_ir::ExecutionPlan>,
+    scope: &mut crate::compile::CompilationAllocationScope<'_>,
+    run: F,
+) -> xlog_core::Result<crate::compile::CompilationOutput<xlog_ir::ExecutionPlan>>
+where
+    F: FnOnce(
+        &mut xlog_ir::ExecutionPlan,
+        &mut crate::compile::CompilationAllocationScope<'_>,
+    ) -> xlog_core::Result<()>,
+{
+    // Declare the actual input after its stage so an error drops rewritten
+    // data before releasing any of the stage's original receipts.
+    let mut stage = scope.child_scope();
+    let mut input = input;
+    run(&mut input.value, &mut stage)?;
+
+    // These canonical passes move input fragments and mix surviving buffers
+    // with scratch. Acquire the exact output clone before allocating it while
+    // both the original input and all live rewritten buffers remain charged.
+    let allocation_owner = stage.reserve_allocation(input.value.owned_allocation_bytes()?)?;
+    let value = input.value.clone();
+    drop(input);
+    drop(stage);
+    Ok(crate::compile::CompilationOutput {
+        value,
+        allocation_owner,
+    })
+}
+
 fn reserve_optimizer(
     scope: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
     bytes: u64,
@@ -319,6 +351,37 @@ impl Optimizer {
         self.optimize_core(node, &mut Some(scope))
     }
 
+    pub(crate) fn optimize_guarded_plan(
+        &self,
+        input: crate::compile::CompilationOutput<xlog_ir::ExecutionPlan>,
+        scope: &mut crate::compile::CompilationAllocationScope<'_>,
+    ) -> xlog_core::Result<crate::compile::CompilationOutput<xlog_ir::ExecutionPlan>> {
+        if !self.config.enable_pushdown {
+            // This is the canonical optimizer's exact identity branch: each
+            // body is visited without changing any input heap allocation.
+            let mut input = input;
+            self.optimize_plan_core(&mut input.value, &mut Some(scope))?;
+            return Ok(input);
+        }
+        run_guarded_plan_stage(input, scope, |plan, stage| {
+            self.optimize_plan_core(plan, &mut Some(stage))
+        })
+    }
+
+    fn optimize_plan_core(
+        &self,
+        plan: &mut xlog_ir::ExecutionPlan,
+        scope: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
+    ) -> xlog_core::Result<()> {
+        for rules in &mut plan.rules_by_scc {
+            for rule in rules {
+                let body = std::mem::replace(&mut rule.body, RirNode::Unit);
+                rule.body = self.optimize_core(body, scope)?;
+            }
+        }
+        Ok(())
+    }
+
     fn optimize_core(
         &self,
         node: RirNode,
@@ -542,12 +605,15 @@ impl Optimizer {
             },
 
             // Union: recursively optimize all inputs
-            RirNode::Union { inputs } => RirNode::Union {
-                inputs: inputs
-                    .into_iter()
-                    .map(|i| self.predicate_pushdown_core(i, scope))
-                    .collect::<xlog_core::Result<Vec<_>>>()?,
-            },
+            RirNode::Union { mut inputs } => {
+                // Reuse the authentic input vector rather than introducing a
+                // collector allocation whose lifetime is unrelated to it.
+                for input in &mut inputs {
+                    let node = std::mem::replace(input, RirNode::Unit);
+                    *input = self.predicate_pushdown_core(node, scope)?;
+                }
+                RirNode::Union { inputs }
+            }
 
             // Distinct: recursively optimize input
             RirNode::Distinct { input, key_cols } => RirNode::Distinct {
@@ -642,8 +708,8 @@ impl Optimizer {
         };
         let output = self.remap_predicate_through_project(predicate, columns);
         if output.is_some() {
-            if let (Some(scope), Some(owner)) = (scope.as_deref_mut(), output_owner) {
-                scope.retain(owner)?;
+            if let (Some(scope), Some(owner)) = (scope.as_deref_mut(), output_owner.as_ref()) {
+                scope.retain(Arc::clone(owner))?;
             }
         }
         Ok(output)
@@ -1567,6 +1633,17 @@ pub mod selectivity_pass {
         run_core(plan, stats, rel_ids, &mut Some(scope))
     }
 
+    pub(crate) fn run_guarded_plan(
+        input: crate::compile::CompilationOutput<ExecutionPlan>,
+        stats: &StatsManager,
+        rel_ids: &HashMap<String, RelId>,
+        scope: &mut crate::compile::CompilationAllocationScope<'_>,
+    ) -> xlog_core::Result<crate::compile::CompilationOutput<ExecutionPlan>> {
+        super::run_guarded_plan_stage(input, scope, |plan, stage| {
+            run_core(plan, stats, rel_ids, &mut Some(stage))
+        })
+    }
+
     fn run_core(
         plan: &mut ExecutionPlan,
         stats: &StatsManager,
@@ -1588,28 +1665,37 @@ pub mod selectivity_pass {
                 if let Some(rewritten) =
                     super::reorder::try_reorder_triangle_with_owner(&rule.body, stats, scope)?
                 {
-                    if let (Some(scope), Some(owner)) = (scope.as_deref_mut(), triangle_owner) {
-                        scope.retain(owner)?;
-                    }
-                    rule.body = rewritten;
+                    rule.body = retain_reordered_body(rewritten, scope)?;
                     continue;
                 }
                 drop(triangle_owner);
-                let cycle_owner = match scope.as_deref_mut() {
+                let _cycle_owner = match scope.as_deref_mut() {
                     Some(scope) => Some(scope.reserve_allocation(reorder_allocation_bytes(4)?)?),
                     None => None,
                 };
                 if let Some(rewritten) =
                     super::reorder::try_reorder_4cycle_with_owner(&rule.body, stats, scope)?
                 {
-                    if let (Some(scope), Some(owner)) = (scope.as_deref_mut(), cycle_owner) {
-                        scope.retain(owner)?;
-                    }
-                    rule.body = rewritten;
+                    rule.body = retain_reordered_body(rewritten, scope)?;
                 }
             }
         }
         Ok(())
+    }
+
+    fn retain_reordered_body(
+        original: RirNode,
+        scope: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
+    ) -> xlog_core::Result<RirNode> {
+        let Some(scope) = scope.as_deref_mut() else {
+            return Ok(original);
+        };
+        // Recognition and construction share a temporary receipt. Keep only
+        // the exact surviving tree, not the now-discarded matching table.
+        scope.acquire(original.owned_allocation_bytes()?)?;
+        let output = original.clone();
+        drop(original);
+        Ok(output)
     }
 
     fn reorder_allocation_bytes(atoms: usize) -> xlog_core::Result<u64> {
@@ -1841,7 +1927,7 @@ pub mod helper_split_pass {
         helper_join_left_keys: Vec<usize>,
         helper_join_right_keys: Vec<usize>,
         exposed_classes: Vec<u32>,
-        allocation_receipt: Option<std::sync::Arc<dyn Send + Sync>>,
+        _allocation_receipt: Option<std::sync::Arc<dyn Send + Sync>>,
     }
 
     struct Rewrite {
@@ -1901,6 +1987,28 @@ pub mod helper_split_pass {
                 )
             },
         )
+    }
+
+    pub(crate) fn run_guarded_plan<F>(
+        input: crate::compile::CompilationOutput<ExecutionPlan>,
+        schemas: &HashMap<RelId, Schema>,
+        stats: &StatsManager,
+        scope: &mut crate::compile::CompilationAllocationScope<'_>,
+        mut allocate: F,
+    ) -> xlog_core::Result<crate::compile::CompilationOutput<ExecutionPlan>>
+    where
+        F: FnMut(
+            Schema,
+            &mut crate::compile::CompilationAllocationScope<'_>,
+        ) -> xlog_core::Result<(String, RelId)>,
+    {
+        super::run_guarded_plan_stage(input, scope, |plan, stage| {
+            // The compiler discards these specifications. Retire their actual
+            // data before the pass's temporary scope, not with the next plan.
+            let specs = run_with_allocation_owner(plan, schemas, stats, stage, &mut allocate)?;
+            drop(specs);
+            Ok(())
+        })
     }
 
     fn run_core<'pool, F>(
@@ -1988,6 +2096,26 @@ pub mod helper_split_pass {
                     .as_deref_mut()
                     .expect("original helper allocation scope"),
             )
+        })
+    }
+
+    pub(crate) fn run_kclique_specs_guarded_plan<F>(
+        input: crate::compile::CompilationOutput<ExecutionPlan>,
+        schemas: &HashMap<RelId, Schema>,
+        scope: &mut crate::compile::CompilationAllocationScope<'_>,
+        mut allocate: F,
+    ) -> xlog_core::Result<crate::compile::CompilationOutput<ExecutionPlan>>
+    where
+        F: FnMut(
+            Schema,
+            &mut crate::compile::CompilationAllocationScope<'_>,
+        ) -> xlog_core::Result<(String, RelId)>,
+    {
+        super::run_guarded_plan_stage(input, scope, |plan, stage| {
+            let specs =
+                run_kclique_specs_with_allocation_owner(plan, schemas, stage, &mut allocate)?;
+            drop(specs);
+            Ok(())
         })
     }
 
@@ -2142,15 +2270,14 @@ pub mod helper_split_pass {
         let Some(linear) = linearize_project_body(&rule.body, schemas) else {
             return Ok(None);
         };
-        let Some(mut candidate) = choose_candidate_with_owner(&linear, schemas, stats, scope)?
-        else {
+        let Some(candidate) = choose_candidate_with_owner(&linear, schemas, stats, scope)? else {
             return Ok(None);
         };
         if scope.is_some() {
             super::reserve_optimizer(scope, candidate.helper_schema.owned_allocation_bytes()?)?;
         }
         let (helper_name, helper_rel) = allocate(candidate.helper_schema.clone(), scope)?;
-        let output_owner = match scope.as_deref_mut() {
+        let _output_owner = match scope.as_deref_mut() {
             Some(scope) => Some(
                 scope.reserve_allocation(helper_output_allocation_bytes(&linear, &candidate)?)?,
             ),
@@ -2160,21 +2287,37 @@ pub mod helper_split_pass {
         let Some(outer_body) = build_outer_body(&linear, &candidate, helper_rel) else {
             return Ok(None);
         };
-        if let Some(scope) = scope.as_deref_mut() {
-            if let Some(owner) = output_owner {
-                scope.retain(owner)?;
-            }
-            if let Some(owner) = candidate.allocation_receipt.take() {
-                scope.retain(owner)?;
-            }
+        if scope.is_some() {
+            let bytes = checked_extent(
+                helper_body
+                    .owned_allocation_bytes()?
+                    .checked_add(outer_body.owned_allocation_bytes()?),
+            )?;
+            super::reserve_optimizer(scope, bytes)?;
+            super::reserve_optimizer(scope, candidate.helper_schema.owned_allocation_bytes()?)?;
         }
+        let retained_helper_body = if scope.is_some() {
+            helper_body.clone()
+        } else {
+            helper_body
+        };
+        let retained_outer_body = if scope.is_some() {
+            outer_body.clone()
+        } else {
+            outer_body
+        };
+        let helper_schema = if scope.is_some() {
+            candidate.helper_schema.clone()
+        } else {
+            candidate.helper_schema
+        };
         Ok(Some(Rewrite {
-            helper_body,
-            outer_body,
+            helper_body: retained_helper_body,
+            outer_body: retained_outer_body,
             spec: HelperRelationSpec {
                 name: helper_name,
                 rel_id: helper_rel,
-                schema: candidate.helper_schema,
+                schema: helper_schema,
                 source_rels: [
                     linear.leaves[candidate.pair_start],
                     linear.leaves[candidate.pair_start + 1],
@@ -2248,8 +2391,8 @@ pub mod helper_split_pass {
             return Ok(None);
         };
         *target = RirNode::Scan { rel: helper_rel };
-        if let (Some(scope), Some(owner)) = (scope.as_deref_mut(), output_owner) {
-            scope.retain(owner)?;
+        if let (Some(scope), Some(owner)) = (scope.as_deref_mut(), output_owner.as_ref()) {
+            scope.retain(std::sync::Arc::clone(owner))?;
         }
         Ok(Some(Rewrite {
             helper_body,
@@ -2534,7 +2677,7 @@ pub mod helper_split_pass {
             let Some(mut candidate) = build_candidate(linear, schemas, pair_start) else {
                 return Ok(None);
             };
-            candidate.allocation_receipt = allocation_receipt;
+            candidate._allocation_receipt = allocation_receipt;
             if skew_ratio_for_candidate(linear, stats, &candidate) >= HEAVY_SKEW_RATIO {
                 return Ok(Some(candidate));
             }
@@ -2612,7 +2755,7 @@ pub mod helper_split_pass {
             helper_join_left_keys: helper_left_keys,
             helper_join_right_keys: helper_right_keys,
             exposed_classes,
-            allocation_receipt: None,
+            _allocation_receipt: None,
         })
     }
 

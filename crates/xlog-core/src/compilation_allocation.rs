@@ -193,6 +193,12 @@ impl<'a> CompilationAllocationScope<'a> {
     /// Retire a known-discarded attempt; retained receipt-vector capacity keeps
     /// its separate original owner and cannot be released by this operation.
     pub fn retire_since(&mut self, checkpoint: usize) -> Result<()> {
+        self.require_receipt_checkpoint(checkpoint)?;
+        self.receipts.truncate(checkpoint);
+        Ok(())
+    }
+
+    fn require_receipt_checkpoint(&mut self, checkpoint: usize) -> Result<()> {
         if checkpoint > self.receipts.len() {
             let producer = Self::prepare_diagnostic(
                 Ok("compiler receipt boundary is not original".len() as u64),
@@ -202,7 +208,25 @@ impl<'a> CompilationAllocationScope<'a> {
                 XlogError::Compilation("compiler receipt boundary is not original".into())
             }));
         }
+        Ok(())
+    }
+
+    /// Prepare the original survivor's receipt storage before retiring data.
+    /// The closure drops replaced allocations while their old receipts remain
+    /// held; replacing the suffix afterward has no fallible allocation step.
+    pub fn replace_since_with_retained_allocation(
+        &mut self,
+        checkpoint: usize,
+        receipt: Arc<dyn Send + Sync>,
+        retire: impl FnOnce(),
+    ) -> Result<()> {
+        self.require_receipt_checkpoint(checkpoint)?;
+        if checkpoint == self.receipts.len() {
+            self.reserve_receipt_storage()?;
+        }
+        retire();
         self.receipts.truncate(checkpoint);
+        self.receipts.push(receipt);
         Ok(())
     }
 

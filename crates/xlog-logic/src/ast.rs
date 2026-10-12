@@ -1316,6 +1316,17 @@ impl Rule {
 }
 
 impl Program {
+    /// Heap storage allocated by the original clone. The Program header is
+    /// inline in its compilation carrier and requires no heap reservation.
+    pub(crate) fn clone_allocation_bytes(&self) -> Result<u64> {
+        self.owned_allocation_bytes()?
+            .checked_sub(
+                u64::try_from(std::mem::size_of::<Self>())
+                    .map_err(|_| AstAllocationSize::overflow())?,
+            )
+            .ok_or_else(AstAllocationSize::overflow)
+    }
+
     /// Actual owned geometry of this AST, for reservation before an original
     /// clone. This does not validate, normalize, or admit the program.
     pub fn owned_allocation_bytes(&self) -> Result<u64> {

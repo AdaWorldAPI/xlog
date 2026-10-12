@@ -12,8 +12,11 @@ pub enum AllocationRefusal {
     /// The exact request would exceed the original owner's capacity.
     #[error("requested {requested} bytes with {used} live bytes and capacity {capacity} bytes")]
     Capacity {
+        /// Bytes requested from the original capacity owner.
         requested: u64,
+        /// Bytes held by live reservations at the refusal boundary.
         used: u64,
+        /// The original owner's unchanged byte limit.
         capacity: u64,
     },
     /// An allocation extent cannot be represented on this host.
@@ -67,7 +70,9 @@ pub enum XlogError {
     /// name and structured reason are inline; rendering belongs to its owner.
     #[error("Allocation refused: {operation}: {reason}")]
     AllocationRefused {
+        /// Static name of the operation that requested storage.
         operation: &'static str,
+        /// Original structured refusal, without formatted diagnostic storage.
         reason: AllocationRefusal,
     },
 

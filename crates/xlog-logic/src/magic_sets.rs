@@ -206,19 +206,25 @@ fn rewrite_enabled_with_owner(
     let recursive = recursive_predicates(program, allocations)?;
     let seeds = collect_query_seeds(program, &recursive, allocations)?;
     if seeds.is_empty() {
+        let reason = "no bound recursive query eligible for magic_sets";
+        allocations.vector::<String>(1)?;
+        allocations.acquire(reason.len() as u64)?;
         return decline_or_error(
             program,
             mode,
-            vec!["no bound recursive query eligible for magic_sets".to_string()],
+            vec![reason.to_string()],
             allocations,
         );
     }
 
     if program.is_probabilistic_profile() {
+        let reason = "probabilistic profiles are handled outside deterministic magic_sets";
+        allocations.vector::<String>(1)?;
+        allocations.acquire(reason.len() as u64)?;
         return decline_or_error(
             program,
             mode,
-            vec!["probabilistic profiles are handled outside deterministic magic_sets".to_string()],
+            vec![reason.to_string()],
             allocations,
         );
     }

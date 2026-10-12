@@ -233,6 +233,58 @@ fn promotion_allocation_bytes(
     Ok(bytes)
 }
 
+fn finish_promotion_attempt(
+    result: Option<RirNode>,
+    scope: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
+    checkpoint: Option<usize>,
+) -> xlog_core::Result<Option<RirNode>> {
+    let Some(scope) = scope.as_deref_mut() else {
+        return Ok(result);
+    };
+    let checkpoint = checkpoint.expect("original promotion receipt boundary");
+    let Some(original) = result else {
+        scope.retire_since(checkpoint)?;
+        return Ok(None);
+    };
+
+    // The matcher receipt covers both its real output and discarded matching
+    // data. Separate the exact surviving tree before retiring that attempt.
+    let allocation_owner = scope.reserve_allocation(original.owned_allocation_bytes()?)?;
+    let output = original.clone();
+    scope.replace_since_with_retained_allocation(
+        checkpoint,
+        std::sync::Arc::clone(&allocation_owner),
+        || drop(original),
+    )?;
+    Ok(Some(output))
+}
+
+fn finish_aggregate_attempt(
+    body: &mut RirNode,
+    changed: bool,
+    scope: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
+    checkpoint: Option<usize>,
+) -> xlog_core::Result<bool> {
+    let Some(scope) = scope.as_deref_mut() else {
+        return Ok(changed);
+    };
+    let checkpoint = checkpoint.expect("original aggregate promotion receipt boundary");
+    if !changed {
+        scope.retire_since(checkpoint)?;
+        return Ok(false);
+    }
+    // Preserve the actual mutated body until every fallible ownership step
+    // succeeds. Replacement drops it before releasing its original receipts.
+    let allocation_owner = scope.reserve_allocation(body.owned_allocation_bytes()?)?;
+    let output = body.clone();
+    scope.replace_since_with_retained_allocation(
+        checkpoint,
+        std::sync::Arc::clone(&allocation_owner),
+        || drop(std::mem::replace(body, output)),
+    )?;
+    Ok(true)
+}
+
 fn promotion_attempt<F>(
     body: &RirNode,
     arities: &HashMap<RelId, usize>,
@@ -243,19 +295,15 @@ fn promotion_attempt<F>(
 where
     F: FnOnce() -> Option<RirNode>,
 {
-    let receipt = match scope.as_deref_mut() {
+    let checkpoint = scope.as_deref().map(|scope| scope.receipt_checkpoint());
+    let _receipt = match scope.as_deref_mut() {
         Some(scope) => {
             Some(scope.reserve_allocation(promotion_allocation_bytes(body, arities, shape)?)?)
         }
         None => None,
     };
     let result = attempt();
-    if result.is_some() {
-        if let (Some(scope), Some(receipt)) = (scope.as_deref_mut(), receipt) {
-            scope.retain(receipt)?;
-        }
-    }
-    Ok(result)
+    finish_promotion_attempt(result, scope, checkpoint)
 }
 
 fn aggregate_attempt<F>(
@@ -269,20 +317,13 @@ where
     F: FnOnce(&mut RirNode) -> bool,
 {
     let checkpoint = scope.as_deref().map(|scope| scope.receipt_checkpoint());
-    match scope.as_deref_mut() {
-        Some(scope) => {
-            let bytes = aggregate_allocation_bytes(body, arities, shape)?;
-            scope.acquire(bytes)?;
-        }
-        None => {}
+    if let Some(scope) = scope.as_deref_mut() {
+        // The original in-place result must remain charged if a later
+        // survivor reservation refuses before that body can be replaced.
+        scope.acquire(aggregate_allocation_bytes(body, arities, shape)?)?;
     }
     let result = attempt(body);
-    if !result {
-        if let (Some(scope), Some(checkpoint)) = (scope.as_deref_mut(), checkpoint) {
-            scope.retire_since(checkpoint)?;
-        }
-    }
-    Ok(result)
+    finish_aggregate_attempt(body, result, scope, checkpoint)
 }
 
 fn aggregate_allocation_bytes(
@@ -406,6 +447,18 @@ pub fn promote_multiway_with_allocation_owner(
     scope: &mut crate::compile::CompilationAllocationScope<'_>,
 ) -> xlog_core::Result<()> {
     promote_multiway_core(plan, rel_ids, stats, config, &mut Some(scope))
+}
+
+pub(crate) fn promote_multiway_guarded_plan(
+    input: crate::compile::CompilationOutput<ExecutionPlan>,
+    rel_ids: &HashMap<String, RelId>,
+    stats: &StatsManager,
+    config: &CompilerConfig,
+    scope: &mut crate::compile::CompilationAllocationScope<'_>,
+) -> xlog_core::Result<crate::compile::CompilationOutput<ExecutionPlan>> {
+    crate::optimizer::run_guarded_plan_stage(input, scope, |plan, stage| {
+        promote_multiway_core(plan, rel_ids, stats, config, &mut Some(stage))
+    })
 }
 
 fn promote_multiway_core(
@@ -544,6 +597,8 @@ fn promote_multiway_core(
                 rule.body = promoted;
                 continue;
             }
+            drop(normalized_tri);
+            drop(_normalized_tri_owner);
             let _normalized_cycle_owner = match scope.as_deref_mut() {
                 Some(scope) => Some(scope.reserve_allocation(rule.body.owned_allocation_bytes()?)?),
                 None => None,
@@ -560,6 +615,8 @@ fn promote_multiway_core(
                 rule.body = promoted;
                 continue;
             }
+            drop(normalized_4c);
+            drop(_normalized_cycle_owner);
             // K-clique promotion for k=5..k=8. Tree-flatten +
             // complete-K_k validation. Robust to left-deep /
             // right-deep / bushy. Order is doc anchor only;
@@ -1303,15 +1360,11 @@ fn try_promote_clique_inside_aggregate_with_owner(
         **inner = promoted;
         true
     })();
-    if !result {
-        if let (Some(scope), Some(checkpoint)) = (scope.as_deref_mut(), checkpoint) {
-            scope.retire_since(checkpoint)?;
-        }
-    }
     if let Some(error) = failure {
+        finish_aggregate_attempt(body, false, scope, checkpoint)?;
         return Err(error);
     }
-    Ok(result)
+    finish_aggregate_attempt(body, result, scope, checkpoint)
 }
 
 /// `[XY, YZ, XZ]` regardless of positional layout. Returns
@@ -2119,7 +2172,7 @@ fn try_promote_clique_k_with_owner(
         return Ok(None);
     }
     let checkpoint = scope.as_deref().map(|scope| scope.receipt_checkpoint());
-    let receipt = match scope.as_deref_mut() {
+    let _receipt = match scope.as_deref_mut() {
         Some(scope) => Some(scope.reserve_allocation(promotion_allocation_bytes(
             body,
             arities,
@@ -2397,20 +2450,12 @@ fn try_promote_clique_k_with_owner(
             var_order,
         })
     })();
-    if result.is_none() {
-        if let (Some(scope), Some(checkpoint)) = (scope.as_deref_mut(), checkpoint) {
-            scope.retire_since(checkpoint)?;
-        }
-    }
     if let Some(error) = failure {
+        drop(result);
+        finish_promotion_attempt(None, scope, checkpoint)?;
         return Err(error);
     }
-    if result.is_some() {
-        if let (Some(scope), Some(receipt)) = (scope.as_deref_mut(), receipt) {
-            scope.retain(receipt)?;
-        }
-    }
-    Ok(result)
+    finish_promotion_attempt(result, scope, checkpoint)
 }
 
 fn build_kclique_shape(k: usize, rels: &[RelId]) -> Option<KCliqueShape> {

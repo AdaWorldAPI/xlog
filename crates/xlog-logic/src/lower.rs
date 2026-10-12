@@ -2149,6 +2149,26 @@ impl Lowerer {
         result
     }
 
+    pub(crate) fn lower_program_guarded_with_allocation_owner(
+        &mut self,
+        program: &Program,
+        scope: &mut crate::compile::CompilationAllocationScope<'_>,
+    ) -> Result<crate::compile::CompilationOutput<ExecutionPlan>> {
+        let mut stage = scope.child_scope();
+        let plan = self.lower_program_with_allocation_owner(program, &mut stage)?;
+        // Lowering moves rule buffers into the plan while its collector also
+        // owns discarded lookup and join scratch. Preserve only an acquired
+        // copy of the actual output after those original buffers have dropped.
+        let allocation_owner = stage.reserve_allocation(plan.owned_allocation_bytes()?)?;
+        let value = plan.clone();
+        drop(plan);
+        drop(stage);
+        Ok(crate::compile::CompilationOutput {
+            value,
+            allocation_owner,
+        })
+    }
+
     fn lower_program_with_owner(
         &mut self,
         program: &Program,
