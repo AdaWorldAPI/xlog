@@ -8227,7 +8227,7 @@ impl PublicationReplayProvenance {
                 ));
             }
             if role == 38
-                && (item.bytes.as_slice() != saved.bytes.as_slice()
+                && (item.bytes.as_slice() != <B as AsRef<[u8]>>::as_ref(&saved.bytes)
                     || publication_abi_bytes(&[item.range])
                         != publication_abi_bytes(&[saved.range]))
             {
