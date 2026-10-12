@@ -1015,7 +1015,12 @@ impl Lowerer {
             bytes,
             &mut LoweringAllocations { scope: Some(scope) },
         )?;
-        self.cardinality_hints = hints.clone();
+        // Copy live entries with the original hasher, not retired bucket capacity.
+        let mut retained = HashMap::with_capacity_and_hasher(hints.len(), hints.hasher().clone());
+        for (name, hint) in &hints {
+            retained.insert(name.clone(), *hint);
+        }
+        self.cardinality_hints = retained;
         self.allocation_owners.commit(pending, 0);
         Ok(())
     }
