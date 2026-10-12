@@ -749,11 +749,7 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         body: &[BodyLiteral],
         bound: &mut HashMap<String, ScalarType>,
     ) -> Result<Vec<BodyLiteral>> {
-        if self.allocation_owner.is_some() {
-            self.acquire(crate::compile::push_vector_allocation_bytes::<BodyLiteral>(
-                body.len(),
-            )?)?;
-        }
+        let mut storage_owner = None;
         let mut out = Vec::new();
         for lit in body {
             match lit {
@@ -761,7 +757,7 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
                     let expanded = self.normalize_positive_atom(atom, bound)?;
                     for lit in expanded {
                         self.record_bound_from_literal(&lit, bound);
-                        out.push(lit);
+                        self.push_body_literal(&mut out, &mut storage_owner, lit)?;
                     }
                 }
                 BodyLiteral::Negated(atom) => {
@@ -770,33 +766,63 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
                     {
                         return Err(meta_error(format_args!("{}", "safe meta-predicates are not supported under negation in the finite meta normalization subset"), &mut self.allocation_owner));
                     }
-                    out.push(BodyLiteral::Negated(self.normalize_atom_values(atom)?));
+                    let literal = BodyLiteral::Negated(self.normalize_atom_values(atom)?);
+                    self.push_body_literal(&mut out, &mut storage_owner, literal)?;
                 }
-                BodyLiteral::Comparison(cmp) => out.push(BodyLiteral::Comparison(Comparison {
-                    op: cmp.op,
-                    left: self.normalize_untyped_value(&cmp.left)?,
-                    right: self.normalize_untyped_value(&cmp.right)?,
-                })),
+                BodyLiteral::Comparison(cmp) => {
+                    let literal = BodyLiteral::Comparison(Comparison {
+                        op: cmp.op,
+                        left: self.normalize_untyped_value(&cmp.left)?,
+                        right: self.normalize_untyped_value(&cmp.right)?,
+                    });
+                    self.push_body_literal(&mut out, &mut storage_owner, literal)?;
+                }
                 BodyLiteral::Epistemic(lit) => {
                     if self.allocation_owner.is_some() {
                         self.acquire(lit.atom.owned_allocation_bytes()?)?;
                     }
-                    out.push(BodyLiteral::Epistemic(lit.clone()));
+                    self.push_body_literal(
+                        &mut out,
+                        &mut storage_owner,
+                        BodyLiteral::Epistemic(lit.clone()),
+                    )?;
                 }
                 BodyLiteral::IsExpr(is_expr) => {
                     if self.allocation_owner.is_some() {
                         self.acquire(lit.owned_allocation_bytes()?)?;
                     }
-                    out.push(BodyLiteral::IsExpr(is_expr.clone()));
+                    self.push_body_literal(
+                        &mut out,
+                        &mut storage_owner,
+                        BodyLiteral::IsExpr(is_expr.clone()),
+                    )?;
                 }
                 BodyLiteral::Univ(univ) => {
                     let lit = self.expand_univ(univ, bound)?;
                     self.record_bound_from_literal(&lit, bound);
-                    out.push(lit);
+                    self.push_body_literal(&mut out, &mut storage_owner, lit)?;
                 }
             }
         }
+        if let Some(owner) = &storage_owner {
+            self.retain_temporary(Some(Arc::clone(owner)))?;
+        }
         Ok(out)
+    }
+
+    fn push_body_literal(
+        &mut self,
+        out: &mut Vec<BodyLiteral>,
+        storage_owner: &mut Option<Arc<dyn Send + Sync>>,
+        literal: BodyLiteral,
+    ) -> Result<()> {
+        let next_owner =
+            self.reserve_vector_growth::<BodyLiteral>(out.len(), out.capacity())?;
+        out.push(literal);
+        if let Some(next_owner) = next_owner {
+            *storage_owner = Some(next_owner);
+        }
+        Ok(())
     }
 
     fn normalize_positive_atom(
