@@ -440,7 +440,7 @@ fn append_resident_expression_descriptor(
                     ConstValue::Symbol(value) => {
                         descriptor.append(scope, format_args!("symbol:{}:", value.len()))?;
                         descriptor.append(scope, format_args!("{}", value))?;
-                        descriptor.push(';');
+                        descriptor.append(scope, format_args!("{}", ";"))?;
                     }
                 }
             }
@@ -459,45 +459,45 @@ fn append_resident_expression_descriptor(
                 pending.extend(items.iter().rev());
             }
             Expr::Not(inner) => {
-                descriptor.push_str("not;");
+                descriptor.append(scope, format_args!("{}", "not;"))?;
                 grow_pending(&mut pending, 1, scope, &mut pending_receipt)?;
                 pending.push(inner);
             }
             Expr::Add(left, right) => {
-                descriptor.push_str("add;");
+                descriptor.append(scope, format_args!("{}", "add;"))?;
                 schedule_binary(&mut pending, left, right, scope, &mut pending_receipt)?;
             }
             Expr::Sub(left, right) => {
-                descriptor.push_str("subtract;");
+                descriptor.append(scope, format_args!("{}", "subtract;"))?;
                 schedule_binary(&mut pending, left, right, scope, &mut pending_receipt)?;
             }
             Expr::Mul(left, right) => {
-                descriptor.push_str("multiply;");
+                descriptor.append(scope, format_args!("{}", "multiply;"))?;
                 schedule_binary(&mut pending, left, right, scope, &mut pending_receipt)?;
             }
             Expr::Div(left, right) => {
-                descriptor.push_str("divide;");
+                descriptor.append(scope, format_args!("{}", "divide;"))?;
                 schedule_binary(&mut pending, left, right, scope, &mut pending_receipt)?;
             }
             Expr::Mod(left, right) => {
-                descriptor.push_str("modulo;");
+                descriptor.append(scope, format_args!("{}", "modulo;"))?;
                 schedule_binary(&mut pending, left, right, scope, &mut pending_receipt)?;
             }
             Expr::Abs(inner) => {
-                descriptor.push_str("absolute_value;");
+                descriptor.append(scope, format_args!("{}", "absolute_value;"))?;
                 grow_pending(&mut pending, 1, scope, &mut pending_receipt)?;
                 pending.push(inner);
             }
             Expr::Min(left, right) => {
-                descriptor.push_str("minimum;");
+                descriptor.append(scope, format_args!("{}", "minimum;"))?;
                 schedule_binary(&mut pending, left, right, scope, &mut pending_receipt)?;
             }
             Expr::Max(left, right) => {
-                descriptor.push_str("maximum;");
+                descriptor.append(scope, format_args!("{}", "maximum;"))?;
                 schedule_binary(&mut pending, left, right, scope, &mut pending_receipt)?;
             }
             Expr::Pow(left, right) => {
-                descriptor.push_str("power;");
+                descriptor.append(scope, format_args!("{}", "power;"))?;
                 schedule_binary(&mut pending, left, right, scope, &mut pending_receipt)?;
             }
             Expr::Cast(inner, target) => {
@@ -510,7 +510,7 @@ fn append_resident_expression_descriptor(
                 then_expr,
                 else_expr,
             } => {
-                descriptor.push_str("conditional;");
+                descriptor.append(scope, format_args!("{}", "conditional;"))?;
                 grow_pending(&mut pending, 3, scope, &mut pending_receipt)?;
                 pending.push(else_expr);
                 pending.push(then_expr);
