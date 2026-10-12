@@ -11,7 +11,7 @@ pub mod types;
 
 pub use compilation_allocation::{
     btree_insert_allocation_bytes, hash_allocation_bytes, push_vector_allocation_bytes,
-    CompilationAllocationScope,
+    push_vector_storage_bytes, CompilationAllocationScope,
 };
 pub use config::{CostModelKind, MemoryBudget, RuntimeConfig};
 pub use config_value::{parse_bool_value, read_bool_env, resolve_bool};

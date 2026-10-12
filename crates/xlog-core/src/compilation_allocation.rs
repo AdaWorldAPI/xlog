@@ -69,6 +69,17 @@ pub fn hash_allocation_bytes<K, V>(count: usize) -> Result<u64> {
 
 /// Checked geometric storage of the original push-built vector and its growth.
 pub fn push_vector_allocation_bytes<T>(count: usize) -> Result<u64> {
+    usize::try_from(push_vector_storage_bytes::<T>(count)?)
+        .ok()
+        .and_then(|n| n.checked_mul(3))
+        .and_then(|n| u64::try_from(n).ok())
+        .ok_or_else(|| XlogError::allocation_extent_overflow("compiler vector"))
+}
+
+/// Checked storage bound of the original push-built vector, excluding the old
+/// buffer's growth overlap. A direct old-buffer owner accounts for that overlap
+/// until the original push has replaced its allocation.
+pub fn push_vector_storage_bytes<T>(count: usize) -> Result<u64> {
     let width = std::mem::size_of::<T>();
     if count == 0 || width == 0 {
         return Ok(0);
@@ -80,12 +91,11 @@ pub fn push_vector_allocation_bytes<T>(count: usize) -> Result<u64> {
     } else {
         1
     };
-    // Capacity of the actual push-built vector, including its old buffer at a
-    // geometric growth operation. This does not allocate a counting vector.
+    // Capacity of the actual push-built vector. This does not allocate a
+    // counting vector or change the original geometric growth sequence.
     count
         .checked_mul(2)
         .map(|n| n.max(minimum))
-        .and_then(|n| n.checked_mul(3))
         .and_then(|n| n.checked_mul(width))
         .and_then(|n| u64::try_from(n).ok())
         .ok_or_else(|| XlogError::allocation_extent_overflow("compiler vector"))

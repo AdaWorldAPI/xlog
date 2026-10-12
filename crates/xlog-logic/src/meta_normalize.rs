@@ -128,6 +128,10 @@ struct MetaNormalizer<'a, 'pool> {
     findall_counter: usize,
     maplist_counter: usize,
     allocation_owner: Option<&'a mut crate::compile::CompilationAllocationScope<'pool>>,
+    _term_ids_storage: Option<Arc<dyn Send + Sync>>,
+    _term_records_storage: Option<Arc<dyn Send + Sync>>,
+    _helper_facts_storage: Option<Arc<dyn Send + Sync>>,
+    _helper_fact_keys_storage: Option<Arc<dyn Send + Sync>>,
     _environment_owner: Option<Arc<dyn Send + Sync>>,
 }
 
@@ -236,17 +240,32 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         term_keys_equal(left, right, &mut self.allocation_owner)
     }
 
-    fn acquire_hash_growth<K, V>(&mut self, length: usize, capacity: usize) -> Result<()> {
+    fn reserve_hash_growth<K, V>(
+        &mut self,
+        length: usize,
+        capacity: usize,
+    ) -> Result<Option<Arc<dyn Send + Sync>>> {
         if self.allocation_owner.is_some() && length == capacity {
             let count = length
                 .checked_add(1)
                 .ok_or_else(|| XlogError::allocation_extent_overflow("meta table"))?;
-            let bytes = crate::compile::hash_allocation_bytes::<K, V>(count)?
-                .checked_mul(2)
-                .ok_or_else(|| XlogError::allocation_extent_overflow("meta table"))?;
-            self.acquire(bytes)?;
+            return self.reserve_temporary(crate::compile::hash_allocation_bytes::<K, V>(count)?);
         }
-        Ok(())
+        Ok(None)
+    }
+
+    fn reserve_vector_growth<T>(
+        &mut self,
+        length: usize,
+        capacity: usize,
+    ) -> Result<Option<Arc<dyn Send + Sync>>> {
+        if self.allocation_owner.is_some() && length == capacity {
+            let count = length
+                .checked_add(1)
+                .ok_or_else(|| XlogError::allocation_extent_overflow("meta vector"))?;
+            return self.reserve_temporary(xlog_core::push_vector_storage_bytes::<T>(count)?);
+        }
+        Ok(None)
     }
 
     fn acquire_vector_growth<T>(&mut self, length: usize, capacity: usize) -> Result<()> {
@@ -537,6 +556,10 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
             findall_counter: 0,
             maplist_counter: 0,
             allocation_owner,
+            _term_ids_storage: None,
+            _term_records_storage: None,
+            _helper_facts_storage: None,
+            _helper_fact_keys_storage: None,
             _environment_owner: environment_owner,
         })
     }
@@ -1888,8 +1911,9 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         }
         let id = self.next_term_id;
         self.next_term_id += 1;
-        self.acquire_hash_growth::<String, u64>(self.term_ids.len(), self.term_ids.capacity())?;
-        self.acquire_vector_growth::<TermRecord>(
+        let term_ids_storage =
+            self.reserve_hash_growth::<String, u64>(self.term_ids.len(), self.term_ids.capacity())?;
+        let term_records_storage = self.reserve_vector_growth::<TermRecord>(
             self.term_records.len(),
             self.term_records.capacity(),
         )?;
@@ -1898,10 +1922,16 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
             self.retain_temporary(owner.clone())?;
         }
         self.term_ids.insert(registered.key.text, id);
+        if let Some(storage) = term_ids_storage {
+            self._term_ids_storage = Some(storage);
+        }
         self.term_records.push(TermRecord {
             id,
             kind: registered.kind,
         });
+        if let Some(storage) = term_records_storage {
+            self._term_records_storage = Some(storage);
+        }
         Ok(id)
     }
 
@@ -1977,6 +2007,7 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
             });
         }
         program.rules.extend(std::mem::take(&mut self.helper_facts));
+        self._helper_facts_storage = None;
         Ok(())
     }
 
@@ -2120,18 +2151,21 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
             format_args!("{pred}:{:?}", terms.values),
             &mut self.allocation_owner,
         )?;
-        if !self.helper_fact_keys.contains(&key.text) {
-            self.acquire_hash_growth::<String, ()>(
-                self.helper_fact_keys.len(),
-                self.helper_fact_keys.capacity(),
-            )?;
-            self.retain_temporary(key._allocation_owner.clone())?;
-        }
-        if !self.helper_fact_keys.insert(key.text) {
+        if self.helper_fact_keys.contains(&key.text) {
             return Ok(());
         }
+        let key_storage = self.reserve_hash_growth::<String, ()>(
+            self.helper_fact_keys.len(),
+            self.helper_fact_keys.capacity(),
+        )?;
+        self.retain_temporary(key._allocation_owner.clone())?;
+        self.helper_fact_keys.insert(key.text);
+        if let Some(storage) = key_storage {
+            self._helper_fact_keys_storage = Some(storage);
+        }
         self.acquire(pred.len() as u64)?;
-        self.acquire_vector_growth::<Rule>(self.helper_facts.len(), self.helper_facts.capacity())?;
+        let facts_storage =
+            self.reserve_vector_growth::<Rule>(self.helper_facts.len(), self.helper_facts.capacity())?;
         self.retain_temporary(terms.allocation_owner.clone())?;
         self.helper_facts.push(Rule {
             head: Atom {
@@ -2140,6 +2174,9 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
             },
             body: vec![],
         });
+        if let Some(storage) = facts_storage {
+            self._helper_facts_storage = Some(storage);
+        }
         Ok(())
     }
 
