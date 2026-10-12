@@ -998,12 +998,12 @@ fn set_compilation_cardinality_hints_core(
     let mut cardinality_hints: HashMap<String, u64> = HashMap::new();
     if let Some(snapshot) = stats_snapshot {
         if !snapshot.rel_names.is_empty() {
-            if scope.is_some() {
-                acquire_frontend(
-                    scope,
+            let _lookup_owner = match scope.as_deref_mut() {
+                Some(scope) => Some(scope.reserve_allocation(
                     hash_allocation_bytes::<RelId, &str>(snapshot.rel_names.len())?,
-                )?;
-            }
+                )?),
+                None => None,
+            };
             let rel_name_by_id: HashMap<RelId, &str> = snapshot
                 .rel_names
                 .iter()
@@ -1091,25 +1091,29 @@ fn compilation_statistics_core(
             scope,
             hash_allocation_bytes::<RelId, xlog_stats::RelationStats>(lowerer.rel_ids().len())?,
         )?;
-        acquire_frontend(
-            scope,
-            hash_allocation_bytes::<String, u64>(program.rules.len())?,
-        )?;
     }
     let mut mgr = StatsManager::new();
-    let mut fact_counts: HashMap<String, u64> = HashMap::new();
-    for fact in program.facts() {
-        acquire_frontend(scope, fact.head.predicate.len() as u64)?;
-        *fact_counts.entry(fact.head.predicate.clone()).or_insert(0) += 1;
-    }
+    {
+        let fact_count = program.facts().count();
+        let _counts_owner = match scope.as_deref_mut() {
+            Some(scope) => Some(scope.reserve_allocation(
+                hash_allocation_bytes::<&str, u64>(fact_count)?,
+            )?),
+            None => None,
+        };
+        let mut fact_counts: HashMap<&str, u64> = HashMap::with_capacity(fact_count);
+        for fact in program.facts() {
+            *fact_counts.entry(fact.head.predicate.as_str()).or_insert(0) += 1;
+        }
 
-    for (pred, rel_id) in lowerer.rel_ids() {
-        mgr.register_relation(*rel_id);
-        let rows = fact_counts.get(pred).copied().unwrap_or(0);
-        if rows > 0 {
-            mgr.update_cardinality(*rel_id, rows);
-            if let Some(schema) = lowerer.schemas().get(pred) {
-                mgr.update_byte_size(*rel_id, rows * schema.row_size_bytes() as u64);
+        for (pred, rel_id) in lowerer.rel_ids() {
+            mgr.register_relation(*rel_id);
+            let rows = fact_counts.get(pred.as_str()).copied().unwrap_or(0);
+            if rows > 0 {
+                mgr.update_cardinality(*rel_id, rows);
+                if let Some(schema) = lowerer.schemas().get(pred) {
+                    mgr.update_byte_size(*rel_id, rows * schema.row_size_bytes() as u64);
+                }
             }
         }
     }
@@ -1119,6 +1123,12 @@ fn compilation_statistics_core(
         if snapshot.rel_names.is_empty() {
             mgr.merge_snapshot(snapshot);
         } else {
+            let _lookup_owner = match scope.as_deref_mut() {
+                Some(scope) => Some(scope.reserve_allocation(
+                    hash_allocation_bytes::<RelId, &str>(snapshot.rel_names.len())?,
+                )?),
+                None => None,
+            };
             let rel_name_by_id: HashMap<RelId, &str> = snapshot
                 .rel_names
                 .iter()
@@ -1215,10 +1225,6 @@ fn reserve_stats_snapshot_merge(
         hash_allocation_bytes::<(RelId, RelId), xlog_stats::JoinSelectivity>(
             snapshot.join_selectivities.len(),
         )?,
-    )?;
-    acquire_frontend(
-        scope,
-        hash_allocation_bytes::<RelId, &str>(snapshot.rel_names.len())?,
     )?;
     for relation in &snapshot.relations {
         acquire_frontend_vector::<xlog_stats::ColumnStats>(scope, relation.column_stats.len())?;
