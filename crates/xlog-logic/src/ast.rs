@@ -565,7 +565,7 @@ impl Rule {
 impl Constraint {
     /// Checked original constraint-body clone geometry.
     pub fn owned_allocation_bytes(&self) -> Result<u64> {
-        let mut size = AstAllocationSize(0);
+        let mut size = AstAllocationSize::new(0);
         size.body(&self.body)?;
         u64::try_from(size.0).map_err(|_| AstAllocationSize::overflow())
     }
@@ -575,19 +575,8 @@ impl PredDecl {
     /// Checked original declaration clone geometry, preserving both authored
     /// type and named-column rosters.
     pub fn owned_allocation_bytes(&self) -> Result<u64> {
-        let mut size = AstAllocationSize(0);
-        size.text(&self.name)?;
-        size.vector(&self.types)?;
-        for typ in &self.types {
-            size.type_ref(typ)?;
-        }
-        size.vector(&self.columns)?;
-        for column in &self.columns {
-            if let Some(name) = &column.name {
-                size.text(name)?;
-            }
-            size.type_ref(&column.typ)?;
-        }
+        let mut size = AstAllocationSize::new(0);
+        size.predicate(self)?;
         u64::try_from(size.0).map_err(|_| AstAllocationSize::overflow())
     }
 }
@@ -1071,10 +1060,22 @@ pub(crate) struct ProgramMergeReport {
 // fields are already included by their outer carrier; only heap children are
 // added here. A Vec/String clone allocates its logical extent, not the source
 // allocation's unused capacity.
-struct AstAllocationSize(usize);
+pub(crate) trait AstHeapUnitSink {
+    fn heap_unit(&mut self, bytes: usize) -> Result<()>;
+}
 
-impl AstAllocationSize {
-    fn overflow() -> XlogError {
+pub(crate) struct AstAllocationSize<'a>(usize, Option<&'a mut dyn AstHeapUnitSink>);
+
+impl<'a> AstAllocationSize<'a> {
+    fn new(inline_bytes: usize) -> Self {
+        Self(inline_bytes, None)
+    }
+
+    pub(crate) fn with_sink(sink: &'a mut dyn AstHeapUnitSink) -> Self {
+        Self(0, Some(sink))
+    }
+
+    pub(crate) fn overflow() -> XlogError {
         XlogError::allocation_extent_overflow("AST")
     }
 
@@ -1083,8 +1084,25 @@ impl AstAllocationSize {
         Ok(())
     }
 
+    fn heap(&mut self, bytes: usize) -> Result<()> {
+        self.add(bytes)?;
+        if bytes != 0 {
+            if let Some(sink) = self.1.as_deref_mut() {
+                sink.heap_unit(bytes)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn boxes<T>(&mut self, count: usize) -> Result<()> {
+        for _ in 0..count {
+            self.heap(std::mem::size_of::<T>())?;
+        }
+        Ok(())
+    }
+
     fn vector<T>(&mut self, items: &[T]) -> Result<()> {
-        self.add(
+        self.heap(
             items
                 .len()
                 .checked_mul(std::mem::size_of::<T>())
@@ -1092,8 +1110,8 @@ impl AstAllocationSize {
         )
     }
 
-    fn text(&mut self, text: &str) -> Result<()> {
-        self.add(text.len())
+    pub(crate) fn text(&mut self, text: &str) -> Result<()> {
+        self.heap(text.len())
     }
 
     fn strings(&mut self, items: &[String]) -> Result<()> {
@@ -1104,11 +1122,11 @@ impl AstAllocationSize {
         Ok(())
     }
 
-    fn type_ref(&mut self, typ: &TypeRef) -> Result<()> {
+    pub(crate) fn type_ref(&mut self, typ: &TypeRef) -> Result<()> {
         match typ {
             TypeRef::Domain(name) => self.text(name),
             TypeRef::List(inner) => {
-                self.add(std::mem::size_of::<TypeRef>())?;
+                self.boxes::<TypeRef>(1)?;
                 self.type_ref(inner)
             }
             TypeRef::Scalar(_) | TypeRef::Term | TypeRef::Compound | TypeRef::PredRef => Ok(()),
@@ -1126,7 +1144,7 @@ impl AstAllocationSize {
                 Ok(())
             }
             Term::Cons { head, tail } => {
-                self.add(2 * std::mem::size_of::<Term>())?;
+                self.boxes::<Term>(2)?;
                 self.term(head)?;
                 self.term(tail)
             }
@@ -1143,7 +1161,7 @@ impl AstAllocationSize {
         }
     }
 
-    fn atom(&mut self, atom: &Atom) -> Result<()> {
+    pub(crate) fn atom(&mut self, atom: &Atom) -> Result<()> {
         self.text(&atom.predicate)?;
         self.vector(&atom.terms)?;
         for term in &atom.terms {
@@ -1164,12 +1182,12 @@ impl AstAllocationSize {
             | ArithExpr::Min(left, right)
             | ArithExpr::Max(left, right)
             | ArithExpr::Pow(left, right) => {
-                self.add(2 * std::mem::size_of::<ArithExpr>())?;
+                self.boxes::<ArithExpr>(2)?;
                 self.expression(left)?;
                 self.expression(right)
             }
             ArithExpr::Abs(inner) | ArithExpr::Cast(inner, _) => {
-                self.add(std::mem::size_of::<ArithExpr>())?;
+                self.boxes::<ArithExpr>(1)?;
                 self.expression(inner)
             }
             ArithExpr::FuncCall { name, args } => {
@@ -1187,7 +1205,7 @@ impl AstAllocationSize {
                 else_expr,
                 ..
             } => {
-                self.add(4 * std::mem::size_of::<ArithExpr>())?;
+                self.boxes::<ArithExpr>(4)?;
                 self.expression(cond_left)?;
                 self.expression(cond_right)?;
                 self.expression(then_expr)?;
@@ -1196,7 +1214,7 @@ impl AstAllocationSize {
         }
     }
 
-    fn body(&mut self, body: &[BodyLiteral]) -> Result<()> {
+    pub(crate) fn body(&mut self, body: &[BodyLiteral]) -> Result<()> {
         self.vector(body)?;
         for literal in body {
             match literal {
@@ -1225,7 +1243,7 @@ impl AstAllocationSize {
             FuncBody::Conditional(condition) => {
                 self.expression(&condition.cond_left)?;
                 self.expression(&condition.cond_right)?;
-                self.add(2 * std::mem::size_of::<FuncBody>())?;
+                self.boxes::<FuncBody>(2)?;
                 self.function_body(&condition.then_branch)?;
                 self.function_body(&condition.else_branch)
             }
@@ -1235,12 +1253,65 @@ impl AstAllocationSize {
             }
         }
     }
+
+    pub(crate) fn import(&mut self, import: &UseDecl) -> Result<()> {
+        self.strings(&import.module_path)?;
+        if let Some(imports) = &import.imports {
+            self.strings(imports)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn function(&mut self, function: &FuncDef) -> Result<()> {
+        self.text(&function.name)?;
+        self.vector(&function.params)?;
+        for parameter in &function.params {
+            self.text(&parameter.name)?;
+        }
+        self.function_body(&function.body)
+    }
+
+    fn predicate(&mut self, predicate: &PredDecl) -> Result<()> {
+        self.text(&predicate.name)?;
+        self.vector(&predicate.types)?;
+        for typ in &predicate.types {
+            self.type_ref(typ)?;
+        }
+        self.vector(&predicate.columns)?;
+        for column in &predicate.columns {
+            if let Some(name) = &column.name {
+                self.text(name)?;
+            }
+            self.type_ref(&column.typ)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn rule(&mut self, rule: &Rule) -> Result<()> {
+        self.atom(&rule.head)?;
+        self.body(&rule.body)
+    }
+
+    pub(crate) fn neural_metadata(&mut self, neural: &NeuralPredDecl) -> Result<()> {
+        self.text(&neural.network)?;
+        self.strings(&neural.inputs)?;
+        self.text(&neural.output)?;
+        if let Some(labels) = &neural.labels {
+            self.vector(labels)?;
+            for label in labels {
+                if let NeuralLabel::Symbol(text) = label {
+                    self.text(text)?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Term {
     /// Owned term geometry for a reservation before the original clone.
     pub fn owned_allocation_bytes(&self) -> Result<u64> {
-        let mut size = AstAllocationSize(std::mem::size_of::<Self>());
+        let mut size = AstAllocationSize::new(std::mem::size_of::<Self>());
         size.term(self)?;
         u64::try_from(size.0).map_err(|_| AstAllocationSize::overflow())
     }
@@ -1249,7 +1320,7 @@ impl Term {
 impl Atom {
     /// Owned atom geometry for a reservation before the original clone.
     pub fn owned_allocation_bytes(&self) -> Result<u64> {
-        let mut size = AstAllocationSize(std::mem::size_of::<Self>());
+        let mut size = AstAllocationSize::new(std::mem::size_of::<Self>());
         size.atom(self)?;
         u64::try_from(size.0).map_err(|_| AstAllocationSize::overflow())
     }
@@ -1258,7 +1329,7 @@ impl Atom {
 impl ArithExpr {
     /// Owned expression geometry for a reservation before the original clone.
     pub fn owned_allocation_bytes(&self) -> Result<u64> {
-        let mut size = AstAllocationSize(std::mem::size_of::<Self>());
+        let mut size = AstAllocationSize::new(std::mem::size_of::<Self>());
         size.expression(self)?;
         u64::try_from(size.0).map_err(|_| AstAllocationSize::overflow())
     }
@@ -1267,7 +1338,7 @@ impl ArithExpr {
 impl TypeRef {
     /// Owned type geometry for a reservation before the original clone.
     pub fn owned_allocation_bytes(&self) -> Result<u64> {
-        let mut size = AstAllocationSize(std::mem::size_of::<Self>());
+        let mut size = AstAllocationSize::new(std::mem::size_of::<Self>());
         size.type_ref(self)?;
         u64::try_from(size.0).map_err(|_| AstAllocationSize::overflow())
     }
@@ -1276,7 +1347,7 @@ impl TypeRef {
 impl BodyLiteral {
     /// Owned literal geometry for a reservation before the original clone.
     pub fn owned_allocation_bytes(&self) -> Result<u64> {
-        let mut size = AstAllocationSize(0);
+        let mut size = AstAllocationSize::new(0);
         size.body(std::slice::from_ref(self))?;
         u64::try_from(size.0).map_err(|_| AstAllocationSize::overflow())
     }
@@ -1285,7 +1356,7 @@ impl BodyLiteral {
 impl FuncBody {
     /// Owned function-body geometry for an original expansion task.
     pub fn owned_allocation_bytes(&self) -> Result<u64> {
-        let mut size = AstAllocationSize(std::mem::size_of::<Self>());
+        let mut size = AstAllocationSize::new(std::mem::size_of::<Self>());
         size.function_body(self)?;
         u64::try_from(size.0).map_err(|_| AstAllocationSize::overflow())
     }
@@ -1294,13 +1365,8 @@ impl FuncBody {
 impl FuncDef {
     /// Original function clone geometry, including parameter names and body.
     pub fn owned_allocation_bytes(&self) -> Result<u64> {
-        let mut size = AstAllocationSize(std::mem::size_of::<Self>());
-        size.text(&self.name)?;
-        size.vector(&self.params)?;
-        for parameter in &self.params {
-            size.text(&parameter.name)?;
-        }
-        size.function_body(&self.body)?;
+        let mut size = AstAllocationSize::new(std::mem::size_of::<Self>());
+        size.function(self)?;
         u64::try_from(size.0).map_err(|_| AstAllocationSize::overflow())
     }
 }
@@ -1308,44 +1374,38 @@ impl FuncDef {
 impl Rule {
     /// Original rule clone geometry for stage-owned compilation.
     pub fn owned_allocation_bytes(&self) -> Result<u64> {
-        let mut size = AstAllocationSize(std::mem::size_of::<Self>());
-        size.atom(&self.head)?;
-        size.body(&self.body)?;
+        let mut size = AstAllocationSize::new(std::mem::size_of::<Self>());
+        size.rule(self)?;
         u64::try_from(size.0).map_err(|_| AstAllocationSize::overflow())
     }
 }
 
 impl Program {
-    /// Heap storage allocated by the original clone. The Program header is
-    /// inline in its compilation carrier and requires no heap reservation.
-    pub(crate) fn clone_allocation_bytes(&self) -> Result<u64> {
-        self.owned_allocation_bytes()?
-            .checked_sub(
-                u64::try_from(std::mem::size_of::<Self>())
-                    .map_err(|_| AstAllocationSize::overflow())?,
-            )
-            .ok_or_else(AstAllocationSize::overflow)
+    /// Acquire each physical clone allocation under the original authority,
+    /// then perform the original clone once. The inline Program header is not
+    /// a heap allocation, and caller-owned receipts are not replaced here.
+    pub(crate) fn clone_with_allocation_custody(
+        &self,
+        scope: &mut xlog_core::CompilationAllocationScope<'_>,
+    ) -> Result<crate::program_custody::RetainedProgram> {
+        let custody = crate::program_custody::ProgramAllocationCustody::for_clone(self, scope)?;
+        Ok(crate::program_custody::RetainedProgram {
+            value: self.clone(),
+            custody,
+        })
     }
 
     /// Actual owned geometry of this AST, for reservation before an original
     /// clone. This does not validate, normalize, or admit the program.
     pub fn owned_allocation_bytes(&self) -> Result<u64> {
-        let mut size = AstAllocationSize(std::mem::size_of::<Self>());
+        let mut size = AstAllocationSize::new(std::mem::size_of::<Self>());
         size.vector(&self.imports)?;
         for import in &self.imports {
-            size.strings(&import.module_path)?;
-            if let Some(imports) = &import.imports {
-                size.strings(imports)?;
-            }
+            size.import(import)?;
         }
         size.vector(&self.functions)?;
         for function in &self.functions {
-            size.text(&function.name)?;
-            size.vector(&function.params)?;
-            for parameter in &function.params {
-                size.text(&parameter.name)?;
-            }
-            size.function_body(&function.body)?;
+            size.function(function)?;
         }
         size.vector(&self.domains)?;
         for domain in &self.domains {
@@ -1353,23 +1413,11 @@ impl Program {
         }
         size.vector(&self.predicates)?;
         for predicate in &self.predicates {
-            size.text(&predicate.name)?;
-            size.vector(&predicate.types)?;
-            for typ in &predicate.types {
-                size.type_ref(typ)?;
-            }
-            size.vector(&predicate.columns)?;
-            for column in &predicate.columns {
-                if let Some(name) = &column.name {
-                    size.text(name)?;
-                }
-                size.type_ref(&column.typ)?;
-            }
+            size.predicate(predicate)?;
         }
         size.vector(&self.rules)?;
         for rule in &self.rules {
-            size.atom(&rule.head)?;
-            size.body(&rule.body)?;
+            size.rule(rule)?;
         }
         size.vector(&self.constraints)?;
         for constraint in &self.constraints {
@@ -1400,17 +1448,7 @@ impl Program {
         }
         size.vector(&self.neural_predicates)?;
         for neural in &self.neural_predicates {
-            size.text(&neural.network)?;
-            size.strings(&neural.inputs)?;
-            size.text(&neural.output)?;
-            if let Some(labels) = &neural.labels {
-                size.vector(labels)?;
-                for label in labels {
-                    if let NeuralLabel::Symbol(text) = label {
-                        size.text(text)?;
-                    }
-                }
-            }
+            size.neural_metadata(neural)?;
             size.atom(&neural.predicate)?;
         }
         size.vector(&self.learnable_rules)?;

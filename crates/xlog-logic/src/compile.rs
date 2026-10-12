@@ -54,17 +54,20 @@ pub struct Compiler {
     lowerer: Lowerer,
 }
 
-pub(crate) struct CompilationOutput<T> {
+pub(crate) struct CompilationOutput<T, O = Arc<dyn Send + Sync>> {
     pub(crate) value: T,
-    pub(crate) allocation_owner: Arc<dyn Send + Sync>,
+    pub(crate) allocation_owner: O,
 }
 
-enum CompilationValue<T> {
+enum CompilationValue<T, O = Arc<dyn Send + Sync>> {
     Unowned(T),
-    Owned(CompilationOutput<T>),
+    Owned(CompilationOutput<T, O>),
 }
 
-impl<T> std::ops::Deref for CompilationValue<T> {
+type CompilationProgram =
+    CompilationValue<Program, crate::program_custody::ProgramAllocationCustody>;
+
+impl<T, O> std::ops::Deref for CompilationValue<T, O> {
     type Target = T;
 
     fn deref(&self) -> &T {
@@ -544,6 +547,12 @@ impl Compiler {
 
     /// Compile through the original complete pipeline. Persistent lowerer state
     /// owns its receipts; discarded compiler data retires with its local stage.
+    ///
+    /// The protective input clone acquires its physical heap allocations and
+    /// typed custody metadata through the caller's original scope before birth.
+    /// Buffer and payload receipts move only with their corresponding data;
+    /// unpartitioned passes keep an independently acquired survivor copy. This
+    /// does not transfer or divide the external caller's original receipts.
     pub fn compile_prepared_program_with_allocation_owner(
         &mut self,
         program: &Program,
@@ -658,7 +667,7 @@ impl Compiler {
 
     fn compile_prepared_owned_program_core(
         &mut self,
-        program: CompilationValue<Program>,
+        program: CompilationProgram,
         config: &CompilerConfig,
         stats_snapshot: Option<&StatsSnapshot>,
         scope: &mut Option<&mut CompilationAllocationScope<'_>>,
@@ -1419,13 +1428,15 @@ impl FrontendPass {
         self,
         program: Program,
         scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+        custody: Option<&mut crate::program_custody::ProgramAllocationCustody>,
     ) -> Result<(Program, bool)> {
         match self {
             Self::Desugar => {
                 let identity = program.constraints.is_empty() && program.queries.is_empty();
+                let transferred = custody.is_some();
                 Ok((
-                    desugar_queries_and_constraints_with_owner(program, scope)?,
-                    identity,
+                    desugar_queries_and_constraints_with_owner(program, scope, custody)?,
+                    identity || transferred,
                 ))
             }
             Self::Meta => {
@@ -1475,18 +1486,18 @@ impl FrontendPass {
 fn clone_compilation_program(
     program: &Program,
     scope: &mut CompilationAllocationScope<'_>,
-) -> Result<CompilationOutput<Program>> {
-    let allocation_owner = scope.reserve_allocation(program.clone_allocation_bytes()?)?;
+) -> Result<CompilationOutput<Program, crate::program_custody::ProgramAllocationCustody>> {
+    let retained = program.clone_with_allocation_custody(scope)?;
     Ok(CompilationOutput {
-        value: program.clone(),
-        allocation_owner,
+        value: retained.value,
+        allocation_owner: retained.custody,
     })
 }
 
 fn run_frontend_passes_with_owner(
-    mut input: CompilationValue<Program>,
+    mut input: CompilationProgram,
     scope: &mut Option<&mut CompilationAllocationScope<'_>>,
-) -> Result<CompilationValue<Program>> {
+) -> Result<CompilationProgram> {
     for pass in [
         FrontendPass::Desugar,
         FrontendPass::Meta,
@@ -1495,22 +1506,26 @@ fn run_frontend_passes_with_owner(
     ] {
         input = match (input, scope.as_deref_mut()) {
             (CompilationValue::Unowned(program), None) => {
-                let (program, _) = pass.run(program, &mut None)?;
+                let (program, _) = pass.run(program, &mut None, None)?;
                 CompilationValue::Unowned(program)
             }
-            (CompilationValue::Owned(input), Some(scope)) => {
+            (CompilationValue::Owned(mut input), Some(scope)) => {
                 let mut stage = scope.child_scope();
-                let (program, identity) = pass.run(input.value, &mut Some(&mut stage))?;
-                if identity {
-                    // No buffers are created or discarded on either proved
-                    // identity branch. Transfer the original genuine receipt.
+                let (program, custody_transferred) = pass.run(
+                    input.value,
+                    &mut Some(&mut stage),
+                    Some(&mut input.allocation_owner),
+                )?;
+                if custody_transferred {
+                    // The pass either preserves the consumed input or moves
+                    // its original typed custody with every surviving field.
                     drop(stage);
                     CompilationValue::Owned(CompilationOutput {
                         value: program,
                         allocation_owner: input.allocation_owner,
                     })
                 } else {
-                    // Mixed legacy leaf collectors cannot separate surviving
+                    // Unpartitioned leaf collectors cannot separate surviving
                     // AST buffers from normalizer scratch. Reserve the one
                     // actual survivor clone while every old owner is live.
                     let output = clone_compilation_program(&program, &mut stage)?;
@@ -1599,6 +1614,7 @@ fn acquire_frontend_variables(
 fn desugar_queries_and_constraints_with_owner(
     program: Program,
     scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+    mut custody: Option<&mut crate::program_custody::ProgramAllocationCustody>,
 ) -> Result<Program> {
     let mut out = program;
     let final_rules = out
@@ -1607,7 +1623,21 @@ fn desugar_queries_and_constraints_with_owner(
         .checked_add(out.constraints.len())
         .and_then(|n| n.checked_add(out.queries.len()))
         .ok_or_else(|| XlogError::allocation_extent_overflow("frontend rule"))?;
-    if final_rules > out.rules.capacity() {
+    if let Some(custody) = custody.as_deref_mut() {
+        let scope = scope.as_deref_mut().expect("original Program custody scope");
+        custody
+            .rules
+            .prepare_elements(final_rules - out.rules.len(), scope)?;
+        if final_rules > out.rules.capacity() {
+            let bytes = final_rules
+                .checked_mul(std::mem::size_of::<AstRule>())
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .ok_or_else(|| XlogError::allocation_extent_overflow("frontend rule"))?;
+            let owner = scope.reserve_allocation(bytes)?;
+            out.rules.reserve_exact(final_rules - out.rules.len());
+            custody.rules.backing_owner = Some(owner);
+        }
+    } else if final_rules > out.rules.capacity() {
         acquire_frontend_vector::<AstRule>(scope, final_rules)?;
     }
     for constraint in &out.constraints {
@@ -1617,9 +1647,28 @@ fn desugar_queries_and_constraints_with_owner(
             }),
             None => constraint.require_authored_index(),
         }?;
-        acquire_frontend_format(scope, format_args!("__xlog_constraint_{authored_index}"))?;
-        acquire_frontend_vector::<Term>(scope, 1)?;
-        if scope.is_some() {
+        let mut payload = custody
+            .as_ref()
+            .map(|_| crate::program_custody::PayloadCustody::default());
+        if let Some(payload) = payload.as_mut() {
+            let scope = scope.as_deref_mut().expect("original Program custody scope");
+            payload.reserve_unit(
+                formatted_text_allocation_bytes(format_args!(
+                    "__xlog_constraint_{authored_index}"
+                ))?,
+                scope,
+            )?;
+            payload.reserve_unit(std::mem::size_of::<Term>() as u64, scope)?;
+            let mut body = crate::program_custody::PayloadCustody::for_body_clone(
+                &constraint.body,
+                scope,
+            )?;
+            payload.append_from(&mut body, scope)?;
+        } else {
+            acquire_frontend_format(scope, format_args!("__xlog_constraint_{authored_index}"))?;
+            acquire_frontend_vector::<Term>(scope, 1)?;
+        }
+        if payload.is_none() && scope.is_some() {
             acquire_frontend_vector::<BodyLiteral>(scope, constraint.body.len())?;
             for literal in &constraint.body {
                 acquire_frontend(scope, literal.owned_allocation_bytes()?)?;
@@ -1633,44 +1682,124 @@ fn desugar_queries_and_constraints_with_owner(
             },
             body: constraint.body.clone(),
         });
+        if let Some(payload) = payload {
+            custody
+                .as_deref_mut()
+                .expect("original Program custody")
+                .rules
+                .elements
+                .push(payload);
+        }
     }
     for (index, Query { atom }) in out.queries.iter().enumerate() {
-        acquire_frontend_format(scope, format_args!("__xlog_query_{index}"))?;
+        let mut payload = custody
+            .as_ref()
+            .map(|_| crate::program_custody::PayloadCustody::default());
+        if let Some(payload) = payload.as_mut() {
+            payload.reserve_unit(
+                formatted_text_allocation_bytes(format_args!("__xlog_query_{index}"))?,
+                scope.as_deref_mut().expect("original Program custody scope"),
+            )?;
+        } else {
+            acquire_frontend_format(scope, format_args!("__xlog_query_{index}"))?;
+        }
         let pred = format!("__xlog_query_{index}");
+        let mut head_terms_owner = None;
         let mut head_terms = Vec::new();
+        let mut seen_owner = None;
         let mut seen = HashSet::new();
         for term in &atom.terms {
-            if scope.is_some() {
+            let _variables_owner = if let Some(scope) = scope.as_deref_mut() {
                 let mut count = Some(0usize);
                 term.visit_variables(&mut |_| count = count.and_then(|n| n.checked_add(1)));
                 let count =
                     count.ok_or_else(|| XlogError::allocation_extent_overflow("query variable"))?;
-                acquire_frontend_vector::<&str>(scope, count)?;
-            }
+                if count == 0 {
+                    None
+                } else {
+                    Some(scope.reserve_allocation(push_vector_allocation_bytes::<&str>(count)?)?)
+                }
+            } else {
+                None
+            };
             for name in term.variables() {
-                if !seen.contains(name) {
-                    if scope.is_some() && seen.len() == seen.capacity() {
-                        acquire_frontend(
-                            scope,
+                if seen.contains(name) {
+                    continue;
+                }
+                let next_seen_owner = if seen.len() == seen.capacity() {
+                    match scope.as_deref_mut() {
+                        Some(scope) => Some(scope.reserve_allocation(
                             hash_allocation_bytes::<&str, ()>(seen.len() + 1)?,
-                        )?;
+                        )?),
+                        None => None,
                     }
-                    if head_terms.len() == head_terms.capacity() {
+                } else {
+                    None
+                };
+                let next_head_terms_owner = if head_terms.len() == head_terms.capacity() {
+                    if payload.is_some() {
+                        Some(
+                            scope
+                                .as_deref_mut()
+                                .expect("original Program custody scope")
+                                .reserve_allocation(
+                                    xlog_core::push_vector_storage_bytes::<Term>(
+                                        head_terms.len() + 1,
+                                    )?,
+                                )?,
+                        )
+                    } else {
                         acquire_frontend_vector::<Term>(scope, head_terms.len() + 1)?;
+                        None
                     }
+                } else {
+                    None
+                };
+                if let Some(payload) = payload.as_mut() {
+                    payload.reserve_unit(
+                        name.len() as u64,
+                        scope.as_deref_mut().expect("original Program custody scope"),
+                    )?;
+                } else {
                     acquire_frontend(scope, name.len() as u64)?;
                 }
-                if seen.insert(name) {
-                    head_terms.push(Term::Variable(name.to_string()));
+                seen.insert(name);
+                if let Some(owner) = next_seen_owner {
+                    seen_owner = Some(owner);
+                }
+                head_terms.push(Term::Variable(name.to_string()));
+                if let Some(owner) = next_head_terms_owner {
+                    head_terms_owner = Some(owner);
                 }
             }
         }
+        drop(seen);
+        drop(seen_owner);
         if head_terms.is_empty() {
-            acquire_frontend_vector::<Term>(scope, 1)?;
+            if payload.is_some() {
+                head_terms_owner = Some(
+                    scope
+                        .as_deref_mut()
+                        .expect("original Program custody scope")
+                        .reserve_allocation(xlog_core::push_vector_storage_bytes::<Term>(1)?)?,
+                );
+            } else {
+                acquire_frontend_vector::<Term>(scope, 1)?;
+            }
             head_terms.push(Term::Integer(1));
         }
-        acquire_frontend_vector::<BodyLiteral>(scope, 1)?;
-        if scope.is_some() {
+        if let Some(payload) = payload.as_mut() {
+            let scope = scope.as_deref_mut().expect("original Program custody scope");
+            if let Some(owner) = head_terms_owner.as_ref() {
+                payload.retain_original(owner, scope)?;
+            }
+            payload.reserve_unit(std::mem::size_of::<BodyLiteral>() as u64, scope)?;
+            let mut atom = crate::program_custody::PayloadCustody::for_atom_clone(atom, scope)?;
+            payload.append_from(&mut atom, scope)?;
+        } else {
+            acquire_frontend_vector::<BodyLiteral>(scope, 1)?;
+        }
+        if payload.is_none() && scope.is_some() {
             acquire_frontend(scope, atom.owned_allocation_bytes()?)?;
         }
         out.rules.push(AstRule {
@@ -1680,6 +1809,14 @@ fn desugar_queries_and_constraints_with_owner(
             },
             body: vec![BodyLiteral::Positive(atom.clone())],
         });
+        if let Some(payload) = payload {
+            custody
+                .as_deref_mut()
+                .expect("original Program custody")
+                .rules
+                .elements
+                .push(payload);
+        }
     }
     Ok(out)
 }
