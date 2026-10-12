@@ -1079,12 +1079,16 @@ fn material_version_digest(previous: [u8; 32], support: [u8; 32], truth: u64) ->
     Sha256::digest(bytes).into()
 }
 
-fn record_encoding_prefix(schema: Identity256, predicate: RelId, arity: usize) -> Vec<u8> {
-    let mut bytes = b"xlog.semantic.record.v2\0".to_vec();
-    bytes.extend_from_slice(schema.as_bytes());
-    bytes.extend_from_slice(&predicate.0.to_le_bytes());
-    bytes.extend_from_slice(&(arity as u32).to_le_bytes());
-    bytes
+fn record_encoding_prefix(
+    schema: Identity256,
+    predicate: RelId,
+    arity: usize,
+    mut emit: impl FnMut(&[u8]),
+) {
+    emit(b"xlog.semantic.record.v2\0");
+    emit(schema.as_bytes());
+    emit(&predicate.0.to_le_bytes());
+    emit(&(arity as u32).to_le_bytes());
 }
 
 fn qualified_statement_identity(
@@ -1129,7 +1133,13 @@ pub(crate) fn material_statement_key(
             "derived target requires an admitted statement schema of at most four arguments",
         ));
     }
-    let mut bytes = record_encoding_prefix(admission.schema_generation, target.predicate, arity);
+    let mut hash = Sha256::new();
+    record_encoding_prefix(
+        admission.schema_generation,
+        target.predicate,
+        arity,
+        |bytes| hash.update(bytes),
+    );
     for argument in 0..4 {
         let record_index = reconstruction[1 + 2 * argument] as usize;
         let argument_index = reconstruction[2 + 2 * argument] as usize;
@@ -1167,7 +1177,7 @@ pub(crate) fn material_statement_key(
         let span = encoding.arguments.get(argument_index).ok_or_else(|| {
             admission_error("derived argument lacks its retained canonical bytes")
         })?;
-        bytes.extend_from_slice(&encoding.bytes[span.clone()]);
+        hash.update(&encoding.bytes[span.clone()]);
     }
     let qualifiers = if reconstruction[9] == u32::MAX {
         &[][..]
@@ -1176,7 +1186,7 @@ pub(crate) fn material_statement_key(
         &admission.records.records[reconstruction[9] as usize].qualifiers
     };
     let identity = qualified_statement_identity(
-        Sha256::digest(bytes).into(),
+        hash.finalize().into(),
         qualifiers
             .iter()
             .map(|&index| Sha256::digest(&admission.encoded_records[index as usize].bytes).into()),
@@ -1993,8 +2003,13 @@ fn prepare_semantic_records_with_budget(
     let mut atoms = Vec::<[u8; 32]>::with_capacity(records.records.len());
     let mut encoded_records = Vec::with_capacity(records.records.len());
     for record in &records.records {
-        let mut bytes =
-            record_encoding_prefix(schema_generation, record.predicate, record.arguments.len());
+        let mut bytes = Vec::new();
+        record_encoding_prefix(
+            schema_generation,
+            record.predicate,
+            record.arguments.len(),
+            |prefix| bytes.extend_from_slice(prefix),
+        );
         let mut arguments = Vec::with_capacity(record.arguments.len());
         for &argument in &record.arguments {
             let start = bytes.len();
