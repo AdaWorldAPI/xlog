@@ -8,6 +8,10 @@ use xlog_core::{Result, ScalarType, XlogError};
 use crate::ast::{
     Atom, BodyLiteral, Comparison, PredColumn, PredDecl, Program, Query, Rule, Term, TypeRef,
 };
+use crate::program_custody::{
+    ColumnCustody, PayloadCustody, PredicateCustody, ProgramAllocationCustody, RetainedProgram,
+    RetainedVectorCustody,
+};
 
 const LIST_ID_TYPE: ScalarType = ScalarType::U64;
 
@@ -47,7 +51,55 @@ fn normalize_list_builtins_with_owner(
     allocate: Option<&mut crate::compile::CompilationAllocationScope<'_>>,
 ) -> Result<Program> {
     let mut normalizer = ListNormalizer::new(&program, allocate)?;
-    normalizer.normalize_program(program)
+    let output = normalizer.normalize_program(
+        RetainedProgram {
+            value: program,
+            custody: ProgramAllocationCustody::default(),
+        },
+        false,
+    )?;
+    normalizer.release_raw_output(output)
+}
+
+pub(crate) fn normalize_list_builtins_retained(
+    program: RetainedProgram,
+    allocations: &mut crate::compile::CompilationAllocationScope<'_>,
+) -> Result<RetainedProgram> {
+    let mut normalizer = ListNormalizer::new(&program.value, Some(allocations))?;
+    normalizer.normalize_program(program, true)
+}
+
+struct RetainedOutput<T> {
+    value: T,
+    custody: PayloadCustody,
+    storage_owner: Option<Arc<dyn Send + Sync>>,
+}
+
+struct TemporaryOutputs<T> {
+    values: Vec<RetainedOutput<T>>,
+    storage_owner: Option<Arc<dyn Send + Sync>>,
+}
+
+struct OriginalRules {
+    values: std::vec::IntoIter<Rule>,
+    payloads: std::vec::IntoIter<PayloadCustody>,
+    _backing_owner: Option<Arc<dyn Send + Sync>>,
+    _metadata_owner: Option<Arc<dyn Send + Sync>>,
+}
+
+struct RetainedRuleBuffer {
+    values: Vec<Rule>,
+    custody: RetainedVectorCustody<PayloadCustody>,
+}
+
+struct RawProgramOwner {
+    _custody: ProgramAllocationCustody,
+    _metadata_owner: Arc<dyn Send + Sync>,
+}
+
+struct RawProgramOutput {
+    value: Program,
+    owner: Arc<RawProgramOwner>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -104,7 +156,12 @@ struct TemporaryListItems {
 
 struct RetainedHelperDeclaration {
     value: PredDecl,
-    allocation_owner: Option<Arc<dyn Send + Sync>>,
+    custody: PredicateCustody,
+}
+
+struct RetainedHelperPredicates {
+    values: HashMap<String, Option<Arc<dyn Send + Sync>>>,
+    _storage_owner: Option<Arc<dyn Send + Sync>>,
 }
 
 #[derive(Debug, Clone)]
@@ -148,27 +205,151 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
             .transpose()
     }
 
-    fn acquire(&mut self, bytes: u64) -> Result<()> {
-        if bytes != 0 {
-            if let Some(allocate) = self.allocation_owner.as_deref_mut() {
-                allocate.acquire(bytes)?;
+    fn acquire(&mut self, payload: &mut PayloadCustody, bytes: u64) -> Result<()> {
+        if let Some(scope) = self.allocation_owner.as_deref_mut() {
+            payload.reserve_unit(bytes, scope)?;
+        }
+        Ok(())
+    }
+
+    fn acquire_vector<T>(&mut self, payload: &mut PayloadCustody, count: usize) -> Result<()> {
+        let bytes = count
+            .checked_mul(std::mem::size_of::<T>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| XlogError::allocation_extent_overflow("list output storage"))?;
+        self.acquire(payload, bytes)
+    }
+
+    fn acquire_term(&mut self, payload: &mut PayloadCustody, term: &Term) -> Result<()> {
+        if let Some(scope) = self.allocation_owner.as_deref_mut() {
+            let mut original = PayloadCustody::for_term_clone(term, scope)?;
+            payload.append_from(&mut original, scope)?;
+        }
+        Ok(())
+    }
+
+    fn acquire_literal(
+        &mut self,
+        payload: &mut PayloadCustody,
+        literal: &BodyLiteral,
+    ) -> Result<()> {
+        if let Some(scope) = self.allocation_owner.as_deref_mut() {
+            let mut original = PayloadCustody::for_literal_clone(literal, scope)?;
+            payload.append_from(&mut original, scope)?;
+        }
+        Ok(())
+    }
+
+    fn absorb<T>(
+        &mut self,
+        payload: &mut PayloadCustody,
+        output: &mut RetainedOutput<T>,
+    ) -> Result<()> {
+        if let Some(scope) = self.allocation_owner.as_deref_mut() {
+            if let Some(owner) = output.storage_owner.as_ref() {
+                payload.retain_original(owner, scope)?;
             }
+            payload.append_from(&mut output.custody, scope)?;
+        }
+        output.storage_owner = None;
+        Ok(())
+    }
+
+    fn reserve_output_vector<T>(
+        &mut self,
+        vector: &mut Vec<T>,
+        owner: &mut Option<Arc<dyn Send + Sync>>,
+        additional: usize,
+    ) -> Result<()> {
+        if self.allocation_owner.is_some() && vector.capacity() - vector.len() < additional {
+            let bytes = vector
+                .len()
+                .checked_add(additional)
+                .and_then(|count| count.checked_mul(std::mem::size_of::<T>()))
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .ok_or_else(|| XlogError::allocation_extent_overflow("list output growth"))?;
+            let next_owner = self.reserve_temporary(bytes)?;
+            vector.reserve_exact(additional);
+            *owner = next_owner;
         }
         Ok(())
     }
 
-    fn acquire_vector<T>(&mut self, count: usize) -> Result<()> {
-        if self.allocation_owner.is_some() {
-            self.acquire(crate::compile::push_vector_allocation_bytes::<T>(count)?)?;
+    fn prepare_program_vector<T, C>(
+        &mut self,
+        values: &mut Vec<T>,
+        custody: &mut RetainedVectorCustody<C>,
+        additional: usize,
+    ) -> Result<()> {
+        if let Some(scope) = self.allocation_owner.as_deref_mut() {
+            custody.prepare_elements(additional, scope)?;
+        } else {
+            custody.elements.reserve(additional);
+            values.reserve(additional);
+        }
+        self.reserve_output_vector(values, &mut custody.backing_owner, additional)
+    }
+
+    fn push_temporary<T>(
+        &mut self,
+        values: &mut Vec<RetainedOutput<T>>,
+        owner: &mut Option<Arc<dyn Send + Sync>>,
+        value: RetainedOutput<T>,
+    ) -> Result<()> {
+        let next_owner = if values.len() == values.capacity() {
+            let count = values
+                .len()
+                .checked_add(1)
+                .ok_or_else(|| XlogError::allocation_extent_overflow("list expansion roster"))?;
+            self.reserve_temporary(xlog_core::push_vector_storage_bytes::<RetainedOutput<T>>(
+                count,
+            )?)?
+        } else {
+            None
+        };
+        values.push(value);
+        if next_owner.is_some() {
+            *owner = next_owner;
         }
         Ok(())
     }
 
-    fn acquire_term(&mut self, term: &Term) -> Result<()> {
-        if self.allocation_owner.is_some() {
-            self.acquire(term.owned_allocation_bytes()? - std::mem::size_of::<Term>() as u64)?;
+    fn push_rule(
+        &mut self,
+        values: &mut Vec<Rule>,
+        custody: &mut RetainedVectorCustody<PayloadCustody>,
+        mut rule: RetainedOutput<Rule>,
+    ) -> Result<()> {
+        self.prepare_program_vector(values, custody, 1)?;
+        if let (Some(scope), Some(owner)) = (
+            self.allocation_owner.as_deref_mut(),
+            rule.storage_owner.as_ref(),
+        ) {
+            rule.custody.retain_original(owner, scope)?;
         }
+        values.push(rule.value);
+        custody.elements.push(rule.custody);
         Ok(())
+    }
+
+    fn release_raw_output(&mut self, output: RetainedProgram) -> Result<Program> {
+        let Some(scope) = self.allocation_owner.as_deref_mut() else {
+            return Ok(output.value);
+        };
+        let metadata = std::mem::size_of::<RawProgramOwner>()
+            .checked_add(2 * std::mem::size_of::<usize>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| XlogError::allocation_extent_overflow("list output owner"))?;
+        let metadata_owner = scope.reserve_allocation(metadata)?;
+        let output = RawProgramOutput {
+            value: output.value,
+            owner: Arc::new(RawProgramOwner {
+                _custody: output.custody,
+                _metadata_owner: metadata_owner,
+            }),
+        };
+        scope.retain(Arc::clone(&output.owner) as Arc<dyn Send + Sync>)?;
+        Ok(output.value)
     }
 
     fn items_clone_bytes(items: &[Term]) -> Result<u64> {
@@ -279,18 +460,6 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
         Ok(None)
     }
 
-    fn reserve_vector<T>(&mut self, vector: &mut Vec<T>, additional: usize) -> Result<()> {
-        if self.allocation_owner.is_some() && vector.capacity() - vector.len() < additional {
-            let count = vector
-                .len()
-                .checked_add(additional)
-                .ok_or_else(|| XlogError::allocation_extent_overflow("list vector"))?;
-            self.acquire_vector::<T>(count)?;
-            vector.reserve_exact(additional);
-        }
-        Ok(())
-    }
-
     fn reserve_hash_growth<K, V>(
         &mut self,
         length: usize,
@@ -361,9 +530,16 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
         Ok((count, self.reserve_temporary(bytes)?))
     }
 
-    fn acquire_format(&mut self, args: std::fmt::Arguments<'_>) -> Result<()> {
+    fn acquire_format(
+        &mut self,
+        payload: &mut PayloadCustody,
+        args: std::fmt::Arguments<'_>,
+    ) -> Result<()> {
         if self.allocation_owner.is_some() {
-            self.acquire(crate::compile::formatted_text_allocation_bytes(args)?)?;
+            self.acquire(
+                payload,
+                crate::compile::formatted_text_allocation_bytes(args)?,
+            )?;
         }
         Ok(())
     }
@@ -536,60 +712,179 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
                 .any(|term| matches!(term, Term::List(_) | Term::Cons { .. }))
     }
 
-    fn normalize_program(&mut self, program: Program) -> Result<Program> {
-        let mut out = program;
-        self.acquire_vector::<Rule>(out.rules.len())?;
-        let mut rules = Vec::with_capacity(out.rules.len());
-        for rule in std::mem::take(&mut out.rules) {
-            if Self::fact_is_identity(&rule) {
-                rules.push(rule);
+    fn normalize_program(
+        &mut self,
+        mut out: RetainedProgram,
+        has_input_custody: bool,
+    ) -> Result<RetainedProgram> {
+        let count = out.value.rules.len();
+        // Raw entries leave original input allocations with their caller.
+        // Only their ownership roster is constructed here; typed entries
+        // move the real original per-record receipts through unchanged.
+        if !has_input_custody {
+            if let Some(scope) = self.allocation_owner.as_deref_mut() {
+                out.custody.rules.prepare_elements(count, scope)?;
+            }
+            out.custody
+                .rules
+                .elements
+                .resize_with(count, PayloadCustody::default);
+        }
+        let next_custody = match self.allocation_owner.as_deref_mut() {
+            Some(scope) => RetainedVectorCustody::for_capacity::<Rule>(count, scope)?,
+            None => RetainedVectorCustody {
+                elements: Vec::with_capacity(count),
+                ..RetainedVectorCustody::default()
+            },
+        };
+        let mut rules = RetainedRuleBuffer {
+            values: Vec::with_capacity(count),
+            custody: next_custody,
+        };
+        let original_custody = std::mem::take(&mut out.custody.rules);
+        let mut original = OriginalRules {
+            values: std::mem::take(&mut out.value.rules).into_iter(),
+            payloads: original_custody.elements.into_iter(),
+            _backing_owner: original_custody.backing_owner,
+            _metadata_owner: original_custody.elements_storage_owner,
+        };
+        while let Some(value) = original.values.next() {
+            let rule = RetainedOutput {
+                value,
+                custody: original
+                    .payloads
+                    .next()
+                    .expect("original list rule custody"),
+                storage_owner: None,
+            };
+            if Self::fact_is_identity(&rule.value) {
+                self.push_rule(&mut rules.values, &mut rules.custody, rule)?;
             } else {
-                let expanded = self.normalize_rule(&rule)?;
-                self.reserve_vector(&mut rules, expanded.len())?;
-                rules.extend(expanded);
+                let expanded = self.normalize_rule(&rule.value)?;
+                for expanded_rule in expanded.values {
+                    self.push_rule(&mut rules.values, &mut rules.custody, expanded_rule)?;
+                }
+                drop(expanded.storage_owner);
+                drop(rule);
             }
         }
-        out.rules = rules;
-        for constraint in &mut out.constraints {
-            constraint.body = self.normalize_body(&constraint.body)?;
+        drop(original);
+        out.value.rules = rules.values;
+        out.custody.rules = rules.custody;
+
+        if !has_input_custody && !out.value.constraints.is_empty() {
+            if let Some(scope) = self.allocation_owner.as_deref_mut() {
+                out.custody
+                    .constraints
+                    .prepare_elements(out.value.constraints.len(), scope)?;
+            }
+            out.custody
+                .constraints
+                .elements
+                .resize_with(out.value.constraints.len(), PayloadCustody::default);
         }
-        for query in &mut out.queries {
-            *query = self.normalize_query(query)?;
+        for (constraint, custody) in out
+            .value
+            .constraints
+            .iter_mut()
+            .zip(&mut out.custody.constraints.elements)
+        {
+            let mut normalized = self.normalize_body(&constraint.body)?;
+            if let (Some(scope), Some(owner)) = (
+                self.allocation_owner.as_deref_mut(),
+                normalized.storage_owner.as_ref(),
+            ) {
+                normalized.custody.retain_original(owner, scope)?;
+            }
+            constraint.body = normalized.value;
+            *custody = normalized.custody;
+        }
+        if !has_input_custody && !out.value.queries.is_empty() {
+            if let Some(scope) = self.allocation_owner.as_deref_mut() {
+                out.custody
+                    .queries
+                    .prepare_elements(out.value.queries.len(), scope)?;
+            }
+            out.custody
+                .queries
+                .elements
+                .resize_with(out.value.queries.len(), PayloadCustody::default);
+        }
+        for (query, custody) in out
+            .value
+            .queries
+            .iter_mut()
+            .zip(&mut out.custody.queries.elements)
+        {
+            let mut normalized = self.normalize_query(query)?;
+            if let (Some(scope), Some(owner)) = (
+                self.allocation_owner.as_deref_mut(),
+                normalized.storage_owner.as_ref(),
+            ) {
+                normalized.custody.retain_original(owner, scope)?;
+            }
+            *query = normalized.value;
+            *custody = normalized.custody;
         }
 
         self.append_helper_declarations_and_facts(&mut out)?;
         Ok(out)
     }
 
-    fn normalize_query(&mut self, query: &Query) -> Result<Query> {
-        if self.allocation_owner.is_some() {
-            self.acquire(query.atom.owned_allocation_bytes()?)?;
-        }
+    fn normalize_query(&mut self, query: &Query) -> Result<RetainedOutput<Query>> {
         let (capacity, _bindings_owner) =
             self.reserve_list_bindings(|visit| query.atom.visit_variables(visit))?;
         let mut var_list_types = HashMap::with_capacity(capacity);
-        let atoms = self.expand_atom(&query.atom, false, &mut var_list_types)?;
-        let atom = atoms
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| query.atom.clone());
-        Ok(Query { atom })
+        let mut atoms = self.expand_atom(&query.atom, false, &mut var_list_types)?;
+        let mut selected = atoms.values.drain(..).next();
+        drop(atoms);
+        let atom = match selected.take() {
+            Some(atom) => atom,
+            None => {
+                let custody = match self.allocation_owner.as_deref_mut() {
+                    Some(scope) => PayloadCustody::for_atom_clone(&query.atom, scope)?,
+                    None => PayloadCustody::default(),
+                };
+                RetainedOutput {
+                    value: query.atom.clone(),
+                    custody,
+                    storage_owner: None,
+                }
+            }
+        };
+        Ok(RetainedOutput {
+            value: Query { atom: atom.value },
+            custody: atom.custody,
+            storage_owner: atom.storage_owner,
+        })
     }
 
-    fn normalize_rule(&mut self, rule: &Rule) -> Result<Vec<Rule>> {
-        self.acquire_vector::<Rule>(1)?;
+    fn normalize_rule(&mut self, rule: &Rule) -> Result<TemporaryOutputs<Rule>> {
         let (capacity, _bindings_owner) = self.reserve_list_bindings(|visit| {
             for literal in &rule.body {
                 literal.visit_variables(visit);
             }
         })?;
         let mut var_list_types = HashMap::with_capacity(capacity);
-        let head = self.normalize_head_atom(&rule.head)?;
-        let body = self.normalize_body_with_env(&rule.body, &mut var_list_types)?;
-        Ok(vec![Rule { head, body }])
+        let mut head = self.normalize_head_atom(&rule.head)?;
+        let mut body = self.normalize_body_with_env(&rule.body, &mut var_list_types)?;
+        self.absorb(&mut head.custody, &mut body)?;
+        let storage_owner =
+            self.reserve_temporary(std::mem::size_of::<RetainedOutput<Rule>>() as u64)?;
+        Ok(TemporaryOutputs {
+            values: vec![RetainedOutput {
+                value: Rule {
+                    head: head.value,
+                    body: body.value,
+                },
+                custody: head.custody,
+                storage_owner: None,
+            }],
+            storage_owner,
+        })
     }
 
-    fn normalize_body(&mut self, body: &[BodyLiteral]) -> Result<Vec<BodyLiteral>> {
+    fn normalize_body(&mut self, body: &[BodyLiteral]) -> Result<RetainedOutput<Vec<BodyLiteral>>> {
         let (capacity, _bindings_owner) = self.reserve_list_bindings(|visit| {
             for literal in body {
                 literal.visit_variables(visit);
@@ -603,20 +898,25 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
         &mut self,
         body: &[BodyLiteral],
         var_list_types: &mut HashMap<String, ScalarType>,
-    ) -> Result<Vec<BodyLiteral>> {
+    ) -> Result<RetainedOutput<Vec<BodyLiteral>>> {
+        let mut payload = PayloadCustody::default();
+        let mut storage_owner = None;
         let mut out = Vec::new();
         for lit in body {
-            self.reserve_vector(&mut out, 1)?;
+            self.reserve_output_vector(&mut out, &mut storage_owner, 1)?;
             match lit {
                 BodyLiteral::Positive(atom) => {
-                    for atom in self.expand_atom(atom, false, var_list_types)? {
-                        self.reserve_vector(&mut out, 1)?;
-                        out.push(BodyLiteral::Positive(atom));
+                    let expanded = self.expand_atom(atom, false, var_list_types)?;
+                    for mut atom in expanded.values {
+                        self.reserve_output_vector(&mut out, &mut storage_owner, 1)?;
+                        self.absorb(&mut payload, &mut atom)?;
+                        out.push(BodyLiteral::Positive(atom.value));
                     }
+                    drop(expanded.storage_owner);
                 }
                 BodyLiteral::Negated(atom) => {
-                    let atoms = self.expand_atom(atom, true, var_list_types)?;
-                    if atoms.len() != 1 {
+                    let mut atoms = self.expand_atom(atom, true, var_list_types)?;
+                    if atoms.values.len() != 1 {
                         return Err(list_error(
                             format_args!(
                                 "{}",
@@ -625,33 +925,35 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
                             &mut self.allocation_owner,
                         ));
                     }
-                    out.push(BodyLiteral::Negated(atoms.into_iter().next().unwrap()));
+                    let mut atom = atoms.values.pop().unwrap();
+                    self.absorb(&mut payload, &mut atom)?;
+                    out.push(BodyLiteral::Negated(atom.value));
                 }
                 BodyLiteral::Comparison(cmp) => {
                     out.push(BodyLiteral::Comparison(Comparison {
                         op: cmp.op,
-                        left: self.normalize_value_term(&cmp.left, None)?,
-                        right: self.normalize_value_term(&cmp.right, None)?,
+                        left: self.normalize_value_term(&cmp.left, None, &mut payload)?,
+                        right: self.normalize_value_term(&cmp.right, None, &mut payload)?,
                     }));
                 }
                 BodyLiteral::Epistemic(epistemic) => {
-                    if self.allocation_owner.is_some() {
-                        self.acquire(lit.owned_allocation_bytes()?)?;
-                    }
-                    out.push(BodyLiteral::Epistemic(epistemic.clone()))
+                    self.acquire_literal(&mut payload, lit)?;
+                    out.push(BodyLiteral::Epistemic(epistemic.clone()));
                 }
                 BodyLiteral::IsExpr(is_expr) => {
-                    if self.allocation_owner.is_some() {
-                        self.acquire(lit.owned_allocation_bytes()?)?;
-                    }
-                    out.push(BodyLiteral::IsExpr(is_expr.clone()))
+                    self.acquire_literal(&mut payload, lit)?;
+                    out.push(BodyLiteral::IsExpr(is_expr.clone()));
                 }
                 BodyLiteral::Univ(_) => {
                     return Err(list_error(format_args!("{}", "univ literals must be normalized by the meta-term pass before list normalization"), &mut self.allocation_owner));
                 }
             }
         }
-        Ok(out)
+        Ok(RetainedOutput {
+            value: out,
+            custody: payload,
+            storage_owner,
+        })
     }
 
     /// Element type of the declared `list<T>` column `idx` of `pred`, if any.
@@ -662,17 +964,31 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
             .map(|(_, col)| col.elem_type)
     }
 
-    fn normalize_head_atom(&mut self, atom: &Atom) -> Result<Atom> {
-        self.acquire_vector::<Term>(atom.terms.len())?;
-        self.acquire(atom.predicate.len() as u64)?;
+    fn normalize_head_atom(&mut self, atom: &Atom) -> Result<RetainedOutput<Atom>> {
+        let mut payload = PayloadCustody::default();
+        self.acquire_vector::<Term>(&mut payload, atom.terms.len())?;
+        self.acquire(&mut payload, atom.predicate.len() as u64)?;
         let mut terms = Vec::with_capacity(atom.terms.len());
         for (idx, term) in atom.terms.iter().enumerate() {
             let expected = self.list_column_elem(&atom.predicate, idx);
-            terms.push(self.normalize_value_term(term, expected)?);
+            terms.push(self.normalize_value_term(term, expected, &mut payload)?);
         }
-        Ok(Atom {
-            predicate: atom.predicate.clone(),
-            terms,
+        Ok(RetainedOutput {
+            value: Atom {
+                predicate: atom.predicate.clone(),
+                terms,
+            },
+            custody: payload,
+            storage_owner: None,
+        })
+    }
+
+    fn single_atom(&mut self, atom: RetainedOutput<Atom>) -> Result<TemporaryOutputs<Atom>> {
+        let storage_owner =
+            self.reserve_temporary(std::mem::size_of::<RetainedOutput<Atom>>() as u64)?;
+        Ok(TemporaryOutputs {
+            values: vec![atom],
+            storage_owner,
         })
     }
 
@@ -681,7 +997,7 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
         atom: &Atom,
         negated: bool,
         var_list_types: &mut HashMap<String, ScalarType>,
-    ) -> Result<Vec<Atom>> {
+    ) -> Result<TemporaryOutputs<Atom>> {
         if let Some(atoms) = self.expand_list_builtin(atom, var_list_types)? {
             return Ok(atoms);
         }
@@ -689,16 +1005,11 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
             return Err(list_error(format_args!("{}", "pair helpers are reserved for meta-term normalization and are not implemented in list normalization"), &mut self.allocation_owner));
         }
 
-        self.acquire_vector::<Term>(atom.terms.len())?;
-        self.acquire_vector::<Atom>(atom.terms.len())?;
-        self.acquire_vector::<Atom>(
-            atom.terms
-                .len()
-                .checked_add(1)
-                .ok_or_else(|| XlogError::allocation_extent_overflow("list atom"))?,
-        )?;
-        self.acquire(atom.predicate.len() as u64)?;
+        let mut payload = PayloadCustody::default();
+        self.acquire_vector::<Term>(&mut payload, atom.terms.len())?;
+        self.acquire(&mut payload, atom.predicate.len() as u64)?;
         let mut terms = Vec::with_capacity(atom.terms.len());
+        let mut extra_storage = None;
         let mut extra_atoms = Vec::new();
         for (idx, term) in atom.terms.iter().enumerate() {
             let expected = self.list_column_elem(&atom.predicate, idx);
@@ -707,7 +1018,7 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
                     if let Some(elem_type) = expected {
                         self.bind_list_type(var_list_types, name, elem_type)?;
                     }
-                    self.acquire_term(term)?;
+                    self.acquire_term(&mut payload, term)?;
                     terms.push(term.clone());
                 }
                 Term::Cons { head, tail } => {
@@ -720,37 +1031,61 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
                             &mut self.allocation_owner,
                         )
                     })?;
-                    let list_var = self.fresh_var("list_cons")?;
-                    let head_term = self.normalize_scalar_term(head, Some(elem_type))?.1;
-                    let tail_arg =
-                        self.normalize_list_arg(tail, Some(elem_type), var_list_types)?;
+                    let mut extra_payload = PayloadCustody::default();
+                    let list_var = self.fresh_var("list_cons", &mut extra_payload)?;
+                    let head_term = self
+                        .normalize_scalar_term(head, Some(elem_type), &mut extra_payload)?
+                        .1;
+                    let tail_arg = self.normalize_list_arg(
+                        tail,
+                        Some(elem_type),
+                        var_list_types,
+                        &mut extra_payload,
+                    )?;
                     if let Term::Variable(name) = &tail_arg.term {
                         self.bind_list_type(var_list_types, name, elem_type)?;
                     }
-                    self.acquire(list_var.len() as u64)?;
-                    self.acquire_vector::<Term>(3)?;
-                    self.acquire_format(format_args!(
-                        "__xlog_list_cons_{}",
-                        scalar_suffix(elem_type)
-                    ))?;
+                    self.acquire(&mut payload, list_var.len() as u64)?;
+                    self.acquire_vector::<Term>(&mut extra_payload, 3)?;
+                    self.acquire_format(
+                        &mut extra_payload,
+                        format_args!("__xlog_list_cons_{}", scalar_suffix(elem_type)),
+                    )?;
                     terms.push(Term::Variable(list_var.clone()));
-                    extra_atoms.push(Atom {
-                        predicate: cons_pred(elem_type),
-                        terms: vec![Term::Variable(list_var), head_term, tail_arg.term],
-                    });
+                    self.push_temporary(
+                        &mut extra_atoms,
+                        &mut extra_storage,
+                        RetainedOutput {
+                            value: Atom {
+                                predicate: cons_pred(elem_type),
+                                terms: vec![Term::Variable(list_var), head_term, tail_arg.term],
+                            },
+                            custody: extra_payload,
+                            storage_owner: None,
+                        },
+                    )?;
                 }
                 _ => {
-                    let normalized = self.normalize_value_term(term, expected)?;
-                    terms.push(normalized);
+                    terms.push(self.normalize_value_term(term, expected, &mut payload)?);
                 }
             }
         }
 
-        let mut atoms = vec![Atom {
-            predicate: atom.predicate.clone(),
-            terms,
-        }];
-        atoms.extend(extra_atoms);
+        let mut atoms = self.single_atom(RetainedOutput {
+            value: Atom {
+                predicate: atom.predicate.clone(),
+                terms,
+            },
+            custody: payload,
+            storage_owner: None,
+        })?;
+        self.reserve_output_vector(
+            &mut atoms.values,
+            &mut atoms.storage_owner,
+            extra_atoms.len(),
+        )?;
+        atoms.values.extend(extra_atoms);
+        drop(extra_storage);
         Ok(atoms)
     }
 
@@ -758,73 +1093,87 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
         &mut self,
         atom: &Atom,
         var_list_types: &mut HashMap<String, ScalarType>,
-    ) -> Result<Option<Vec<Atom>>> {
+    ) -> Result<Option<TemporaryOutputs<Atom>>> {
         let pred = atom.predicate.as_str();
-        if matches!(
-            pred,
-            "is_list"
-                | "member"
-                | "memberchk"
-                | "length"
-                | "nth"
-                | "append"
-                | "sort"
-                | "msort"
-                | "list_to_set"
-        ) {
-            self.acquire_vector::<Atom>(1)?;
-            self.acquire_vector::<Term>(3)?;
-            // Every emitted helper has one original scalar suffix. The
-            // longest original spelling is selected without constructing it.
-            self.acquire_format(format_args!(
-                "__xlog_list_to_set_{}",
-                scalar_suffix(ScalarType::Symbol)
-            ))?;
-        }
+        let mut payload = PayloadCustody::default();
         match pred {
             "is_list" => {
                 require_arity(atom, 1, &mut self.allocation_owner)?;
-                let arg = self.normalize_list_arg(&atom.terms[0], None, var_list_types)?;
-                Ok(Some(vec![Atom {
-                    predicate: len_pred().to_string(),
-                    terms: vec![arg.term, Term::Anonymous],
-                }]))
+                let arg =
+                    self.normalize_list_arg(&atom.terms[0], None, var_list_types, &mut payload)?;
+                self.acquire_vector::<Term>(&mut payload, 2)?;
+                self.acquire(&mut payload, len_pred().len() as u64)?;
+                Ok(Some(self.single_atom(RetainedOutput {
+                    value: Atom {
+                        predicate: len_pred().to_string(),
+                        terms: vec![arg.term, Term::Anonymous],
+                    },
+                    custody: payload,
+                    storage_owner: None,
+                })?))
             }
             "member" | "memberchk" => {
                 require_arity(atom, 2, &mut self.allocation_owner)?;
-                let list = self.normalize_list_arg(&atom.terms[1], None, var_list_types)?;
+                let list =
+                    self.normalize_list_arg(&atom.terms[1], None, var_list_types, &mut payload)?;
                 let value = self
-                    .normalize_scalar_term(&atom.terms[0], Some(list.elem_type))?
+                    .normalize_scalar_term(&atom.terms[0], Some(list.elem_type), &mut payload)?
                     .1;
-                Ok(Some(vec![Atom {
-                    predicate: item_pred(list.elem_type),
-                    terms: vec![list.term, Term::Anonymous, value],
-                }]))
+                self.acquire_vector::<Term>(&mut payload, 3)?;
+                self.acquire_format(
+                    &mut payload,
+                    format_args!("__xlog_list_item_{}", scalar_suffix(list.elem_type)),
+                )?;
+                Ok(Some(self.single_atom(RetainedOutput {
+                    value: Atom {
+                        predicate: item_pred(list.elem_type),
+                        terms: vec![list.term, Term::Anonymous, value],
+                    },
+                    custody: payload,
+                    storage_owner: None,
+                })?))
             }
             "length" => {
                 require_arity(atom, 2, &mut self.allocation_owner)?;
-                let list = self.normalize_list_arg(&atom.terms[0], None, var_list_types)?;
+                let list =
+                    self.normalize_list_arg(&atom.terms[0], None, var_list_types, &mut payload)?;
                 let len = self
-                    .normalize_scalar_term(&atom.terms[1], Some(ScalarType::U32))?
+                    .normalize_scalar_term(&atom.terms[1], Some(ScalarType::U32), &mut payload)?
                     .1;
-                Ok(Some(vec![Atom {
-                    predicate: len_pred().to_string(),
-                    terms: vec![list.term, len],
-                }]))
+                self.acquire_vector::<Term>(&mut payload, 2)?;
+                self.acquire(&mut payload, len_pred().len() as u64)?;
+                Ok(Some(self.single_atom(RetainedOutput {
+                    value: Atom {
+                        predicate: len_pred().to_string(),
+                        terms: vec![list.term, len],
+                    },
+                    custody: payload,
+                    storage_owner: None,
+                })?))
             }
             "nth" => {
                 require_arity(atom, 3, &mut self.allocation_owner)?;
                 let idx = self
-                    .normalize_scalar_term(&atom.terms[0], Some(ScalarType::U32))?
+                    .normalize_scalar_term(&atom.terms[0], Some(ScalarType::U32), &mut payload)?
                     .1;
-                let list = self.normalize_list_arg(&atom.terms[1], None, var_list_types)?;
+                let list =
+                    self.normalize_list_arg(&atom.terms[1], None, var_list_types, &mut payload)?;
                 let value = self
-                    .normalize_scalar_term(&atom.terms[2], Some(list.elem_type))?
+                    .normalize_scalar_term(&atom.terms[2], Some(list.elem_type), &mut payload)?
                     .1;
-                Ok(Some(vec![Atom {
-                    predicate: item_pred(list.elem_type),
-                    terms: vec![list.term, idx, value],
-                }]))
+                self.acquire_vector::<Term>(&mut payload, 3)?;
+                self.acquire_format(
+                    &mut payload,
+                    format_args!("__xlog_list_item_{}", scalar_suffix(list.elem_type)),
+                )?;
+                Ok(Some(self.single_atom(RetainedOutput {
+                    value: Atom {
+                        predicate: item_pred(list.elem_type),
+                        terms: vec![list.term, idx, value],
+                    },
+                    custody: payload,
+                    storage_owner: None,
+                })?))
             }
             "append" => {
                 require_arity(atom, 3, &mut self.allocation_owner)?;
@@ -834,9 +1183,14 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
                 {
                     return Err(list_error(format_args!("{}", "unbounded append/3 generation is unsupported during list normalization; bind the first two lists to finite literals"), &mut self.allocation_owner));
                 }
-                let left = self.normalize_list_arg(&atom.terms[0], None, var_list_types)?;
-                let right =
-                    self.normalize_list_arg(&atom.terms[1], Some(left.elem_type), var_list_types)?;
+                let left =
+                    self.normalize_list_arg(&atom.terms[0], None, var_list_types, &mut payload)?;
+                let right = self.normalize_list_arg(
+                    &atom.terms[1],
+                    Some(left.elem_type),
+                    var_list_types,
+                    &mut payload,
+                )?;
                 if left.elem_type != right.elem_type {
                     return Err(list_error(
                         format_args!(
@@ -846,8 +1200,12 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
                         &mut self.allocation_owner,
                     ));
                 }
-                let out =
-                    self.normalize_list_arg(&atom.terms[2], Some(left.elem_type), var_list_types)?;
+                let out = self.normalize_list_arg(
+                    &atom.terms[2],
+                    Some(left.elem_type),
+                    var_list_types,
+                    &mut payload,
+                )?;
                 if !left.is_literal || !right.is_literal {
                     return Err(list_error(format_args!("{}", "unbounded append/3 generation is unsupported during list normalization; bind the first two lists to finite literals"), &mut self.allocation_owner));
                 }
@@ -880,14 +1238,24 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
                 if let Term::Variable(name) = &out.term {
                     self.bind_list_type(var_list_types, name, left.elem_type)?;
                 }
-                Ok(Some(vec![Atom {
-                    predicate: append_pred(left.elem_type),
-                    terms: vec![left.term, right.term, out.term],
-                }]))
+                self.acquire_vector::<Term>(&mut payload, 3)?;
+                self.acquire_format(
+                    &mut payload,
+                    format_args!("__xlog_list_append_{}", scalar_suffix(left.elem_type)),
+                )?;
+                Ok(Some(self.single_atom(RetainedOutput {
+                    value: Atom {
+                        predicate: append_pred(left.elem_type),
+                        terms: vec![left.term, right.term, out.term],
+                    },
+                    custody: payload,
+                    storage_owner: None,
+                })?))
             }
             "sort" | "msort" | "list_to_set" => {
                 require_arity(atom, 2, &mut self.allocation_owner)?;
-                let input = self.normalize_list_arg(&atom.terms[0], None, var_list_types)?;
+                let input =
+                    self.normalize_list_arg(&atom.terms[0], None, var_list_types, &mut payload)?;
                 if !input.is_literal {
                     return Err(list_error(format_args!("{}", "sort/msort/list_to_set require a finite list literal during list normalization"), &mut self.allocation_owner));
                 }
@@ -897,8 +1265,12 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
                     "list_to_set" => ListOp::ListToSet,
                     _ => unreachable!(),
                 };
-                let out =
-                    self.normalize_list_arg(&atom.terms[1], Some(input.elem_type), var_list_types)?;
+                let out = self.normalize_list_arg(
+                    &atom.terms[1],
+                    Some(input.elem_type),
+                    var_list_types,
+                    &mut payload,
+                )?;
                 let input_id = input.id.expect("literal list has id");
                 let out_id = match out.id {
                     Some(id) => id,
@@ -923,16 +1295,31 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
                 if let Term::Variable(name) = &out.term {
                     self.bind_list_type(var_list_types, name, input.elem_type)?;
                 }
+                self.acquire_vector::<Term>(&mut payload, 2)?;
+                let spelling = match op {
+                    ListOp::Sort => "__xlog_list_sort_",
+                    ListOp::MSort => "__xlog_list_msort_",
+                    ListOp::ListToSet => "__xlog_list_to_set_",
+                    ListOp::Append => unreachable!(),
+                };
+                self.acquire_format(
+                    &mut payload,
+                    format_args!("{}{}", spelling, scalar_suffix(input.elem_type)),
+                )?;
                 let helper = match op {
                     ListOp::Sort => sort_pred(input.elem_type),
                     ListOp::MSort => msort_pred(input.elem_type),
                     ListOp::ListToSet => list_to_set_pred(input.elem_type),
                     ListOp::Append => unreachable!(),
                 };
-                Ok(Some(vec![Atom {
-                    predicate: helper,
-                    terms: vec![input.term, out.term],
-                }]))
+                Ok(Some(self.single_atom(RetainedOutput {
+                    value: Atom {
+                        predicate: helper,
+                        terms: vec![input.term, out.term],
+                    },
+                    custody: payload,
+                    storage_owner: None,
+                })?))
             }
             _ => Ok(None),
         }
@@ -942,10 +1329,11 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
         &mut self,
         term: &Term,
         expected_list_elem: Option<ScalarType>,
+        payload: &mut PayloadCustody,
     ) -> Result<Term> {
         match term {
             Term::List(_) => Ok(self
-                .normalize_list_arg_with_fresh_bindings(term, expected_list_elem)?
+                .normalize_list_arg_with_fresh_bindings(term, expected_list_elem, payload)?
                 .term),
             Term::Cons { head, tail } => {
                 let elem_type = expected_list_elem.ok_or_else(|| {
@@ -966,6 +1354,7 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
                             head,
                             Some(elem_type),
                             storage_owner.as_ref(),
+                            None,
                         )?
                         .1,
                     ],
@@ -973,7 +1362,7 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
                     payload_owners: [payload_owner, None],
                 };
                 let tail_arg =
-                    self.normalize_list_arg_with_fresh_bindings(tail, Some(elem_type))?;
+                    self.normalize_list_arg_with_fresh_bindings(tail, Some(elem_type), payload)?;
                 let tail_id = tail_arg.id.ok_or_else(|| {
                     list_error(
                         format_args!("{}", "cons literal tail must be a finite list literal"),
@@ -986,7 +1375,7 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
                 Ok(Term::Integer(id as i64))
             }
             _ => {
-                self.acquire_term(term)?;
+                self.acquire_term(payload, term)?;
                 Ok(term.clone())
             }
         }
@@ -996,11 +1385,12 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
         &mut self,
         term: &Term,
         expected_elem_type: Option<ScalarType>,
+        payload: &mut PayloadCustody,
     ) -> Result<ListArg> {
         let (capacity, _bindings_owner) =
             self.reserve_list_bindings(|visit| term.visit_variables(visit))?;
         let mut bindings = HashMap::with_capacity(capacity);
-        self.normalize_list_arg(term, expected_elem_type, &mut bindings)
+        self.normalize_list_arg(term, expected_elem_type, &mut bindings, payload)
     }
 
     fn normalize_list_arg(
@@ -1008,6 +1398,7 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
         term: &Term,
         expected_elem_type: Option<ScalarType>,
         var_list_types: &mut HashMap<String, ScalarType>,
+        payload: &mut PayloadCustody,
     ) -> Result<ListArg> {
         match term {
             Term::List(items) => {
@@ -1027,7 +1418,7 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
                 })
             }
             Term::Cons { .. } => {
-                let value = self.normalize_value_term(term, expected_elem_type)?;
+                let value = self.normalize_value_term(term, expected_elem_type, payload)?;
                 let id = match value {
                     Term::Integer(id) if id >= 0 => id as u64,
                     _ => {
@@ -1078,7 +1469,7 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
                         )
                     })?;
                 self.bind_list_type(var_list_types, name, elem_type)?;
-                self.acquire_term(term)?;
+                self.acquire_term(payload, term)?;
                 Ok(ListArg {
                     term: term.clone(),
                     id: None,
@@ -1117,8 +1508,9 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
         &mut self,
         term: &Term,
         expected: Option<ScalarType>,
+        payload: &mut PayloadCustody,
     ) -> Result<(ScalarType, Term)> {
-        self.normalize_scalar_term_with_receipt(term, expected, None)
+        self.normalize_scalar_term_with_receipt(term, expected, None, Some(payload))
     }
 
     fn normalize_scalar_term_with_receipt(
@@ -1126,15 +1518,16 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
         term: &Term,
         expected: Option<ScalarType>,
         temporary_receipt: Option<&Arc<dyn Send + Sync>>,
+        mut payload: Option<&mut PayloadCustody>,
     ) -> Result<(ScalarType, Term)> {
-        if temporary_receipt.is_none() {
-            self.acquire_term(term)?;
-        }
         match term {
             Term::Variable(_) | Term::Anonymous => {
                 let typ = expected.ok_or_else(|| {
                     list_error(format_args!("{}", "list element variable requires a known list<T> element type"), &mut self.allocation_owner)
                 })?;
+                if temporary_receipt.is_none() && self.allocation_owner.is_some() {
+                    self.acquire_term(payload.as_deref_mut().expect("original scalar output custody"), term)?;
+                }
                 Ok((typ, term.clone()))
             }
             Term::Integer(i) => match expected {
@@ -1175,6 +1568,9 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
             },
             Term::String(s) => {
                 if expected.is_none() || expected == Some(ScalarType::Symbol) {
+                    if temporary_receipt.is_none() && self.allocation_owner.is_some() {
+                        self.acquire_term(payload.as_deref_mut().expect("original scalar output custody"), term)?;
+                    }
                     Ok((ScalarType::Symbol, Term::String(s.clone())))
                 } else {
                     Err(list_error(format_args!("{}", "string list element is only valid for symbol lists"), &mut self.allocation_owner))
@@ -1188,8 +1584,9 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
                 }
             }
             Term::List(_) | Term::Cons { .. } => {
+                let mut nested_payload = PayloadCustody::default();
                 let id = self
-                    .normalize_list_arg_with_fresh_bindings(term, None)?
+                    .normalize_list_arg_with_fresh_bindings(term, None, &mut nested_payload)?
                     .id
                     .expect("literal list has id");
                 let typ = expected.unwrap_or(LIST_ID_TYPE);
@@ -1243,6 +1640,7 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
                 item,
                 elem_type,
                 normalized_owner.as_ref(),
+                None,
             ) {
                 Ok(value) => value,
                 Err(err) if matches!(err.unowned(), XlogError::AllocationRefused { .. }) => {
@@ -1430,62 +1828,26 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
         self.register_list_terms(items, Some(input.elem_type))
     }
 
-    fn append_helper_declarations_and_facts(&mut self, program: &mut Program) -> Result<()> {
+    fn append_helper_declarations_and_facts(
+        &mut self,
+        program: &mut RetainedProgram,
+    ) -> Result<()> {
         self.ensure_tail_lists()?;
+        let mut facts = self.operation_rows.len();
+        for list in &self.lists {
+            facts = facts
+                .checked_add(1)
+                .and_then(|n| n.checked_add(list.value.items.len()))
+                .and_then(|n| n.checked_add(usize::from(!list.value.items.is_empty())))
+                .ok_or_else(|| XlogError::allocation_extent_overflow("list helper"))?;
+        }
+        self.prepare_program_vector(&mut program.value.rules, &mut program.custody.rules, facts)?;
 
         let _lists_owner = self.reserve_lists_clone()?;
-        if self.allocation_owner.is_some() {
-            let mut facts = 0usize;
-            let mut bytes = 0u64;
-            for list in &self.lists {
-                let list = &list.value;
-                facts = facts
-                    .checked_add(1)
-                    .and_then(|n| n.checked_add(list.items.len()))
-                    .and_then(|n| n.checked_add(usize::from(!list.items.is_empty())))
-                    .ok_or_else(|| XlogError::allocation_extent_overflow("list helper"))?;
-                let name = crate::compile::formatted_text_allocation_bytes(format_args!(
-                    "__xlog_list_cons_{}",
-                    scalar_suffix(list.elem_type)
-                ))?;
-                bytes = bytes
-                    .checked_add(
-                        name.checked_mul(
-                            (list.items.len() + usize::from(!list.items.is_empty())) as u64,
-                        )
-                        .ok_or_else(|| XlogError::allocation_extent_overflow("list helper"))?,
-                    )
-                    .and_then(|n| n.checked_add(len_pred().len() as u64))
-                    .and_then(|n| n.checked_add(Self::items_clone_bytes(&list.items).ok()?))
-                    .ok_or_else(|| XlogError::allocation_extent_overflow("list helper"))?;
-            }
-            facts = facts
-                .checked_add(self.operation_rows.len())
-                .ok_or_else(|| XlogError::allocation_extent_overflow("list helper"))?;
-            for (_, typ, _) in self.operation_rows.keys() {
-                let name = crate::compile::formatted_text_allocation_bytes(format_args!(
-                    "__xlog_list_to_set_{}",
-                    scalar_suffix(*typ)
-                ))?;
-                bytes = bytes
-                    .checked_add(name)
-                    .ok_or_else(|| XlogError::allocation_extent_overflow("list helper"))?;
-            }
-            bytes = bytes
-                .checked_add(crate::compile::push_vector_allocation_bytes::<Rule>(facts)?)
-                .and_then(|n| {
-                    n.checked_add(
-                        crate::compile::push_vector_allocation_bytes::<Term>(3)
-                            .ok()?
-                            .checked_mul(facts as u64)?,
-                    )
-                })
-                .ok_or_else(|| XlogError::allocation_extent_overflow("list helper"))?;
-            self.acquire(bytes)?;
-            self.reserve_vector(&mut program.rules, facts)?;
-        }
-
-        let mut helper_rules = Vec::new();
+        let mut helper_rules = TemporaryOutputs {
+            values: Vec::new(),
+            storage_owner: None,
+        };
         for list in self
             .lists
             .iter()
@@ -1493,13 +1855,22 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
             .collect::<Vec<_>>()
         {
             self.insert_helper_pred(len_pred())?;
-            helper_rules.push(fact(
+            let rule = self.fact_output(
                 len_pred(),
-                vec![
-                    Term::Integer(list.id as i64),
-                    Term::Integer(list.items.len() as i64),
-                ],
-            ));
+                RetainedOutput {
+                    value: [
+                        Term::Integer(list.id as i64),
+                        Term::Integer(list.items.len() as i64),
+                    ],
+                    custody: PayloadCustody::default(),
+                    storage_owner: None,
+                },
+            )?;
+            self.push_temporary(
+                &mut helper_rules.values,
+                &mut helper_rules.storage_owner,
+                rule,
+            )?;
 
             let _item_name_owner =
                 self.reserve_temporary(crate::compile::formatted_text_allocation_bytes(
@@ -1508,14 +1879,25 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
             let item_name = item_pred(list.elem_type);
             self.insert_helper_pred(&item_name)?;
             for (idx, item) in list.items.iter().enumerate() {
-                helper_rules.push(fact(
+                let mut payload = PayloadCustody::default();
+                self.acquire_term(&mut payload, item)?;
+                let rule = self.fact_output(
                     &item_name,
-                    vec![
-                        Term::Integer(list.id as i64),
-                        Term::Integer(idx as i64),
-                        item.clone(),
-                    ],
-                ));
+                    RetainedOutput {
+                        value: [
+                            Term::Integer(list.id as i64),
+                            Term::Integer(idx as i64),
+                            item.clone(),
+                        ],
+                        custody: payload,
+                        storage_owner: None,
+                    },
+                )?;
+                self.push_temporary(
+                    &mut helper_rules.values,
+                    &mut helper_rules.storage_owner,
+                    rule,
+                )?;
             }
             drop(item_name);
             drop(_item_name_owner);
@@ -1527,21 +1909,28 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
                     )?)?;
                 let cons_name = cons_pred(list.elem_type);
                 self.insert_helper_pred(&cons_name)?;
-                helper_rules.push(fact(
+                let rule = self.fact_output(
                     &cons_name,
-                    vec![
-                        Term::Integer(list.id as i64),
-                        head,
-                        Term::Integer(tail_id as i64),
-                    ],
-                ));
+                    RetainedOutput {
+                        value: [
+                            Term::Integer(list.id as i64),
+                            head.value,
+                            Term::Integer(tail_id as i64),
+                        ],
+                        custody: head.custody,
+                        storage_owner: None,
+                    },
+                )?;
+                self.push_temporary(
+                    &mut helper_rules.values,
+                    &mut helper_rules.storage_owner,
+                    rule,
+                )?;
             }
         }
         drop(_lists_owner);
 
-        // Deterministic emission order: `operation_rows` is a hash table, so
-        // iterating it directly would make helper-fact order (and with it
-        // relation numbering in the plan) vary between processes.
+        // Deterministic emission order keeps relation numbering stable.
         let operation_rows_owner = if self.allocation_owner.is_some() {
             let overflow = || XlogError::allocation_extent_overflow("list operation snapshot");
             let mut bytes = self
@@ -1562,8 +1951,7 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
         } else {
             None
         };
-        let mut operation_rows: Vec<(ListOp, ScalarType, Vec<u64>)> =
-            Vec::with_capacity(self.operation_rows.len());
+        let mut operation_rows = Vec::with_capacity(self.operation_rows.len());
         operation_rows.extend(self.operation_rows.keys().cloned());
         operation_rows.sort_unstable_by(|a, b| {
             (a.0 as u8, a.1 as u8, &a.2).cmp(&(b.0 as u8, b.1 as u8, &b.2))
@@ -1580,15 +1968,46 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
                 ListOp::ListToSet => list_to_set_pred(elem_type),
             };
             self.insert_helper_pred(&pred)?;
+            let mut payload = PayloadCustody::default();
+            self.acquire(&mut payload, pred.len() as u64)?;
+            self.acquire_vector::<Term>(&mut payload, ids.len())?;
             let mut terms = Vec::with_capacity(ids.len());
             terms.extend(ids.into_iter().map(|id| Term::Integer(id as i64)));
-            helper_rules.push(fact(&pred, terms));
+            let rule = RetainedOutput {
+                value: fact(&pred, terms),
+                custody: payload,
+                storage_owner: None,
+            };
+            self.push_temporary(
+                &mut helper_rules.values,
+                &mut helper_rules.storage_owner,
+                rule,
+            )?;
         }
         drop(operation_rows_owner);
 
         self.append_helper_pred_decls(program)?;
-        program.rules.extend(helper_rules);
+        for rule in helper_rules.values {
+            self.push_rule(&mut program.value.rules, &mut program.custody.rules, rule)?;
+        }
+        drop(helper_rules.storage_owner);
         Ok(())
+    }
+
+    fn fact_output<const N: usize>(
+        &mut self,
+        pred: &str,
+        mut terms: RetainedOutput<[Term; N]>,
+    ) -> Result<RetainedOutput<Rule>> {
+        self.acquire(&mut terms.custody, pred.len() as u64)?;
+        self.acquire_vector::<Term>(&mut terms.custody, N)?;
+        let mut values = Vec::with_capacity(N);
+        values.extend(terms.value);
+        Ok(RetainedOutput {
+            value: fact(pred, values),
+            custody: terms.custody,
+            storage_owner: None,
+        })
     }
 
     fn ensure_tail_lists(&mut self) -> Result<()> {
@@ -1618,20 +2037,22 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
         Ok(())
     }
 
-    fn cons_fact_parts(&mut self, list_id: u64) -> Result<Option<(Term, u64)>> {
+    fn cons_fact_parts(&mut self, list_id: u64) -> Result<Option<(RetainedOutput<Term>, u64)>> {
         let mut tail_owner = None;
         if self.allocation_owner.is_some() {
             let list = Self::list_by_id(&self.lists, list_id, &mut self.allocation_owner)?;
-            if let Some(head) = list.items.first() {
+            if !list.items.is_empty() {
                 let tail_bytes = Self::keys_clone_bytes(&list.keys[1..])?;
-                let head_bytes = head.owned_allocation_bytes()?;
                 tail_owner = self.reserve_temporary(tail_bytes)?;
-                self.acquire(head_bytes)?;
             }
         }
         let list = Self::list_by_id(&self.lists, list_id, &mut self.allocation_owner)?;
         let Some(head) = list.items.first() else {
             return Ok(None);
+        };
+        let custody = match self.allocation_owner.as_deref_mut() {
+            Some(scope) => PayloadCustody::for_term_clone(head, scope)?,
+            None => PayloadCustody::default(),
         };
         let tail_key = (list.elem_type, list.keys[1..].to_vec());
         let tail_id = self
@@ -1646,14 +2067,26 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
             })?;
         drop(tail_key);
         drop(tail_owner);
-        Ok(Some((head.clone(), tail_id)))
+        Ok(Some((
+            RetainedOutput {
+                value: head.clone(),
+                custody,
+                storage_owner: None,
+            },
+            tail_id,
+        )))
     }
 
-    fn append_helper_pred_decls(&mut self, program: &mut Program) -> Result<()> {
+    fn append_helper_pred_decls(&mut self, program: &mut RetainedProgram) -> Result<()> {
+        let helper_table = RetainedHelperPredicates {
+            values: std::mem::take(&mut self.helper_preds),
+            _storage_owner: self._helper_preds_owner.take(),
+        };
         let count = program
+            .value
             .predicates
             .len()
-            .checked_add(self.helper_preds.len())
+            .checked_add(helper_table.values.len())
             .ok_or_else(|| XlogError::allocation_extent_overflow("list declaration names"))?;
         let _existing_owner = if self.allocation_owner.is_some() {
             self.reserve_temporary(crate::compile::hash_allocation_bytes::<
@@ -1664,25 +2097,28 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
             None
         };
         let mut existing = HashMap::with_capacity(count);
-        for predicate in &program.predicates {
+        for predicate in &program.value.predicates {
             if existing.contains_key(&predicate.name) {
                 continue;
             }
             let owner = self.reserve_temporary(predicate.name.len() as u64)?;
             existing.insert(predicate.name.clone(), owner);
         }
-        let additions = self
-            .helper_preds
+        let additions = helper_table
+            .values
             .keys()
             .filter(|name| !existing.contains_key(*name))
             .count();
-        self.reserve_vector(&mut program.predicates, additions)?;
+        self.prepare_program_vector(
+            &mut program.value.predicates,
+            &mut program.custody.predicates,
+            additions,
+        )?;
 
-        // Sorted for a process-independent declaration order (see
-        // `append_helper_declarations_and_facts`).
+        // Borrowed names are sorted without cloning the private registry.
         let _helper_preds_owner = if self.allocation_owner.is_some() {
-            let bytes = self
-                .helper_preds
+            let bytes = helper_table
+                .values
                 .len()
                 .checked_mul(std::mem::size_of::<&String>())
                 .and_then(|bytes| u64::try_from(bytes).ok())
@@ -1691,63 +2127,79 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
         } else {
             None
         };
-        let mut helper_preds = Vec::with_capacity(self.helper_preds.len());
-        helper_preds.extend(self.helper_preds.keys());
+        let mut helper_preds = Vec::with_capacity(helper_table.values.len());
+        helper_preds.extend(helper_table.values.keys());
         helper_preds.sort_unstable();
         for pred in helper_preds {
             if existing.contains_key(pred) {
                 continue;
             }
-            let name_owner = self
-                .allocation_owner
-                .as_deref_mut()
-                .map(|scope| scope.reserve_allocation(pred.len() as u64))
-                .transpose()?;
+            let name_owner = self.reserve_temporary(pred.len() as u64)?;
             let existing_name = pred.clone();
-            let schema = helper_column_schema(pred);
-            let column_count = schema.iter().flatten().count();
-            let declaration_owner = if let Some(scope) = self.allocation_owner.as_deref_mut() {
-                let overflow = || XlogError::allocation_extent_overflow("list declaration payload");
-                let mut bytes = column_count
-                    .checked_mul(std::mem::size_of::<PredColumn>() + std::mem::size_of::<TypeRef>())
-                    .and_then(|bytes| u64::try_from(bytes).ok())
-                    .and_then(|bytes| bytes.checked_add(pred.len() as u64))
-                    .ok_or_else(overflow)?;
-                for (name, _) in schema.iter().flatten() {
-                    bytes = bytes.checked_add(name.len() as u64).ok_or_else(overflow)?;
-                }
-                Some(scope.reserve_allocation(bytes)?)
-            } else {
-                None
-            };
-            let mut columns = Vec::with_capacity(column_count);
-            for (name, typ) in schema.into_iter().flatten() {
-                columns.push(PredColumn {
-                    name: Some(name.to_string()),
-                    typ: TypeRef::Scalar(typ),
-                });
-            }
-            let mut types = Vec::with_capacity(column_count);
-            types.extend(columns.iter().map(|column| column.typ.clone()));
-            let declaration = RetainedHelperDeclaration {
-                value: PredDecl {
-                    name: pred.clone(),
-                    types,
-                    columns,
-                    is_private: true,
-                },
-                allocation_owner: declaration_owner,
-            };
-            if let Some(scope) = self.allocation_owner.as_deref_mut() {
-                scope.retain_allocations([declaration.allocation_owner.clone()])?;
-            }
-            program.predicates.push(declaration.value);
+            let declaration = self.helper_declaration(pred)?;
+            program.value.predicates.push(declaration.value);
+            program
+                .custody
+                .predicates
+                .elements
+                .push(declaration.custody);
             existing.insert(existing_name, name_owner);
         }
         drop(_helper_preds_owner);
         drop(existing);
         drop(_existing_owner);
+        drop(helper_table);
         Ok(())
+    }
+
+    fn helper_declaration(&mut self, pred: &str) -> Result<RetainedHelperDeclaration> {
+        let schema = helper_column_schema(pred);
+        let count = schema.iter().flatten().count();
+        let name = match self.allocation_owner.as_deref_mut() {
+            Some(scope) => PayloadCustody::for_text_clone(pred, scope)?,
+            None => PayloadCustody::default(),
+        };
+        let mut column_custody = match self.allocation_owner.as_deref_mut() {
+            Some(scope) => RetainedVectorCustody::for_capacity::<PredColumn>(count, scope)?,
+            None => RetainedVectorCustody::default(),
+        };
+        let mut columns = Vec::with_capacity(count);
+        for (column_name, typ) in schema.into_iter().flatten() {
+            let name = match self.allocation_owner.as_deref_mut() {
+                Some(scope) => PayloadCustody::for_text_clone(column_name, scope)?,
+                None => PayloadCustody::default(),
+            };
+            columns.push(PredColumn {
+                name: Some(column_name.to_string()),
+                typ: TypeRef::Scalar(typ),
+            });
+            column_custody.elements.push(ColumnCustody {
+                name,
+                typ: PayloadCustody::default(),
+            });
+        }
+        let mut type_custody = match self.allocation_owner.as_deref_mut() {
+            Some(scope) => RetainedVectorCustody::for_capacity::<TypeRef>(count, scope)?,
+            None => RetainedVectorCustody::default(),
+        };
+        let mut types = Vec::with_capacity(count);
+        for column in &columns {
+            types.push(column.typ.clone());
+            type_custody.elements.push(PayloadCustody::default());
+        }
+        Ok(RetainedHelperDeclaration {
+            value: PredDecl {
+                name: pred.to_string(),
+                types,
+                columns,
+                is_private: true,
+            },
+            custody: PredicateCustody {
+                name,
+                types: type_custody,
+                columns: column_custody,
+            },
+        })
     }
 
     fn list_by_id<'list>(
@@ -1763,14 +2215,16 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
         })
     }
 
-    fn fresh_var(&mut self, prefix: &str) -> Result<String> {
-        self.acquire(prefix.len() as u64)?;
-        self.acquire_format(format_args!("__XLOG_{prefix}_{}", self.fresh_counter))?;
-        let var = format!(
-            "__XLOG_{}_{}",
-            prefix.to_ascii_uppercase(),
-            self.fresh_counter
-        );
+    fn fresh_var(&mut self, prefix: &str, payload: &mut PayloadCustody) -> Result<String> {
+        let uppercase_owner = self.reserve_temporary(prefix.len() as u64)?;
+        let uppercase = prefix.to_ascii_uppercase();
+        self.acquire_format(
+            payload,
+            format_args!("__XLOG_{prefix}_{}", self.fresh_counter),
+        )?;
+        let var = format!("__XLOG_{}_{}", uppercase, self.fresh_counter);
+        drop(uppercase);
+        drop(uppercase_owner);
         self.fresh_counter += 1;
         Ok(var)
     }

@@ -1451,6 +1451,17 @@ impl FrontendPass {
                 Ok((program, false))
             }
             Self::List => {
+                if let (Some(scope), Some(custody)) = (scope.as_deref_mut(), custody) {
+                    let program = crate::list_normalize::normalize_list_builtins_retained(
+                        crate::program_custody::RetainedProgram {
+                            value: program,
+                            custody: std::mem::take(custody),
+                        },
+                        scope,
+                    )?;
+                    *custody = program.custody;
+                    return Ok((program.value, true));
+                }
                 let program = match scope.as_deref_mut() {
                     Some(scope) => {
                         crate::list_normalize::normalize_list_builtins_owned_with_allocation_owner(
