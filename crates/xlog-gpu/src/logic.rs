@@ -1283,13 +1283,17 @@ impl SemanticLogicTaskProgram {
             }
             None => (LogicProgram::compile(&source)?, None),
         };
-        if !program.source_program.imports.is_empty() {
+        let program = TemporaryCompilation {
+            value: program,
+            _owner: compiler_allocations,
+        };
+        if !program.value.source_program.imports.is_empty() {
             return Err(semantic_task_compilation_error(scope, format_args!(
                 "semantic task source must contain its complete program without imports"
             )));
         }
         for &ordinal in &query_ordinals {
-            let query = program.source_program.queries.get(ordinal).ok_or_else(|| {
+            let query = program.value.source_program.queries.get(ordinal).ok_or_else(|| {
                 semantic_task_compilation_error(scope, format_args!(
                     "semantic task query ordinal {ordinal} is absent"
                 ))
@@ -1307,10 +1311,10 @@ impl SemanticLogicTaskProgram {
         Ok(Self {
             source,
             query_ordinals,
-            program,
+            program: program.value,
             editable: None,
             allocation_owner: None,
-            compiler_allocations,
+            compiler_allocations: program._owner,
             endpoint_allocations: None,
         })
     }
