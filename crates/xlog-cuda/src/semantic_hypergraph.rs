@@ -3281,7 +3281,7 @@ struct SemanticKernelLaunchIo<'a> {
 pub(crate) struct SemanticRootExport {
     owner: u64,
     root: SemanticRootHandle,
-    issuance: Arc<()>,
+    issuance: Arc<SemanticRootExportIssuance>,
     command: OriginalSemanticCommand,
     arena_admitted: bool,
     #[cfg(feature = "semantic-policy")]
@@ -3289,6 +3289,11 @@ pub(crate) struct SemanticRootExport {
     arena: crate::device::RetainedDeviceRead<u64>,
     material: Option<SemanticRootMaterial>,
     _material_allocation: Option<Arc<crate::semantic_transition::SemanticReplayMaterialReservation>>,
+}
+
+// Both the graph and original export retain this actual issuance allocation.
+struct SemanticRootExportIssuance {
+    _allocation_owner: Option<Arc<dyn Send + Sync>>,
 }
 
 pub(crate) struct SemanticAllocatedRootMaterial<Allocation> {
@@ -3595,7 +3600,7 @@ pub struct SemanticHypergraph {
     // Its guard prevents that original report from closing before child joins.
     cold_work_custody: Option<Arc<()>>,
     cold_work_allowance: Option<ColdWorkAllowance>,
-    root_export: Option<Arc<()>>,
+    root_export: Option<Arc<SemanticRootExportIssuance>>,
     original_command: Option<(Option<Arc<()>>, Arc<Mutex<OriginalSemanticCommand>>)>,
     root_restoration: Option<(Arc<()>, Arc<Mutex<OriginalRootRestoration>>)>,
     root_restore_submission_allowed: bool,
@@ -4490,22 +4495,39 @@ impl SemanticHypergraph {
     pub(crate) fn transition_root_export_allocation_bound(
         &self,
     ) -> Result<usize, SemanticHypergraphError> {
-        self.transition_root_export_storage_bound(true, true)
+        self.transition_root_export_storage_bound()
     }
 
-    /// Original readback storage. Extraction, material copies, and their
-    /// lineage-validation scratch have separate phase owners on this path.
-    pub(crate) fn transition_root_read_working_allocation_bound(
+    /// Original upload, receipt-read, and arena-read buffer phase bounds. The
+    /// returned two-copy read bounds cover pinned-plus-Vec and Vec-plus-Vec
+    /// overlap; issuance and completion nodes have their own owners.
+    pub(crate) fn transition_root_read_buffer_allocation_bytes(
         &self,
-    ) -> Result<usize, SemanticHypergraphError> {
-        self.transition_root_export_storage_bound(false, false)
+    ) -> Result<[u64; 3], SemanticHypergraphError> {
+        let upload =
+            u64::try_from(std::mem::size_of::<DeviceCommand>()).map_err(|_| size_overflow())?;
+        let receipt = std::mem::size_of::<DeviceReceipt>()
+            .checked_mul(2)
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(size_overflow)?;
+        let arena = self
+            .arena
+            .len()
+            .checked_mul(2 * std::mem::size_of::<u64>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(size_overflow)?;
+        Ok([upload, receipt, arena])
     }
 
-    fn transition_root_export_storage_bound(
-        &self,
-        include_encoding: bool,
-        include_material: bool,
-    ) -> Result<usize, SemanticHypergraphError> {
+    pub(crate) fn transition_root_export_issuance_allocation_bytes(
+    ) -> Result<u64, SemanticHypergraphError> {
+        std::mem::size_of::<SemanticRootExportIssuance>()
+            .checked_add(2 * std::mem::size_of::<usize>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(size_overflow)
+    }
+
+    fn transition_root_export_storage_bound(&self) -> Result<usize, SemanticHypergraphError> {
         let admission = self
             .admission
             .as_ref()
@@ -4522,121 +4544,124 @@ impl SemanticHypergraph {
             Ok(())
         };
         // Extraction plus either lineage validation or the retained result clone.
-        if include_material {
+        add(
+            admission.records.predicates.len(),
+            2 * std::mem::size_of::<SemanticPredicateRecord>(),
+        )?;
+        for predicate in &admission.records.predicates {
             add(
-                admission.records.predicates.len(),
-                2 * std::mem::size_of::<SemanticPredicateRecord>(),
-            )?;
-            for predicate in &admission.records.predicates {
-                add(
-                    predicate.schema.columns.len(),
-                    2 * std::mem::size_of::<(String, ScalarType)>(),
-                )?;
-                add(
-                    predicate.schema.key_columns.len(),
-                    2 * std::mem::size_of::<usize>(),
-                )?;
-                add(
-                    predicate.schema.sort_labels().len(),
-                    2 * std::mem::size_of::<String>(),
-                )?;
-                for (name, _) in &predicate.schema.columns {
-                    add(name.len(), 2)?;
-                }
-                for label in predicate.schema.sort_labels() {
-                    add(label.len(), 2)?;
-                }
-            }
-            add(
-                admission.records.records.len(),
-                2 * std::mem::size_of::<SemanticTypedRecord>(),
-            )?;
-            for record in &admission.records.records {
-                add(
-                    record.arguments.len(),
-                    2 * std::mem::size_of::<SemanticArgument>(),
-                )?;
-                add(record.qualifiers.len(), 2 * std::mem::size_of::<u32>())?;
-            }
-            add(
-                admission.records.supports.len(),
-                2 * std::mem::size_of::<SemanticSupportRecord>(),
+                predicate.schema.columns.len(),
+                2 * std::mem::size_of::<(String, ScalarType)>(),
             )?;
             add(
-                admission.symbols.entries().len(),
+                predicate.schema.key_columns.len(),
+                2 * std::mem::size_of::<usize>(),
+            )?;
+            add(
+                predicate.schema.sort_labels().len(),
                 2 * std::mem::size_of::<String>(),
             )?;
-            for (_, text) in admission.symbols.entries() {
-                add(text.len(), 2)?;
+            for (name, _) in &predicate.schema.columns {
+                add(name.len(), 2)?;
             }
+            for label in predicate.schema.sort_labels() {
+                add(label.len(), 2)?;
+            }
+        }
+        add(
+            admission.records.records.len(),
+            2 * std::mem::size_of::<SemanticTypedRecord>(),
+        )?;
+        for record in &admission.records.records {
+            add(
+                record.arguments.len(),
+                2 * std::mem::size_of::<SemanticArgument>(),
+            )?;
+            add(record.qualifiers.len(), 2 * std::mem::size_of::<u32>())?;
+        }
+        add(
+            admission.records.supports.len(),
+            2 * std::mem::size_of::<SemanticSupportRecord>(),
+        )?;
+        add(
+            admission.symbols.entries().len(),
+            2 * std::mem::size_of::<String>(),
+        )?;
+        for (_, text) in admission.symbols.entries() {
+            add(text.len(), 2)?;
         }
         let versions = usize::try_from(self.capacities.versions).map_err(|_| size_overflow())?;
         let supports = usize::try_from(self.capacities.supports).map_err(|_| size_overflow())?;
-        if include_encoding {
-            // The original graph encoder and publication prefix can coexist. Count
-            // their actual immutable fields and at most one insertion per version;
-            // Vec growth doubles each of the two live encoded buffers.
-            let mut encoded = 8usize + 4 + 5 * 4 + 88;
-            let mut encode_add = |count: usize, width: usize| -> Result<(), SemanticHypergraphError> {
-                encoded = encoded
-                    .checked_add(count.checked_mul(width).ok_or_else(size_overflow)?)
-                    .ok_or_else(size_overflow)?;
-                Ok(())
-            };
-            for predicate in &admission.records.predicates {
-                encode_add(1, 13)?;
-                encode_add(predicate.schema.key_columns.len(), 4)?;
-                for ((name, _), label) in predicate
-                    .schema
-                    .columns
-                    .iter()
-                    .zip(predicate.schema.sort_labels())
-                {
-                    encode_add(1, 9)?;
-                    encode_add(name.len(), 1)?;
-                    encode_add(label.len(), 1)?;
-                }
+        // The original graph encoder and publication prefix can coexist. Count
+        // their actual immutable fields and at most one insertion per version;
+        // Vec growth doubles each of the two live encoded buffers.
+        let mut encoded = 8usize + 4 + 5 * 4 + 88;
+        let mut encode_add = |count: usize, width: usize| -> Result<(), SemanticHypergraphError> {
+            encoded = encoded
+                .checked_add(count.checked_mul(width).ok_or_else(size_overflow)?)
+                .ok_or_else(size_overflow)?;
+            Ok(())
+        };
+        for predicate in &admission.records.predicates {
+            encode_add(1, 13)?;
+            encode_add(predicate.schema.key_columns.len(), 4)?;
+            for ((name, _), label) in predicate
+                .schema
+                .columns
+                .iter()
+                .zip(predicate.schema.sort_labels())
+            {
+                encode_add(1, 9)?;
+                encode_add(name.len(), 1)?;
+                encode_add(label.len(), 1)?;
             }
-            for record in &admission.records.records {
-                encode_add(1, 12)?;
-                // A typed argument uses one tag plus at most one 64-bit scalar.
-                encode_add(record.arguments.len(), 9)?;
-                encode_add(record.qualifiers.len(), 4)?;
-            }
-            encode_add(admission.records.supports.len(), 21)?;
-            for (_, text) in admission.symbols.entries() {
-                encode_add(1, 4)?;
-                encode_add(text.len(), 1)?;
-            }
-            encode_add(
-                versions,
-                1 + 4 + 10 * 4 + std::mem::size_of::<SemanticRootSupport>() + 32,
-            )?;
-            add(encoded, 4)?;
         }
+        for record in &admission.records.records {
+            encode_add(1, 12)?;
+            // A typed argument uses one tag plus at most one 64-bit scalar.
+            encode_add(record.arguments.len(), 9)?;
+            encode_add(record.qualifiers.len(), 4)?;
+        }
+        encode_add(admission.records.supports.len(), 21)?;
+        for (_, text) in admission.symbols.entries() {
+            encode_add(1, 4)?;
+            encode_add(text.len(), 1)?;
+        }
+        encode_add(
+            versions,
+            1 + 4 + 10 * 4 + std::mem::size_of::<SemanticRootSupport>() + 32,
+        )?;
+        add(encoded, 4)?;
         let node = |key: usize, value: usize| {
             key.checked_add(value)
                 .and_then(|n| n.checked_mul(11))
                 .and_then(|n| n.checked_add(16 * std::mem::size_of::<usize>()))
                 .ok_or_else(size_overflow)
         };
-        if include_material {
-            add(versions, node(std::mem::size_of::<usize>(), 0)?)?;
-            add(supports, node(std::mem::size_of::<usize>(), 0)?)?;
-            add(versions, node(32, 32 + std::mem::size_of::<u64>())?)?;
-            add(versions, node(64, 0)?)?;
-            add(
-                versions,
-                2 * std::mem::size_of::<(u64, SemanticRootInsertion)>()
-                    + 2 * std::mem::size_of::<SemanticRootInsertion>(),
-            )?;
-            add(4, std::mem::size_of::<(u64, SemanticRootInsertion)>())?;
-        }
+        add(versions, node(std::mem::size_of::<usize>(), 0)?)?;
+        add(supports, node(std::mem::size_of::<usize>(), 0)?)?;
+        add(versions, node(32, 32 + std::mem::size_of::<u64>())?)?;
+        add(versions, node(64, 0)?)?;
+        add(
+            versions,
+            2 * std::mem::size_of::<(u64, SemanticRootInsertion)>()
+                + 2 * std::mem::size_of::<SemanticRootInsertion>(),
+        )?;
+        add(4, std::mem::size_of::<(u64, SemanticRootInsertion)>())?;
         add(
             1,
-            std::mem::size_of::<SemanticRootExport>()
-                + std::mem::size_of::<DeviceCommand>()
-                + 2 * std::mem::size_of::<DeviceReceipt>(),
+            std::mem::size_of::<DeviceCommand>()
+                + 2 * std::mem::size_of::<DeviceReceipt>()
+                + std::mem::size_of::<SemanticRootExportIssuance>()
+                + 2 * std::mem::size_of::<usize>(),
+        )?;
+        add(
+            1,
+            usize::try_from(
+                crate::device::ExecutionCompletion::single_stream_allocation_bytes()
+                    .map_err(|_| size_overflow())?,
+            )
+            .map_err(|_| size_overflow())?,
         )?;
         Ok(bound)
     }
@@ -4653,6 +4678,25 @@ impl SemanticHypergraph {
         root: SemanticRootHandle,
         allocation_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<SemanticRootExport, SemanticHypergraphError> {
+        self.prepare_transition_root_export_with_allocations(
+            root,
+            allocation_owner.clone(),
+            allocation_owner.clone(),
+            allocation_owner.clone(),
+            allocation_owner.clone(),
+            allocation_owner,
+        )
+    }
+
+    pub(crate) fn prepare_transition_root_export_with_allocations(
+        &mut self,
+        root: SemanticRootHandle,
+        upload_owner: Option<Arc<dyn Send + Sync>>,
+        receipt_owner: Option<Arc<dyn Send + Sync>>,
+        arena_owner: Option<Arc<dyn Send + Sync>>,
+        completion_owner: Option<Arc<dyn Send + Sync>>,
+        issuance_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<SemanticRootExport, SemanticHypergraphError> {
         self.ensure_not_poisoned()?;
         if root.owner != self.owner {
             return Err(SemanticHypergraphError::ForeignHandle {
@@ -4664,17 +4708,21 @@ impl SemanticHypergraph {
                 "root material export requires typed admission",
             ));
         }
-        let issuance = Arc::new(());
+        let issuance = Arc::new(SemanticRootExportIssuance {
+            _allocation_owner: issuance_owner,
+        });
         let mut command = self.command_for(OP_SNAPSHOT);
         write_view(&mut command, SemanticView::Root(root));
         let original = SemanticRootExport {
             owner: self.owner,
             root,
             issuance: Arc::clone(&issuance),
-            command: self.prepare_original_command_with_owner(
+            command: self.prepare_original_command_with_allocations(
                 command,
                 ArenaAccess::Read,
-                allocation_owner.clone(),
+                upload_owner,
+                receipt_owner,
+                completion_owner,
             )?,
             arena_admitted: false,
             #[cfg(feature = "semantic-policy")]
@@ -4682,7 +4730,7 @@ impl SemanticHypergraph {
             arena: crate::device::RetainedDeviceRead::new_with_owner(
                 &self.stream,
                 self.arena.view(),
-                allocation_owner,
+                arena_owner,
             )
             .map_err(|error| runtime_error("root export arena staging", error))?,
             material: None,
@@ -4836,7 +4884,6 @@ impl SemanticHypergraph {
             |_, _| Ok(None),
             |_, _| Ok(()),
             |_, _| Ok(((), ())),
-            || (),
             |error| error,
         )
         .map(|owned| owned.material)
@@ -4864,7 +4911,6 @@ impl SemanticHypergraph {
             SemanticHypergraphCapacities,
             usize,
         ) -> Result<(Seen, Ordered), Error>,
-        retire_readback: impl FnOnce(),
         error: impl Fn(SemanticHypergraphError) -> Error,
     ) -> Result<SemanticAllocatedRootMaterial<Allocation>, Error> {
         if original.owner != self.owner {
@@ -4904,6 +4950,7 @@ impl SemanticHypergraph {
                 .map_err(&error)?,
         );
         drop(receipts);
+        original.command.receipt.retire_completed_values();
         let acquired: Result<(Allocation, Lineage, Seen, Ordered), Error> = (|| {
             let admission = self.admission.as_ref().expect("checked typed admission");
             let insertions = snapshot.extents.versions as usize;
@@ -4917,7 +4964,6 @@ impl SemanticHypergraph {
             Err(failure) => {
                 drop(arena);
                 self.retire_transition_root_export_readback(original);
-                retire_readback();
                 return Err(failure);
             }
         };
@@ -4935,7 +4981,6 @@ impl SemanticHypergraph {
         let material = poison_after_reconciliation_error(&mut self.poisoned, result).map_err(&error)?;
         drop(arena);
         self.retire_transition_root_export_readback(original);
-        retire_readback();
         let cached_allocation = reserve_cache(
             self.admission.as_ref().expect("checked typed admission"),
             material.insertions.len(),
@@ -4950,7 +4995,6 @@ impl SemanticHypergraph {
 
     fn retire_transition_root_export_readback(&mut self, original: &mut SemanticRootExport) {
         original.command.poisoned = false;
-        original.command.receipt.retire_completed_values();
         original.arena.retire_completed_values();
         self.root_export = None;
     }
@@ -5960,6 +6004,23 @@ impl SemanticHypergraph {
         access: ArenaAccess,
         allocation_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<OriginalSemanticCommand, SemanticHypergraphError> {
+        self.prepare_original_command_with_allocations(
+            command,
+            access,
+            allocation_owner.clone(),
+            allocation_owner.clone(),
+            allocation_owner,
+        )
+    }
+
+    fn prepare_original_command_with_allocations(
+        &self,
+        command: DeviceCommand,
+        access: ArenaAccess,
+        upload_owner: Option<Arc<dyn Send + Sync>>,
+        receipt_owner: Option<Arc<dyn Send + Sync>>,
+        completion_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<OriginalSemanticCommand, SemanticHypergraphError> {
         Ok(OriginalSemanticCommand {
             owner: self.owner,
             command,
@@ -5968,7 +6029,7 @@ impl SemanticHypergraph {
                 &self.stream,
                 &[command],
                 self.command.view(),
-                allocation_owner.clone(),
+                upload_owner,
             )
             .map_err(|error| runtime_error("semantic command staging", error))?,
             upload_admitted: false,
@@ -5983,12 +6044,15 @@ impl SemanticHypergraph {
             receipt_dma_recorded: false,
             #[cfg(feature = "semantic-policy")]
             dma_allowance: self.cold_work_allowance().as_ref().map(Arc::downgrade),
-            completion: crate::device::ExecutionCompletion::new(self.stream.context())
-                .map_err(|error| runtime_error("semantic command completion allocation", error))?,
+            completion: crate::device::ExecutionCompletion::new_with_owner(
+                self.stream.context(),
+                completion_owner,
+            )
+            .map_err(|error| runtime_error("semantic command completion allocation", error))?,
             receipt: crate::device::RetainedDeviceRead::new_with_owner(
                 &self.stream,
                 self.receipt.view(),
-                allocation_owner,
+                receipt_owner,
             )
             .map_err(|error| runtime_error("semantic receipt staging", error))?,
             value: None,
@@ -6127,7 +6191,7 @@ impl SemanticHypergraph {
             }
             if original.completion_entered {
                 original.completion =
-                    crate::device::ExecutionCompletion::new(self.stream.context())
+                    original.completion.renew(self.stream.context())
                         .map_err(|error| runtime_error("semantic completion allocation", error))?;
                 original.completion_entered = false;
             }

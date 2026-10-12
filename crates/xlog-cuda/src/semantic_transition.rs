@@ -40207,25 +40207,42 @@ impl SemanticTransitionSession {
                 &budget,
             );
         }
-        let export_bytes = self
+        let [upload_bytes, receipt_bytes, arena_bytes] = self
             .graph
-            .transition_root_read_working_allocation_bound()
-            .map_err(SemanticTransitionError::Semantic)?
-            .checked_add(size_of::<SemanticReplayMaterialReservation>() + 2 * size_of::<usize>())
-            .ok_or(SemanticTransitionError::GenerationExhausted)?;
-        let mut export_allocation = Some(Arc::new(budget.reserve_auxiliary(
-            u64::try_from(export_bytes).map_err(|_| SemanticTransitionError::GenerationExhausted)?,
-        )?));
+            .transition_root_read_buffer_allocation_bytes()
+            .map_err(SemanticTransitionError::Semantic)?;
+        let owner_bytes =
+            u64::try_from(size_of::<SemanticReplayMaterialReservation>() + 2 * size_of::<usize>())
+                .map_err(|_| SemanticTransitionError::GenerationExhausted)?;
+        let reserve_owner =
+            |bytes: u64| -> Result<Option<Arc<dyn Send + Sync>>, SemanticTransitionError> {
+                let allocation = budget.reserve_auxiliary(
+                    bytes
+                        .checked_add(owner_bytes)
+                        .ok_or(SemanticTransitionError::GenerationExhausted)?,
+                )?;
+                Ok(Some(Arc::new(allocation)))
+            };
+        let upload_owner = reserve_owner(upload_bytes)?;
+        let receipt_owner = reserve_owner(receipt_bytes)?;
+        let arena_owner = reserve_owner(arena_bytes)?;
+        let completion_owner = reserve_owner(
+            crate::device::ExecutionCompletion::single_stream_allocation_bytes()
+                .map_err(|_| SemanticTransitionError::GenerationExhausted)?,
+        )?;
+        let issuance_owner = reserve_owner(
+                crate::semantic_hypergraph::SemanticHypergraph::transition_root_export_issuance_allocation_bytes()
+                    .map_err(SemanticTransitionError::Semantic)?,
+            )?;
         let mut original = self
             .graph
-            .prepare_transition_root_export_with_owner(
+            .prepare_transition_root_export_with_allocations(
                 self.root,
-                Some(
-                    export_allocation
-                        .as_ref()
-                        .expect("original readback allocation")
-                        .clone() as Arc<dyn Send + Sync>,
-                ),
+                upload_owner,
+                receipt_owner,
+                arena_owner,
+                completion_owner,
+                issuance_owner,
             )
             .map_err(SemanticTransitionError::Semantic)?;
         let material = self.graph.resolve_transition_root_export_with_allocations(
@@ -40278,11 +40295,9 @@ impl SemanticTransitionSession {
                 )?;
                 Ok(((seen_versions, seen_supports), ordered))
             },
-            || drop(export_allocation.take()),
             SemanticTransitionError::Semantic,
         )?;
         drop(original);
-        drop(export_allocation);
         let admission = self
             .graph
             .admission()

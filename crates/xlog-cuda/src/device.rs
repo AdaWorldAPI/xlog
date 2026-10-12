@@ -621,6 +621,9 @@ pub(crate) struct RetainedDeviceRead<T: DeviceRepr + Copy> {
     retired: bool,
     original_stream_id: u64,
     values: Option<Vec<T>>,
+    // The pin can retire before resolve clones its result. Cached values keep
+    // the original phase owner until the caller retires those real values.
+    values_allocation_owner: Option<Arc<dyn Send + Sync>>,
 }
 
 impl<T: DeviceRepr + Copy> RetainedDeviceRead<T> {
@@ -649,13 +652,14 @@ impl<T: DeviceRepr + Copy> RetainedDeviceRead<T> {
             buffer: Some(PinnedHostBuffer::new_with_owner(
                 stream,
                 bytes,
-                retained_owner,
+                retained_owner.clone(),
             )?),
             entered: false,
             submitted: false,
             retired: false,
             original_stream_id: crate::cuda_graph::stream_execution_id(stream)?,
             values: None,
+            values_allocation_owner: retained_owner,
         })
     }
 
@@ -733,14 +737,15 @@ impl<T: DeviceRepr + Copy> RetainedDeviceRead<T> {
         Ok(values)
     }
 
-    /// The enclosing material owner has retained the authenticated result, so
-    /// this completed component no longer needs a duplicate host allocation.
+    /// The caller has dropped or independently retained the returned copies;
+    /// this completed component no longer needs its duplicate host allocation.
     pub(crate) fn retire_completed_values(&mut self) {
         assert!(
             self.values.is_some(),
             "original read must complete before retirement"
         );
         self.values = None;
+        self.values_allocation_owner = None;
         self.retired = true;
     }
 
@@ -763,6 +768,7 @@ impl<T: DeviceRepr + Copy> RetainedDeviceRead<T> {
         self.retired = true;
         self.buffer = None;
         self.values = None;
+        self.values_allocation_owner = None;
         Ok(())
     }
 }
@@ -1154,19 +1160,49 @@ impl ExecutionFence {
 }
 
 /// Per-stream execution fences and a separate, irreversible reuse poison.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(crate) struct ExecutionCompletion {
     events: BTreeMap<u64, (CudaEvent, ExecutionFence)>,
     spare: Option<CudaEvent>,
     uncertain: bool,
+    allocation_owner: Option<Arc<dyn Send + Sync>>,
+}
+
+impl std::fmt::Debug for ExecutionCompletion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExecutionCompletion")
+            .field("events", &self.events)
+            .field("spare", &self.spare)
+            .field("uncertain", &self.uncertain)
+            .finish()
+    }
 }
 
 impl ExecutionCompletion {
     pub(crate) fn new(context: &Arc<CudarcContext>) -> std::result::Result<Self, DriverError> {
+        Self::new_with_owner(context, None)
+    }
+
+    /// Typed host tree-node bound for an original command on one stream. This
+    /// does not claim the driver's opaque event allocation as host heap bytes.
+    pub(crate) fn single_stream_allocation_bytes() -> xlog_core::Result<u64> {
+        xlog_core::btree_insert_allocation_bytes::<u64, (CudaEvent, ExecutionFence)>(0)
+    }
+
+    pub(crate) fn new_with_owner(
+        context: &Arc<CudarcContext>,
+        allocation_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> std::result::Result<Self, DriverError> {
         Ok(Self {
             spare: Some(context.new_event(None)?),
+            allocation_owner,
             ..Self::default()
         })
+    }
+
+    pub(crate) fn renew(&self, context: &Arc<CudarcContext>) -> std::result::Result<Self, DriverError> {
+        Self::new_with_owner(context, self.allocation_owner.clone())
     }
 
     pub(crate) fn submit(
