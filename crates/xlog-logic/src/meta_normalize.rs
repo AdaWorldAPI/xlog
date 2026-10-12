@@ -1979,7 +1979,7 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
     fn append_helpers(&mut self, program: &mut Program) -> Result<()> {
         self.append_term_helper_facts()?;
 
-        if self.allocation_owner.is_some() {
+        let existing_owner = if self.allocation_owner.is_some() {
             let overflow = || XlogError::allocation_extent_overflow("meta helper output");
             let mut bytes =
                 crate::compile::hash_allocation_bytes::<String, ()>(program.predicates.len())?;
@@ -1988,16 +1988,29 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
                     .checked_add(predicate.name.len() as u64)
                     .ok_or_else(overflow)?;
             }
+            self.reserve_temporary(bytes)?
+        } else {
+            None
+        };
+        let existing: HashSet<String> = program
+            .predicates
+            .iter()
+            .map(|pred| pred.name.clone())
+            .collect();
+
+        if self.allocation_owner.is_some() {
+            let overflow = || XlogError::allocation_extent_overflow("meta helper output");
+            let additions = self
+                .helper_decls
+                .keys()
+                .filter(|name| !existing.contains(*name))
+                .count();
             let predicates = program
                 .predicates
                 .len()
-                .checked_add(self.helper_decls.len())
+                .checked_add(additions)
                 .ok_or_else(overflow)?;
-            bytes = bytes
-                .checked_add(crate::compile::push_vector_allocation_bytes::<PredDecl>(
-                    predicates,
-                )?)
-                .ok_or_else(overflow)?;
+            let mut bytes = crate::compile::push_vector_allocation_bytes::<PredDecl>(predicates)?;
             let rules = program
                 .rules
                 .len()
@@ -2007,6 +2020,9 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
                 .checked_add(crate::compile::push_vector_allocation_bytes::<Rule>(rules)?)
                 .ok_or_else(overflow)?;
             for (name, columns) in &self.helper_decls {
+                if existing.contains(name) {
+                    continue;
+                }
                 bytes = bytes.checked_add(name.len() as u64).ok_or_else(overflow)?;
                 bytes = bytes
                     .checked_add(
@@ -2019,7 +2035,8 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
                     )
                     .ok_or_else(overflow)?;
                 for column in columns {
-                    let typ = column.typ.owned_allocation_bytes()?;
+                    let typ = column.typ.owned_allocation_bytes()?
+                        - std::mem::size_of::<TypeRef>() as u64;
                     bytes = bytes
                         .checked_add(typ.checked_mul(2).ok_or_else(overflow)?)
                         .ok_or_else(overflow)?;
@@ -2031,11 +2048,6 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
             self.acquire(bytes)?;
         }
 
-        let existing: HashSet<String> = program
-            .predicates
-            .iter()
-            .map(|pred| pred.name.clone())
-            .collect();
         for (name, columns) in &self.helper_decls {
             if existing.contains(name) {
                 continue;
@@ -2047,6 +2059,8 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
                 is_private: true,
             });
         }
+        drop(existing);
+        drop(existing_owner);
         program.rules.extend(std::mem::take(&mut self.helper_facts));
         self._helper_facts_storage = None;
         Ok(())
