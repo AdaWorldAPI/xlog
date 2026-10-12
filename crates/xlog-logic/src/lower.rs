@@ -175,6 +175,53 @@ enum ConstantDataAllocation<'a> {
     Prepared(&'a Option<Arc<dyn Send + Sync>>),
 }
 
+fn group_proper_rules_with_owner<'p>(
+    program: &'p Program,
+    allocations: &mut LoweringAllocations<'_, '_>,
+) -> Result<(HashMap<&'p str, Vec<&'p Rule>>, Option<Arc<dyn Send + Sync>>)> {
+    match allocations.scope.as_deref_mut() {
+        Some(scope) => {
+            let mut stage = scope.child_scope();
+            stage.prepare_output_owner()?;
+            let rules = group_proper_rules_core(
+                program,
+                &mut LoweringAllocations {
+                    scope: Some(&mut stage),
+                },
+            )?;
+            let owner = stage.into_owner()?;
+            // The lookup drops before the receipts that own its real buffers.
+            Ok((rules, Some(owner)))
+        }
+        None => Ok((group_proper_rules_core(program, allocations)?, None)),
+    }
+}
+
+fn group_proper_rules_core<'p>(
+    program: &'p Program,
+    allocations: &mut LoweringAllocations<'_, '_>,
+) -> Result<HashMap<&'p str, Vec<&'p Rule>>> {
+    let mut rules_by_pred: HashMap<&str, Vec<&Rule>> = HashMap::new();
+    for rule in program.proper_rules() {
+        let predicate = rule.head.predicate.as_str();
+        if !rules_by_pred.contains_key(predicate)
+            && rules_by_pred.len() == rules_by_pred.capacity()
+        {
+            allocations.hash::<&str, Vec<&Rule>>(rules_by_pred.len() + 1)?;
+        }
+        let (length, capacity) = rules_by_pred
+            .get(predicate)
+            .map(|rules| (rules.len(), rules.capacity()))
+            .unwrap_or((0, 0));
+        if length == capacity {
+            allocations.vector::<&Rule>(length + 1)?;
+        }
+        // The authored AST remains live for the whole lowering operation.
+        rules_by_pred.entry(predicate).or_default().push(rule);
+    }
+    Ok(rules_by_pred)
+}
+
 fn arithmetic_expression_nodes(expression: &ArithExpr) -> Result<usize> {
     let overflow = || XlogError::allocation_extent_overflow("arithmetic expression");
     let children = match expression {
@@ -2211,7 +2258,12 @@ impl Lowerer {
 
         // Build strata from our strata field
         for (id, preds) in self.strata.iter().enumerate() {
-            allocations.hash::<&str, ()>(preds.len())?;
+            let _predicate_set_owner = match allocations.scope.as_deref_mut() {
+                Some(scope) => Some(scope.reserve_allocation(
+                    crate::compile::hash_allocation_bytes::<&str, ()>(preds.len())?,
+                )?),
+                None => None,
+            };
             allocations.vector::<u32>(self.sccs.len())?;
             // Find which SCCs belong to this stratum
             let pred_set: std::collections::HashSet<&str> =
@@ -2231,54 +2283,40 @@ impl Lowerer {
             }
         }
 
-        // Lower each rule
-        let mut rules_by_pred: HashMap<String, Vec<&Rule>> = HashMap::new();
-        for rule in program.proper_rules() {
-            allocations.acquire(rule.head.predicate.len() as u64)?;
-            if !rules_by_pred.contains_key(&rule.head.predicate)
-                && rules_by_pred.len() == rules_by_pred.capacity()
-            {
-                allocations.hash::<String, Vec<&Rule>>(rules_by_pred.len() + 1)?;
-            }
-            let (length, capacity) = rules_by_pred
-                .get(&rule.head.predicate)
-                .map(|rules| (rules.len(), rules.capacity()))
-                .unwrap_or((0, 0));
-            if length == capacity {
-                allocations.vector::<&Rule>(length + 1)?;
-            }
-            rules_by_pred
-                .entry(rule.head.predicate.clone())
-                .or_default()
-                .push(rule);
-        }
+        {
+            let rules_by_pred = group_proper_rules_with_owner(program, allocations)?;
+            // Preserve lexicographic head order and authored order within each
+            // group. The lookup and sorting buffers retire before learnable
+            // rules; the builder owns only the actual compiled rule outputs.
+            let _sort_owner = match allocations.scope.as_deref_mut() {
+                Some(scope) => Some(scope.reserve_allocation(
+                    crate::compile::push_vector_allocation_bytes::<&str>(rules_by_pred.0.len())?,
+                )?),
+                None => None,
+            };
+            let mut preds_sorted: Vec<&str> = rules_by_pred.0.keys().copied().collect();
+            preds_sorted.sort();
+            for pred in preds_sorted {
+                let rules = &rules_by_pred.0[pred];
+                let scc_id = self.find_scc_for_predicate(pred);
 
-        // Lower proper rules in sorted head order: HashMap iteration order
-        // varies per process, which used to make rule order (and RelId
-        // assignment for head-first predicates) process-nondeterministic.
-        allocations.vector::<&String>(rules_by_pred.len())?;
-        let mut preds_sorted: Vec<&String> = rules_by_pred.keys().collect();
-        preds_sorted.sort();
-        for pred in preds_sorted {
-            let rules = &rules_by_pred[pred];
-            let scc_id = self.find_scc_for_predicate(pred);
+                for rule in rules {
+                    let body = self.lower_rule_with_owner(rule, allocations)?;
+                    if let Some(schema) = self.schemas.get(pred) {
+                        allocations.schema(schema)?;
+                    }
+                    let meta = self.create_meta_for_predicate(pred);
+                    allocations.acquire(pred.len() as u64)?;
 
-            for rule in rules {
-                let body = self.lower_rule_with_owner(rule, allocations)?;
-                if let Some(schema) = self.schemas.get(pred) {
-                    allocations.schema(schema)?;
+                    builder.add_rule(
+                        scc_id,
+                        CompiledRule {
+                            head: pred.to_owned(),
+                            body,
+                            meta,
+                        },
+                    );
                 }
-                let meta = self.create_meta_for_predicate(pred);
-                allocations.acquire(pred.len() as u64)?;
-
-                builder.add_rule(
-                    scc_id,
-                    CompiledRule {
-                        head: pred.clone(),
-                        body,
-                        meta,
-                    },
-                );
             }
         }
 

@@ -1349,7 +1349,7 @@ fn generated_query_heads_output_with_owner(
     match scope.as_deref_mut() {
         Some(scope) => {
             let mut output_scope = scope.child_scope();
-            output_scope.prepare_owner()?;
+            output_scope.prepare_output_owner()?;
             let value = generated_query_heads_for_program_with_owner(
                 program,
                 &mut Some(&mut output_scope),

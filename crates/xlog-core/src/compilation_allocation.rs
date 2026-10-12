@@ -13,6 +13,7 @@ pub struct CompilationAllocationScope<'a> {
     planner_threshold: Option<f64>,
     receipt_storage: Option<Arc<dyn Send + Sync>>,
     owner_metadata: Option<Arc<dyn Send + Sync>>,
+    failure_metadata: Option<Arc<dyn Send + Sync>>,
 }
 
 struct CompilationAllocationReceipts {
@@ -145,6 +146,7 @@ impl<'a> CompilationAllocationScope<'a> {
             planner_threshold: None,
             receipt_storage: None,
             owner_metadata: None,
+            failure_metadata: None,
         }
     }
 
@@ -158,6 +160,7 @@ impl<'a> CompilationAllocationScope<'a> {
             planner_threshold: self.planner_threshold,
             receipt_storage: None,
             owner_metadata: None,
+            failure_metadata: None,
         }
     }
 
@@ -255,17 +258,45 @@ impl<'a> CompilationAllocationScope<'a> {
         (self.reserve)(bytes)
     }
 
-    /// Acquire the returned owner's own metadata before the result's data is
-    /// constructed. Final transfer then cannot refuse capacity after that data
-    /// has already outlived this scope's receipts.
+    /// Prepare both the returned owner and a possible failed-attempt diagnostic
+    /// before the operation's data is constructed. The original bundled
+    /// reservation preserves infallible failure transfer.
     pub fn prepare_owner(&mut self) -> Result<()> {
+        self.prepare_owner_metadata(true)
+    }
+
+    /// Prepare only the actual returned owner's metadata before its data is
+    /// constructed. Errors must already carry independent diagnostic custody;
+    /// this does not prepare an `into_failure` transfer.
+    pub fn prepare_output_owner(&mut self) -> Result<()> {
+        self.prepare_owner_metadata(false)
+    }
+
+    fn prepare_owner_metadata(&mut self, for_failure: bool) -> Result<()> {
         if self.owner_metadata.is_none() {
             let bytes = std::mem::size_of::<CompilationAllocationReceipts>()
                 .checked_add(2 * std::mem::size_of::<usize>())
-                .and_then(|n| n.checked_add(crate::error::OwnedDiagnostic::allocation_bytes()))
+                .and_then(|n| {
+                    n.checked_add(if for_failure {
+                        crate::error::OwnedDiagnostic::allocation_bytes()
+                    } else {
+                        0
+                    })
+                })
                 .and_then(|n| u64::try_from(n).ok())
                 .ok_or_else(|| XlogError::allocation_extent_overflow("compiler owner"))?;
-            self.owner_metadata = Some((self.reserve)(bytes)?);
+            let metadata = (self.reserve)(bytes)?;
+            if for_failure {
+                self.failure_metadata = Some(Arc::clone(&metadata));
+            }
+            self.owner_metadata = Some(metadata);
+        }
+        if for_failure && self.failure_metadata.is_none() {
+            // An explicitly output-only scope may prepare a later failed
+            // attempt without replacing or repricing its original metadata.
+            let bytes = u64::try_from(crate::error::OwnedDiagnostic::allocation_bytes())
+                .map_err(|_| XlogError::allocation_extent_overflow("compiler diagnostic owner"))?;
+            self.failure_metadata = Some((self.reserve)(bytes)?);
         }
         Ok(())
     }
@@ -289,7 +320,9 @@ impl<'a> CompilationAllocationScope<'a> {
     /// Transfer all receipts into the original returned compiler owner. Its
     /// metadata is acquired before the owning Arc is allocated.
     pub fn into_owner(mut self) -> Result<Arc<dyn Send + Sync>> {
-        self.prepare_owner()?;
+        if self.owner_metadata.is_none() {
+            self.prepare_owner()?;
+        }
         let metadata = self
             .owner_metadata
             .take()
@@ -309,11 +342,15 @@ impl<'a> CompilationAllocationScope<'a> {
             .owner_metadata
             .take()
             .expect("failed compiler attempt requires its prepared original owner");
+        let failure_metadata = self
+            .failure_metadata
+            .take()
+            .expect("failed compiler attempt requires its prepared diagnostic owner");
         let allocations = Arc::new(CompilationAllocationReceipts {
             _receipts: self.receipts,
             _receipt_storage: self.receipt_storage,
-            _metadata: Arc::clone(&metadata),
+            _metadata: metadata,
         });
-        error.with_diagnostic_owner(allocations, metadata)
+        error.with_diagnostic_owner(allocations, failure_metadata)
     }
 }
