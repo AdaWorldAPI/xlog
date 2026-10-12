@@ -65,10 +65,16 @@ enum RegisteredTerm {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct TermRecord {
     id: u64,
     kind: RegisteredTerm,
+    _allocation_owners: [Option<Arc<dyn Send + Sync>>; 2],
+}
+
+struct RegisteredTermId {
+    id: u64,
+    _key_allocation: Option<Arc<dyn Send + Sync>>,
 }
 
 struct RetainedSourceFacts {
@@ -119,12 +125,12 @@ struct MetaNormalizer<'a, 'pool> {
     /// expansion only, so it is built only when a meta predicate occurs.
     source_facts: HashMap<String, Vec<Atom>>,
     derived_predicates: HashSet<String>,
-    term_ids: HashMap<String, u64>,
+    term_ids: HashMap<String, RegisteredTermId>,
     term_records: Vec<TermRecord>,
     next_term_id: u64,
     helper_decls: BTreeMap<String, Vec<PredColumn>>,
     helper_facts: Vec<Rule>,
-    helper_fact_keys: HashSet<String>,
+    helper_fact_keys: HashMap<String, Option<Arc<dyn Send + Sync>>>,
     findall_counter: usize,
     maplist_counter: usize,
     allocation_owner: Option<&'a mut crate::compile::CompilationAllocationScope<'pool>>,
@@ -552,7 +558,7 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
             next_term_id: 1,
             helper_decls: BTreeMap::new(),
             helper_facts: Vec::new(),
-            helper_fact_keys: HashSet::new(),
+            helper_fact_keys: HashMap::new(),
             findall_counter: 0,
             maplist_counter: 0,
             allocation_owner,
@@ -1907,27 +1913,33 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         }
 
         if let Some(id) = self.term_ids.get(&registered.key.text) {
-            return Ok(*id);
+            return Ok(id.id);
         }
         let id = self.next_term_id;
         self.next_term_id += 1;
         let term_ids_storage =
-            self.reserve_hash_growth::<String, u64>(self.term_ids.len(), self.term_ids.capacity())?;
+            self.reserve_hash_growth::<String, RegisteredTermId>(
+                self.term_ids.len(),
+                self.term_ids.capacity(),
+            )?;
         let term_records_storage = self.reserve_vector_growth::<TermRecord>(
             self.term_records.len(),
             self.term_records.capacity(),
         )?;
-        self.retain_temporary(registered.key._allocation_owner.clone())?;
-        for owner in &registered.allocation_owners {
-            self.retain_temporary(owner.clone())?;
-        }
-        self.term_ids.insert(registered.key.text, id);
+        self.term_ids.insert(
+            registered.key.text,
+            RegisteredTermId {
+                id,
+                _key_allocation: registered.key._allocation_owner,
+            },
+        );
         if let Some(storage) = term_ids_storage {
             self._term_ids_storage = Some(storage);
         }
         self.term_records.push(TermRecord {
             id,
             kind: registered.kind,
+            _allocation_owners: registered.allocation_owners,
         });
         if let Some(storage) = term_records_storage {
             self._term_records_storage = Some(storage);
@@ -2151,15 +2163,14 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
             format_args!("{pred}:{:?}", terms.values),
             &mut self.allocation_owner,
         )?;
-        if self.helper_fact_keys.contains(&key.text) {
+        if self.helper_fact_keys.contains_key(&key.text) {
             return Ok(());
         }
-        let key_storage = self.reserve_hash_growth::<String, ()>(
+        let key_storage = self.reserve_hash_growth::<String, Option<Arc<dyn Send + Sync>>>(
             self.helper_fact_keys.len(),
             self.helper_fact_keys.capacity(),
         )?;
-        self.retain_temporary(key._allocation_owner.clone())?;
-        self.helper_fact_keys.insert(key.text);
+        self.helper_fact_keys.insert(key.text, key._allocation_owner);
         if let Some(storage) = key_storage {
             self._helper_fact_keys_storage = Some(storage);
         }

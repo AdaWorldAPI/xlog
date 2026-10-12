@@ -106,6 +106,10 @@ struct ListNormalizer<'a, 'pool> {
     operation_rows: HashSet<(ListOp, ScalarType, Vec<u64>)>,
     fresh_counter: usize,
     allocation_owner: Option<&'a mut crate::compile::CompilationAllocationScope<'pool>>,
+    _lists_by_key_owner: Option<Arc<dyn Send + Sync>>,
+    _lists_owner: Option<Arc<dyn Send + Sync>>,
+    _helper_preds_owner: Option<Arc<dyn Send + Sync>>,
+    _operation_rows_owner: Option<Arc<dyn Send + Sync>>,
     _environment_owner: Option<Arc<dyn Send + Sync>>,
 }
 
@@ -211,16 +215,33 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
         Ok(())
     }
 
-    fn acquire_hash_growth<K, V>(&mut self, length: usize, capacity: usize) -> Result<()> {
+    fn reserve_hash_growth<K, V>(
+        &mut self,
+        length: usize,
+        capacity: usize,
+    ) -> Result<Option<Arc<dyn Send + Sync>>> {
         if self.allocation_owner.is_some() && length == capacity {
             let bytes = crate::compile::hash_allocation_bytes::<K, V>(
                 length
                     .checked_add(1)
                     .ok_or_else(|| XlogError::allocation_extent_overflow("list table"))?,
-            )?
-            .checked_mul(2)
-            .ok_or_else(|| XlogError::allocation_extent_overflow("list table"))?;
-            self.acquire(bytes)?;
+            )?;
+            return self.reserve_temporary(bytes);
+        }
+        Ok(None)
+    }
+
+    fn insert_helper_pred(&mut self, pred: String) -> Result<()> {
+        if self.helper_preds.contains(&pred) {
+            return Ok(());
+        }
+        let owner = self.reserve_hash_growth::<String, ()>(
+            self.helper_preds.len(),
+            self.helper_preds.capacity(),
+        )?;
+        self.helper_preds.insert(pred);
+        if owner.is_some() {
+            self._helper_preds_owner = owner;
         }
         Ok(())
     }
@@ -417,6 +438,10 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
             operation_rows: HashSet::new(),
             fresh_counter: 0,
             allocation_owner,
+            _lists_by_key_owner: None,
+            _lists_owner: None,
+            _helper_preds_owner: None,
+            _operation_rows_owner: None,
             _environment_owner: environment_owner,
         })
     }
@@ -765,16 +790,27 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
                     Some(id) => id,
                     None => self.concat_lists(left_id, right_id)?,
                 };
-                self.acquire_hash_growth::<(ListOp, ScalarType, Vec<u64>), ()>(
-                    self.operation_rows.len(),
-                    self.operation_rows.capacity(),
-                )?;
-                self.acquire_vector::<u64>(3)?;
-                self.operation_rows.insert((
+                let key_owner = self.reserve_temporary(3 * std::mem::size_of::<u64>() as u64)?;
+                let key = (
                     ListOp::Append,
                     left.elem_type,
                     vec![left_id, right_id, out_id],
-                ));
+                );
+                if !self.operation_rows.contains(&key) {
+                    let operation_rows_owner = self
+                        .reserve_hash_growth::<(ListOp, ScalarType, Vec<u64>), ()>(
+                            self.operation_rows.len(),
+                            self.operation_rows.capacity(),
+                        )?;
+                    self.retain_temporary(key_owner.clone())?;
+                    self.operation_rows.insert(key);
+                    if operation_rows_owner.is_some() {
+                        self._operation_rows_owner = operation_rows_owner;
+                    }
+                } else {
+                    drop(key);
+                }
+                drop(key_owner);
                 if let Term::Variable(name) = &out.term {
                     self.bind_list_type(var_list_types, name, left.elem_type)?;
                 }
@@ -802,13 +838,23 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
                     Some(id) => id,
                     None => self.derived_ordered_list(input_id, op)?,
                 };
-                self.acquire_hash_growth::<(ListOp, ScalarType, Vec<u64>), ()>(
-                    self.operation_rows.len(),
-                    self.operation_rows.capacity(),
-                )?;
-                self.acquire_vector::<u64>(2)?;
-                self.operation_rows
-                    .insert((op, input.elem_type, vec![input_id, out_id]));
+                let key_owner = self.reserve_temporary(2 * std::mem::size_of::<u64>() as u64)?;
+                let key = (op, input.elem_type, vec![input_id, out_id]);
+                if !self.operation_rows.contains(&key) {
+                    let operation_rows_owner = self
+                        .reserve_hash_growth::<(ListOp, ScalarType, Vec<u64>), ()>(
+                            self.operation_rows.len(),
+                            self.operation_rows.capacity(),
+                        )?;
+                    self.retain_temporary(key_owner.clone())?;
+                    self.operation_rows.insert(key);
+                    if operation_rows_owner.is_some() {
+                        self._operation_rows_owner = operation_rows_owner;
+                    }
+                } else {
+                    drop(key);
+                }
+                drop(key_owner);
                 if let Term::Variable(name) = &out.term {
                     self.bind_list_type(var_list_types, name, input.elem_type)?;
                 }
@@ -1201,13 +1247,21 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
             return Ok(*id);
         }
 
-        self.acquire_hash_growth::<(ScalarType, Vec<LiteralKey>), u64>(
+        let lists_by_key_owner = self.reserve_hash_growth::<(ScalarType, Vec<LiteralKey>), u64>(
             self.lists_by_key.len(),
             self.lists_by_key.capacity(),
         )?;
-        if self.lists.len() == self.lists.capacity() {
-            self.acquire_vector::<ListDef>(self.lists.len() + 1)?;
-        }
+        let lists_owner =
+            if self.allocation_owner.is_some() && self.lists.len() == self.lists.capacity() {
+                let count = self
+                    .lists
+                    .len()
+                    .checked_add(1)
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("list registry"))?;
+                self.reserve_temporary(xlog_core::push_vector_storage_bytes::<ListDef>(count)?)?
+            } else {
+                None
+            };
         self.acquire_vector::<LiteralKey>(keys.len())?;
         self.retain_temporary(normalized_owner.clone())?;
         self.retain_temporary(key_owner.clone())?;
@@ -1219,12 +1273,18 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
         let id = self.next_list_id;
         self.next_list_id += 1;
         self.lists_by_key.insert(key, id);
+        if lists_by_key_owner.is_some() {
+            self._lists_by_key_owner = lists_by_key_owner;
+        }
         self.lists.push(ListDef {
             id,
             elem_type,
             items: normalized,
             keys: retained_keys,
         });
+        if lists_owner.is_some() {
+            self._lists_owner = lists_owner;
+        }
         Ok(id)
     }
 
@@ -1287,15 +1347,11 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
         if self.allocation_owner.is_some() {
             let mut facts = 0usize;
             let mut bytes = 0u64;
-            let mut names = 0usize;
             for list in &self.lists {
                 facts = facts
                     .checked_add(1)
                     .and_then(|n| n.checked_add(list.items.len()))
                     .and_then(|n| n.checked_add(usize::from(!list.items.is_empty())))
-                    .ok_or_else(|| XlogError::allocation_extent_overflow("list helper"))?;
-                names = names
-                    .checked_add(3)
                     .ok_or_else(|| XlogError::allocation_extent_overflow("list helper"))?;
                 let name = crate::compile::formatted_text_allocation_bytes(format_args!(
                     "__xlog_list_cons_{}",
@@ -1315,9 +1371,6 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
                 }
             }
             facts = facts
-                .checked_add(self.operation_rows.len())
-                .ok_or_else(|| XlogError::allocation_extent_overflow("list helper"))?;
-            names = names
                 .checked_add(self.operation_rows.len())
                 .ok_or_else(|| XlogError::allocation_extent_overflow("list helper"))?;
             for (_, typ, ids) in &self.operation_rows {
@@ -1348,13 +1401,6 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
                 })
                 .and_then(|n| {
                     n.checked_add(
-                        crate::compile::hash_allocation_bytes::<String, ()>(names)
-                            .ok()?
-                            .checked_mul(2)?,
-                    )
-                })
-                .and_then(|n| {
-                    n.checked_add(
                         crate::compile::push_vector_allocation_bytes::<(
                             ListOp,
                             ScalarType,
@@ -1370,7 +1416,7 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
 
         let mut helper_rules = Vec::new();
         for list in self.lists.clone() {
-            self.helper_preds.insert(len_pred().to_string());
+            self.insert_helper_pred(len_pred().to_string())?;
             helper_rules.push(fact(
                 len_pred(),
                 vec![
@@ -1380,7 +1426,7 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
             ));
 
             let item_name = item_pred(list.elem_type);
-            self.helper_preds.insert(item_name.clone());
+            self.insert_helper_pred(item_name.clone())?;
             for (idx, item) in list.items.iter().enumerate() {
                 helper_rules.push(fact(
                     &item_name,
@@ -1394,7 +1440,7 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
 
             if let Some((head, tail_id)) = self.cons_fact_parts(list.id)? {
                 let cons_name = cons_pred(list.elem_type);
-                self.helper_preds.insert(cons_name.clone());
+                self.insert_helper_pred(cons_name.clone())?;
                 helper_rules.push(fact(
                     &cons_name,
                     vec![
@@ -1421,7 +1467,7 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
                 ListOp::MSort => msort_pred(elem_type),
                 ListOp::ListToSet => list_to_set_pred(elem_type),
             };
-            self.helper_preds.insert(pred.clone());
+            self.insert_helper_pred(pred.clone())?;
             helper_rules.push(fact(
                 &pred,
                 ids.into_iter().map(|id| Term::Integer(id as i64)).collect(),
