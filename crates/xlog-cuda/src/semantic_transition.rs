@@ -16760,7 +16760,7 @@ impl FeedbackBuffers {
         let cold_work = original.as_ref().map(|(_, work, _)| *work);
         #[cfg(not(feature = "semantic-policy"))]
         let cold_work: Option<&DeviceMemoryView<u64>> = None;
-        descriptor.native_work = cold_work.map_or(0, |work| *work.device_ptr());
+        descriptor.publication.native_work = cold_work.map_or(0, |work| *work.device_ptr());
         let mut recorder = domain.new_strict_recorder();
         recorder.read(lease);
         recorder.read(&storage.control);

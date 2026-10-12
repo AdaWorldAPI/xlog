@@ -7133,7 +7133,7 @@ __device__ uint64_t publication_feedback_inputs(uint64_t control_ptr,
     const auto* bytes=publication_range_bytes(control,*records);
     uint64_t digest[4];
     if(!bytes || reinterpret_cast<uint64_t>(bytes)%alignof(RawFeedbackRecord) ||
-       publication_range_digest(control,*records,nullptr,digest,work) ||
+       publication_range_digest(control,*records,nullptr,digest,nullptr,work) ||
        !publication_identity_equal(digest,records->digest,work))return 1;
     inputs->bank=bank;
     inputs->records=reinterpret_cast<const RawFeedbackRecord*>(bytes);
@@ -7147,7 +7147,7 @@ __device__ uint64_t publication_feedback_inputs(uint64_t control_ptr,
         const auto* statement=publication_find_range(ranges,bank->header.range_count,16,index,work);
         if(!statement || !statement->length_bytes)return 1;
         const auto* data=publication_range_bytes(control,*statement);
-        if(!data || publication_range_digest(control,*statement,nullptr,digest,work) ||
+        if(!data || publication_range_digest(control,*statement,nullptr,digest,nullptr,work) ||
            !publication_identity_equal(digest,statement->digest,work))return 1;
         if(statement->length_bytes>inputs->statement_capacity)inputs->statement_capacity=statement->length_bytes;
     }
@@ -7283,7 +7283,7 @@ extern "C" __global__ void semantic_feedback_project(Descriptor descriptor,
         semantic_graph::Receipt* queries,uint64_t* original_statements,uint64_t* offsets,
         uint64_t* supports,uint64_t support_capacity,uint64_t* status) {
     if(blockIdx.x || threadIdx.x)return;
-    const uint64_t cold_work_ptr=descriptor.native_work;
+    const uint64_t cold_work_ptr=descriptor.publication.native_work;
     if(cold_work_ptr && !publication_pointer_span(cold_work_ptr,sizeof(semantic_graph::NativeWorkTally),
             alignof(semantic_graph::NativeWorkTally))) { semantic_content_integrity_trap();return; }
     auto* work=reinterpret_cast<semantic_graph::NativeWorkTally*>(cold_work_ptr);
