@@ -1133,7 +1133,7 @@ impl<'a> AstAllocationSize<'a> {
         }
     }
 
-    fn term(&mut self, term: &Term) -> Result<()> {
+    pub(crate) fn term(&mut self, term: &Term) -> Result<()> {
         match term {
             Term::Variable(name) | Term::String(name) | Term::PredRef(name) => self.text(name),
             Term::List(items) => {
@@ -1217,24 +1217,28 @@ impl<'a> AstAllocationSize<'a> {
     pub(crate) fn body(&mut self, body: &[BodyLiteral]) -> Result<()> {
         self.vector(body)?;
         for literal in body {
-            match literal {
-                BodyLiteral::Positive(atom) | BodyLiteral::Negated(atom) => self.atom(atom)?,
-                BodyLiteral::Epistemic(literal) => self.atom(&literal.atom)?,
-                BodyLiteral::Comparison(comparison) => {
-                    self.term(&comparison.left)?;
-                    self.term(&comparison.right)?;
-                }
-                BodyLiteral::IsExpr(expression) => {
-                    self.text(&expression.target)?;
-                    self.expression(&expression.expr)?;
-                }
-                BodyLiteral::Univ(univ) => {
-                    self.term(&univ.term)?;
-                    self.term(&univ.parts)?;
-                }
-            }
+            self.body_literal(literal)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn body_literal(&mut self, literal: &BodyLiteral) -> Result<()> {
+        match literal {
+            BodyLiteral::Positive(atom) | BodyLiteral::Negated(atom) => self.atom(atom),
+            BodyLiteral::Epistemic(literal) => self.atom(&literal.atom),
+            BodyLiteral::Comparison(comparison) => {
+                self.term(&comparison.left)?;
+                self.term(&comparison.right)
+            }
+            BodyLiteral::IsExpr(expression) => {
+                self.text(&expression.target)?;
+                self.expression(&expression.expr)
+            }
+            BodyLiteral::Univ(univ) => {
+                self.term(&univ.term)?;
+                self.term(&univ.parts)
+            }
+        }
     }
 
     fn function_body(&mut self, body: &FuncBody) -> Result<()> {

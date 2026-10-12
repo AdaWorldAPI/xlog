@@ -116,6 +116,20 @@ impl PayloadCustody {
         Self::for_clone(ClonePayload::Atom(atom), scope)
     }
 
+    pub(crate) fn for_term_clone(
+        term: &crate::ast::Term,
+        scope: &mut CompilationAllocationScope<'_>,
+    ) -> Result<Self> {
+        Self::for_clone(ClonePayload::Term(term), scope)
+    }
+
+    pub(crate) fn for_literal_clone(
+        literal: &BodyLiteral,
+        scope: &mut CompilationAllocationScope<'_>,
+    ) -> Result<Self> {
+        Self::for_clone(ClonePayload::Literal(literal), scope)
+    }
+
     pub(crate) fn for_type_clone(
         typ: &TypeRef,
         scope: &mut CompilationAllocationScope<'_>,
@@ -179,6 +193,8 @@ impl AstHeapUnitSink for ReserveHeapUnits<'_, '_> {
 #[derive(Clone, Copy)]
 enum ClonePayload<'a> {
     Text(&'a str),
+    Term(&'a crate::ast::Term),
+    Literal(&'a BodyLiteral),
     Type(&'a TypeRef),
     Atom(&'a Atom),
     Body(&'a [BodyLiteral]),
@@ -192,6 +208,8 @@ impl ClonePayload<'_> {
     fn walk(self, size: &mut AstAllocationSize<'_>) -> Result<()> {
         match self {
             Self::Text(text) => size.text(text),
+            Self::Term(term) => size.term(term),
+            Self::Literal(literal) => size.body_literal(literal),
             Self::Type(typ) => size.type_ref(typ),
             Self::Atom(atom) => size.atom(atom),
             Self::Body(body) => size.body(body),

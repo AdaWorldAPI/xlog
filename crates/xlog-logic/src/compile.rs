@@ -1462,6 +1462,18 @@ impl FrontendPass {
                 Ok((program, false))
             }
             Self::Magic => {
+                if let (Some(scope), Some(custody)) = (scope.as_deref_mut(), custody) {
+                    let rewritten = crate::magic_sets::rewrite_magic_sets_retained(
+                        crate::program_custody::RetainedProgram {
+                            value: program,
+                            custody: std::mem::take(custody),
+                        },
+                        scope,
+                    )?;
+                    drop(rewritten.report);
+                    *custody = rewritten.program.custody;
+                    return Ok((rewritten.program.value, true));
+                }
                 let rewritten = match scope.as_deref_mut() {
                     Some(scope) => {
                         crate::magic_sets::rewrite_magic_sets_owned_with_allocation_owner(
