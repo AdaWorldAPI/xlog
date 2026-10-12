@@ -6,8 +6,7 @@ use std::sync::Arc;
 use xlog_core::{symbol, Result, ScalarType, XlogError};
 
 use crate::ast::{
-    Atom, BodyLiteral, Comparison, Constraint, PredColumn, PredDecl, Program, Query, Rule, Term,
-    TypeRef, Univ,
+    Atom, BodyLiteral, Comparison, PredColumn, PredDecl, Program, Rule, Term, TypeRef, Univ,
 };
 
 const TERM_ID_TYPE: ScalarType = ScalarType::U64;
@@ -576,92 +575,43 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
 
     fn normalize_program(&mut self, program: Program) -> Result<Program> {
         let mut out = program;
-        self.acquire_vector::<Rule>(out.rules.len())?;
-        out.rules = std::mem::take(&mut out.rules)
-            .into_iter()
-            .map(|rule| {
-                if self.fact_is_identity(&rule) {
-                    Ok(rule)
-                } else {
-                    self.normalize_rule(&rule)
-                }
-            })
-            .collect::<Result<Vec<_>>>()?;
-        self.acquire_vector::<Constraint>(out.constraints.len())?;
-        out.constraints = std::mem::take(&mut out.constraints)
-            .into_iter()
-            .map(|constraint| {
-                let (capacity, _bound_owner) = self.reserve_binding_map(&constraint.body)?;
-                let mut bound = HashMap::with_capacity(capacity);
-                Ok(Constraint {
-                    authored_index: constraint.authored_index,
-                    body: self.normalize_body(&constraint.body, &mut bound)?,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        self.acquire_vector::<Query>(out.queries.len())?;
-        out.queries = std::mem::take(&mut out.queries)
-            .into_iter()
-            .map(|query| {
-                Ok(Query {
-                    atom: self.normalize_atom_values(&query.atom)?,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+        for rule in &mut out.rules {
+            if !self.fact_is_identity(rule) {
+                *rule = self.normalize_rule(rule)?;
+            }
+        }
+        for constraint in &mut out.constraints {
+            let (capacity, _bound_owner) = self.reserve_binding_map(&constraint.body)?;
+            let mut bound = HashMap::with_capacity(capacity);
+            constraint.body = self.normalize_body(&constraint.body, &mut bound)?;
+        }
+        for query in &mut out.queries {
+            query.atom = self.normalize_atom_values(&query.atom)?;
+        }
 
-        self.acquire_vector::<crate::ast::ProbFact>(out.prob_facts.len())?;
-        out.prob_facts = std::mem::take(&mut out.prob_facts)
-            .into_iter()
-            .map(|mut pf| {
-                pf.atom = self.normalize_atom_values(&pf.atom)?;
-                Ok(pf)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        self.acquire_vector::<crate::ast::AnnotatedDisjunction>(out.annotated_disjunctions.len())?;
-        out.annotated_disjunctions = std::mem::take(&mut out.annotated_disjunctions)
-            .into_iter()
-            .map(|mut ad| {
-                for choice in &mut ad.choices {
-                    choice.atom = self.normalize_atom_values(&choice.atom)?;
-                }
-                Ok(ad)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        self.acquire_vector::<crate::ast::Evidence>(out.evidence.len())?;
-        out.evidence = std::mem::take(&mut out.evidence)
-            .into_iter()
-            .map(|mut evidence| {
-                evidence.atom = self.normalize_atom_values(&evidence.atom)?;
-                Ok(evidence)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        self.acquire_vector::<crate::ast::ProbQuery>(out.prob_queries.len())?;
-        out.prob_queries = std::mem::take(&mut out.prob_queries)
-            .into_iter()
-            .map(|mut query| {
-                query.atom = self.normalize_atom_values(&query.atom)?;
-                Ok(query)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        self.acquire_vector::<crate::ast::NeuralPredDecl>(out.neural_predicates.len())?;
-        out.neural_predicates = std::mem::take(&mut out.neural_predicates)
-            .into_iter()
-            .map(|mut neural| {
-                neural.predicate = self.normalize_atom_values(&neural.predicate)?;
-                Ok(neural)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        self.acquire_vector::<crate::ast::LearnableRule>(out.learnable_rules.len())?;
-        out.learnable_rules = std::mem::take(&mut out.learnable_rules)
-            .into_iter()
-            .map(|mut learnable| {
-                let (capacity, _bound_owner) = self.reserve_binding_map(&learnable.body)?;
-                let mut bound = HashMap::with_capacity(capacity);
-                learnable.head = self.normalize_atom_values(&learnable.head)?;
-                learnable.body = self.normalize_body(&learnable.body, &mut bound)?;
-                Ok(learnable)
-            })
-            .collect::<Result<Vec<_>>>()?;
+        for pf in &mut out.prob_facts {
+            pf.atom = self.normalize_atom_values(&pf.atom)?;
+        }
+        for ad in &mut out.annotated_disjunctions {
+            for choice in &mut ad.choices {
+                choice.atom = self.normalize_atom_values(&choice.atom)?;
+            }
+        }
+        for evidence in &mut out.evidence {
+            evidence.atom = self.normalize_atom_values(&evidence.atom)?;
+        }
+        for query in &mut out.prob_queries {
+            query.atom = self.normalize_atom_values(&query.atom)?;
+        }
+        for neural in &mut out.neural_predicates {
+            neural.predicate = self.normalize_atom_values(&neural.predicate)?;
+        }
+        for learnable in &mut out.learnable_rules {
+            let (capacity, _bound_owner) = self.reserve_binding_map(&learnable.body)?;
+            let mut bound = HashMap::with_capacity(capacity);
+            learnable.head = self.normalize_atom_values(&learnable.head)?;
+            learnable.body = self.normalize_body(&learnable.body, &mut bound)?;
+        }
 
         self.append_helpers(&mut out)?;
         if self.allocation_owner.is_some() {

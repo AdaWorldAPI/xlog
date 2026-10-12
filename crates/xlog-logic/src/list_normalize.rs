@@ -550,22 +550,12 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
             }
         }
         out.rules = rules;
-        self.acquire_vector::<crate::ast::Constraint>(out.constraints.len())?;
-        out.constraints = std::mem::take(&mut out.constraints)
-            .into_iter()
-            .map(|constraint| {
-                let body = self.normalize_body(&constraint.body)?;
-                Ok(crate::ast::Constraint {
-                    authored_index: constraint.authored_index,
-                    body,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        self.acquire_vector::<Query>(out.queries.len())?;
-        out.queries = std::mem::take(&mut out.queries)
-            .into_iter()
-            .map(|query| self.normalize_query(&query))
-            .collect::<Result<Vec<_>>>()?;
+        for constraint in &mut out.constraints {
+            constraint.body = self.normalize_body(&constraint.body)?;
+        }
+        for query in &mut out.queries {
+            *query = self.normalize_query(query)?;
+        }
 
         self.append_helper_declarations_and_facts(&mut out)?;
         Ok(out)
