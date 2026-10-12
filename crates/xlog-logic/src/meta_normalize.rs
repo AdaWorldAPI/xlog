@@ -8,7 +8,10 @@ use xlog_core::{symbol, Result, ScalarType, XlogError};
 use crate::ast::{
     Atom, BodyLiteral, Comparison, PredColumn, PredDecl, Program, Rule, Term, TypeRef, Univ,
 };
-use crate::program_custody::{ColumnCustody, PayloadCustody, PredicateCustody, RetainedVectorCustody};
+use crate::program_custody::{
+    ColumnCustody, PayloadCustody, PredicateCustody, ProgramAllocationCustody, RetainedProgram,
+    RetainedVectorCustody,
+};
 
 const TERM_ID_TYPE: ScalarType = ScalarType::U64;
 
@@ -43,8 +46,46 @@ fn normalize_meta_builtins_with_owner(
     program: Program,
     reserve: Option<&mut crate::compile::CompilationAllocationScope<'_>>,
 ) -> Result<Program> {
-    let mut normalizer = MetaNormalizer::new(&program, reserve)?;
+    let mut program = RetainedProgram {
+        value: program,
+        custody: ProgramAllocationCustody::default(),
+    };
+    let mut normalizer = MetaNormalizer::new(&program.value, reserve)?;
+    normalizer.prepare_raw_custody(&mut program)?;
+    let program = normalizer.normalize_program(program)?;
+    normalizer.retain_raw_program(program)
+}
+
+/// Move original compiler custody through the same finite normalizer while
+/// newly constructed payloads retain their original birth-time receipts.
+pub(crate) fn normalize_meta_builtins_retained(
+    program: RetainedProgram,
+    scope: &mut crate::compile::CompilationAllocationScope<'_>,
+) -> Result<RetainedProgram> {
+    let mut normalizer = MetaNormalizer::new(&program.value, Some(scope))?;
     normalizer.normalize_program(program)
+}
+
+struct RetainedMetaValue<T> {
+    value: T,
+    custody: PayloadCustody,
+}
+
+struct MetaProgramAllocation {
+    _custody: ProgramAllocationCustody,
+    _metadata_owner: Arc<dyn Send + Sync>,
+}
+
+struct RetainedRawMetaProgram {
+    value: Program,
+    owner: Arc<MetaProgramAllocation>,
+}
+
+fn meta_storage_bytes<T>(count: usize) -> Result<u64> {
+    count
+        .checked_mul(std::mem::size_of::<T>())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(|| XlogError::allocation_extent_overflow("meta vector storage"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,19 +135,25 @@ struct RetainedBindings {
 
 struct RetainedTermRow {
     values: Vec<Term>,
-    allocation_owner: Option<Arc<dyn Send + Sync>>,
+    custody: PayloadCustody,
     storage_owner: Option<Arc<dyn Send + Sync>>,
-    nested_storage_owner: Option<Arc<dyn Send + Sync>>,
 }
 
 struct RetainedTermValue {
     value: Term,
-    _allocation_owner: Option<Arc<dyn Send + Sync>>,
+    custody: PayloadCustody,
 }
 
 struct RetainedTermRows {
     rows: Vec<RetainedTermRow>,
     _allocation_owner: Option<Arc<dyn Send + Sync>>,
+}
+
+struct RetainedFindallGroup {
+    terms: RetainedTermRow,
+    values: Vec<RetainedTermValue>,
+    _key_owner: Option<Arc<dyn Send + Sync>>,
+    values_storage: Option<Arc<dyn Send + Sync>>,
 }
 
 struct RetainedRegisteredTerm {
@@ -179,14 +226,9 @@ struct RetainedHelperDeclarations {
     storage: PayloadCustody,
 }
 
-struct HelperDeclarationAllocation {
-    _custody: PredicateCustody,
-    _metadata_owner: Arc<dyn Send + Sync>,
-}
-
 struct RetainedHelperEmission {
     value: PredDecl,
-    allocation_owner: Option<Arc<HelperDeclarationAllocation>>,
+    custody: PredicateCustody,
 }
 
 struct MetaNormalizer<'a, 'pool> {
@@ -206,19 +248,132 @@ struct MetaNormalizer<'a, 'pool> {
     next_term_id: u64,
     helper_decls: BTreeMap<String, RegisteredHelperDeclaration>,
     helper_facts: Vec<Rule>,
+    helper_facts_custody: RetainedVectorCustody<PayloadCustody>,
     helper_fact_keys: HashMap<String, Option<Arc<dyn Send + Sync>>>,
     findall_counter: usize,
     maplist_counter: usize,
     allocation_owner: Option<&'a mut crate::compile::CompilationAllocationScope<'pool>>,
     _term_ids_storage: Option<Arc<dyn Send + Sync>>,
     _term_records_storage: Option<Arc<dyn Send + Sync>>,
-    _helper_facts_storage: Option<Arc<dyn Send + Sync>>,
     _helper_fact_keys_storage: Option<Arc<dyn Send + Sync>>,
     helper_decls_storage: PayloadCustody,
     _environment_owner: Option<Arc<dyn Send + Sync>>,
+    capture_stack: Vec<Option<PayloadCustody>>,
+    active_capture: Option<PayloadCustody>,
+    _capture_stack_storage: Option<Arc<dyn Send + Sync>>,
 }
 
 impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
+    /// Keep suspended parent receipts in the context until their partial data
+    /// has unwound; a successful constructor returns its data before custody.
+    fn capture<T>(
+        &mut self,
+        build: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<RetainedMetaValue<T>> {
+        if self.capture_stack.len() == self.capture_stack.capacity() {
+            let count = self
+                .capture_stack
+                .len()
+                .checked_add(1)
+                .and_then(|count| count.max(4).checked_next_power_of_two())
+                .ok_or_else(|| XlogError::allocation_extent_overflow("meta constructor stack"))?;
+            let owner = self.reserve_temporary(meta_storage_bytes::<Option<PayloadCustody>>(count)?)?;
+            self.capture_stack.reserve_exact(count - self.capture_stack.len());
+            self._capture_stack_storage = owner;
+        }
+        self.capture_stack.push(self.active_capture.take());
+        self.active_capture = Some(PayloadCustody::default());
+        let result = build(self);
+        let custody = self
+            .active_capture
+            .take()
+            .expect("active meta constructor custody");
+        self.active_capture = self
+            .capture_stack
+            .pop()
+            .expect("original meta constructor custody");
+        result.map(|value| RetainedMetaValue { value, custody })
+    }
+
+    fn append_custody(&mut self, into: &mut PayloadCustody, from: &mut PayloadCustody) -> Result<()> {
+        if let Some(scope) = self.allocation_owner.as_deref_mut() {
+            into.append_from(from, scope)?;
+        }
+        Ok(())
+    }
+
+    fn adopt_custody(&mut self, from: &mut PayloadCustody) -> Result<()> {
+        if let Some(scope) = self.allocation_owner.as_deref_mut() {
+            self.active_capture
+                .as_mut()
+                .expect("active meta output custody")
+                .append_from(from, scope)?;
+        }
+        Ok(())
+    }
+
+    fn prepare_raw_custody(&mut self, program: &mut RetainedProgram) -> Result<()> {
+        let Some(scope) = self.allocation_owner.as_deref_mut() else {
+            return Ok(());
+        };
+        macro_rules! prepare {
+            ($field:ident) => {{
+                program
+                    .custody
+                    .$field
+                    .prepare_elements(program.value.$field.len(), scope)?;
+                program
+                    .custody
+                    .$field
+                    .elements
+                    .resize_with(program.value.$field.len(), Default::default);
+            }};
+        }
+        prepare!(rules);
+        prepare!(constraints);
+        prepare!(queries);
+        prepare!(prob_facts);
+        prepare!(evidence);
+        prepare!(prob_queries);
+        prepare!(neural_predicates);
+        prepare!(learnable_rules);
+        prepare!(predicates);
+        prepare!(annotated_disjunctions);
+        for (value, custody) in program
+            .value
+            .annotated_disjunctions
+            .iter()
+            .zip(&mut program.custody.annotated_disjunctions.elements)
+        {
+            custody.choices.prepare_elements(value.choices.len(), scope)?;
+            custody
+                .choices
+                .elements
+                .resize_with(value.choices.len(), Default::default);
+        }
+        Ok(())
+    }
+
+    fn retain_raw_program(&mut self, program: RetainedProgram) -> Result<Program> {
+        let Some(scope) = self.allocation_owner.as_deref_mut() else {
+            return Ok(program.value);
+        };
+        let bytes = std::mem::size_of::<MetaProgramAllocation>()
+            .checked_add(2 * std::mem::size_of::<usize>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| XlogError::allocation_extent_overflow("meta program custody"))?;
+        let metadata_owner = scope.reserve_allocation(bytes)?;
+        let output = RetainedRawMetaProgram {
+            value: program.value,
+            owner: Arc::new(MetaProgramAllocation {
+                _custody: program.custody,
+                _metadata_owner: metadata_owner,
+            }),
+        };
+        scope.retain(Arc::clone(&output.owner) as Arc<dyn Send + Sync>)?;
+        Ok(output.value)
+    }
+
     fn reserve_temporary(&mut self, bytes: u64) -> Result<Option<Arc<dyn Send + Sync>>> {
         if bytes == 0 {
             return Ok(None);
@@ -231,10 +386,14 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
 
     fn retain_temporary(&mut self, owner: Option<Arc<dyn Send + Sync>>) -> Result<()> {
         if let Some(owner) = owner {
-            self.allocation_owner
+            let scope = self
+                .allocation_owner
                 .as_deref_mut()
-                .expect("original meta allocation scope")
-                .retain(owner)?;
+                .expect("original meta allocation scope");
+            self.active_capture
+                .as_mut()
+                .expect("active meta output custody")
+                .retain_original(&owner, scope)?;
         }
         Ok(())
     }
@@ -265,7 +424,10 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
     fn acquire(&mut self, bytes: u64) -> Result<()> {
         if bytes != 0 {
             if let Some(reserve) = self.allocation_owner.as_deref_mut() {
-                reserve.acquire(bytes)?;
+                self.active_capture
+                    .as_mut()
+                    .expect("active meta output custody")
+                    .reserve_unit(bytes, reserve)?;
             }
         }
         Ok(())
@@ -273,31 +435,31 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
 
     fn acquire_vector<T>(&mut self, count: usize) -> Result<()> {
         if self.allocation_owner.is_some() {
-            self.acquire(crate::compile::push_vector_allocation_bytes::<T>(count)?)?;
+            self.acquire(meta_storage_bytes::<T>(count)?)?;
         }
         Ok(())
     }
 
     fn acquire_term_clone(&mut self, term: &Term) -> Result<()> {
-        if self.allocation_owner.is_some() {
-            self.acquire(term.owned_allocation_bytes()? - std::mem::size_of::<Term>() as u64)?;
+        if let Some(scope) = self.allocation_owner.as_deref_mut() {
+            let mut original = PayloadCustody::for_term_clone(term, scope)?;
+            self.active_capture
+                .as_mut()
+                .expect("active meta output custody")
+                .append_from(&mut original, scope)?;
         }
         Ok(())
     }
 
-    fn resolve_symbol(&mut self, id: u32) -> Result<String> {
-        match self.allocation_owner.as_deref_mut() {
-            Some(reserve) => {
-                let (text, _) = symbol::resolve_with_allocation_owner(id, &mut |bytes| {
-                    reserve.acquire(
-                        u64::try_from(bytes)
-                            .map_err(|_| XlogError::allocation_extent_overflow("meta symbol"))?,
-                    )
-                })?;
-                Ok(text)
-            }
-            None => Ok(symbol::resolve(id)),
+    fn acquire_literal_clone(&mut self, literal: &BodyLiteral) -> Result<()> {
+        if let Some(scope) = self.allocation_owner.as_deref_mut() {
+            let mut original = PayloadCustody::for_literal_clone(literal, scope)?;
+            self.active_capture
+                .as_mut()
+                .expect("active meta output custody")
+                .append_from(&mut original, scope)?;
         }
+        Ok(())
     }
 
     fn intern_symbol(&mut self, text: &str) -> Result<u32> {
@@ -661,16 +823,19 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
             next_term_id: 1,
             helper_decls: BTreeMap::new(),
             helper_facts: Vec::new(),
+            helper_facts_custody: RetainedVectorCustody::default(),
             helper_fact_keys: HashMap::new(),
             findall_counter: 0,
             maplist_counter: 0,
             allocation_owner,
             _term_ids_storage: None,
             _term_records_storage: None,
-            _helper_facts_storage: None,
             _helper_fact_keys_storage: None,
             helper_decls_storage: PayloadCustody::default(),
             _environment_owner: environment_owner,
+            capture_stack: Vec::new(),
+            active_capture: None,
+            _capture_stack_storage: None,
         })
     }
 
@@ -691,48 +856,97 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         rule.body.is_empty() && !self.term_valued_preds.contains(&rule.head.predicate)
     }
 
-    fn normalize_program(&mut self, program: Program) -> Result<Program> {
+    fn normalize_program(&mut self, program: RetainedProgram) -> Result<RetainedProgram> {
         let mut out = program;
-        for rule in &mut out.rules {
+        for (index, rule) in out.value.rules.iter_mut().enumerate() {
             if !self.fact_is_identity(rule) {
-                *rule = self.normalize_rule(rule)?;
+                let replacement = self.capture(|normalizer| normalizer.normalize_rule(rule))?;
+                *rule = replacement.value;
+                if self.allocation_owner.is_some() {
+                    out.custody.rules.elements[index] = replacement.custody;
+                }
             }
         }
-        for constraint in &mut out.constraints {
+        for (index, constraint) in out.value.constraints.iter_mut().enumerate() {
             let (capacity, _bound_owner) = self.reserve_binding_map(&constraint.body)?;
             let mut bound = HashMap::with_capacity(capacity);
-            constraint.body = self.normalize_body(&constraint.body, &mut bound)?;
-        }
-        for query in &mut out.queries {
-            query.atom = self.normalize_atom_values(&query.atom)?;
-        }
-
-        for pf in &mut out.prob_facts {
-            pf.atom = self.normalize_atom_values(&pf.atom)?;
-        }
-        for ad in &mut out.annotated_disjunctions {
-            for choice in &mut ad.choices {
-                choice.atom = self.normalize_atom_values(&choice.atom)?;
+            let replacement = self
+                .capture(|normalizer| normalizer.normalize_body(&constraint.body, &mut bound))?;
+            constraint.body = replacement.value;
+            if self.allocation_owner.is_some() {
+                out.custody.constraints.elements[index] = replacement.custody;
             }
         }
-        for evidence in &mut out.evidence {
-            evidence.atom = self.normalize_atom_values(&evidence.atom)?;
+        for (index, query) in out.value.queries.iter_mut().enumerate() {
+            let replacement =
+                self.capture(|normalizer| normalizer.normalize_atom_values(&query.atom))?;
+            query.atom = replacement.value;
+            if self.allocation_owner.is_some() {
+                out.custody.queries.elements[index] = replacement.custody;
+            }
         }
-        for query in &mut out.prob_queries {
-            query.atom = self.normalize_atom_values(&query.atom)?;
+
+        for (index, pf) in out.value.prob_facts.iter_mut().enumerate() {
+            let replacement = self.capture(|normalizer| normalizer.normalize_atom_values(&pf.atom))?;
+            pf.atom = replacement.value;
+            if self.allocation_owner.is_some() {
+                out.custody.prob_facts.elements[index] = replacement.custody;
+            }
         }
-        for neural in &mut out.neural_predicates {
-            neural.predicate = self.normalize_atom_values(&neural.predicate)?;
+        for (index, ad) in out.value.annotated_disjunctions.iter_mut().enumerate() {
+            for (choice_index, choice) in ad.choices.iter_mut().enumerate() {
+                let replacement =
+                    self.capture(|normalizer| normalizer.normalize_atom_values(&choice.atom))?;
+                choice.atom = replacement.value;
+                if self.allocation_owner.is_some() {
+                    out.custody.annotated_disjunctions.elements[index]
+                        .choices
+                        .elements[choice_index] = replacement.custody;
+                }
+            }
         }
-        for learnable in &mut out.learnable_rules {
+        for (index, evidence) in out.value.evidence.iter_mut().enumerate() {
+            let replacement =
+                self.capture(|normalizer| normalizer.normalize_atom_values(&evidence.atom))?;
+            evidence.atom = replacement.value;
+            if self.allocation_owner.is_some() {
+                out.custody.evidence.elements[index] = replacement.custody;
+            }
+        }
+        for (index, query) in out.value.prob_queries.iter_mut().enumerate() {
+            let replacement = self.capture(|normalizer| normalizer.normalize_atom_values(&query.atom))?;
+            query.atom = replacement.value;
+            if self.allocation_owner.is_some() {
+                out.custody.prob_queries.elements[index] = replacement.custody;
+            }
+        }
+        for (index, neural) in out.value.neural_predicates.iter_mut().enumerate() {
+            let replacement =
+                self.capture(|normalizer| normalizer.normalize_atom_values(&neural.predicate))?;
+            neural.predicate = replacement.value;
+            if self.allocation_owner.is_some() {
+                out.custody.neural_predicates.elements[index].predicate = replacement.custody;
+            }
+        }
+        for (index, learnable) in out.value.learnable_rules.iter_mut().enumerate() {
             let (capacity, _bound_owner) = self.reserve_binding_map(&learnable.body)?;
             let mut bound = HashMap::with_capacity(capacity);
-            learnable.head = self.normalize_atom_values(&learnable.head)?;
-            learnable.body = self.normalize_body(&learnable.body, &mut bound)?;
+            let head =
+                self.capture(|normalizer| normalizer.normalize_atom_values(&learnable.head))?;
+            learnable.head = head.value;
+            if self.allocation_owner.is_some() {
+                out.custody.learnable_rules.elements[index].head = head.custody;
+            }
+            let body =
+                self.capture(|normalizer| normalizer.normalize_body(&learnable.body, &mut bound))?;
+            learnable.body = body.value;
+            if self.allocation_owner.is_some() {
+                out.custody.learnable_rules.elements[index].body = body.custody;
+            }
         }
 
         self.append_helpers(&mut out)?;
-        lower_meta_type_refs_in_predicates(&mut out);
+        lower_meta_type_refs_in_predicates(&mut out.value);
         Ok(out)
     }
 
@@ -755,7 +969,7 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
             match lit {
                 BodyLiteral::Positive(atom) => {
                     let expanded = self.normalize_positive_atom(atom, bound)?;
-                    for lit in expanded {
+                    if let Some(lit) = expanded {
                         self.record_bound_from_literal(&lit, bound);
                         self.push_body_literal(&mut out, &mut storage_owner, lit)?;
                     }
@@ -777,20 +991,16 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
                     });
                     self.push_body_literal(&mut out, &mut storage_owner, literal)?;
                 }
-                BodyLiteral::Epistemic(lit) => {
-                    if self.allocation_owner.is_some() {
-                        self.acquire(lit.atom.owned_allocation_bytes()?)?;
-                    }
+                BodyLiteral::Epistemic(epistemic) => {
+                    self.acquire_literal_clone(lit)?;
                     self.push_body_literal(
                         &mut out,
                         &mut storage_owner,
-                        BodyLiteral::Epistemic(lit.clone()),
+                        BodyLiteral::Epistemic(epistemic.clone()),
                     )?;
                 }
                 BodyLiteral::IsExpr(is_expr) => {
-                    if self.allocation_owner.is_some() {
-                        self.acquire(lit.owned_allocation_bytes()?)?;
-                    }
+                    self.acquire_literal_clone(lit)?;
                     self.push_body_literal(
                         &mut out,
                         &mut storage_owner,
@@ -829,8 +1039,7 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         &mut self,
         atom: &Atom,
         bound: &HashMap<String, ScalarType>,
-    ) -> Result<Vec<BodyLiteral>> {
-        self.acquire_vector::<BodyLiteral>(1)?;
+    ) -> Result<Option<BodyLiteral>> {
         if is_blocked_dynamic_predicate(&atom.predicate) {
             return Err(dynamic_predicate_error(
                 &atom.predicate,
@@ -845,9 +1054,9 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
             "functor" => self.expand_functor(atom, bound),
             "findall" => self.expand_findall(atom, bound),
             "maplist" => self.expand_maplist(atom),
-            _ => Ok(vec![BodyLiteral::Positive(
+            _ => Ok(Some(BodyLiteral::Positive(
                 self.normalize_atom_values(atom)?,
-            )]),
+            ))),
         }
     }
 
@@ -874,16 +1083,10 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         term: &Term,
         expected: Option<&TypeRef>,
     ) -> Result<RetainedTermValue> {
-        let allocation_owner = if self.allocation_owner.is_some() {
-            self.reserve_temporary(normalized_value_allocation_bytes(term, expected)?)?
-        } else {
-            None
-        };
-        let value =
-            self.normalize_value_term_with_receipt(term, expected, allocation_owner.as_ref())?;
+        let value = self.capture(|normalizer| normalizer.normalize_value_term(term, expected))?;
         Ok(RetainedTermValue {
-            value,
-            _allocation_owner: allocation_owner,
+            value: value.value,
+            custody: value.custody,
         })
     }
 
@@ -942,18 +1145,18 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
                 if temporary_receipt.is_none() {
                     self.acquire_vector::<Term>(items.len())?;
                 }
-                Ok(Term::List(
-                    items
-                        .iter()
-                        .map(|item| {
-                            self.normalize_untyped_value_with_receipt(item, temporary_receipt)
-                        })
-                        .collect::<Result<Vec<_>>>()?,
-                ))
+                let mut values = Vec::with_capacity(items.len());
+                for item in items {
+                    values.push(
+                        self.normalize_untyped_value_with_receipt(item, temporary_receipt)?,
+                    );
+                }
+                Ok(Term::List(values))
             }
             Term::Cons { head, tail } => {
                 if temporary_receipt.is_none() {
-                    self.acquire_vector::<Term>(2)?;
+                    self.acquire(std::mem::size_of::<Term>() as u64)?;
+                    self.acquire(std::mem::size_of::<Term>() as u64)?;
                 }
                 Ok(Term::Cons {
                     head: Box::new(
@@ -984,22 +1187,20 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
                 if temporary_receipt.is_none() {
                     self.acquire_vector::<Term>(items.len())?;
                 }
-                Ok(Term::List(
-                    items
-                        .iter()
-                        .map(|item| {
-                            self.normalize_value_term_with_receipt(
-                                item,
-                                Some(inner),
-                                temporary_receipt,
-                            )
-                        })
-                        .collect::<Result<Vec<_>>>()?,
-                ))
+                let mut values = Vec::with_capacity(items.len());
+                for item in items {
+                    values.push(self.normalize_value_term_with_receipt(
+                        item,
+                        Some(inner),
+                        temporary_receipt,
+                    )?);
+                }
+                Ok(Term::List(values))
             }
             Term::Cons { head, tail } => {
                 if temporary_receipt.is_none() {
-                    self.acquire_vector::<Term>(2)?;
+                    self.acquire(std::mem::size_of::<Term>() as u64)?;
+                    self.acquire(std::mem::size_of::<Term>() as u64)?;
                 }
                 Ok(Term::Cons {
                     head: Box::new(self.normalize_value_term_with_receipt(
@@ -1031,7 +1232,7 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         atom: &Atom,
         bound: &HashMap<String, ScalarType>,
         kind: MetaTruthKind,
-    ) -> Result<Vec<BodyLiteral>> {
+    ) -> Result<Option<BodyLiteral>> {
         require_arity(atom, 1, &mut self.allocation_owner)?;
         let truth = match kind {
             MetaTruthKind::Ground => self.is_ground(&atom.terms[0], bound),
@@ -1039,9 +1240,9 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
             MetaTruthKind::NonVar => self.is_nonvar(&atom.terms[0], bound),
         };
         if truth {
-            Ok(Vec::new())
+            Ok(None)
         } else {
-            Ok(vec![BodyLiteral::Positive(self.fail_atom()?)])
+            Ok(Some(BodyLiteral::Positive(self.fail_atom()?)))
         }
     }
 
@@ -1049,7 +1250,7 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         &mut self,
         atom: &Atom,
         bound: &HashMap<String, ScalarType>,
-    ) -> Result<Vec<BodyLiteral>> {
+    ) -> Result<Option<BodyLiteral>> {
         require_arity(atom, 3, &mut self.allocation_owner)?;
         let term = self.term_id_or_bound_variable(&atom.terms[0], bound, "functor/3")?;
         let name = self.normalize_symbol_argument(&atom.terms[1], "functor/3 name")?;
@@ -1062,10 +1263,10 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         self.register_helper_decl(functor_pred(), columns)?;
         self.acquire(functor_pred().len() as u64)?;
         self.acquire_vector::<Term>(3)?;
-        Ok(vec![BodyLiteral::Positive(Atom {
+        Ok(Some(BodyLiteral::Positive(Atom {
             predicate: functor_pred().to_string(),
             terms: vec![term, name, arity],
-        })])
+        })))
     }
 
     fn expand_univ(
@@ -1089,7 +1290,7 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         &mut self,
         atom: &Atom,
         bound: &HashMap<String, ScalarType>,
-    ) -> Result<Vec<BodyLiteral>> {
+    ) -> Result<Option<BodyLiteral>> {
         require_arity(atom, 3, &mut self.allocation_owner)?;
         let template = &atom.terms[0];
         let _goal_owner = if self.allocation_owner.is_some() {
@@ -1198,12 +1399,7 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
                 bytes = bytes
                     .checked_add(xlog_core::btree_insert_allocation_bytes::<
                         String,
-                        (
-                            RetainedTermRow,
-                            Vec<Term>,
-                            Option<Arc<dyn Send + Sync>>,
-                            Option<Arc<dyn Send + Sync>>,
-                        ),
+                        RetainedFindallGroup,
                     >(length)?)
                     .ok_or_else(|| {
                         XlogError::allocation_extent_overflow("finite findall groups")
@@ -1213,15 +1409,7 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         } else {
             None
         };
-        let mut groups: BTreeMap<
-            String,
-            (
-                RetainedTermRow,
-                Vec<Term>,
-                Option<Arc<dyn Send + Sync>>,
-                Option<Arc<dyn Send + Sync>>,
-            ),
-        > = BTreeMap::new();
+        let mut groups: BTreeMap<String, RetainedFindallGroup> = BTreeMap::new();
         let mut source_facts = self.cloned_source_facts(&goal.predicate)?;
         for fact in std::mem::take(&mut source_facts.facts) {
             if fact.terms.len() != goal.terms.len() {
@@ -1230,41 +1418,20 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
             let Some(bindings) = self.match_goal_fact(&goal, &fact)? else {
                 continue;
             };
-            let allocation_owner = if self.allocation_owner.is_some() {
-                let mut bytes = 0u64;
+            let storage_owner =
+                self.reserve_temporary(meta_storage_bytes::<Term>(group_positions.len())?)?;
+            let group_terms = self.capture(|normalizer| {
+                let mut values = Vec::with_capacity(group_positions.len());
                 for (idx, _) in &group_positions {
-                    bytes = bytes
-                        .checked_add(
-                            fact.terms[*idx].owned_allocation_bytes()?
-                                - std::mem::size_of::<Term>() as u64,
-                        )
-                        .ok_or_else(|| {
-                            XlogError::allocation_extent_overflow("finite findall group")
-                        })?;
+                    normalizer.acquire_term_clone(&fact.terms[*idx])?;
+                    values.push(fact.terms[*idx].clone());
                 }
-                self.reserve_temporary(bytes)?
-            } else {
-                None
-            };
-            let storage_owner = if self.allocation_owner.is_some() {
-                let bytes = group_positions
-                    .len()
-                    .checked_mul(std::mem::size_of::<Term>())
-                    .and_then(|bytes| u64::try_from(bytes).ok())
-                    .ok_or_else(|| XlogError::allocation_extent_overflow("finite findall group"))?;
-                self.reserve_temporary(bytes)?
-            } else {
-                None
-            };
-            let group_terms: Vec<Term> = group_positions
-                .iter()
-                .map(|(idx, _)| fact.terms[*idx].clone())
-                .collect();
+                Ok(values)
+            })?;
             let group_terms = RetainedTermRow {
-                values: group_terms,
-                allocation_owner,
+                values: group_terms.value,
+                custody: group_terms.custody,
                 storage_owner,
-                nested_storage_owner: None,
             };
             let _keys_owner = if self.allocation_owner.is_some() {
                 self.reserve_temporary(crate::compile::push_vector_allocation_bytes::<
@@ -1283,15 +1450,20 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
                 self.substitute_template(template, &bindings.values, &elem_type_ref.value)?;
             let (length, capacity) = groups
                 .get(&key.text)
-                .map(|(_, values, _, _)| (values.len(), values.capacity()))
+                .map(|group| (group.values.len(), group.values.capacity()))
                 .unwrap_or((0, 0));
-            let values_storage = self.reserve_vector_growth::<Term>(length, capacity)?;
+            let values_storage = self.reserve_vector_growth::<RetainedTermValue>(length, capacity)?;
             let group = groups
                 .entry(key.text)
-                .or_insert_with(|| (group_terms, Vec::new(), key._allocation_owner, None));
-            group.1.push(template_value);
+                .or_insert_with(|| RetainedFindallGroup {
+                    terms: group_terms,
+                    values: Vec::new(),
+                    _key_owner: key._allocation_owner,
+                    values_storage: None,
+                });
+            group.values.push(template_value);
             if values_storage.is_some() {
-                group.3 = values_storage;
+                group.values_storage = values_storage;
             }
         }
         drop(source_facts);
@@ -1300,53 +1472,69 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         if groups.is_empty() && group_positions.is_empty() {
             groups.insert(
                 String::new(),
-                (
-                    RetainedTermRow {
+                RetainedFindallGroup {
+                    terms: RetainedTermRow {
                         values: Vec::new(),
-                        allocation_owner: None,
+                        custody: PayloadCustody::default(),
                         storage_owner: None,
-                        nested_storage_owner: None,
                     },
-                    Vec::new(),
-                    None,
-                    None,
-                ),
+                    values: Vec::new(),
+                    _key_owner: None,
+                    values_storage: None,
+                },
             );
         }
 
-        for (_, (mut group_terms, values, _key_owner, values_storage)) in groups {
-            let list = Term::List(values);
-            let row_storage = self.reserve_vector_growth::<Term>(
-                group_terms.values.len(),
-                group_terms.values.capacity(),
-            )?;
-            group_terms.values.push(list);
-            if row_storage.is_some() {
-                group_terms.storage_owner = row_storage;
+        for (_, mut group) in groups {
+            let list = self.capture(|normalizer| {
+                normalizer.acquire_vector::<Term>(group.values.len())?;
+                let mut values = Vec::with_capacity(group.values.len());
+                for mut value in std::mem::take(&mut group.values) {
+                    normalizer.adopt_custody(&mut value.custody)?;
+                    values.push(value.value);
+                }
+                Ok(Term::List(values))
+            })?;
+            if self.allocation_owner.is_some()
+                && group.terms.values.len() == group.terms.values.capacity()
+            {
+                let count = group
+                    .terms
+                    .values
+                    .len()
+                    .checked_add(1)
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("finite findall row"))?;
+                let owner = self.reserve_temporary(meta_storage_bytes::<Term>(count)?)?;
+                group.terms.values.reserve_exact(1);
+                group.terms.storage_owner = owner;
             }
-            group_terms.nested_storage_owner = values_storage;
-            self.add_helper_fact_retained(&helper, group_terms)?;
+            let mut list = list;
+            self.append_custody(&mut group.terms.custody, &mut list.custody)?;
+            group.terms.values.push(list.value);
+            self.add_helper_fact_retained(&helper, group.terms)?;
         }
         drop(_groups_owner);
 
-        self.acquire(crate::compile::push_vector_allocation_bytes::<Term>(
-            group_positions.len() + 1,
-        )?)?;
+        let count = group_positions
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| XlogError::allocation_extent_overflow("finite findall output"))?;
+        self.acquire_vector::<Term>(count)?;
         for (_, name) in &group_positions {
             self.acquire(name.len() as u64)?;
         }
-        let mut terms: Vec<Term> = group_positions
-            .iter()
-            .map(|(_, name)| Term::Variable(name.clone()))
-            .collect();
+        let mut terms = Vec::with_capacity(count);
+        for (_, name) in &group_positions {
+            terms.push(Term::Variable(name.clone()));
+        }
         terms.push(out_list);
-        Ok(vec![BodyLiteral::Positive(Atom {
+        Ok(Some(BodyLiteral::Positive(Atom {
             predicate: helper,
             terms,
-        })])
+        })))
     }
 
-    fn expand_maplist(&mut self, atom: &Atom) -> Result<Vec<BodyLiteral>> {
+    fn expand_maplist(&mut self, atom: &Atom) -> Result<Option<BodyLiteral>> {
         if atom.terms.len() != 2 && atom.terms.len() != 3 {
             return Err(meta_error(
                 format_args!(
@@ -1357,14 +1545,21 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
             ));
         }
         let pred = match &atom.terms[0] {
-            Term::Symbol(id) => self.resolve_symbol(*id)?,
+            Term::Symbol(id) => retained_symbol(*id, &mut self.allocation_owner)?,
             Term::String(name) | Term::PredRef(name) => {
-                self.acquire(name.len() as u64)?;
-                name.clone()
+                let owner = self.reserve_temporary(name.len() as u64)?;
+                RetainedTermKey {
+                    text: name.clone(),
+                    _allocation_owner: owner,
+                }
             }
-            term => static_pred_name(term, &mut self.allocation_owner)?,
+            term => RetainedTermKey {
+                text: static_pred_name(term, &mut self.allocation_owner)?,
+                _allocation_owner: None,
+            },
         };
-        if self.derived_predicates.contains(&pred) {
+        let pred_name = &pred.text;
+        if self.derived_predicates.contains(pred_name) {
             return Err(meta_error(
                 format_args!(
                     "{}",
@@ -1376,7 +1571,7 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         let input_items =
             finite_list_items(&atom.terms[1], "maplist input", &mut self.allocation_owner)?;
         let input_type = self
-            .cloned_column_type(&pred, 0)?
+            .cloned_column_type(pred_name, 0)?
             .unwrap_or_else(|| infer_type_ref_from_terms(input_items));
         let _input_owner = if self.allocation_owner.is_some() {
             let mut bytes =
@@ -1407,9 +1602,9 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         );
         self.acquire_format(format_args!(
             "__xlog_meta_maplist_{}_{}",
-            pred, self.maplist_counter
+            pred_name, self.maplist_counter
         ))?;
-        let helper = format!("__xlog_meta_maplist_{}_{}", pred, self.maplist_counter);
+        let helper = format!("__xlog_meta_maplist_{}_{}", pred_name, self.maplist_counter);
         self.maplist_counter += 1;
 
         if atom.terms.len() == 2 {
@@ -1417,23 +1612,26 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
             let input_type = input_type.into_list(&mut self.allocation_owner)?;
             self.push_helper_column(&mut columns, "input", input_type, false)?;
             self.register_helper_decl(&helper, columns)?;
-            if self.maplist_unary_holds(&pred, &input_list)? {
-                self.acquire_vector::<Term>(1)?;
-                self.acquire_term_clone(&input_list)?;
-                self.add_helper_fact(&helper, vec![input_list.clone()])?;
+            if self.maplist_unary_holds(pred_name, &input_list)? {
+                let terms = self.capture(|normalizer| {
+                    normalizer.acquire_vector::<Term>(1)?;
+                    normalizer.acquire_term_clone(&input_list)?;
+                    Ok(vec![input_list.clone()])
+                })?;
+                self.add_helper_fact(&helper, terms)?;
             }
             drop(input_list);
             drop(_input_owner);
             self.acquire_vector::<Term>(1)?;
             self.acquire_term_clone(&atom.terms[1])?;
-            return Ok(vec![BodyLiteral::Positive(Atom {
+            return Ok(Some(BodyLiteral::Positive(Atom {
                 predicate: helper,
                 terms: vec![atom.terms[1].clone()],
-            })]);
+            })));
         }
 
         let output_type = self
-            .cloned_column_type(&pred, 1)?
+            .cloned_column_type(pred_name, 1)?
             .unwrap_or(RetainedTypeRef::scalar(ScalarType::U64));
         let mut columns = self.helper_columns(2)?;
         let input_type = input_type.into_list(&mut self.allocation_owner)?;
@@ -1443,20 +1641,25 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
                 .into_list(&mut self.allocation_owner)?;
         self.push_helper_column(&mut columns, "output", helper_output_type, false)?;
         self.register_helper_decl(&helper, columns)?;
-        let mut outputs = self.maplist_binary_outputs(&pred, &input_list, &output_type.value)?;
+        let mut outputs = self.maplist_binary_outputs(pred_name, &input_list, &output_type.value)?;
         drop(output_type);
-        for output in std::mem::take(&mut outputs.rows) {
-            self.acquire_vector::<Term>(2)?;
-            self.acquire_term_clone(&input_list)?;
-            self.add_helper_fact_retained(
-                &helper,
-                RetainedTermRow {
-                    values: vec![input_list.clone(), Term::List(output.values)],
-                    allocation_owner: output.allocation_owner,
-                    storage_owner: None,
-                    nested_storage_owner: None,
-                },
-            )?;
+        for mut output in std::mem::take(&mut outputs.rows) {
+            if let (Some(scope), Some(owner)) = (
+                self.allocation_owner.as_deref_mut(),
+                output.storage_owner.as_ref(),
+            ) {
+                output.custody.retain_original(owner, scope)?;
+            }
+            let mut terms = self.capture(|normalizer| {
+                normalizer.acquire_vector::<Term>(2)?;
+                normalizer.acquire_term_clone(&input_list)?;
+                let mut values = Vec::with_capacity(2);
+                values.push(input_list.clone());
+                Ok(values)
+            })?;
+            self.append_custody(&mut terms.custody, &mut output.custody)?;
+            terms.value.push(Term::List(output.values));
+            self.add_helper_fact(&helper, terms)?;
         }
         drop(outputs);
         drop(input_list);
@@ -1464,10 +1667,10 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         self.acquire_vector::<Term>(2)?;
         self.acquire_term_clone(&atom.terms[1])?;
         self.acquire_term_clone(&atom.terms[2])?;
-        Ok(vec![BodyLiteral::Positive(Atom {
+        Ok(Some(BodyLiteral::Positive(Atom {
             predicate: helper,
             terms: vec![atom.terms[1].clone(), atom.terms[2].clone()],
-        })])
+        })))
     }
 
     fn maplist_unary_holds(&mut self, pred: &str, input: &Term) -> Result<bool> {
@@ -1511,9 +1714,8 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
             return Ok(RetainedTermRows {
                 rows: vec![RetainedTermRow {
                     values: Vec::new(),
-                    allocation_owner: None,
+                    custody: PayloadCustody::default(),
                     storage_owner: None,
-                    nested_storage_owner: None,
                 }],
                 _allocation_owner: allocation_owner,
             });
@@ -1596,7 +1798,7 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         template: &Term,
         bindings: &HashMap<String, Term>,
         elem_type: &TypeRef,
-    ) -> Result<Term> {
+    ) -> Result<RetainedTermValue> {
         let construction_owner = if self.allocation_owner.is_some() {
             // Completed children and one active child's constructed/normalized
             // copies can coexist. The checked shape includes vector growth;
@@ -1619,7 +1821,7 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         // Only this final value survives in the helper fact. Nested normalized
         // values and the constructed template remain under the scratch receipt;
         // registrations made by either normalization keep their original scope.
-        let output = self.normalize_value_term(&value, Some(elem_type));
+        let output = self.normalize_value_term_retained(&value, Some(elem_type));
         drop(value);
         drop(construction_owner);
         output
@@ -1777,16 +1979,13 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
             }
             Term::List(items) => {
                 self.acquire_vector::<Term>(items.len())?;
-                Ok(Term::List(
-                    items
-                        .iter()
-                        .map(|item| {
-                            Ok(Term::Integer(
-                                self.register_term(item, ExpectedTerm::Any)? as i64
-                            ))
-                        })
-                        .collect::<Result<Vec<_>>>()?,
-                ))
+                let mut values = Vec::with_capacity(items.len());
+                for item in items {
+                    values.push(Term::Integer(
+                        self.register_term(item, ExpectedTerm::Any)? as i64,
+                    ));
+                }
+                Ok(Term::List(values))
             }
             _ => Err(meta_error(
                 format_args!(
@@ -1799,10 +1998,11 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
     }
 
     fn normalize_symbol_argument(&mut self, term: &Term, context: &str) -> Result<Term> {
-        self.acquire_term_clone(term)?;
         match term {
-            Term::Variable(_) | Term::Anonymous => Ok(term.clone()),
-            Term::Symbol(_) | Term::String(_) => Ok(term.clone()),
+            Term::Variable(_) | Term::Anonymous | Term::Symbol(_) | Term::String(_) => {
+                self.acquire_term_clone(term)?;
+                Ok(term.clone())
+            }
             _ => Err(meta_error(
                 format_args!("{context} must be a symbol or variable"),
                 &mut self.allocation_owner,
@@ -1811,10 +2011,15 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
     }
 
     fn normalize_u32_argument(&mut self, term: &Term, context: &str) -> Result<Term> {
-        self.acquire_term_clone(term)?;
         match term {
-            Term::Variable(_) | Term::Anonymous => Ok(term.clone()),
-            Term::Integer(value) if *value >= 0 && *value <= u32::MAX as i64 => Ok(term.clone()),
+            Term::Variable(_) | Term::Anonymous => {
+                self.acquire_term_clone(term)?;
+                Ok(term.clone())
+            }
+            Term::Integer(value) if *value >= 0 && *value <= u32::MAX as i64 => {
+                self.acquire_term_clone(term)?;
+                Ok(term.clone())
+            }
             _ => Err(meta_error(
                 format_args!("{context} must be a u32 integer or variable"),
                 &mut self.allocation_owner,
@@ -2035,14 +2240,14 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         Ok(id)
     }
 
-    fn append_helpers(&mut self, program: &mut Program) -> Result<()> {
+    fn append_helpers(&mut self, program: &mut RetainedProgram) -> Result<()> {
         self.append_term_helper_facts()?;
 
         let existing_owner = if self.allocation_owner.is_some() {
             let overflow = || XlogError::allocation_extent_overflow("meta helper output");
             let mut bytes =
-                crate::compile::hash_allocation_bytes::<String, ()>(program.predicates.len())?;
-            for predicate in &program.predicates {
+                crate::compile::hash_allocation_bytes::<String, ()>(program.value.predicates.len())?;
+            for predicate in &program.value.predicates {
                 bytes = bytes
                     .checked_add(predicate.name.len() as u64)
                     .ok_or_else(overflow)?;
@@ -2052,6 +2257,7 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
             None
         };
         let existing: HashSet<String> = program
+            .value
             .predicates
             .iter()
             .map(|pred| pred.name.clone())
@@ -2064,21 +2270,34 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
                 .keys()
                 .filter(|name| !existing.contains(*name))
                 .count();
+            let scope = self
+                .allocation_owner
+                .as_deref_mut()
+                .expect("original helper allocation scope");
+            program.custody.predicates.prepare_elements(additions, scope)?;
+            program.custody.rules.prepare_elements(self.helper_facts.len(), scope)?;
             let predicates = program
+                .value
                 .predicates
                 .len()
                 .checked_add(additions)
                 .ok_or_else(overflow)?;
-            let mut bytes = crate::compile::push_vector_allocation_bytes::<PredDecl>(predicates)?;
+            if predicates > program.value.predicates.capacity() {
+                let owner = scope.reserve_allocation(meta_storage_bytes::<PredDecl>(predicates)?)?;
+                program.value.predicates.reserve_exact(additions);
+                program.custody.predicates.backing_owner = Some(owner);
+            }
             let rules = program
+                .value
                 .rules
                 .len()
                 .checked_add(self.helper_facts.len())
                 .ok_or_else(overflow)?;
-            bytes = bytes
-                .checked_add(crate::compile::push_vector_allocation_bytes::<Rule>(rules)?)
-                .ok_or_else(overflow)?;
-            self.acquire(bytes)?;
+            if rules > program.value.rules.capacity() {
+                let owner = scope.reserve_allocation(meta_storage_bytes::<Rule>(rules)?)?;
+                program.value.rules.reserve_exact(self.helper_facts.len());
+                program.custody.rules.backing_owner = Some(owner);
+            }
         }
 
         let declarations = RetainedHelperDeclarations {
@@ -2094,19 +2313,25 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
                 continue;
             }
             let emitted = self.helper_declaration(&name.text, declaration.columns)?;
-            if let (Some(scope), Some(owner)) = (
-                self.allocation_owner.as_deref_mut(),
-                emitted.allocation_owner.as_ref(),
-            ) {
-                scope.retain(Arc::clone(owner) as Arc<dyn Send + Sync>)?;
+            program.value.predicates.push(emitted.value);
+            if self.allocation_owner.is_some() {
+                program.custody.predicates.elements.push(emitted.custody);
             }
-            program.predicates.push(emitted.value);
         }
         drop(declarations.storage);
         drop(existing);
         drop(existing_owner);
-        program.rules.extend(std::mem::take(&mut self.helper_facts));
-        self._helper_facts_storage = None;
+        let custody = std::mem::take(&mut self.helper_facts_custody);
+        let payloads = custody.elements.into_iter();
+        let values = std::mem::take(&mut self.helper_facts).into_iter();
+        if self.allocation_owner.is_some() {
+            for (value, payload) in values.zip(payloads) {
+                program.value.rules.push(value);
+                program.custody.rules.elements.push(payload);
+            }
+        } else {
+            program.value.rules.extend(values);
+        }
         Ok(())
     }
 
@@ -2126,80 +2351,47 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         ])?;
         self.register_helper_decl(arg_pred(), columns)?;
 
-        let _records_owner = if self.allocation_owner.is_some() {
-            let mut bytes = (self.term_records.len() as u64)
-                .checked_mul(std::mem::size_of::<TermRecord>() as u64)
-                .ok_or_else(|| XlogError::allocation_extent_overflow("meta term record"))?;
-            for record in &self.term_records {
-                if let RegisteredTerm::Compound {
-                    functor,
-                    args,
-                    parts,
-                } = &record.kind
-                {
-                    bytes = bytes
-                        .checked_add(functor.len() as u64)
-                        .and_then(|n| {
-                            n.checked_add(
-                                (args.len() as u64)
-                                    .checked_mul(std::mem::size_of::<u64>() as u64)?,
-                            )
-                        })
-                        .and_then(|n| {
-                            n.checked_add(
-                                (parts.len() as u64)
-                                    .checked_mul(std::mem::size_of::<u64>() as u64)?,
-                            )
-                        })
-                        .ok_or_else(|| XlogError::allocation_extent_overflow("meta term record"))?;
-                }
-            }
-            self.reserve_temporary(bytes)?
-        } else {
-            None
-        };
-
-        for record in self.term_records.clone() {
+        let _records_storage = self._term_records_storage.take();
+        for record in std::mem::take(&mut self.term_records) {
             if let RegisteredTerm::Compound {
                 functor,
                 args,
                 parts,
             } = record.kind
             {
-                self.acquire_vector::<Term>(3)?;
                 let functor_id = self.intern_symbol(&functor)?;
-                self.add_helper_fact(
-                    functor_pred(),
-                    vec![
+                let terms = self.capture(|normalizer| {
+                    normalizer.acquire_vector::<Term>(3)?;
+                    Ok(vec![
                         Term::Integer(record.id as i64),
                         Term::Symbol(functor_id),
                         Term::Integer(args.len() as i64),
-                    ],
-                )?;
-                self.acquire_vector::<Term>(2)?;
-                self.acquire_vector::<Term>(parts.len())?;
-                self.add_helper_fact(
-                    univ_pred(),
-                    vec![
+                    ])
+                })?;
+                self.add_helper_fact(functor_pred(), terms)?;
+                let terms = self.capture(|normalizer| {
+                    normalizer.acquire_vector::<Term>(2)?;
+                    normalizer.acquire_vector::<Term>(parts.len())?;
+                    let mut values = Vec::with_capacity(parts.len());
+                    for id in parts {
+                        values.push(Term::Integer(id as i64));
+                    }
+                    Ok(vec![
                         Term::Integer(record.id as i64),
-                        Term::List(
-                            parts
-                                .into_iter()
-                                .map(|id| Term::Integer(id as i64))
-                                .collect(),
-                        ),
-                    ],
-                )?;
+                        Term::List(values),
+                    ])
+                })?;
+                self.add_helper_fact(univ_pred(), terms)?;
                 for (idx, arg_id) in args.into_iter().enumerate() {
-                    self.acquire_vector::<Term>(3)?;
-                    self.add_helper_fact(
-                        arg_pred(),
-                        vec![
+                    let terms = self.capture(|normalizer| {
+                        normalizer.acquire_vector::<Term>(3)?;
+                        Ok(vec![
                             Term::Integer(record.id as i64),
                             Term::Integer(idx as i64),
                             Term::Integer(arg_id as i64),
-                        ],
-                    )?;
+                        ])
+                    })?;
+                    self.add_helper_fact(arg_pred(), terms)?;
                 }
             }
         }
@@ -2251,25 +2443,17 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
                 custody.elements.push(typ.custody);
             }
         }
-        let allocation_owner = if let Some(scope) = self.allocation_owner.as_deref_mut() {
-            let bytes = std::mem::size_of::<HelperDeclarationAllocation>()
-                .checked_add(2 * std::mem::size_of::<usize>())
-                .and_then(|bytes| u64::try_from(bytes).ok())
-                .ok_or_else(|| XlogError::allocation_extent_overflow("meta declaration owner"))?;
-            let metadata_owner = scope.reserve_allocation(bytes)?;
-            Some(Arc::new(HelperDeclarationAllocation {
-                _custody: PredicateCustody {
-                    name: name_custody,
-                    types: types_custody.take().expect("original helper type custody"),
-                    columns: columns
-                        .custody
-                        .take()
-                        .expect("original helper column custody"),
-                },
-                _metadata_owner: metadata_owner,
-            }))
+        let custody = if self.allocation_owner.is_some() {
+            PredicateCustody {
+                name: name_custody,
+                types: types_custody.take().expect("original helper type custody"),
+                columns: columns
+                    .custody
+                    .take()
+                    .expect("original helper column custody"),
+            }
         } else {
-            None
+            PredicateCustody::default()
         };
         Ok(RetainedHelperEmission {
             value: PredDecl {
@@ -2278,23 +2462,22 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
                 columns: columns.value,
                 is_private: true,
             },
-            allocation_owner,
+            custody,
         })
     }
 
-    fn add_helper_fact(&mut self, pred: &str, terms: Vec<Term>) -> Result<()> {
+    fn add_helper_fact(&mut self, pred: &str, terms: RetainedMetaValue<Vec<Term>>) -> Result<()> {
         self.add_helper_fact_retained(
             pred,
             RetainedTermRow {
-                values: terms,
-                allocation_owner: None,
+                values: terms.value,
+                custody: terms.custody,
                 storage_owner: None,
-                nested_storage_owner: None,
             },
         )
     }
 
-    fn add_helper_fact_retained(&mut self, pred: &str, terms: RetainedTermRow) -> Result<()> {
+    fn add_helper_fact_retained(&mut self, pred: &str, mut terms: RetainedTermRow) -> Result<()> {
         let key = retained_format(
             format_args!("{pred}:{:?}", terms.values),
             &mut self.allocation_owner,
@@ -2310,25 +2493,34 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         if let Some(storage) = key_storage {
             self._helper_fact_keys_storage = Some(storage);
         }
-        self.acquire(pred.len() as u64)?;
+        let mut name = self.capture(|normalizer| {
+            normalizer.acquire(pred.len() as u64)?;
+            Ok(pred.to_string())
+        })?;
+        self.append_custody(&mut terms.custody, &mut name.custody)?;
+        if let (Some(scope), Some(owner)) = (
+            self.allocation_owner.as_deref_mut(),
+            terms.storage_owner.as_ref(),
+        ) {
+            terms.custody.retain_original(owner, scope)?;
+        }
+        if let Some(scope) = self.allocation_owner.as_deref_mut() {
+            self.helper_facts_custody.prepare_elements(1, scope)?;
+        }
         let facts_storage =
             self.reserve_vector_growth::<Rule>(self.helper_facts.len(), self.helper_facts.capacity())?;
-        if let Some(scope) = self.allocation_owner.as_deref_mut() {
-            scope.retain_allocations([
-                terms.allocation_owner.clone(),
-                terms.storage_owner.clone(),
-                terms.nested_storage_owner.clone(),
-            ])?;
-        }
         self.helper_facts.push(Rule {
             head: Atom {
-                predicate: pred.to_string(),
+                predicate: name.value,
                 terms: terms.values,
             },
             body: vec![],
         });
+        if self.allocation_owner.is_some() {
+            self.helper_facts_custody.elements.push(terms.custody);
+        }
         if let Some(storage) = facts_storage {
-            self._helper_facts_storage = Some(storage);
+            self.helper_facts_custody.backing_owner = Some(storage);
         }
         Ok(())
     }
@@ -2565,68 +2757,67 @@ fn cartesian_product(
     choices: &[Vec<RetainedTermValue>],
     allocate: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
 ) -> Result<RetainedTermRows> {
-    let mut rows_owner = allocate
+    let rows_owner = allocate
         .as_deref_mut()
         .map(|scope| scope.reserve_allocation(std::mem::size_of::<RetainedTermRow>() as u64))
         .transpose()?;
-    let mut rows = vec![RetainedTermRow {
-        values: Vec::new(),
-        allocation_owner: None,
-        storage_owner: None,
-        nested_storage_owner: None,
-    }];
+    let mut rows = RetainedTermRows {
+        rows: vec![RetainedTermRow {
+            values: Vec::new(),
+            custody: PayloadCustody::default(),
+            storage_owner: None,
+        }],
+        _allocation_owner: rows_owner,
+    };
     for choice in choices {
+        let next_rows = rows
+            .rows
+            .len()
+            .checked_mul(choice.len())
+            .ok_or_else(|| XlogError::allocation_extent_overflow("finite meta product"))?;
         let next_owner =
             if let Some(allocate) = allocate.as_deref_mut() {
-                let overflow = || XlogError::allocation_extent_overflow("finite meta product");
-                let next_rows = rows.len().checked_mul(choice.len()).ok_or_else(overflow)?;
                 Some(allocate.reserve_allocation(
-                    crate::compile::push_vector_allocation_bytes::<RetainedTermRow>(next_rows)?,
+                    meta_storage_bytes::<RetainedTermRow>(next_rows)?,
                 )?)
             } else {
                 None
             };
-        let mut next = Vec::new();
-        for row in &rows {
+        let mut next = RetainedTermRows {
+            rows: Vec::with_capacity(next_rows),
+            _allocation_owner: next_owner,
+        };
+        for row in &rows.rows {
             for value in choice {
-                let allocation_owner = if let Some(allocate) = allocate.as_deref_mut() {
-                    let overflow = || XlogError::allocation_extent_overflow("finite meta product");
-                    let clone_bytes = row.values.iter().try_fold(0u64, |total, term| {
-                        total
-                            .checked_add(term.owned_allocation_bytes()?)
-                            .ok_or_else(overflow)
-                    })?;
-                    let count = row.values.len().checked_add(1).ok_or_else(overflow)?;
-                    let replacement = crate::compile::push_vector_allocation_bytes::<Term>(count)?;
-                    let value_bytes = value.value.owned_allocation_bytes()?;
-                    let bytes = clone_bytes
-                        .checked_add(replacement)
-                        .and_then(|bytes| bytes.checked_add(value_bytes))
-                        .ok_or_else(overflow)?;
-                    Some(allocate.reserve_allocation(bytes)?)
-                } else {
-                    None
-                };
-                let mut values = row.values.clone();
-                values.push(value.value.clone());
-                next.push(RetainedTermRow {
-                    values,
-                    allocation_owner,
+                let count = row
+                    .values
+                    .len()
+                    .checked_add(1)
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("finite meta product"))?;
+                let mut custody = PayloadCustody::default();
+                if let Some(scope) = allocate.as_deref_mut() {
+                    custody.reserve_unit(meta_storage_bytes::<Term>(count)?, scope)?;
+                }
+                let mut next_row = RetainedTermRow {
+                    values: Vec::with_capacity(count),
+                    custody,
                     storage_owner: None,
-                    nested_storage_owner: None,
-                });
+                };
+                for term in row.values.iter().chain(std::iter::once(&value.value)) {
+                    if let Some(scope) = allocate.as_deref_mut() {
+                        let mut original = PayloadCustody::for_term_clone(term, scope)?;
+                        next_row.custody.append_from(&mut original, scope)?;
+                    }
+                    next_row.values.push(term.clone());
+                }
+                next.rows.push(next_row);
             }
         }
         // The old batch and each of its row receipts retire together. The new
         // batch was acquired before any clone while all original rows lived.
-        drop(rows);
         rows = next;
-        rows_owner = next_owner;
     }
-    Ok(RetainedTermRows {
-        rows,
-        _allocation_owner: rows_owner,
-    })
+    Ok(rows)
 }
 
 fn joined_text_bytes(items: &[String], separator: &str) -> Result<u64> {

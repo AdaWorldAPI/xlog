@@ -550,9 +550,9 @@ impl Compiler {
     ///
     /// The protective input clone acquires its physical heap allocations and
     /// typed custody metadata through the caller's original scope before birth.
-    /// Buffer and payload receipts move only with their corresponding data;
-    /// unpartitioned passes keep an independently acquired survivor copy. This
-    /// does not transfer or divide the external caller's original receipts.
+    /// Buffer and payload receipts move with their corresponding data through
+    /// every frontend pass. This does not transfer or divide the external
+    /// caller's original receipts.
     pub fn compile_prepared_program_with_allocation_owner(
         &mut self,
         program: &Program,
@@ -1429,79 +1429,51 @@ impl FrontendPass {
         program: Program,
         scope: &mut Option<&mut CompilationAllocationScope<'_>>,
         custody: Option<&mut crate::program_custody::ProgramAllocationCustody>,
-    ) -> Result<(Program, bool)> {
-        match self {
-            Self::Desugar => {
-                let identity = program.constraints.is_empty() && program.queries.is_empty();
-                let transferred = custody.is_some();
-                Ok((
-                    desugar_queries_and_constraints_with_owner(program, scope, custody)?,
-                    identity || transferred,
-                ))
-            }
-            Self::Meta => {
-                let program = match scope.as_deref_mut() {
-                    Some(scope) => {
-                        crate::meta_normalize::normalize_meta_builtins_owned_with_allocation_owner(
-                            program, scope,
-                        )?
-                    }
-                    None => normalize_meta_builtins_owned(program)?,
+    ) -> Result<Program> {
+        match (scope.as_deref_mut(), custody) {
+            (Some(scope), Some(custody)) => {
+                let mut input = crate::program_custody::RetainedProgram {
+                    value: program,
+                    custody: std::mem::take(custody),
                 };
-                Ok((program, false))
+                let output = match self {
+                    Self::Desugar => {
+                        input.value = desugar_queries_and_constraints_with_owner(
+                            input.value,
+                            &mut Some(scope),
+                            Some(&mut input.custody),
+                        )?;
+                        input
+                    }
+                    Self::Meta => {
+                        crate::meta_normalize::normalize_meta_builtins_retained(input, scope)?
+                    }
+                    Self::List => {
+                        crate::list_normalize::normalize_list_builtins_retained(input, scope)?
+                    }
+                    Self::Magic => {
+                        let rewritten =
+                            crate::magic_sets::rewrite_magic_sets_retained(input, scope)?;
+                        drop(rewritten.report);
+                        rewritten.program
+                    }
+                };
+                *custody = output.custody;
+                Ok(output.value)
             }
-            Self::List => {
-                if let (Some(scope), Some(custody)) = (scope.as_deref_mut(), custody) {
-                    let program = crate::list_normalize::normalize_list_builtins_retained(
-                        crate::program_custody::RetainedProgram {
-                            value: program,
-                            custody: std::mem::take(custody),
-                        },
-                        scope,
-                    )?;
-                    *custody = program.custody;
-                    return Ok((program.value, true));
+            (None, None) => match self {
+                Self::Desugar => {
+                    desugar_queries_and_constraints_with_owner(program, &mut None, None)
                 }
-                let program = match scope.as_deref_mut() {
-                    Some(scope) => {
-                        crate::list_normalize::normalize_list_builtins_owned_with_allocation_owner(
-                            program, scope,
-                        )?
-                    }
-                    None => normalize_list_builtins_owned(program)?,
-                };
-                Ok((program, false))
-            }
-            Self::Magic => {
-                if let (Some(scope), Some(custody)) = (scope.as_deref_mut(), custody) {
-                    let rewritten = crate::magic_sets::rewrite_magic_sets_retained(
-                        crate::program_custody::RetainedProgram {
-                            value: program,
-                            custody: std::mem::take(custody),
-                        },
-                        scope,
-                    )?;
+                Self::Meta => normalize_meta_builtins_owned(program),
+                Self::List => normalize_list_builtins_owned(program),
+                Self::Magic => {
+                    let rewritten = rewrite_magic_sets_owned(program)?;
                     drop(rewritten.report);
-                    *custody = rewritten.program.custody;
-                    return Ok((rewritten.program.value, true));
+                    Ok(rewritten.program)
                 }
-                let rewritten = match scope.as_deref_mut() {
-                    Some(scope) => {
-                        crate::magic_sets::rewrite_magic_sets_owned_with_allocation_owner(
-                            program, scope,
-                        )?
-                    }
-                    None => rewrite_magic_sets_owned(program)?,
-                };
-                // Disabled and declined rewriting return the exact consumed
-                // input. The report drops before this pass's scratch scope.
-                let identity = matches!(
-                    rewritten.report.status,
-                    crate::magic_sets::MagicSetStatus::Disabled
-                        | crate::magic_sets::MagicSetStatus::Declined
-                );
-                Ok((rewritten.program, identity))
-            }
+            },
+            _ => unreachable!("canonical frontend allocation custody"),
         }
     }
 }
@@ -1529,34 +1501,23 @@ fn run_frontend_passes_with_owner(
     ] {
         input = match (input, scope.as_deref_mut()) {
             (CompilationValue::Unowned(program), None) => {
-                let (program, _) = pass.run(program, &mut None, None)?;
+                let program = pass.run(program, &mut None, None)?;
                 CompilationValue::Unowned(program)
             }
             (CompilationValue::Owned(mut input), Some(scope)) => {
                 let mut stage = scope.child_scope();
-                let (program, custody_transferred) = pass.run(
+                let program = pass.run(
                     input.value,
                     &mut Some(&mut stage),
                     Some(&mut input.allocation_owner),
                 )?;
-                if custody_transferred {
-                    // The pass either preserves the consumed input or moves
-                    // its original typed custody with every surviving field.
-                    drop(stage);
-                    CompilationValue::Owned(CompilationOutput {
-                        value: program,
-                        allocation_owner: input.allocation_owner,
-                    })
-                } else {
-                    // Unpartitioned leaf collectors cannot separate surviving
-                    // AST buffers from normalizer scratch. Reserve the one
-                    // actual survivor clone while every old owner is live.
-                    let output = clone_compilation_program(&program, &mut stage)?;
-                    drop(program);
-                    drop(stage);
-                    drop(input.allocation_owner);
-                    CompilationValue::Owned(output)
-                }
+                // Every pass returns real data with its original typed custody;
+                // only the pass's independent scratch scope retires here.
+                drop(stage);
+                CompilationValue::Owned(CompilationOutput {
+                    value: program,
+                    allocation_owner: input.allocation_owner,
+                })
             }
             _ => unreachable!("canonical frontend allocation custody"),
         };
