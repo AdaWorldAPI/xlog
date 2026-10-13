@@ -197,7 +197,9 @@ range and reservation. It does not copy the bytes or create another permission.
 `Some(admission)` only after its original signed record is confirmed. Applying the
 transition requires that Admission; the receiving Session also checks its own
 memory pool. `SemanticLearningPhaseRecord` retains the real owner and exposes its
-ordered operations through the borrowed `recipe()` getter. Cloning records
+ordered operations and retained Admission through the borrowed `recipe()` and
+`admission()` getters. Neither retained field can be replaced to detach the
+original allocation guard while the other remains live. Cloning records
 or checkpoint proofs shares Admission, and bounded history decoding keeps a
 checked view of the original checkpoint. The serialized history and signed-byte
 comparisons are unchanged. Recipe and other metadata allocations still require

@@ -86,13 +86,17 @@ pub struct SemanticLearningPhaseRecord {
     pub completed_updates: u64,
     pub recipe_digest: Identity256,
     recipe: Arc<[SemanticLearningCopyReset]>,
-    pub admission: SemanticLearningPhaseAdmission,
+    admission: SemanticLearningPhaseAdmission,
     _metadata: Option<Arc<SemanticReplayMaterialReservation>>,
 }
 
 impl SemanticLearningPhaseRecord {
     pub fn recipe(&self) -> &[SemanticLearningCopyReset] {
         &self.recipe
+    }
+
+    pub fn admission(&self) -> &SemanticLearningPhaseAdmission {
+        &self.admission
     }
 }
 

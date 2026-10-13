@@ -37135,10 +37135,10 @@ impl SemanticTransitionSession {
         add(1, 4)?;
         for phase in history {
             u32::try_from(phase.recipe().len()).map_err(|_| SemanticTransitionError::GenerationExhausted)?;
-            u32::try_from(phase.admission.len()).map_err(|_| SemanticTransitionError::GenerationExhausted)?;
+            u32::try_from(phase.admission().len()).map_err(|_| SemanticTransitionError::GenerationExhausted)?;
             add(1, 7 * 8 + 4 * 32 + 4 + 4)?;
             add(phase.recipe().len(), 5 * 8)?;
-            add(phase.admission.len(), 1)?;
+            add(phase.admission().len(), 1)?;
         }
         Ok(extent)
     }
@@ -37548,7 +37548,7 @@ impl SemanticTransitionSession {
             )?;
             // The retained histories share their original admission owner.
             // Encoding still retains the history buffer and final wire bytes.
-            add(phase.admission.len() as u64, 2)?;
+            add(phase.admission().len() as u64, 2)?;
         }
         // Fixed publication ABI fields and count prefixes coexist with the
         // graph prefix; the graph encoder's requested bound is counted above.

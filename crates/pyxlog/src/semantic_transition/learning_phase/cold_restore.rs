@@ -842,7 +842,7 @@ fn require_executed_lineage_records<'a>(
         .ok_or_else(|| invalid("phase checkpoint lacks its original executed native transition"))?;
     if added
         .iter()
-        .any(|record| record.admission.as_bytes() != admission)
+        .any(|record| record.admission().as_bytes() != admission)
         || added.first().is_some_and(|first| {
             first.source != source_phase || recipe_material(first) != recipe_bytes
         })
@@ -2266,7 +2266,7 @@ impl CheckpointCustody {
             } else {
                 phases
                     .last()
-                    .is_some_and(|phase| phase.admission.as_bytes() == closure.admission.as_ref())
+                    .is_some_and(|phase| phase.admission().as_bytes() == closure.admission.as_ref())
             };
             if !valid {
                 return Err(invalid(
