@@ -61,7 +61,9 @@ impl ReplayPayload {
 
     pub(super) fn original_loaded(&self) -> PyResult<xlog_cuda::SemanticReplayLoadedMaterial> {
         self.payload.require_budget(&self.source()?.native_budget()?).map_err(xlog_err)?;
-        Ok(self.payload.clone())
+        self.payload
+            .slice_payload(0..self.payload.as_bytes().len())
+            .map_err(xlog_err)
     }
 }
 
@@ -845,7 +847,8 @@ impl MaterialSourceRegistry {
     ) -> PyResult<xlog_cuda::SemanticReplayLoadedMaterial> {
         let payload = self.resolve_carrier(py, reference)?;
         let budget = self.native_budget()?;
-        payload.borrow(py).original_loaded(&budget)
+        let loaded = payload.borrow(py).original_loaded(&budget);
+        loaded
     }
 
     pub(super) fn resolve_carrier(

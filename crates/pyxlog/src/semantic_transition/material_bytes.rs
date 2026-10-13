@@ -874,8 +874,9 @@ impl PySemanticMaterialWriter {
             .task_use
             .borrow(py)
             .require_original_identity(&owner)?;
+        let lease = published.lease()?;
         let binding = owner
-            .published_state_observation_binding(&published.lease()?)
+            .published_state_observation_binding(&*lease)
             .map_err(xlog_err)?;
         let mut origin = self
             .origin

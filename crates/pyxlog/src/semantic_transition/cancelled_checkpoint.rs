@@ -439,7 +439,13 @@ impl OriginalCancelledCheckpointCustody {
         };
         let handoff = Py::new(
             py,
-            material_bytes::PySemanticMaterialBytes::from_native(py, sealed.clone(), &self.budget)?,
+            material_bytes::PySemanticMaterialBytes::from_native(
+                py,
+                sealed
+                    .slice_payload(0..sealed.as_bytes().len())
+                    .map_err(xlog_err)?,
+                &self.budget,
+            )?,
         )?;
         completion.handoff = Some(handoff.clone_ref(py));
         Ok(Some(handoff))

@@ -2801,7 +2801,7 @@ impl PySemanticTransitionSession {
         // task, signing, export or writer mutex held across Python execution.
         let result = serializer.bind(py).call1((writer.clone_ref(py),)).and_then(|model| {
             writer.borrow(py).require_sealed_material(py, &model)?;
-            model.extract::<Py<material_bytes::PySemanticMaterialBytes>>()
+            Ok(model.extract::<Py<material_bytes::PySemanticMaterialBytes>>()?)
         });
         let mut original = pending.lock().map_err(|_| invalid("checkpoint export custody is poisoned"))?;
         match result {
@@ -4632,7 +4632,8 @@ impl PySemanticSegmentInstructionAdmission {
         }
         if private.is_some() {
             let work_ref = work.borrow(py);
-            let reader = work_ref.reader.borrow(py);
+            let custody = work_ref.custody(py)?;
+            let reader = custody.reader.borrow(py);
             let source = reader.session.borrow(py);
             if std::ptr::eq(&*source, &*session) {
                 return Err(invalid(
@@ -4646,7 +4647,7 @@ impl PySemanticSegmentInstructionAdmission {
                     &self.inner.inner,
                     &*self.inner.parent.borrow(py).lease()?,
                     &source,
-                    &work_ref.inner,
+                    &custody.inner,
                 )
                 .map_err(xlog_err)?;
         }
@@ -10961,7 +10962,8 @@ impl OriginalActorRefreshAdmission {
             }
             owner
                 .bind_actor_refresh_initial_episodes(prepared.index_identity, &prepared.episodes)
-                .map_err(xlog_err)
+                .map_err(xlog_err)?;
+            Ok(())
         }
     }
 }
@@ -11449,7 +11451,10 @@ impl TaskCheckpointSeed {
                 out.value(&admission.initial_kit)?;
                 out.sequence(admission.replay_limits.len())?;
                 for limit in admission.replay_limits {
-                    out.unsigned(limit)?;
+                    out.unsigned(
+                        u64::try_from(limit)
+                            .map_err(|_| invalid("replay material limit exceeds u64"))?,
+                    )?;
                 }
             } else {
                 out.append(&[0])?;
@@ -15555,11 +15560,12 @@ impl PySemanticPreparedStep {
         let require_frozen_work = || -> PyResult<()> {
             let work_ref = work.borrow(py);
             work_ref.check(py)?;
+            let custody = work_ref.custody(py)?;
             if let Some(private) = &private {
                 private
                     .borrow(py)
                     .require_private_actor_cold_callback(py, &session, &step, &work_ref)?;
-                let reader = work_ref.reader.borrow(py);
+                let reader = custody.reader.borrow(py);
                 let source = reader.session.borrow(py);
                 let owner = session.owner()?;
                 if std::ptr::eq(&*source, &*session) {
@@ -15569,7 +15575,7 @@ impl PySemanticPreparedStep {
                             &*instruction.parent.borrow(py).lease()?,
                             &step.inner,
                             &owner,
-                            &work_ref.inner,
+                            &custody.inner,
                         )
                         .map_err(xlog_err)?;
                 } else {
@@ -15579,7 +15585,7 @@ impl PySemanticPreparedStep {
                             &*instruction.parent.borrow(py).lease()?,
                             &step.inner,
                             &*source.owner()?,
-                            &work_ref.inner,
+                            &custody.inner,
                         )
                         .map_err(xlog_err)?;
                 }
@@ -15590,7 +15596,7 @@ impl PySemanticPreparedStep {
                         &instruction.inner,
                         &*instruction.parent.borrow(py).lease()?,
                         &step.inner,
-                        &work_ref.inner,
+                        &custody.inner,
                     )
                     .map_err(xlog_err)?;
             }
@@ -23534,10 +23540,12 @@ impl PySemanticTransitionController {
                 snapshot.newer_than(&state.snapshot)?;
                 let phase = checkpoint_task_phase(&state)?;
                 match &phase {
-                    CheckpointTaskPhase::Imported | CheckpointTaskPhase::InitialPrefillBound =>
-                        task_use.authority.check_snapshot(&snapshot)?,
-                    CheckpointTaskPhase::Segment(operation) =>
-                        task_use.authority.check_use(operation, &snapshot, false)?,
+                    CheckpointTaskPhase::Imported | CheckpointTaskPhase::InitialPrefillBound => {
+                        task_use.authority.check_snapshot(&snapshot)?;
+                    }
+                    CheckpointTaskPhase::Segment(operation) => {
+                        task_use.authority.check_use(operation, &snapshot, false)?;
+                    }
                 }
                 let metadata = material_bytes::reserve_material_metadata(&pool,
                     snapshot.canonical.len().checked_add(state.snapshot.canonical.len())
@@ -23586,7 +23594,8 @@ impl PySemanticTransitionController {
             let material_bytes::CheckpointExportOrigin::Published(binding) = &original.origin else {
                 return Err(invalid("checkpoint continuation changed its original publication producer"));
             };
-            session.owner()?.require_published_state_observation_binding(&parent.lease()?, binding).map_err(xlog_err)?;
+            let lease = parent.lease()?;
+            session.owner()?.require_published_state_observation_binding(&*lease, binding).map_err(xlog_err)?;
         }
         session.prepare_checkpoint_writer(py, &pool, &pending, || {
             let original = pending.lock().map_err(|_| invalid("checkpoint export custody is poisoned"))?;
