@@ -1022,7 +1022,8 @@ impl PrivateReplayChildCustody {
             if original.scope.as_ref().is_none_or(|scope| !Arc::ptr_eq(scope, &retained.scope)) || retained.task_use.as_ptr() != self.task.as_ptr() {
                 return Err(invalid("SOURCE target changed its original prepared scope"));
             }
-            retained.steps.get(self.step_index).ok_or_else(|| invalid("SOURCE target lost its original Update"))?.borrow(py).inner.clone()
+            let step = retained.steps.get(self.step_index).ok_or_else(|| invalid("SOURCE target lost its original Update"))?.borrow(py).inner.clone();
+            step
         };
         if original.native_steps.get(self.step_index).is_none_or(|target| !target.same_handle(&step)) {
             return Err(invalid("SOURCE target changed its original native instruction member"));

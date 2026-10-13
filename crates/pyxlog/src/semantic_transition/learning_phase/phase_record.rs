@@ -184,7 +184,7 @@ pub(super) fn lifecycle_payloads<'a>(
         ));
     }
     let mut inputs = RecordReader(&admission[INPUT_DOMAIN.len()..]);
-    for _ in 0..8 {
+    for _ in 0..7 {
         inputs.field()?;
     }
     if inputs.field()? != limits.encode() {
@@ -221,7 +221,9 @@ pub(super) struct PreparedRecordOutput {
 impl PreparedRecordOutput {
     fn finish(&mut self, key: &SigningKey) -> PyResult<xlog_cuda::SemanticReplayLoadedMaterial> {
         if let Some(record) = &self.record {
-            return Ok(record.clone());
+            return record
+                .slice_payload(0..record.as_bytes().len())
+                .map_err(xlog_err);
         }
         let body = self.output.seal_frame_body().map_err(xlog_err)?;
         if !self.signature_written {
@@ -237,8 +239,11 @@ impl PreparedRecordOutput {
             self.signature_written = true;
         }
         let record = self.output.seal_frame().map_err(xlog_err)?;
-        self.record = Some(record.clone());
-        Ok(record)
+        let retained = record
+            .slice_payload(0..record.as_bytes().len())
+            .map_err(xlog_err)?;
+        self.record = Some(record);
+        Ok(retained)
     }
 }
 
@@ -344,13 +349,16 @@ impl PhaseRecords {
                 "checkpoint issuer requires known full signed Delivery readback",
             ));
         }
+        let admission = self
+            .admission
+            .as_ref()
+            .ok_or_else(|| invalid("known Delivery lost its original native Admission"))?;
         Ok((
             self.phase_id,
             self.previous,
-            self.admission
-                .as_ref()
-                .cloned()
-                .ok_or_else(|| invalid("known Delivery lost its original native Admission"))?,
+            admission
+                .slice_payload(0..admission.as_bytes().len())
+                .map_err(xlog_err)?,
         ))
     }
 
@@ -371,10 +379,13 @@ impl PhaseRecords {
     /// native writes. Scientific acceptance is not obtained before those writes.
     pub(super) fn confirmed_admission(&self) -> PyResult<xlog_cuda::SemanticReplayLoadedMaterial> {
         self.require_preparation_admission()?;
-        self.admission
+        let admission = self
+            .admission
             .as_ref()
-            .cloned()
-            .ok_or_else(|| invalid("private phase lost its original confirmed native admission"))
+            .ok_or_else(|| invalid("private phase lost its original confirmed native admission"))?;
+        admission
+            .slice_payload(0..admission.as_bytes().len())
+            .map_err(xlog_err)
     }
 
     /// A confirmed original pin may still precede the first admission write.
@@ -591,29 +602,50 @@ impl PhaseRecords {
             .checked_add(attempt.bytes.as_bytes().len() as u64)
             .ok_or_else(|| invalid("phase record total size overflowed"))?;
         self.previous = attempt.digest;
+        let attempt = self
+            .attempt
+            .take()
+            .expect("confirmed original record attempt");
         match attempt.kind {
-            RecordKind::Admission => self.admission = Some(attempt.bytes.clone()),
+            RecordKind::Admission => self.admission = Some(attempt.bytes),
             RecordKind::PreparationOutcome => {
                 self.preparation_outcome_known = true;
-                self.preparation_record = Some(attempt.bytes.clone());
+                self.preparation_record = Some(attempt.bytes);
             }
             RecordKind::Delivery => {
                 self.delivery_known = true;
-                self.delivery_record = Some(attempt.bytes.clone());
+                self.delivery_record = Some(attempt.bytes);
             }
             RecordKind::TerminalRefusal => {
                 self.refusal_known = true;
-                self.refusal_record = Some(attempt.bytes.clone());
+                self.refusal_record = Some(attempt.bytes);
             }
         }
-        self.attempt = None;
         Ok(())
     }
 
     pub(super) fn completed_lifecycle(
         &self,
     ) -> PyResult<([Option<xlog_cuda::SemanticReplayLoadedMaterial>; 3], usize)> {
-        let admission = self.confirmed_admission()?;
+        let prepared = self.preparation_record.is_some();
+        if !self.issuer_pinned
+            || self.attempt.is_some()
+            || self.delivery_known == self.refusal_known
+            || self.preparation_outcome_known != prepared
+            || self.ordinal != if prepared { 3 } else { 2 }
+            || self.delivery_known && !prepared
+        {
+            return Err(invalid(
+                "phase closure requires its complete original terminal readback",
+            ));
+        }
+        let admission = self
+            .admission
+            .as_ref()
+            .ok_or_else(|| invalid("phase closure lost its original confirmed admission"))?;
+        let admission = admission
+            .slice_payload(0..admission.as_bytes().len())
+            .map_err(xlog_err)?;
         let completion = if self.refusal_known {
             self.refusal_record.as_ref()
         } else if self.delivery_known {
@@ -623,11 +655,16 @@ impl PhaseRecords {
                 "phase closure precedes known terminal record readback",
             ));
         }
-        .ok_or_else(|| invalid("phase closure lost its original terminal signed record"))?
-        .clone();
+        .ok_or_else(|| invalid("phase closure lost its original terminal signed record"))?;
+        let completion = completion
+            .slice_payload(0..completion.as_bytes().len())
+            .map_err(xlog_err)?;
         if let Some(preparation) = &self.preparation_record {
+            let preparation = preparation
+                .slice_payload(0..preparation.as_bytes().len())
+                .map_err(xlog_err)?;
             Ok((
-                [Some(admission), Some(preparation.clone()), Some(completion)],
+                [Some(admission), Some(preparation), Some(completion)],
                 3,
             ))
         } else {

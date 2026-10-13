@@ -947,12 +947,14 @@ impl PySemanticLearningPhaseTransition {
             if refusal.private_save_verified {
                 return Ok(());
             }
+            let checkpoint = refusal
+                .private_checkpoint
+                .as_ref()
+                .ok_or_else(|| invalid("cancelled save lacks its original canonical return"))?;
             (
-                refusal
-                    .private_checkpoint
-                    .as_ref()
-                    .ok_or_else(|| invalid("cancelled save lacks its original canonical return"))?
-                    .clone(),
+                checkpoint
+                    .slice_payload(0..checkpoint.as_bytes().len())
+                    .map_err(xlog_err)?,
                 current.owners()?.parent.clone_ref(py),
                 current.owners()?.task.clone_ref(py),
                 current.regions[current.private_snapshot_region()].clone_ref(py),
@@ -965,6 +967,7 @@ impl PySemanticLearningPhaseTransition {
             .require_closed_cold_model_work_region(
                 region
                     .borrow(py)
+                    .custody(py)?
                     .region
                     .as_ref()
                     .expect("original full private save region"),
@@ -1167,6 +1170,7 @@ impl PySemanticLearningPhaseTransition {
             .require_closed_cold_model_work_region(
                 region
                     .borrow(py)
+                    .custody(py)?
                     .region
                     .as_ref()
                     .expect("original private retirement region"),
@@ -1356,6 +1360,7 @@ impl PySemanticLearningPhaseTransition {
             .require_closed_cold_model_work_region(
                 region
                     .borrow(py)
+                    .custody(py)?
                     .region
                     .as_ref()
                     .expect("original cancelled execution cleanup region"),
@@ -1475,7 +1480,12 @@ impl PySemanticLearningPhaseTransition {
             .expect("original cancellation")
             .private_checkpoint
             .as_ref()
-            .cloned();
+            .map(|checkpoint| {
+                checkpoint
+                    .slice_payload(0..checkpoint.as_bytes().len())
+                    .map_err(xlog_err)
+            })
+            .transpose()?;
         let expected_expense = if let Some(private) = private {
             let private_manifest = SemanticCheckpointManifest::decode_borrowed(private.as_bytes())?;
             let (private_seed, _, _, _) = TaskCheckpointSeed::decode(&private_manifest.task)?;
@@ -1712,7 +1722,15 @@ impl PySemanticLearningPhaseTransition {
                         let history =
                             Arc::clone(refusal.history.as_ref().expect("known terminal history"));
                         let cause = refusal.cause;
-                        let private = refusal.private_checkpoint.clone();
+                        let private = refusal
+                            .private_checkpoint
+                            .as_ref()
+                            .map(|checkpoint| {
+                                checkpoint
+                                    .slice_payload(0..checkpoint.as_bytes().len())
+                                    .map_err(xlog_err)
+                            })
+                            .transpose()?;
                         drop(retained);
                         let snapshot = self.task_use.borrow(py).state()?.snapshot.canonical.clone();
                         let reason = reason.canonical_bytes();
@@ -1794,7 +1812,7 @@ impl PySemanticLearningPhaseTransition {
         drop(retained);
         let material_sources = Arc::clone(&self.task_use.borrow(py).checkpoint.material_sources);
         let source_issuer = self
-            .session
+            .source
             .borrow(py)
             .checkpoint_custody()?
             .as_ref()
@@ -1852,7 +1870,9 @@ impl PySemanticLearningPhaseTransition {
             ),
             material_bytes::PySemanticMaterialBytes::from_native(
                 py,
-                record.clone(),
+                record
+                    .slice_payload(0..record.as_bytes().len())
+                    .map_err(xlog_err)?,
                 &self
                     .task_use
                     .borrow(py)
@@ -1989,11 +2009,12 @@ impl PySemanticLearningPhaseTransition {
             .get(2)
             .ok_or_else(|| invalid("cancelled evaluation lost its original cleanup region"))?
             .borrow(py);
+        let cleanup_custody = cleanup.custody(py)?;
         self.source
             .borrow(py)
             .owner()?
             .cancel_cold_model_work_evaluation_cleanup(
-                cleanup
+                cleanup_custody
                     .region
                     .as_ref()
                     .expect("original evaluation cleanup"),
@@ -2030,9 +2051,10 @@ impl PySemanticLearningPhaseTransition {
                 .get(2)
                 .ok_or_else(|| invalid("phase evaluation lost its original cleanup region"))?
                 .borrow(py);
+            let cleanup_custody = cleanup.custody(py)?;
             let source = self.source.borrow(py);
             let parent = current.owners()?.parent.borrow(py);
-            let region = cleanup
+            let region = cleanup_custody
                 .region
                 .as_ref()
                 .expect("original evaluation cleanup");

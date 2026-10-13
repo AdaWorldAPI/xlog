@@ -73,23 +73,15 @@ impl PySemanticLearningPhaseTransition {
             {
                 return Err(invalid("final handoff precedes known checkpoint accounting or changed its selected owners"));
             }
-            (
-                current
-                    .saved
-                    .as_ref()
-                    .ok_or_else(|| invalid("final handoff lost its saved full checkpoint"))?
-                    .borrow(py)
-                    .original_loaded(
-                        &current
-                            .owners
-                            .task
-                            .borrow(py)
-                            .checkpoint
-                            .material_sources
-                            .native_budget()?,
-                    )?,
-                current.ordinal,
-            )
+            let task = current.owners.task.borrow(py);
+            let budget = task.checkpoint.material_sources.native_budget()?;
+            let checkpoint = current
+                .saved
+                .as_ref()
+                .ok_or_else(|| invalid("final handoff lost its saved full checkpoint"))?
+                .borrow(py)
+                .original_loaded(&budget)?;
+            (checkpoint, current.ordinal)
         };
         let next = self.scientific_owner.bind(py).getattr("next_operation")?;
         if !next.is_exact_instance_of::<PyTuple>() {

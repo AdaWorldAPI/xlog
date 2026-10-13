@@ -5871,6 +5871,10 @@ trait PublicationByteStorage:
     fn slice_bytes(&self, range: std::ops::Range<usize>) -> Result<Self, SemanticTransitionError>;
     fn copy_owned(&self) -> Result<Self, SemanticTransitionError>;
     fn writable_bytes(&mut self) -> Result<&mut [u8], SemanticTransitionError>;
+    fn into_learning_phase_admission(
+        self,
+    ) -> Result<SemanticLearningPhaseAdmission, SemanticTransitionError>;
+    fn learning_admission_decode_bound(bytes: usize) -> Result<usize, SemanticTransitionError>;
     fn reserve_decode(&self, _bytes: usize) -> Result<(), SemanticTransitionError> {
         Ok(())
     }
@@ -5890,6 +5894,17 @@ impl PublicationByteStorage for Vec<u8> {
     }
     fn writable_bytes(&mut self) -> Result<&mut [u8], SemanticTransitionError> {
         Ok(self.as_mut_slice())
+    }
+    fn into_learning_phase_admission(
+        self,
+    ) -> Result<SemanticLearningPhaseAdmission, SemanticTransitionError> {
+        SemanticLearningPhaseAdmission::from_decoded(self.into())
+    }
+    fn learning_admission_decode_bound(bytes: usize) -> Result<usize, SemanticTransitionError> {
+        bytes
+            .checked_add(size_of::<PublicationMaterialBytesOwner>())
+            .and_then(|bytes| bytes.checked_add(2 * size_of::<usize>()))
+            .ok_or(SemanticTransitionError::GenerationExhausted)
     }
 }
 
@@ -6331,6 +6346,73 @@ pub struct SemanticReplayLoadedMaterial {
     decoded: Option<OwnedPublicationMaterial>,
 }
 
+/// The original immutable signed learning admission and its retained byte owner.
+/// Sharing this view preserves the same allocation and capacity reservations.
+#[derive(Clone)]
+pub struct SemanticLearningPhaseAdmission {
+    bytes: PublicationMaterialBytes,
+}
+
+impl SemanticLearningPhaseAdmission {
+    pub fn from_loaded(
+        loaded: SemanticReplayLoadedMaterial,
+        budget: &SemanticReplayMaterialBudget,
+    ) -> Result<Self, SemanticTransitionError> {
+        loaded.require_budget(budget)?;
+        Self::from_decoded(loaded.bytes)
+    }
+
+    fn from_decoded(bytes: PublicationMaterialBytes) -> Result<Self, SemanticTransitionError> {
+        if bytes.is_empty() {
+            return Err(publication_input_error(
+                "learning admission requires its original nonempty signed material",
+            ));
+        }
+        Ok(Self { bytes })
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    fn require_budget(
+        &self,
+        budget: &SemanticReplayMaterialBudget,
+    ) -> Result<(), SemanticTransitionError> {
+        if self.bytes.budget().is_none_or(|original| !original.same_pool(budget)) {
+            return Err(publication_input_error(
+                "learning admission changed its original capacity pool",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for SemanticLearningPhaseAdmission {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SemanticLearningPhaseAdmission")
+            .field("bytes", &self.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for SemanticLearningPhaseAdmission {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl Eq for SemanticLearningPhaseAdmission {}
+
 /// Original authenticated append bytes and their live shared-pool custody.
 pub struct SemanticReplayAppendRows {
     rows: Vec<Vec<u8>>,
@@ -6562,24 +6644,6 @@ impl SemanticReplayStateMaterialProof {
                         .ok_or(SemanticTransitionError::GenerationExhausted)?,
                 )
                 .ok_or(SemanticTransitionError::GenerationExhausted)?;
-        }
-        for phase in &material.learning_phases {
-            for (count, width) in [
-                (phase.recipe.len(), size_of::<SemanticLearningCopyReset>()),
-                (phase.admission.len(), 1),
-            ] {
-                bytes = bytes
-                    .checked_add(
-                        u64::try_from(count)
-                            .map_err(|_| SemanticTransitionError::GenerationExhausted)?
-                            .checked_mul(
-                                u64::try_from(width)
-                                    .map_err(|_| SemanticTransitionError::GenerationExhausted)?,
-                            )
-                            .ok_or(SemanticTransitionError::GenerationExhausted)?,
-                    )
-                    .ok_or(SemanticTransitionError::GenerationExhausted)?;
-            }
         }
         let reservation = budget.reserve_auxiliary(bytes)?;
         let contract = material.ranges.iter()
@@ -7025,6 +7089,14 @@ impl PublicationByteStorage for PublicationMaterialBytes {
             ));
         };
         Ok(&mut bytes[self.range.clone()])
+    }
+    fn into_learning_phase_admission(
+        self,
+    ) -> Result<SemanticLearningPhaseAdmission, SemanticTransitionError> {
+        SemanticLearningPhaseAdmission::from_decoded(self)
+    }
+    fn learning_admission_decode_bound(_bytes: usize) -> Result<usize, SemanticTransitionError> {
+        Ok(0)
     }
     fn reserve_decode(&self, bytes: usize) -> Result<(), SemanticTransitionError> {
         let Some(budget) = self.budget() else {
@@ -10621,6 +10693,7 @@ impl<B: PublicationByteStorage> PublicationMaterialStorage<B> {
             .map_err(SemanticTransitionError::Semantic)?;
         add(history, size_of::<SemanticLearningPhaseRecord>())?;
         for _ in 0..history {
+            add(2, size_of::<usize>())?;
             reader
                 .take(7 * 8 + 4 * 32)
                 .map_err(SemanticTransitionError::Semantic)?;
@@ -10638,13 +10711,8 @@ impl<B: PublicationByteStorage> PublicationMaterialStorage<B> {
                         .ok_or(SemanticTransitionError::GenerationExhausted)?,
                 )
                 .map_err(SemanticTransitionError::Semantic)?;
-            add(
-                reader
-                    .bytes()
-                    .map_err(SemanticTransitionError::Semantic)?
-                    .len(),
-                3,
-            )?;
+            let admission = reader.bytes().map_err(SemanticTransitionError::Semantic)?;
+            add(1, B::learning_admission_decode_bound(admission.len())?)?;
         }
         reader.finish().map_err(SemanticTransitionError::Semantic)?;
         Ok(bound)
@@ -10764,7 +10832,9 @@ impl<B: PublicationByteStorage> PublicationMaterialStorage<B> {
                 bytes: payload,
             });
         }
-        let learning_phases = learning_phase::decode_history(&mut reader)?;
+        let learning_phases = learning_phase::decode_history(&mut reader, |admission| {
+            Self::decoded_byte_view(&owner, bytes, admission)?.into_learning_phase_admission()
+        })?;
         reader.finish().map_err(SemanticTransitionError::Semantic)?;
         let material = Self {
             bank,
@@ -37064,10 +37134,10 @@ impl SemanticTransitionSession {
         u32::try_from(history.len()).map_err(|_| SemanticTransitionError::GenerationExhausted)?;
         add(1, 4)?;
         for phase in history {
-            u32::try_from(phase.recipe.len()).map_err(|_| SemanticTransitionError::GenerationExhausted)?;
+            u32::try_from(phase.recipe().len()).map_err(|_| SemanticTransitionError::GenerationExhausted)?;
             u32::try_from(phase.admission.len()).map_err(|_| SemanticTransitionError::GenerationExhausted)?;
             add(1, 7 * 8 + 4 * 32 + 4 + 4)?;
-            add(phase.recipe.len(), 5 * 8)?;
+            add(phase.recipe().len(), 5 * 8)?;
             add(phase.admission.len(), 1)?;
         }
         Ok(extent)
@@ -37473,10 +37543,12 @@ impl SemanticTransitionSession {
         )?;
         for phase in learning_phases {
             add(
-                phase.recipe.len() as u64,
-                3 * size_of::<SemanticLearningCopyReset>() as u64 + 2 * 5 * 8,
+                phase.recipe().len() as u64,
+                2 * 5 * 8,
             )?;
-            add(phase.admission.len() as u64, 4)?;
+            // The retained histories share their original admission owner.
+            // Encoding still retains the history buffer and final wire bytes.
+            add(phase.admission.len() as u64, 2)?;
         }
         // Fixed publication ABI fields and count prefixes coexist with the
         // graph prefix; the graph encoder's requested bound is counted above.

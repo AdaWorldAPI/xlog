@@ -925,7 +925,16 @@ impl PySemanticLearningPhaseTransition {
     }
 
     pub(super) fn terminal_refusal_outcome(&self, py: Python<'_>) -> PyResult<Option<Py<PyTuple>>> {
-        let record = self.records()?.refusal_record.clone();
+        let record = self
+            .records()?
+            .refusal_record
+            .as_ref()
+            .map(|record| {
+                record
+                    .slice_payload(0..record.as_bytes().len())
+                    .map_err(xlog_err)
+            })
+            .transpose()?;
         let Some(record) = record else {
             return Ok(None);
         };
@@ -946,7 +955,7 @@ impl PySemanticLearningPhaseTransition {
                 PyBytes::new(py, tail.history.as_ref().expect("known terminal history")),
                 material_bytes::PySemanticMaterialBytes::from_native(
                     py,
-                    record.clone(),
+                    record,
                     &self
                         .task_use
                         .borrow(py)
@@ -1256,7 +1265,9 @@ impl PySemanticLearningPhaseTransition {
                 let (selected, checkpoint) = if source_call {
                     (
                         self.model_owner(py, PhaseModelOwner::Source)?,
-                        self.source_checkpoint.clone(),
+                        self.source_checkpoint
+                            .slice_payload(0..self.source_checkpoint.as_bytes().len())
+                            .map_err(xlog_err)?,
                     )
                 } else {
                     let (candidate, checkpoint) = self.candidate(py)?;
@@ -1605,7 +1616,7 @@ impl PySemanticLearningPhaseTransition {
             let parent = reader.borrow(py);
             if !verified && !refusing {
                 let (_, checkpoint) = self.candidate(py)?;
-                let manifest = SemanticCheckpointManifest::decode(&checkpoint)?;
+                let manifest = SemanticCheckpointManifest::decode(checkpoint.as_bytes())?;
                 let (_, saved_snapshot, _, _) = TaskCheckpointSeed::decode(&manifest.task)?;
                 verify_phase_checkpoint(
                     py,
@@ -1700,7 +1711,7 @@ impl PySemanticLearningPhaseTransition {
             arguments.set_item("instruction_bytes", PyBytes::new(py, &instruction))?;
             arguments.set_item("operation_ordinal", ordinal)?;
             arguments.set_item("published_parent", identity.bind(py))?;
-            arguments.set_item("full_checkpoint", PyBytes::new(py, &checkpoint))?;
+            arguments.set_item("full_checkpoint", PyBytes::new(py, checkpoint.as_bytes()))?;
             arguments.set_item("resource_usage", (expenditure, peak, report.model_calls))?;
             self.preparation_inputs
                 .resource_observer

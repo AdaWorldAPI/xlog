@@ -453,7 +453,7 @@ impl PySemanticLearningPhaseTransition {
                 .expect("original retirement registrar")
                 .clone_ref(py)
         };
-        let parent = work.borrow(py).parent.clone_ref(py);
+        let parent = work.borrow(py).custody(py)?.parent()?.clone_ref(py);
         let task = parent.borrow(py).task_use.clone_ref(py);
         if !completed {
             if self

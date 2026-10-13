@@ -1463,7 +1463,7 @@ Full backing allocations, padding, strides, and shared storage are retained;
 conflicting effects on aliases refuse the entire private candidate.
 
 `controller.prepare_learning_phase_transition(task_use, *, parent, recipe, source_checkpoint,
-consumer_streams, snapshot, scientific_owner, scientific_refusal_type, source_model, execute_phase_instruction,
+consumer_streams, snapshot, scientific_owner, scientific_refusal_type, source_model, prepare_checkpoint_writer, execute_phase_instruction,
 release_cancelled_phase_execution, resource_observer, feedback_interventions, learning_grant_ref,
 checkpoint_destination, snapshot_model_state, restore_model,
 snapshot_restored_model, retire_restored_model, cancelled_retirement_context, retire_source_model,
@@ -1481,6 +1481,7 @@ grant covering the complete dependency closure; fast-adaptation permission alone
 cannot authorize this durable full checkpoint. Fresh publication, data-use,
 retention and revocation checks remain independent of scientific acceptance.
 The pending owner retains the exact original `source_model`, callable
+`prepare_checkpoint_writer`, callable
 `execute_phase_instruction`, callable `release_cancelled_phase_execution`,
 named `xlog.resource_observer.v2` capsule and
 `feedback_interventions` tuple before entering the original issuer/store callbacks.
@@ -1750,14 +1751,25 @@ continuation cannot repeat an entered comparison.
 Private copy/reset and folding instead consume the exact signed Admission
 after its original issuer pin and durable readback. The canonical restore
 checks the original pending, full source bytes, complete recipe and that same
-Admission before allocation. Native phase lineage retains those original
-Admission bytes, not an early assertion of scientific success. Native publication
+Admission before allocation. Native phase lineage shares the original loaded
+Admission's immutable byte allocation, exact range and memory reservation through
+the transition, record, Session and checkpoint proof. It checks the receiving
+Session's original memory pool before applying the recipe. An unbound recipe has
+no Admission; empty bytes cannot authorize it. These owners remain retained during
+unknown completion and until their last consumer retires. Sharing Admission does
+not assert scientific success. Native publication
 material now uses format 3; format 2 is not reinterpreted as admission-bearing
 material. The signed preparation outcome holds three length-prefixed materials:
 the unchanged full final checkpoint, its original scientific history, and the
 acceptance bytes. Acceptance stays outside the checkpoint whose bytes it binds.
 Cold recovery consumes these same original records in the canonical loader
-described above. A preparation outcome is not a complete signed Delivery;
+described above. After authenticating allocation, range and memory pool, it retains
+the first nested native checkpoint proof outside the byte owner and reuses it for
+later lineage and identity reads. Cache storage is reserved before allocation.
+A decode error cannot be retried, and another range of the same byte owner cannot
+evade its single-decoder guard. Keeping the proof outside the byte owner avoids a
+cycle through the proof's retained Admission history.
+A preparation outcome is not a complete signed Delivery;
 refusing an incomplete prefix does not complete the scientific executor or
 establish its whole-operation work, backing memory or GPU transfer evidence.
 
@@ -2078,6 +2090,12 @@ Native binds the original complete source checkpoint, `frozen_program_bytes`, fu
 five-field recipe, original grant, destination, both original feedback intervention
 materials and exact storage limits to a
 deterministic 32-byte `pending.phase_id`. The same inputs identify the same attempt.
+The signed input contains those seven length-prefixed fields in that order, then
+the unchanged encoded `RecordLimits`. Every reader checks the limits and the end
+of the input. There is no caller-selected cold-work capacity field or replacement
+default; a record with that extra field is rejected. Checkpoint-source byte limits
+remain independent. Native admits the complete operation plan once and derives
+its cold-work capacity before allocating the plan's storage.
 `frozen_program_bytes` must exactly match the scientific owner's `program_bytes`
 before the signed admission is issued;
 native neither synthesizes a program nor interprets a shorter program as equivalent.

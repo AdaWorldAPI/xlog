@@ -290,6 +290,23 @@ impl SemanticTransitionSession {
         }
     }
 
+    fn require_learning_phase_admission(
+        &self,
+        transition: Option<&SemanticLearningPhaseTransition>,
+    ) -> Result<(), SemanticTransitionError> {
+        if let Some(transition) = transition {
+            let admission = transition.admission.as_ref().ok_or_else(|| {
+                publication_input_error(
+                    "learning transition requires its original admitted material",
+                )
+            })?;
+            let budget = self.replay_material_budget.as_ref()
+                .ok_or(SemanticTransitionError::NotBound)?;
+            admission.require_budget(budget)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn restore_state_material_inner(
         &mut self,
         bytes: &[u8],
@@ -297,6 +314,7 @@ impl SemanticTransitionSession {
         immutable_models: Option<RestoredModelOwners<'_>>,
     ) -> Result<Option<SemanticPublishedIdentity>, SemanticTransitionError> {
         self.require_state_material_restore_entry()?;
+        self.require_learning_phase_admission(transition)?;
         if self.replay_material_budget.is_some() {
             return Err(publication_input_error(
                 "bounded state restoration requires its original loaded material",
@@ -343,6 +361,7 @@ impl SemanticTransitionSession {
         >,
     ) -> Result<Option<SemanticPublishedIdentity>, SemanticTransitionError> {
         self.require_state_material_restore_entry()?;
+        self.require_learning_phase_admission(transition)?;
         let budget = self.replay_material_budget.as_ref().ok_or_else(|| {
             publication_input_error("loaded restoration requires its original capacity pool")
         })?;
@@ -390,7 +409,7 @@ impl SemanticTransitionSession {
 
     fn restore_decoded_state_material_original(
         &mut self,
-        mut material: OwnedPublicationMaterial,
+        material: OwnedPublicationMaterial,
         source_digest: Identity256,
         transition: Option<&SemanticLearningPhaseTransition>,
         immutable_models: Option<RestoredModelOwners<'_>>,
@@ -398,12 +417,17 @@ impl SemanticTransitionSession {
             SemanticPreparedResidentModelRestoration,
         >,
     ) -> Result<Option<SemanticPublishedIdentity>, SemanticTransitionError> {
+        // Keep the outside-array receipt alive through every local material
+        // error drop, then transfer it behind the retained material's data.
+        let mut phase_metadata: Option<Arc<SemanticReplayMaterialReservation>> = None;
+        let mut material = material;
         if self.state_material_restore.is_some() {
             return Err(publication_input_error(
                 "original state restoration is already retained; resolve that owner",
             ));
         }
         self.require_state_material_restore_entry()?;
+        self.require_learning_phase_admission(transition)?;
         #[cfg(feature = "semantic-policy")]
         let resident_prelude = resident_restoration
             .as_ref()
@@ -433,6 +457,28 @@ impl SemanticTransitionSession {
             return Err(publication_input_error(
                 "actor context cannot apply a learning-phase fold",
             ));
+        }
+        if let Some(transition) = transition {
+            let budget = self.replay_material_budget.as_ref()
+                .ok_or(SemanticTransitionError::NotBound)?;
+            let bytes = learning_phase::record_allocation_bound(
+                &transition.recipe,
+                material.learning_phases.len(),
+                material.learning_phases.capacity(),
+            )?;
+            phase_metadata = Some(Arc::new(budget.reserve_auxiliary(bytes)?));
+            material.learning_phases.try_reserve_exact(1)
+                .map_err(|_| publication_input_error("learning history allocation failed"))?;
+        } else if let Some(budget) = self.replay_material_budget.as_ref() {
+            if !material.learning_phases.is_empty() {
+                let bytes = material.learning_phases.len()
+                    .checked_mul(size_of::<SemanticLearningPhaseRecord>())
+                    .and_then(|bytes| bytes.checked_add(size_of::<SemanticReplayMaterialReservation>() + 2 * size_of::<usize>()))
+                    .ok_or(SemanticTransitionError::GenerationExhausted)?;
+                phase_metadata = Some(Arc::new(budget.reserve_auxiliary(
+                    u64::try_from(bytes).map_err(|_| SemanticTransitionError::GenerationExhausted)?,
+                )?));
+            }
         }
         if retain_current_models {
             let coverage = material
@@ -468,7 +514,8 @@ impl SemanticTransitionSession {
         let mut rng = header.rng_binding()?;
         let mut fold = None;
         if let Some(transition) = transition {
-            let (record, absorption) = transition.apply(&mut material)?;
+            let metadata = phase_metadata.as_ref().expect("original learning history allocation");
+            let (record, absorption) = transition.apply(&mut material, Arc::clone(metadata))?;
             material.learning_phases.push(record);
             fold = absorption;
         }
@@ -576,6 +623,7 @@ impl SemanticTransitionSession {
                 append_next: 0,
                 result: None,
                 poisoned: false,
+                _phase_metadata: phase_metadata,
             }),
         });
         #[cfg(feature = "semantic-policy")]
@@ -1543,6 +1591,8 @@ struct StateMaterialRestore {
     append_next: usize,
     result: Option<SemanticPublishedIdentity>,
     poisoned: bool,
+    // Data fields, including the grown history array, drop before this receipt.
+    _phase_metadata: Option<Arc<SemanticReplayMaterialReservation>>,
 }
 
 impl SemanticTransitionSession {

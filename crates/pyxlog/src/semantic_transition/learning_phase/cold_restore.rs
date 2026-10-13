@@ -56,6 +56,35 @@ struct BoundCheckpointContext<'a> {
     original: xlog_cuda::SemanticReplayLoadedMaterial,
     records: [Option<xlog_cuda::SemanticReplayLoadedMaterial>; 3],
     proof: xlog_cuda::SemanticReplayStateMaterialProof,
+    native_proofs: Mutex<Option<RetainedNativeProof>>,
+}
+
+struct RetainedNativeProof {
+    data: Box<NativeProofData>,
+    _metadata: Arc<xlog_cuda::SemanticReplayMaterialReservation>,
+}
+
+struct NativeProofData {
+    original_begin: usize,
+    original_extent: usize,
+    loaded: xlog_cuda::SemanticReplayLoadedMaterial,
+    outcome: Option<
+        Result<xlog_cuda::SemanticReplayStateMaterialProof, xlog_cuda::SemanticTransitionError>,
+    >,
+    next: Option<RetainedNativeProof>,
+}
+
+impl NativeProofData {
+    fn original_proof(&self) -> PyResult<xlog_cuda::SemanticReplayStateMaterialProof> {
+        match self
+            .outcome
+            .as_ref()
+            .ok_or_else(|| invalid("original native checkpoint proof has not completed"))?
+        {
+            Ok(proof) => Ok(proof.clone()),
+            Err(error) => Err(xlog_err(error)),
+        }
+    }
 }
 
 struct BoundPhaseLineage {
@@ -81,11 +110,27 @@ impl<'a> BoundCheckpointContext<'a> {
             .require_budget(&source.native_budget()?)
             .map_err(xlog_err)?;
         let proof = native.checkpoint_proof().map_err(xlog_err)?;
+        let mut retained_records = std::array::from_fn(|_| None);
+        for (index, record) in records.iter().enumerate() {
+            if let Some(record) = record {
+                record
+                    .require_budget(&source.native_budget()?)
+                    .map_err(xlog_err)?;
+                retained_records[index] = Some(
+                    record
+                        .slice_payload(0..record.as_bytes().len())
+                        .map_err(xlog_err)?,
+                );
+            }
+        }
         Ok(Self {
             source,
-            original: native.clone(),
-            records: records.clone(),
+            original: native
+                .slice_payload(0..native.as_bytes().len())
+                .map_err(xlog_err)?,
+            records: retained_records,
             proof,
+            native_proofs: Mutex::new(None),
         })
     }
 
@@ -112,11 +157,61 @@ impl<'a> BoundCheckpointContext<'a> {
     }
 
     fn native_proof(&self, native: &[u8]) -> PyResult<xlog_cuda::SemanticReplayStateMaterialProof> {
-        if native == self.original.as_bytes() {
+        let loaded = self.original_material(native)?;
+        loaded
+            .require_budget(&self.source.native_budget()?)
+            .map_err(xlog_err)?;
+        let original_begin = loaded.as_bytes().as_ptr() as usize;
+        let original_extent = loaded.as_bytes().len();
+        if original_begin == self.original.as_bytes().as_ptr() as usize
+            && original_extent == self.original.as_bytes().len()
+        {
             return Ok(self.proof.clone());
         }
-        let mut loaded = self.original_material(native)?;
-        loaded.checkpoint_proof().map_err(xlog_err)
+        let mut cache = self
+            .native_proofs
+            .lock()
+            .map_err(|_| invalid("original native checkpoint proof mutex is poisoned"))?;
+        let mut entry = cache.as_ref();
+        while let Some(original) = entry {
+            if original.data.original_begin == original_begin
+                && original.data.original_extent == original_extent
+            {
+                return original.data.original_proof();
+            }
+            entry = original.data.next.as_ref();
+        }
+        let metadata_extent = std::mem::size_of::<NativeProofData>()
+            .checked_add(std::mem::size_of::<xlog_cuda::SemanticReplayMaterialReservation>())
+            .and_then(|bytes| bytes.checked_add(2 * std::mem::size_of::<usize>()))
+            .ok_or_else(|| invalid("original native checkpoint proof metadata extent overflow"))?;
+        let metadata = Arc::new(
+            self.source
+                .native_budget()?
+                .reserve_auxiliary(u64::try_from(metadata_extent).map_err(|_| {
+                    invalid("original native checkpoint proof metadata exceeds its native index")
+                })?)
+                .map_err(xlog_err)?,
+        );
+        // The receipt lives outside its Box, so data and the Box allocation
+        // retire first, including when the original decode refuses.
+        let mut original = RetainedNativeProof {
+            data: Box::new(NativeProofData {
+                original_begin,
+                original_extent,
+                loaded,
+                outcome: None,
+                next: None,
+            }),
+            _metadata: metadata,
+        };
+        original.data.next = cache.take();
+        *cache = Some(original);
+        let original = &mut cache.as_mut().expect("retained native checkpoint proof").data;
+        // Retain the first owner before entering its one decoder. Both a proof
+        // and a refusal are immutable; neither permits another decode.
+        original.outcome = Some(original.loaded.checkpoint_proof());
+        original.original_proof()
     }
 
     fn lineage(
@@ -672,7 +767,7 @@ fn require_operation_observation(
 fn recipe_material(record: &xlog_cuda::SemanticLearningPhaseRecord) -> Vec<u8> {
     let integer = |value: u64| ColdValue::Integer(value.to_string());
     let views = record
-        .recipe
+        .recipe()
         .iter()
         .map(|operation| {
             let (role, index, action, source_role, source_index) = match *operation {
@@ -747,7 +842,7 @@ fn require_executed_lineage_records<'a>(
         .ok_or_else(|| invalid("phase checkpoint lacks its original executed native transition"))?;
     if added
         .iter()
-        .any(|record| record.admission.as_slice() != admission)
+        .any(|record| record.admission.as_bytes() != admission)
         || added.first().is_some_and(|first| {
             first.source != source_phase || recipe_material(first) != recipe_bytes
         })
@@ -856,7 +951,6 @@ fn closure_metadata_bound(lifecycle: &phase_record::LifecyclePayloads<'_>) -> Py
                 .ok_or_else(|| invalid("cold closure feedback projection extent overflow"))?,
         )?;
     }
-    canonical(&mut total, inputs.field()?)?;
     inputs.field()?;
     inputs.finish()?;
     if let Some(preparation) = lifecycle.preparation {
@@ -1063,11 +1157,14 @@ impl VerifiedClosure {
         let mut wrappers: [Option<Py<material_bytes::PySemanticMaterialBytes>>; 3] =
             std::array::from_fn(|_| None);
         for (index, original) in original_records.iter().take(record_count).enumerate() {
+            let original = original.as_ref().unwrap();
             wrappers[index] = Some(Py::new(
                 py,
                 material_bytes::PySemanticMaterialBytes::from_native(
                     py,
-                    original.as_ref().unwrap().clone(),
+                    original
+                        .slice_payload(0..original.as_bytes().len())
+                        .map_err(xlog_err)?,
                     &budget,
                 )?,
             )?);
@@ -1675,13 +1772,13 @@ impl VerifiedClosure {
             ));
         }
         let limits = RecordLimits::read(limits)?;
-        let phase = fence.get_item(0)?;
-        if !phase.is_exact_instance_of::<PyBytes>() {
+        let phase_identifier = fence.get_item(0)?;
+        if !phase_identifier.is_exact_instance_of::<PyBytes>() {
             return Err(invalid(
                 "cold phase identifier requires its exact original bytes",
             ));
         }
-        let phase_id: [u8; 32] = phase
+        let phase_id: [u8; 32] = phase_identifier
             .cast::<PyBytes>()?
             .as_bytes()
             .try_into()
@@ -1744,7 +1841,6 @@ impl VerifiedClosure {
             return Err(invalid("cold phase chain changed its original destination"));
         }
         let feedback = [reader.field()?, reader.field()?];
-        let _capacity = ColdValue::from_canonical_bytes(reader.field()?)?;
         if reader.field()? != limits.encode() {
             return Err(invalid("cold phase chain changed its original bounds"));
         }
@@ -2170,7 +2266,7 @@ impl CheckpointCustody {
             } else {
                 phases
                     .last()
-                    .is_some_and(|phase| phase.admission.as_slice() == closure.admission.as_ref())
+                    .is_some_and(|phase| phase.admission.as_bytes() == closure.admission.as_ref())
             };
             if !valid {
                 return Err(invalid(
@@ -2368,7 +2464,10 @@ impl VerifiedClosure {
                     PyBytes::new(py, &self.history),
                     material_bytes::PySemanticMaterialBytes::from_native(
                         py,
-                        refusal.record.clone(),
+                        refusal
+                            .record
+                            .slice_payload(0..refusal.record.as_bytes().len())
+                            .map_err(xlog_err)?,
                         &self.material_sources.native_budget()?,
                     )?,
                 )

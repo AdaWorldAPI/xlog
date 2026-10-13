@@ -186,6 +186,27 @@ included in restoration compatibility identity. Integrity and ABI checks do
 not establish numerical correctness or GPU equivalence. Older header versions
 and three-field domains are rejected, not converted.
 
+## Retained learning-phase admission
+
+Use `SemanticLearningPhaseAdmission::from_loaded(material, budget)` to move an
+original guarded, nonempty signed Admission into a native learning transition.
+The constructor checks the original memory pool and keeps the same byte owner,
+range and reservation. It does not copy the bytes or create another permission.
+
+`SemanticLearningPhaseTransition::admission` is `None` for an unbound recipe and
+`Some(admission)` only after its original signed record is confirmed. Applying the
+transition requires that Admission; the receiving Session also checks its own
+memory pool. `SemanticLearningPhaseRecord` retains the real owner and exposes its
+ordered operations through the borrowed `recipe()` getter. Cloning records
+or checkpoint proofs shares Admission, and bounded history decoding keeps a
+checked view of the original checkpoint. The serialized history and signed-byte
+comparisons are unchanged. Recipe and other metadata allocations still require
+their original reservations; shared Admission is not a whole-process memory or
+zero-transfer certificate.
+
+See the [Python learning-phase contract](/reference/python) for original issuer
+pinning, durable readback, unknown completion and cold recovery.
+
 ## Breaking changes
 
 Changes on this list stop downstream Rust code from compiling. Each entry names

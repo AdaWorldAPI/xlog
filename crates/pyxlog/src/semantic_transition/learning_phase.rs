@@ -18,7 +18,9 @@ pub(crate) use resource_observer::{
 #[cfg(feature = "semantic-policy")]
 pub(crate) mod cold_model_work;
 #[cfg(feature = "semantic-policy")]
-use cold_model_work::{ColdCallbackScope, PySemanticColdModelWork};
+use cold_model_work::ColdCallbackScope;
+#[cfg(feature = "semantic-policy")]
+pub(crate) use cold_model_work::PySemanticColdModelWork;
 #[cfg(feature = "semantic-policy")]
 pub(super) mod phase_evaluation;
 #[cfg(feature = "semantic-policy")]
@@ -173,7 +175,7 @@ impl PySemanticLearningPhaseRecipe {
                 phase_index,
                 completed_updates_index,
                 recipe,
-                admission: Vec::new(),
+                admission: None,
             },
         })
     }
@@ -632,11 +634,10 @@ fn verify_phase_checkpoint(
     task.require_current(&owner)?;
     let phase = checkpoint_task_phase(&*task.state()?)?;
     let binding = TaskCheckpointBinding::from_owner(&owner)?;
-    if task
+    let task_checkpoint = task
         .checkpoint
-        .encode(&owner, saved_snapshot, &phase, &binding)?
-        != manifest.task
-    {
+        .encode(&owner, saved_snapshot, &phase, &binding)?;
+    if task_checkpoint.bytes.as_slice() != manifest.task {
         return Err(invalid(
             "phase checkpoint differs from its original live task capsule",
         ));
@@ -728,7 +729,8 @@ impl PySemanticLearningPhaseTransition {
     ) -> PyResult<()> {
         let writer = work.borrow(py).original_checkpoint_writer_port(py)?;
         writer.borrow(py).require_sealed_material(py, result)?;
-        writer.borrow(py).complete_producer()
+        let completion = writer.borrow(py).complete_producer();
+        completion
     }
 
     fn singleton_lifecycle_material(entries: &Bound<'_, PyTuple>) -> PyResult<(Vec<u8>, Vec<u8>)> {
@@ -1248,15 +1250,19 @@ impl PySemanticLearningPhaseTransition {
     }
 
     fn preparation_outcome(&self) -> PyResult<xlog_cuda::SemanticReplayLoadedMaterial> {
-        self.candidate
+        let candidate = self
+            .candidate
             .lock()
-            .map_err(|_| invalid("learning-phase candidate owner mutex is poisoned"))?
+            .map_err(|_| invalid("learning-phase candidate owner mutex is poisoned"))?;
+        let outcome = candidate
             .as_ref()
             .and_then(|candidate| candidate.preparation_outcome.as_ref())
-            .cloned()
             .ok_or_else(|| {
                 invalid("preparation continuation lacks its original complete retained outcome; unknown native/model work cannot be repeated")
-            })
+            })?;
+        outcome
+            .slice_payload(0..outcome.as_bytes().len())
+            .map_err(xlog_err)
     }
 
     /// Finish only the already known cold result. Its checkpoint and history
@@ -1344,7 +1350,7 @@ impl PySemanticLearningPhaseTransition {
         cold_restore::require_executed_lineage_bound(
             &source,
             &selected,
-            &admission,
+            admission.as_bytes(),
             recipe,
             Some(self.preparation_inputs.final_phase),
         )?;
@@ -1462,7 +1468,9 @@ impl PySemanticLearningPhaseTransition {
                 actual_parent,
                 actual_model,
                 material_bytes::PySemanticMaterialBytes::from_native(py,
-                    checkpoint.clone(),
+                    checkpoint
+                        .slice_payload(0..checkpoint.as_bytes().len())
+                        .map_err(xlog_err)?,
                     &self.task_use.borrow(py).checkpoint.material_sources.native_budget()?)?,
                 PyBytes::new(py, &self.preparation_inputs.frozen_program),
                 PyBytes::new(py, &history),
@@ -1471,7 +1479,7 @@ impl PySemanticLearningPhaseTransition {
             // Retain the exact checkpoint/history before entering external
             // code. No phase/native/task mutex survives into the owner.
             *self.acceptance()? = Some(ScientificAcceptance {
-                checkpoint: checkpoint.clone(),
+                checkpoint,
                 history: Arc::clone(&history),
                 result: None,
                 error: None,
@@ -1527,7 +1535,10 @@ impl PySemanticLearningPhaseTransition {
                 return Err(error.clone_ref(py));
             }
             (
-                retained.checkpoint.clone(),
+                retained
+                    .checkpoint
+                    .slice_payload(0..retained.checkpoint.as_bytes().len())
+                    .map_err(xlog_err)?,
                 Arc::clone(&retained.history),
                 retained
                     .result
@@ -1817,7 +1828,10 @@ impl PySemanticLearningPhaseTransition {
             (
                 records.phase_id,
                 attempt.ordinal,
-                attempt.bytes.clone(),
+                attempt
+                    .bytes
+                    .slice_payload(0..attempt.bytes.as_bytes().len())
+                    .map_err(xlog_err)?,
                 attempt.digest,
             )
         };
@@ -1831,7 +1845,7 @@ impl PySemanticLearningPhaseTransition {
             &self.destination,
             PyBytes::new(py, &phase_id),
             ordinal,
-            material_bytes::PySemanticMaterialBytes::from_native(py, bytes.clone(), &pool)?,
+            material_bytes::PySemanticMaterialBytes::from_native(py, bytes, &pool)?,
             PyBytes::new(py, &digest),
         ))?;
         let mut records = self.records()?;
@@ -1862,7 +1876,10 @@ impl PySemanticLearningPhaseTransition {
                 .as_ref()
                 .ok_or_else(|| invalid("private candidate consumers and owners have retired"))?
                 .clone_ref(py),
-            candidate.checkpoint.clone(),
+            candidate
+                .checkpoint
+                .slice_payload(0..candidate.checkpoint.as_bytes().len())
+                .map_err(xlog_err)?,
         ))
     }
 
@@ -1871,12 +1888,15 @@ impl PySemanticLearningPhaseTransition {
             .candidate
             .lock()
             .map_err(|_| invalid("learning-phase candidate owner mutex is poisoned"))?;
-        candidate
+        let candidate = candidate
             .as_ref()
-            .map(|candidate| candidate.checkpoint.clone())
             .ok_or_else(|| {
                 invalid("learning-phase preparation has no complete candidate checkpoint")
-            })
+            })?;
+        candidate
+            .checkpoint
+            .slice_payload(0..candidate.checkpoint.as_bytes().len())
+            .map_err(xlog_err)
     }
 
     fn private_restore(&self) -> PyResult<MutexGuard<'_, Option<PrivateRestoreOwners>>> {
@@ -2329,7 +2349,9 @@ impl PySemanticLearningPhaseTransition {
         let readback = commit.call1((
             &self.destination,
             material_bytes::PySemanticMaterialBytes::from_native(py,
-                checkpoint.clone(),
+                checkpoint
+                    .slice_payload(0..checkpoint.as_bytes().len())
+                    .map_err(xlog_err)?,
                 &self.task_use.borrow(py).checkpoint.material_sources.native_budget()?)?,
             PyBytes::new(py, &Sha256::digest(&checkpoint)),
         ))?;
@@ -2713,7 +2735,6 @@ impl PySemanticTransitionController {
                 checkpoint_destination.as_bytes(),
                 feedback_materials[0].as_bytes(),
                 feedback_materials[1].as_bytes(),
-                &cold_capacity_material.canonical_bytes(),
             ],
             record_limits,
         )?;
@@ -2765,7 +2786,7 @@ impl PySemanticTransitionController {
                 parent: parent.clone_ref(py),
                 candidate: Mutex::new(None),
                 private_restore: Mutex::new(None),
-                source_checkpoint: source_checkpoint_loaded.clone(),
+                source_checkpoint: source_checkpoint_loaded,
                 source_checkpoint_handoff,
                 scientific_owner: scientific_owner.clone_ref(py),
                 accept_learning_phase: accept_learning_phase.unbind(),
