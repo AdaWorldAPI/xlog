@@ -1271,7 +1271,8 @@ impl PySemanticLearningPhaseTransition {
                     )
                 } else {
                     let (candidate, checkpoint) = self.candidate(py)?;
-                    (candidate.borrow(py).model.clone_ref(py), checkpoint)
+                    let model = candidate.borrow(py).model.clone_ref(py);
+                    (model, checkpoint)
                 };
                 Some(self.prepare_model_comparison_writer(py, &selected, &region, &checkpoint)?)
             };
