@@ -4,6 +4,8 @@ use super::*;
 use xlog_cuda::{SemanticPreparedResidentModelMemory, SemanticResidentModelMemory};
 
 #[cfg(feature = "semantic-policy")]
+use super::learning_phase::cold_model_work::PySemanticColdModelWork;
+#[cfg(feature = "semantic-policy")]
 use xlog_cuda::{SemanticPreparedResidentModelRestoration, SemanticResidentModelRead};
 
 /// Opaque metadata for one original read; the actual carrier owns its device use.
@@ -173,8 +175,9 @@ impl PySemanticPreparedResidentModelMemory {
             .task_use
             .borrow(py)
             .require_original_identity(&owner)?;
+        let lease = parent.lease()?;
         self.inner
-            .prepare_resident_restoration(&owner, &*parent.lease()?, work)
+            .prepare_resident_restoration(&owner, &*lease, work)
             .map_err(xlog_err)
     }
 

@@ -292,12 +292,20 @@ impl OriginalSourceContentOccurrences {
                     .map_err(|_| invalid("source content phase projection exceeds u64"))?,
             )
             .map_err(xlog_err)?;
+        // Each handle's phase is immutable native geometry in a frozen class;
+        // the counted filter therefore supplies exactly this many handles.
+        let mut handles = self
+            .handles
+            .iter()
+            .filter(|handle| handle.borrow(py).inner.phase() == phase);
         let value = PyTuple::new(
             py,
-            self.handles
-                .iter()
-                .filter(|handle| handle.borrow(py).inner.phase() == phase)
-                .map(|handle| handle.clone_ref(py)),
+            (0..count).map(|_| {
+                handles
+                    .next()
+                    .expect("counted frozen source content phase")
+                    .clone_ref(py)
+            }),
         )?
         .unbind();
         self.phases[index] = Some(RetainedOccurrenceTuple {
@@ -460,7 +468,7 @@ impl PySemanticSourceContentOccurrence {
     }
 }
 
-fn exact_tuple<'py>(
+pub(super) fn exact_tuple<'py>(
     value: &Bound<'py, PyAny>,
     arity: Option<usize>,
     budget: &mut usize,

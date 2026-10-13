@@ -3,7 +3,9 @@ use super::*;
 #[cfg(feature = "semantic-policy")]
 use super::resident_model_memory::PySemanticPreparedResidentModelMemory;
 #[cfg(feature = "semantic-policy")]
-use xlog_cuda::{SemanticPreparedSourceContent, SemanticPreparedSourceContentPorts};
+use xlog_cuda::{
+    SemanticPreparedSourceContent, SemanticPreparedSourceContentPorts, SemanticPublishedIdentity,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ImportPreparationStage {

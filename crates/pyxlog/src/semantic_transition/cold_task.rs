@@ -14,8 +14,8 @@ use xlog_cuda::{
 };
 
 use super::{
-    invalid, xlog_err, CheckpointSources, ProposalExpense, PySemanticTransitionController,
-    PySemanticTransitionSession,
+    invalid, material_owner, xlog_err, CheckpointSources, ProposalExpense,
+    PySemanticTransitionController, PySemanticTransitionSession,
 };
 
 const MAX_POSITION: u64 = 262_144;
@@ -704,7 +704,8 @@ impl PySemanticTransitionColdTask {
             None
         };
         #[cfg(not(feature = "semantic-policy"))]
-        let inherited_material_sources: Option<Arc<material_source::MaterialSourceRegistry>> = None;
+        let inherited_material_sources: Option<Arc<super::material_source::MaterialSourceRegistry>> =
+            None;
         let material_sources = match (inherited_material_sources, explicit_material_sources) {
             (Some(original), Some(supplied)) => {
                 if !Arc::ptr_eq(&original, &supplied) {

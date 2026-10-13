@@ -261,6 +261,7 @@ pub(super) fn record_prepared_steps(
     Ok(())
 }
 
+use super::source_content_occurrences::exact_tuple;
 use super::*;
 use std::sync::Weak;
 use xlog_cuda::SemanticColdNativeWork;
@@ -2716,7 +2717,7 @@ impl PySemanticPreparedStep {
                 ordinal,
                 &material.material,
                 batch_identity,
-                &batch_bytes,
+                batch_bytes.as_bytes(),
                 [
                     geometry[0].borrow(py).native().clone(),
                     geometry[1].borrow(py).native().clone(),
