@@ -207,6 +207,21 @@ impl CudaEnqueue<'_> {
         Arc::clone(self.owner.completion())
     }
 
+    /// Borrow this operation's exact manifest and submission pin without
+    /// reserving its device ranges a second time.
+    pub(crate) fn memory_access(&self) -> ResourceResult<crate::memory::MemoryEnqueue<'_>> {
+        if self.submission.validate_execution(self.stream())? != self.execution_id {
+            return Err(cudarc::driver::DriverError(
+                cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_CONTEXT,
+            )
+            .into());
+        }
+        Ok(crate::memory::MemoryEnqueue::from_admission(
+            self.owner,
+            self.submission,
+        ))
+    }
+
     pub(crate) fn submit<T>(
         &self,
         operation: impl FnOnce(

@@ -531,37 +531,50 @@ impl<T: DeviceRepr> RetainedDeviceWrite<T> {
     }
 
     pub(crate) fn enqueue(&mut self, stream: &Arc<CudaStream>) -> ResourceResult<()> {
+        self.require_enqueue(stream)?;
+        let destination = self.destination.clone();
+        with_memory_access(
+            Arc::clone(stream),
+            vec![destination.access(Access::Write)?],
+            |proof| self.enqueue_admitted(&proof.cuda_enqueue()?),
+        )
+    }
+
+    fn require_enqueue(&self, stream: &CudaStream) -> ResourceResult<()> {
         if self.entered
             || self.retired
             || crate::cuda_graph::stream_execution_id(stream)? != self.original_stream_id
         {
             return Err(DriverError(sys::CUresult::CUDA_ERROR_INVALID_VALUE).into());
         }
-        let destination = &self.destination;
+        Ok(())
+    }
+
+    /// Use the caller's original write admission; never reserve this span again.
+    pub(crate) fn enqueue_admitted(
+        &mut self,
+        enqueue: &crate::launch::CudaEnqueue<'_>,
+    ) -> ResourceResult<()> {
+        let stream = enqueue.stream();
+        self.require_enqueue(stream)?;
+        let proof = enqueue.memory_access()?;
+        let mut destination = proof.write(&self.destination)?;
+        let (ptr, _guard) = destination.device_ptr_mut(stream);
         let entered = &mut self.entered;
         let submitted = &mut self.submitted;
         let buffer = self.buffer.as_mut().expect("original write staging");
         let bytes = buffer.bytes;
-        with_memory_access(
-            Arc::clone(stream),
-            vec![destination.access(Access::Write)?],
-            |proof| {
-                let mut destination = proof.write(destination)?;
-                let (ptr, _guard) = destination.device_ptr_mut(stream);
-                // SAFETY: the destination is admitted and both original
-                // allocations remain owned through uncertain completion.
-                unsafe {
-                    buffer.enqueue(stream, |host| {
-                        *entered = true;
-                        sys::cuMemcpyHtoDAsync_v2(ptr, host.cast(), bytes, stream.cu_stream())
-                            .result()?;
-                        *submitted = true;
-                        Ok(())
-                    })?;
-                }
+        // SAFETY: this exact destination is covered by the original admission;
+        // device storage and pinned staging survive any uncertain completion.
+        unsafe {
+            buffer.enqueue(stream, |host| {
+                *entered = true;
+                sys::cuMemcpyHtoDAsync_v2(ptr, host.cast(), bytes, stream.cu_stream()).result()?;
+                *submitted = true;
                 Ok(())
-            },
-        )
+            })?;
+        }
+        Ok(())
     }
 
     pub(crate) fn resolve(&mut self) -> std::result::Result<(), DriverError> {

@@ -1169,7 +1169,7 @@ impl<T: DeviceRepr + Send + Sync> OriginalTypedWrite for TypedOriginalWrite<T> {
         recorder.write(&self.destination);
         let _ = stream;
         enqueue_recorded(domain, poisoned, recorder, |enqueue| {
-            self.write.enqueue(enqueue.stream())
+            self.write.enqueue_admitted(enqueue)
         })
     }
 
