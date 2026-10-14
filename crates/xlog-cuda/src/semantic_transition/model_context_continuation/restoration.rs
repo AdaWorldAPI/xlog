@@ -58,7 +58,7 @@ pub(super) struct OriginalDormantContextRestore {
     _reservation: Arc<SemanticReplayMaterialReservation>,
 }
 
-pub(super) struct OriginalModelContextAcknowledgement {
+pub(in crate::semantic_transition) struct OriginalModelContextAcknowledgement {
     continuation: std::sync::Weak<ModelContextContinuationOwner>,
     issuer: Arc<()>,
     storage: Arc<PublicationStorage>,
@@ -168,7 +168,7 @@ impl OriginalDormantContextRestore {
 }
 
 impl SemanticTransitionSession {
-    pub(super) fn retain_original_model_context_source_boundary(
+    pub(in crate::semantic_transition) fn retain_original_model_context_source_boundary(
         &self,
         header: PublicationHeader,
     ) -> Result<(), SemanticTransitionError> {
@@ -382,7 +382,7 @@ impl SemanticTransitionSession {
         Ok(anchor)
     }
 
-    pub(super) fn require_model_context_acknowledgement_parent(
+    pub(in crate::semantic_transition) fn require_model_context_acknowledgement_parent(
         &self,
         target: &Self,
         parent: &SemanticPublishedLease,
@@ -422,7 +422,7 @@ impl SemanticTransitionSession {
         self.require_model_context_acknowledgement_chain(owner, parent, true)
     }
 
-    pub(super) fn stage_model_context_acknowledgement(
+    pub(in crate::semantic_transition) fn stage_model_context_acknowledgement(
         &self,
         parent: &SemanticPublishedLease,
         receipt: &[u8],
@@ -531,7 +531,7 @@ impl SemanticTransitionSession {
         Ok(Some(edge))
     }
 
-    pub(super) fn complete_model_context_acknowledgement(
+    pub(in crate::semantic_transition) fn complete_model_context_acknowledgement(
         &self,
         parent: &SemanticPublishedLease,
         edge: &Arc<Mutex<OriginalModelContextAcknowledgement>>,
@@ -577,7 +577,7 @@ impl SemanticTransitionSession {
         Ok(())
     }
 
-    pub(super) fn abandon_model_context_acknowledgement(
+    pub(in crate::semantic_transition) fn abandon_model_context_acknowledgement(
         &self,
         edge: &Arc<Mutex<OriginalModelContextAcknowledgement>>,
     ) -> Result<(), SemanticTransitionError> {

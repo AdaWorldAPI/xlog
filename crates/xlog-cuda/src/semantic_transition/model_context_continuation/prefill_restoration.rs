@@ -693,7 +693,7 @@ struct RestoredModelContextPrefillOwner {
 }
 
 impl ModelContextContinuationOwner {
-    pub(super) fn with_dormant_prefill_stage<R>(
+    pub(in crate::semantic_transition) fn with_dormant_prefill_stage<R>(
         &self,
         issuer: &Arc<()>,
         scope: &Arc<()>,
@@ -736,7 +736,7 @@ impl ModelContextContinuationOwner {
         operation(stage)
     }
 
-    pub(super) fn restored_prefill_content_proof(
+    pub(in crate::semantic_transition) fn restored_prefill_content_proof(
         &self,
         target: &SemanticTransitionSession,
         scope: &Arc<()>,
@@ -770,7 +770,7 @@ impl ModelContextContinuationOwner {
 }
 
 impl SemanticRestoredModelContextPrefill {
-    pub(super) fn take_consumer_batch(
+    pub(in crate::semantic_transition) fn take_consumer_batch(
         &self,
         occurrence: usize,
         kind: InitialPrefillCaptureKind,
@@ -797,7 +797,7 @@ impl SemanticRestoredModelContextPrefill {
         slot.take().ok_or(SemanticTransitionError::NotBound)
     }
 
-    pub(super) fn retain_completed_consumer_batch(
+    pub(in crate::semantic_transition) fn retain_completed_consumer_batch(
         &self,
         occurrence: usize,
         content: &TensorContentBuffers,
@@ -905,7 +905,7 @@ impl SemanticRestoredModelContextPrefill {
         })
     }
 
-    pub(super) fn require_consumer_content_slot(
+    pub(in crate::semantic_transition) fn require_consumer_content_slot(
         &self,
         occurrence: usize,
         kind: InitialPrefillCaptureKind,

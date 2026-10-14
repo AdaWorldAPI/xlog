@@ -530,7 +530,7 @@ enum ModelContextColdKind {
 /// This grants material transport/restoration, never a TARGET model callback.
 pub(super) struct ModelContextMaterialWork {
     owner: std::sync::Weak<model_context_continuation::ModelContextContinuationOwner>,
-    work: SemanticColdModelWork,
+    pub(super) work: SemanticColdModelWork,
     source_parent: SemanticPublishedIdentity,
     native_work: SemanticColdNativeWork,
     dma_ceiling: [u64; 9],
@@ -1619,14 +1619,14 @@ impl SemanticTransitionSession {
             .graph
             .cold_work_allowance()
             .ok_or(SemanticTransitionError::ObservationMismatch)?;
-        allowance
+        let mut allowance = allowance
             .lock()
-            .map_err(|_| publication_input_error("context prefill allowance is poisoned"))?
-            .claim_model_context_prefill_input_guard(
-                context,
-                &initial.scope,
-                stage.layout.prefill_tokens.len(),
-            )
+            .map_err(|_| publication_input_error("context prefill allowance is poisoned"))?;
+        allowance.claim_model_context_prefill_input_guard(
+            context,
+            &initial.scope,
+            stage.layout.prefill_tokens.len(),
+        )
     }
 
     #[expect(
@@ -3629,10 +3629,10 @@ impl SemanticTransitionSession {
             .as_ref()
             .ok_or(SemanticTransitionError::ObservationMismatch)?
             .native_ceiling;
-        allowance
+        let mut allowance = allowance
             .lock()
-            .map_err(|_| publication_input_error("context activation allowance is poisoned"))?
-            .claim_model_context_activation(ceiling)
+            .map_err(|_| publication_input_error("context activation allowance is poisoned"))?;
+        allowance.claim_model_context_activation(ceiling)
     }
 
     /// Only confirmed original submissions awaiting their own completion are

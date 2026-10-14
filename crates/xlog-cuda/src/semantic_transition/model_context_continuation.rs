@@ -344,14 +344,11 @@ impl ModelContextContinuationOwner {
         }
         drop(original);
         self.require_dormant_parent(target)?;
-        target.validate_transfer_original_program_context_continuation(
-            source,
-            &self
-                .program
-                .lock()
-                .map_err(|_| SemanticTransitionError::Poisoned)?,
-            parent,
-        )
+        let program = self
+            .program
+            .lock()
+            .map_err(|_| SemanticTransitionError::Poisoned)?;
+        target.validate_transfer_original_program_context_continuation(source, &program, parent)
     }
     pub(super) fn pending(&self) -> bool {
         self.original.lock().map_or(true, |original| {
@@ -1392,7 +1389,7 @@ impl SemanticTransitionSession {
         recorder.read_write(&parent.proof);
         let mut proof_ptr = parent.proof.device_ptr_value();
         let mut lease_ptr = source_reader.device.device_ptr_value();
-        let mut work_ptr = native_work.device_ptr_value();
+        let mut work_ptr = *native_work.device_ptr();
         let OriginalModelContextContinuation {
             command, poisoned, ..
         } = &mut *original;
@@ -1593,9 +1590,12 @@ impl SemanticTransitionSession {
             .program
             .lock()
             .map_err(|_| SemanticTransitionError::Poisoned)?;
-        let mut admission =
+        if instruction != program.instruction() {
+            return Err(SemanticTransitionError::ObservationMismatch);
+        }
+        let admission =
             self.admit_future_original_program_instruction(&mut program, parent, instruction)?;
-        completed.bind(&mut admission);
+        completed.bind(self.instruction_admission_mut(&admission)?);
         Ok(admission)
     }
 
@@ -1608,15 +1608,12 @@ impl SemanticTransitionSession {
         if !Arc::ptr_eq(&self.publication_issuer, &continuation.inner.target_issuer) {
             return Err(SemanticTransitionError::ObservationMismatch);
         }
-        self.enter_future_original_program_execution(
-            &continuation
-                .inner
-                .program
-                .lock()
-                .map_err(|_| SemanticTransitionError::Poisoned)?,
-            admission,
-            parent,
-        )
+        let program = continuation
+            .inner
+            .program
+            .lock()
+            .map_err(|_| SemanticTransitionError::Poisoned)?;
+        self.enter_future_original_program_execution(&program, admission, parent)
     }
 
     /// Bind the actual selected model wrapper to its original numerical owners.
@@ -2114,14 +2111,12 @@ impl SemanticTransitionSession {
         if !Arc::ptr_eq(&self.publication_issuer, &continuation.inner.target_issuer) {
             return Err(SemanticTransitionError::ObservationMismatch);
         }
-        ModelContextContinuationOwner::resolve_dormant_parent(
-            self,
-            &mut continuation
-                .inner
-                .original
-                .lock()
-                .map_err(|_| SemanticTransitionError::Poisoned)?,
-        )
+        let mut original = continuation
+            .inner
+            .original
+            .lock()
+            .map_err(|_| SemanticTransitionError::Poisoned)?;
+        ModelContextContinuationOwner::resolve_dormant_parent(self, &mut original)
     }
 
     /// Freeze the next real instruction and existing numerical owners, without

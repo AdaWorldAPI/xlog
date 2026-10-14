@@ -33635,9 +33635,7 @@ impl SemanticTransitionSession {
                 stage.expected_tokens.device_ptr_value(),
                 actual_ptr,
                 stage.layout.prefill_tokens.len() as u64,
-                native_work
-                    .as_ref()
-                    .map_or(0, DeviceMemoryView::device_ptr_value),
+                native_work.as_ref().map_or(0, |work| *work.device_ptr()),
             );
             if let Some(work) = native_work {
                 recorder.read_write(&work);
