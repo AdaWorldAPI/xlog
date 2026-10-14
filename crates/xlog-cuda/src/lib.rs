@@ -127,12 +127,15 @@ pub use semantic_transition::{
     SemanticCompletedLaneOutcomeMaterial, SemanticCompletedMaterialCapacity,
     SemanticCompletedModelCarrierMaterial, SemanticCompletedReplayMaterials,
     SemanticCompletedStepWitnessMaterial, SemanticCompletedTaskGroundMaterial,
-    SemanticCompletedTheoryDeltaMaterial, SemanticPolicyGradients,
-    SemanticPolicyNumericalDomainLayout, SemanticPreparedActorRefresh,
+    SemanticCompletedTheoryDeltaMaterial, SemanticModelContextCheckpointAttachment,
+    SemanticModelContextContinuation, SemanticModelContextPrefillContentGeometry,
+    SemanticModelContextPrefillRestoreDeclaration, SemanticModelContextPrefillTensorGeometry,
+    SemanticPolicyGradients, SemanticPolicyNumericalDomainLayout, SemanticPreparedActorRefresh,
     SemanticPreparedResidentModelRestoration, SemanticResidentModelRead,
-    SemanticSegmentInstructionAdmission, SemanticSelectedPolicyGradients,
-    SemanticTransitionSessionConstruction, SemanticUpdateCanaryMeasurement,
-    SemanticUpdateForwardReceipt, SemanticUpdateForwardReceiptMaterial, SemanticUpdateMeasurements,
+    SemanticRestoredModelContextPrefill, SemanticSegmentInstructionAdmission,
+    SemanticSelectedPolicyGradients, SemanticTransitionSessionConstruction,
+    SemanticUpdateCanaryMeasurement, SemanticUpdateForwardReceipt,
+    SemanticUpdateForwardReceiptMaterial, SemanticUpdateMeasurements,
 };
 #[cfg(feature = "semantic-policy")]
 pub use semantic_transition::{

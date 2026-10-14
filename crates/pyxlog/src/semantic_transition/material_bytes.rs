@@ -40,6 +40,12 @@ pub(super) struct OriginalCheckpointExport {
     pub(super) prefill_observation: Option<xlog_cuda::SemanticCheckpointInitialPrefillObservation>,
     pub(super) native: Option<xlog_cuda::SemanticReplayLoadedMaterial>,
     pub(super) initial_prefill: Option<xlog_cuda::SemanticReplayLoadedMaterial>,
+    pub(super) model_context: Option<xlog_cuda::SemanticReplayLoadedMaterial>,
+    pub(super) model_context_capacity: usize,
+    pub(super) model_context_request_bound: bool,
+    #[cfg(feature = "semantic-policy")]
+    pub(super) model_context_custody:
+        Option<Box<model_context_checkpoint::CheckpointModelContextCustody>>,
     pub(super) task: Option<EncodedTaskCheckpoint>,
     pub(super) config: Option<Vec<u8>>,
     pub(super) output: Option<xlog_cuda::SemanticReplayMaterialOutput>,
@@ -107,6 +113,11 @@ impl OriginalCheckpointExport {
             prefill_observation: None,
             native: None,
             initial_prefill: None,
+            model_context: None,
+            model_context_capacity: 0,
+            model_context_request_bound: false,
+            #[cfg(feature = "semantic-policy")]
+            model_context_custody: None,
             task: None,
             config: None,
             output: None,
