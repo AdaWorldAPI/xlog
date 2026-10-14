@@ -321,7 +321,7 @@ pub(super) fn child_constructor_native_work_ceiling(
         ceiling_product(32, qualifiers)?,
     ])?;
     let words = ceiling_sum([
-        25,
+        model_catalogue::HEADER_WORDS as u64,
         ceiling_product(10, targets)?,
         ceiling_product(6, operands)?,
         ceiling_product(3, qualifier_rows)?,
@@ -1993,18 +1993,19 @@ fn rule_prefix_native_work_ceiling(
     predicate_bound: u64,
 ) -> Result<[u64; 9], SemanticTransitionError> {
     // prefix_completes admits seven trailing nulls and examines three predicate
-    // positions. A fixed predicate costs Category 3 and TableSlot 11 (head) or
-    // 7 (body); a searched predicate costs Category 2 and TableSlot 12 or 8.
+    // positions. Owned-range checks add two slots in admission and two in the
+    // typed decoder, independently of external support. The prefix also reads
+    // its own two structural range endpoints instead of the global table end.
     let predicate_categories = ceiling_product(3, ceiling_product(2, predicate_bound)?.max(3))?;
     let predicate_slots = ceiling_sum([
         3,
-        ceiling_product(12, predicate_bound)?.max(11),
-        ceiling_product(2, ceiling_product(8, predicate_bound)?.max(7))?,
+        ceiling_product(16, predicate_bound)?.max(15),
+        ceiling_product(2, ceiling_product(12, predicate_bound)?.max(11))?,
     ])?;
     // Every first/second pair can visit four positions, sixteen covering masks
     // per position, four variable candidates per mask, and sixteen final masks.
     // available_variable includes its rejected candidate, admitted coordinate,
-    // and the six-slot operand decoder: Category 3 and TableSlot 7 at most.
+    // and the context-bound operand decoder: Category 3 and TableSlot 11 at most.
     let pairs = ceiling_product(4, 4)?;
     let covering_visits = ceiling_product(pairs, ceiling_product(4, 16)?)?;
     let final_visits = ceiling_product(pairs, 16)?;
@@ -2020,9 +2021,10 @@ fn rule_prefix_native_work_ceiling(
         0,
         ceiling_sum([
             7,
+            2, // Original context structural range endpoints.
             predicate_slots,
-            7, // Optional fixed-variable validation.
-            ceiling_product(variable_calls, 7)?,
+            11, // Optional fixed-variable validation.
+            ceiling_product(variable_calls, 11)?,
             loop_slots,
         ])?,
         0,
@@ -2129,6 +2131,8 @@ pub(super) fn policy_vjp_native_work_ceiling(
             clear,
             traversal,
             numerical,
+            ceiling_product(2, policy_viability_category_ceiling(source)?)?,
+            ceiling_product(2, legality_calls)?,
             ceiling_product(5, roots)?, // Final actor/full-domain/error packing.
         ])?,
         0,
@@ -2382,7 +2386,20 @@ pub(super) fn actor_refresh_transition_native_work_ceilings(
             if io.policy.is_some() {
                 return Err(SemanticTransitionError::ObservationMismatch);
             }
-            add_native_work_ceiling(ceiling, [0, 0, 0, viability, 0, 0, 0, 0, 0])?;
+            add_native_work_ceiling(
+                ceiling,
+                [
+                    0,
+                    ceiling_product(2, viability)?,
+                    0,
+                    viability,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            )?;
             if let Some(prefix) = prefix {
                 repeat_native_ceiling(ceiling, prefix, 4)?;
             }
@@ -2447,7 +2464,7 @@ pub(super) fn actor_refresh_transition_native_work_ceilings(
                 ceiling,
                 [
                     0,
-                    ceiling_sum([7, 10, ceiling_product(8, 6)?, 1])?,
+                    ceiling_sum([7, 12, ceiling_product(8, 8)?, 1])?,
                     0,
                     ceiling_sum([1, 7, 3, 6, 1])?,
                     0,
@@ -2509,7 +2526,10 @@ pub(super) fn actor_refresh_transition_native_work_ceilings(
             ceiling,
             [
                 0,
-                0,
+                ceiling_product(
+                    2,
+                    ceiling_sum([viability, ceiling_product(2, edit_cells)?])?,
+                )?,
                 0,
                 categories,
                 comparisons,

@@ -13,6 +13,22 @@ struct UnaccountedPrefixWork {
     __device__ void operator()(PrefixWorkEvent) const {}
 };
 
+// NULL and intrinsic fields retain their meaning. Context-specific rows are
+// namespaced by original occurrence; external support cannot grant foreign rows.
+template <typename Charge = UnaccountedPrefixWork>
+__device__ bool context_category(const uint64_t* books, uint32_t field,
+                                uint32_t category, Charge charge = {}) {
+    if (!category) return true;
+    const uint32_t range = field == 2 ? 0 : field >= 3 && field <= 10 ? 1 :
+                           field == 11 ? 2 : field == 17 ? 3 : UINT32_MAX;
+    if (range == UINT32_MAX) return true;
+    charge(PrefixWorkEvent::TableSlot);
+    const uint64_t begin = books[29 + 2 * range];
+    charge(PrefixWorkEvent::TableSlot);
+    const uint64_t end = books[30 + 2 * range];
+    return category >= begin && category < end;
+}
+
 // Structural descriptors occupy disjoint, typed ranges after the ordinary
 // graph descriptors. No ordinary value or statement target decodes as a rule.
 template <typename Charge = UnaccountedPrefixWork>
@@ -20,7 +36,8 @@ __device__ bool head_predicate(const uint64_t* books, uint32_t category,
                                uint32_t predicate_count, uint32_t* predicate,
                                Charge charge = {}) {
     charge(PrefixWorkEvent::Category);
-    if (!books || !predicate || !category || category >= books[1]) return false;
+    if (!books || !predicate || !category || category >= books[1] ||
+        !context_category(books, 2, category, charge)) return false;
     const uint64_t* row = books + books[0] + 10 * uint64_t(category);
     if ((charge(PrefixWorkEvent::TableSlot), row[1] != UINT64_MAX) ||
         (charge(PrefixWorkEvent::TableSlot), row[0] >= predicate_count)) return false;
@@ -37,7 +54,8 @@ __device__ bool operand(const uint64_t* books, uint32_t category,
                         uint32_t kind, uint32_t bound, uint32_t* value,
                         Charge charge = {}) {
     charge(PrefixWorkEvent::Category);
-    if (!books || !value || !category || category >= books[3]) return false;
+    if (!books || !value || !category || category >= books[3] ||
+        !context_category(books, 3, category, charge)) return false;
     const uint64_t* row = books + books[2] + 6 * uint64_t(category);
     if ((charge(PrefixWorkEvent::TableSlot), row[0]) ||
         (charge(PrefixWorkEvent::TableSlot), row[1]) ||
@@ -106,14 +124,20 @@ __device__ bool prefix_completes(const uint64_t* books,
         field < 1 || field >= 18 || books[1] <= uint64_t(predicate_count) ||
         books[3] <= uint64_t(predicate_count) + 4 ||
         (field == 1 ? category != 2 : choices[1] != 2)) return false;
-    const uint32_t head_start = uint32_t(books[1]) - predicate_count;
-    const uint32_t body_start = uint32_t(books[3]) - predicate_count - 4;
-    const uint32_t variable_start = uint32_t(books[3]) - 4;
+    charge(PrefixWorkEvent::TableSlot);
+    const uint32_t head_end = uint32_t(books[30]);
+    charge(PrefixWorkEvent::TableSlot);
+    const uint32_t body_end = uint32_t(books[32]);
+    if (head_end < predicate_count || body_end < predicate_count + 4) return false;
+    const uint32_t head_start = head_end - predicate_count;
+    const uint32_t body_start = body_end - predicate_count - 4;
+    const uint32_t variable_start = body_end - 4;
     auto admitted = [&](uint32_t position, uint32_t candidate) {
         charge(PrefixWorkEvent::Category);
         charge(PrefixWorkEvent::TableSlot);
         const Component component = components[start + position];
         return candidate < component.cardinality &&
+               context_category(books, position, candidate, charge) &&
                support[component.offset + candidate] &&
                (position > field ||
                 candidate == (position == field ? category : choices[position]));

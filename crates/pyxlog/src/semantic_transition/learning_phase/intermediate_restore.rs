@@ -1450,6 +1450,7 @@ impl PySemanticLearningPhaseTransition {
                     Some(pending),
                     resident_restoration.as_ref(),
                     None,
+                    task.checkpoint.native_model_context.as_ref(),
                 );
                 let mut retained = self.intermediate()?;
                 let current = retained.as_mut().expect("original intermediate restore");

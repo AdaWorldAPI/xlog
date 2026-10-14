@@ -949,6 +949,7 @@ impl PySemanticTransitionColdTask {
                     material_sources,
                     allocation,
                     canary,
+                    None,
                 )
                 .map_err(|error| {
                     #[cfg(feature = "semantic-policy")]
@@ -1070,6 +1071,41 @@ impl PySemanticTransitionColdTask {
     fn parent(&self, py: Python<'_>) -> PyResult<Py<PySemanticTransitionFreshParent>> {
         self.session.borrow(py).owner()?;
         Ok(self.parent.clone_ref(py))
+    }
+
+    /// Freeze both genuine cold rosters before importing tasks or loading the
+    /// model. Calling again after Unknown resolves the same native operation.
+    /// The common model identity is then available through Session.policy_layout;
+    /// TaskUse.feedback_schema retains the shared shape and each own payload.
+    fn freeze_model_contexts(&self, py: Python<'_>, next: PyRef<'_, Self>) -> PyResult<()> {
+        let left = self.session.borrow(py);
+        let right = next.session.borrow(py);
+        left.require_creator()?;
+        right.require_creator()?;
+        if Arc::ptr_eq(&left.inner, &right.inner) {
+            return Err(invalid(
+                "model context domain requires two original cold owners",
+            ));
+        }
+        let left_parent = self.parent.borrow(py);
+        let right_parent = next.parent.borrow(py);
+        if left.device_ordinal != right.device_ordinal
+            || left.memory_bytes != right.memory_bytes
+            || left_parent.prefix_capacity != right_parent.prefix_capacity
+            || left_parent.feedback_capacity != right_parent.feedback_capacity
+            || left_parent.pad_token != right_parent.pad_token
+            || left_parent.terminal_tokens != right_parent.terminal_tokens
+        {
+            return Err(invalid(
+                "model contexts require the same original device and finite model input envelope",
+            ));
+        }
+        let mut source = left.owner()?;
+        let mut target = right.owner()?;
+        source
+            .freeze_model_contexts(&mut target)
+            .map_err(xlog_err)?;
+        Ok(())
     }
 
     /// Terminally release this observed-only fresh CUDA Session before a

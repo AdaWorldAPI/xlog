@@ -708,13 +708,16 @@ impl SemanticTransitionSession {
                         .graph
                         .admission()
                         .ok_or(SemanticTransitionError::NotBound)?;
-                    let codebooks = ActionCodebooks::derive(
+                    let mut codebooks = ActionCodebooks::derive(
                         admission,
                         self.graph.transition_arena()[1],
                         self.task
                             .as_ref()
                             .and_then(|(task, _)| task.spec.program.editable_program()),
                     )?;
+                    if let Some((catalogue, member)) = &self.codebooks.model_catalogue {
+                        codebooks.project_model_catalogue(Arc::clone(catalogue), *member)?;
+                    }
                     if codebooks.input_cells != self.codebooks.input_cells
                         || codebooks.words.len() != self.device_codebooks.len()
                     {
@@ -735,17 +738,25 @@ impl SemanticTransitionSession {
                     let words = task.words(self.graph.transition_arena()[1]);
                     let writes = vec![
                         OriginalDeviceWrite::new(&self.stream, &words, device.view(), true)?,
-                        OriginalDeviceWrite::new(
+                        OriginalDeviceWrite::new_with_owner(
                             &self.stream,
                             &codebooks.words,
                             self.device_codebooks.view(),
                             true,
+                            codebooks
+                                .model_projection_reservation
+                                .as_ref()
+                                .map(Arc::clone),
                         )?,
-                        OriginalDeviceWrite::new(
+                        OriginalDeviceWrite::new_with_owner(
                             &self.stream,
                             &codebooks.components,
                             self.device_components.view(),
                             true,
+                            codebooks
+                                .model_projection_reservation
+                                .as_ref()
+                                .map(Arc::clone),
                         )?,
                     ];
                     let codebook = original

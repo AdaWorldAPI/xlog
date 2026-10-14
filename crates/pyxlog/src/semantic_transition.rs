@@ -736,6 +736,7 @@ impl PySemanticTransitionSession {
         material_sources: Arc<material_source::MaterialSourceRegistry>,
         allocation_domain: Option<CheckpointAllocationDomain>,
         training_canary_owner: Option<TrainingCanaryOwner>,
+        model_context: Option<&xlog_cuda::SemanticFrozenModelContext>,
     ) -> PyResult<Self> {
         let records = records.into();
         let editable_source =
@@ -817,11 +818,17 @@ impl PySemanticTransitionSession {
             }
         }
         .map_err(xlog_err)?;
-        let mut session = SemanticTransitionSession::from_hypergraph_with_program(
+        if let Some(context) = model_context {
+            context
+                .require_budget(&material_sources.native_budget()?)
+                .map_err(xlog_err)?;
+        }
+        let mut session = SemanticTransitionSession::from_hypergraph_with_model_context(
             graph,
             editable_source
                 .as_ref()
                 .map(|source| source.program.as_ref()),
+            model_context,
         )
         .map_err(xlog_err)?;
         if material_sources.saved_caps()?.is_some() {
@@ -2319,6 +2326,7 @@ impl PySemanticTransitionSession {
             Arc::new(material_source::MaterialSourceRegistry::default()),
             None,
             None,
+            None,
         )
     }
 
@@ -2344,7 +2352,7 @@ impl PySemanticTransitionSession {
         self.require_creator()?;
         let owner = self.owner()?;
         let layout = owner.policy_layout().map_err(xlog_err)?;
-        let binding = owner.binding();
+        let binding = owner.model_catalogue_binding();
         policy_layout_object(py, &layout, binding)
     }
 
@@ -2490,7 +2498,7 @@ impl PySemanticTransitionSession {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (checkpoint, *, device_ordinal, snapshot, restore_model, training_domain, training_canary_source, material_source, max_resolved_material_bytes, original_program=None, referent=None, resolve_checkpoint=None, max_checkpoint_bytes=None, max_total_checkpoint_bytes=None, refresh_snapshot=None, learning_phase_issuer=None, learning_phase_records=None, learning_phase_record_limits=None, learning_phase_fence=None, learning_phase_checkpoint_issuer=None))]
+    #[pyo3(signature = (checkpoint, *, device_ordinal, snapshot, restore_model, training_domain, training_canary_source, material_source, max_resolved_material_bytes, original_program=None, original_task_use=None, referent=None, resolve_checkpoint=None, max_checkpoint_bytes=None, max_total_checkpoint_bytes=None, refresh_snapshot=None, learning_phase_issuer=None, learning_phase_records=None, learning_phase_record_limits=None, learning_phase_fence=None, learning_phase_checkpoint_issuer=None))]
     #[expect(
         clippy::too_many_arguments,
         reason = "restore uses the original bounded checkpoint-source resolver"
@@ -2506,6 +2514,7 @@ impl PySemanticTransitionSession {
         material_source: &Bound<'_, PyAny>,
         max_resolved_material_bytes: &Bound<'_, PyAny>,
         original_program: Option<&Bound<'_, PyAny>>,
+        original_task_use: Option<Py<PySemanticTransitionTaskUse>>,
         referent: Option<&Bound<'_, PyAny>>,
         resolve_checkpoint: Option<&Bound<'_, PyAny>>,
         max_checkpoint_bytes: Option<&Bound<'_, PyAny>>,
@@ -2547,6 +2556,17 @@ impl PySemanticTransitionSession {
         let (seed, _, phase, binding) =
             TaskCheckpointSeed::decode_bound(manifest.task, &material_sources)?;
         let expense = seed.proposal_expense()?;
+        let model_context = original_task_use.as_ref().map(|original| {
+            let original = original.borrow(py);
+                let session = original.session.borrow(py);
+                session.require_creator()?;
+                let owner = session.owner()?;
+                original.require_current(&owner)?;
+            if !Arc::ptr_eq(&original.checkpoint.material_sources, &material_sources) {
+                return Err(invalid("restoration requires the freshly imported original model context in the same material owner"));
+            }
+                owner.frozen_model_context().map_err(xlog_err)
+        }).transpose()?.flatten();
         let expected_program = original_program.map(exact_replay_bytes).transpose()?;
         if expected_program
             != expense
@@ -2618,6 +2638,7 @@ impl PySemanticTransitionSession {
             #[cfg(feature = "semantic-policy")]
             None,
             Some(native_state),
+            model_context.as_ref(),
         )?;
         let origin = Sha256::digest(raw).into();
         let restored_owner = restored.borrow(py);
@@ -3176,6 +3197,7 @@ impl PySemanticTransitionSession {
             &xlog_cuda::SemanticPreparedResidentModelRestoration,
         >,
         loaded_native: Option<xlog_cuda::SemanticReplayLoadedMaterial>,
+        model_context: Option<&xlog_cuda::SemanticFrozenModelContext>,
     ) -> PyResult<Py<PySemanticTransitionRestoredCheckpoint>> {
         if learning_transition.is_some() && learning_owner.is_none() {
             return Err(invalid(
@@ -3249,6 +3271,7 @@ impl PySemanticTransitionSession {
             ));
         }
         seed.training_canary_owner = canary_owner.clone();
+        seed.native_model_context = model_context.cloned();
         if let Some(shared) = shared_proposal_expense {
             let saved = seed.proposal_expense()?;
             let current = shared
@@ -3462,6 +3485,10 @@ impl PySemanticTransitionSession {
             }
             (original, source) => original.or(source),
         };
+        let native_state_proof = native_state.checkpoint_proof().map_err(xlog_err)?;
+        native_state_proof
+            .require_frozen_model_context(model_context)
+            .map_err(xlog_err)?;
         let restored_session = Self::from_admission(
             admission,
             config.capacities,
@@ -3473,6 +3500,7 @@ impl PySemanticTransitionSession {
             Arc::clone(&seed.material_sources),
             allocation_domain,
             canary_source.clone().zip(canary_owner.clone()),
+            seed.native_model_context.as_ref(),
         )?;
         let session = Py::new(py, restored_session)?;
         session
@@ -3497,7 +3525,6 @@ impl PySemanticTransitionSession {
         #[cfg(feature = "semantic-policy")]
         let actor_episodes = seed.actor_refresh_episodes()?;
         let selected_referents = selected_checkpoint_referents(&authority.replay, selection)?;
-        let native_state_proof = native_state.checkpoint_proof().map_err(xlog_err)?;
         let native_binding = (|| -> PyResult<TaskCheckpointBinding> {
             let restored = session.borrow(py);
             let mut owner = restored.owner()?;
@@ -11544,6 +11571,7 @@ struct TaskCheckpointSeed {
     training_domain: ColdValue,
     training_canary_source: ColdValue,
     training_canary_owner: Option<Arc<Py<cold_task::PySemanticTransitionColdTask>>>,
+    native_model_context: Option<xlog_cuda::SemanticFrozenModelContext>,
     replay_capacity: ColdValue,
     original_training_roster: Arc<Mutex<OriginalTrainingRoster>>,
     initial_sources: ColdValue,
@@ -11995,6 +12023,7 @@ impl TaskCheckpointSeed {
                 training_domain: fields[10].clone(),
                 training_canary_source: fields[16].clone(),
                 training_canary_owner: None,
+                native_model_context: None,
                 replay_capacity: fields[14].clone(),
                 original_training_roster: Arc::new(Mutex::new(OriginalTrainingRoster::new(
                     roster[0].clone(),
@@ -20986,8 +21015,7 @@ impl PySemanticTransitionTaskUse {
         let session = self.session.borrow(py);
         let owner = session.owner()?;
         self.require_current(&owner)?;
-        let schema = FeedbackSchema::new(owner.feedback_statement_bytes().map_err(xlog_err)?)
-            .map_err(xlog_err)?;
+        let schema = owner.feedback_schema().map_err(xlog_err)?;
         feedback_schema_object(py, &schema)
     }
 
@@ -23770,6 +23798,7 @@ impl PySemanticTransitionController {
                 training_domain: training_domain_value,
                 training_canary_source: canary_projection,
                 training_canary_owner: canary_owner.clone(),
+                native_model_context: None,
                 replay_capacity: replay_capacity_value,
                 initial_sources,
                 source_mapping,
@@ -23782,6 +23811,8 @@ impl PySemanticTransitionController {
             }
         };
         checkpoint.training_canary_owner = canary_owner;
+        checkpoint.native_model_context =
+            session.owner()?.frozen_model_context().map_err(xlog_err)?;
         checkpoint.proposal_expense = Arc::clone(&session.proposal_expense);
         checkpoint.checkpoint_sources = Arc::clone(&session.checkpoint_sources);
         checkpoint.material_sources = Arc::clone(&session.material_sources);
