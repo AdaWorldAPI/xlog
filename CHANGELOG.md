@@ -6,6 +6,11 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- *(cuda, python)* [**breaking**] freeze paired cold model row catalogues before
+  model use, with context-owned GPU category admission and a shared feedback
+  shape derived from the actual statement payloads. Paired checkpoints require
+  their freshly imported original task context before resident allocation;
+  model-row identity remains distinct from context material identity.
 - Epistemic execution classifies modal dependencies before single-pass planning.
   Acyclic programs use Generate-Propagate-Test; positive FAEEL cycles run to an
   ordinary founded least fixpoint; supported positive exact-tuple

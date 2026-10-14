@@ -19,6 +19,8 @@ pub use actor_refresh_program::SemanticSegmentInstructionAdmission;
 mod cold_model_work;
 mod late_replay;
 mod learning_phase;
+mod model_catalogue;
+pub use model_catalogue::SemanticFrozenModelContext;
 mod model_contract;
 use late_replay::{PendingReplayDelivery, ReplayAuthentication};
 #[cfg(feature = "semantic-policy")]
@@ -1617,9 +1619,25 @@ struct ActionCodebooks {
     binding: SemanticCatalogueBinding,
     program_binding: Option<Identity256>,
     input_cells: usize,
+    model_catalogue: Option<(Arc<model_catalogue::FrozenModelCatalogue>, usize)>,
+    model_projection_reservation: Option<Arc<SemanticReplayMaterialReservation>>,
 }
 
 impl ActionCodebooks {
+    fn local_category(&self, field: u32, category: u32) -> Option<usize> {
+        let range = match field {
+            2 => 0,
+            3..=10 => 1,
+            11 => 2,
+            17 => 3,
+            _ => return None,
+        };
+        let begin = self.words[29 + 2 * range];
+        let end = self.words[30 + 2 * range];
+        (u64::from(category) >= begin && u64::from(category) < end)
+            .then(|| (u64::from(category) - begin) as usize)
+    }
+
     fn program_binding(program: &crate::SemanticProgramAdmission) -> Identity256 {
         let mut hash = Sha256::new();
         hash.update(b"xlog.semantic.rule-codebook.program.v1\0");
@@ -1643,10 +1661,9 @@ impl ActionCodebooks {
         }
         fn chosen(
             entries: &[SemanticActionDescriptor],
-            choice: u32,
+            index: Option<usize>,
         ) -> Result<&SemanticActionDescriptor, SemanticTransitionError> {
-            choice
-                .checked_sub(1)
+            index
                 .and_then(|index| entries.get(index as usize))
                 .ok_or(SemanticTransitionError::ObservationMismatch)
         }
@@ -1663,21 +1680,27 @@ impl ActionCodebooks {
             _ => Err(SemanticTransitionError::ObservationMismatch),
         };
         let rule = crate::SemanticProgramRule {
-            head_predicate: predicate(chosen(&self.targets, choices[2])?)?,
-            left_predicate: predicate(chosen(&self.operands, choices[3])?)?,
-            right_predicate: predicate(chosen(&self.operands, choices[4])?)?,
+            head_predicate: predicate(chosen(&self.targets, self.local_category(2, choices[2]))?)?,
+            left_predicate: predicate(chosen(&self.operands, self.local_category(3, choices[3]))?)?,
+            right_predicate: predicate(chosen(
+                &self.operands,
+                self.local_category(4, choices[4]),
+            )?)?,
             body_count: 2,
             head_variables: [
-                variable(chosen(&self.operands, choices[5])?)?,
-                variable(chosen(&self.operands, choices[6])?)?,
+                variable(chosen(&self.operands, self.local_category(5, choices[5]))?)?,
+                variable(chosen(&self.operands, self.local_category(6, choices[6]))?)?,
             ],
             left_variables: [
-                variable(chosen(&self.operands, choices[7])?)?,
-                variable(chosen(&self.operands, choices[8])?)?,
+                variable(chosen(&self.operands, self.local_category(7, choices[7]))?)?,
+                variable(chosen(&self.operands, self.local_category(8, choices[8]))?)?,
             ],
             right_variables: [
-                variable(chosen(&self.operands, choices[9])?)?,
-                variable(chosen(&self.operands, choices[10])?)?,
+                variable(chosen(&self.operands, self.local_category(9, choices[9]))?)?,
+                variable(chosen(
+                    &self.operands,
+                    self.local_category(10, choices[10]),
+                )?)?,
             ],
         };
         let bound = rule
@@ -1726,14 +1749,12 @@ impl ActionCodebooks {
         if choices[0] != 1 || choices[1] != 1 {
             return Err(SemanticTransitionError::ObservationMismatch);
         }
-        let chosen = |count: usize, choice: u32| {
-            usize::try_from(choice)
-                .ok()
-                .and_then(|choice| choice.checked_sub(1))
+        let chosen = |field: u32, count: usize, choice: u32| {
+            self.local_category(field, choice)
                 .filter(|&index| index < count)
                 .ok_or(SemanticTransitionError::ObservationMismatch)
         };
-        let target = chosen(self.targets.len(), choices[2])?;
+        let target = chosen(2, self.targets.len(), choices[2])?;
         let predicate = match self.targets[target] {
             SemanticActionDescriptor::Target { predicate } => predicate,
             _ => return Err(SemanticTransitionError::ObservationMismatch),
@@ -1750,15 +1771,15 @@ impl ActionCodebooks {
         reconstruction[0] = predicate.0;
         for argument in 0..arity {
             let choice = choices[3 + argument];
-            chosen(self.operands.len(), choice)?;
+            chosen(3 + argument as u32, self.operands.len(), choice)?;
             let offset = self.words[2] as usize + 6 * choice as usize;
             reconstruction[1 + 2 * argument] = self.words[offset + 4] as u32;
             reconstruction[2 + 2 * argument] = self.words[offset + 5] as u32;
         }
         let qualifier = choices[11];
-        chosen(self.qualifiers.len(), qualifier)?;
+        chosen(11, self.qualifiers.len(), qualifier)?;
         reconstruction[9] = self.words[self.words[4] as usize + 3 * qualifier as usize + 2] as u32;
-        let leaf = chosen(self.leaves.len(), choices[17])?;
+        let leaf = chosen(17, self.leaves.len(), choices[17])?;
         let source_event = match self.leaves[leaf] {
             SemanticActionDescriptor::SupportEvent { source_record } => source_record,
             _ => return Err(SemanticTransitionError::ObservationMismatch),
@@ -1989,7 +2010,7 @@ impl ActionCodebooks {
                 detail: "descriptor codebook exceeds 65535 non-NULL entries".into(),
             });
         }
-        let mut words = vec![0; 25];
+        let mut words = vec![0; model_catalogue::HEADER_WORDS];
         let mut bytes = Vec::new();
         words[0] = words.len() as u64;
         words[1] = (targets.len() + additional_targets) as u64 + 1;
@@ -2088,6 +2109,12 @@ impl ActionCodebooks {
         hash.update(CATALOGUE_DIGEST);
         hash.update(admission.identity().as_bytes());
         let program_binding = program.map(Self::program_binding);
+        for (range, count) in [1, 3, 5, 7].into_iter().enumerate() {
+            words[29 + 2 * range] = 1;
+            words[30 + 2 * range] = words[count];
+        }
+        words[38] = u64::from(program.is_some());
+        words[39] = u64::from(program.is_some());
         if let Some(identity) = program_binding {
             hash.update(identity.as_bytes());
         }
@@ -2111,6 +2138,8 @@ impl ActionCodebooks {
             },
             program_binding,
             input_cells,
+            model_catalogue: None,
+            model_projection_reservation: None,
         })
     }
 
@@ -2118,7 +2147,8 @@ impl ActionCodebooks {
         words: &[u64],
         has_program: bool,
     ) -> Result<([SemanticComponent; COMPONENT_COUNT], usize), SemanticTransitionError> {
-        if words.len() < 25
+        if words.len() < model_catalogue::HEADER_WORDS
+            || words[39] != u64::from(has_program)
             || [1, 3, 5, 7]
                 .into_iter()
                 .any(|index| words[index] == 0 || words[index] > 65536)
@@ -2138,8 +2168,8 @@ impl ActionCodebooks {
                 match component.field {
                     2 => words[1] as u32,
                     3..=6 => words[3] as u32,
-                    7..=10 if has_program => words[3] as u32,
-                    1 if !has_program => 2,
+                    7..=10 if words[38] != 0 => words[3] as u32,
+                    1 if words[38] == 0 => 2,
                     11 => words[5] as u32,
                     17 => words[7] as u32,
                     _ => component.cardinality,
@@ -6562,7 +6592,7 @@ struct ReplayStateMaterialProofContents {
     layouts: BTreeMap<(u64, u64), SemanticTensorLayout>,
     directory: Vec<PublicationRange>,
     allocation_geometry: Vec<PublicationAllocationGeometry>,
-    codebook_header: [u64; 25],
+    codebook_header: [u64; model_catalogue::HEADER_WORDS],
     continuation_blocks: Option<usize>,
     model_contract: SemanticReplayLoadedMaterial,
     learning_phases: Vec<SemanticLearningPhaseRecord>,
@@ -6749,9 +6779,9 @@ impl SemanticReplayStateMaterialProof {
             .ok_or(SemanticTransitionError::ObservationMismatch)?;
         let header_bytes = codebook
             .bytes
-            .get(..25 * size_of::<u64>())
+            .get(..model_catalogue::HEADER_WORDS * size_of::<u64>())
             .ok_or(SemanticTransitionError::ObservationMismatch)?;
-        let mut codebook_header = [0; 25];
+        let mut codebook_header = [0; model_catalogue::HEADER_WORDS];
         for (word, bytes) in codebook_header.iter_mut().zip(header_bytes.chunks_exact(8)) {
             *word = u64::from_le_bytes(
                 bytes
@@ -7753,7 +7783,7 @@ fn publication_action_receipts_digest_bytes(
     bytes: &[u8],
     receipts: &[SemanticTransitionReceipt],
 ) -> Result<Identity256, SemanticTransitionError> {
-    if bytes.len() < 25 * 8 || !bytes.len().is_multiple_of(8) {
+    if bytes.len() < model_catalogue::HEADER_WORDS * 8 || !bytes.len().is_multiple_of(8) {
         return Err(publication_input_error(
             "replay action codebook has another native extent",
         ));
@@ -10170,7 +10200,7 @@ fn relocate_publication_codebooks(
     saved: &[u8],
     actual: &[u64],
 ) -> Result<Vec<u8>, SemanticTransitionError> {
-    if actual.len() < 25
+    if actual.len() < model_catalogue::HEADER_WORDS
         || saved.len()
             != actual
                 .len()
@@ -10213,6 +10243,7 @@ fn publication_material_runtime() -> [u8; 32] {
         ));
         #[cfg(feature = "semantic-policy")]
         hash.update(include_bytes!("semantic_transition/model_evaluation.rs"));
+        hash.update(include_bytes!("semantic_transition/model_catalogue.rs"));
         hash.update(include_bytes!("../kernels/semantic_transition.cu"));
         hash.update(include_bytes!("../kernels/semantic_program.cuh"));
         hash.update(include_bytes!("../kernels/semantic_rule_action.cuh"));
@@ -20176,6 +20207,8 @@ pub struct SemanticTransitionSession {
     // A cold read can precede the final observed-source/authority import. The
     // later binding must reproduce this exact executed task content.
     cold_content: Option<(SemanticTaskContentIdentity, Vec<crate::SemanticTruth>)>,
+    cold_statement_records: Vec<u32>,
+    cold_statement_reservation: Option<SemanticReplayMaterialReservation>,
     cold_observer_entered: bool,
     cold_observer_completed: bool,
     cold_canary_source: Option<Arc<crate::SemanticTrainingCanarySource>>,
@@ -22351,6 +22384,7 @@ struct OriginalSessionCodebooks {
     poisoned: bool,
     complete: bool,
     retired: bool,
+    _model_catalogue: Option<Arc<model_catalogue::FrozenModelCatalogue>>,
 }
 
 /// Retains actual graph and Session allocations before the first constructor
@@ -22360,6 +22394,7 @@ pub struct SemanticTransitionSessionConstruction {
     graph: Option<crate::semantic_hypergraph::OriginalSemanticGraphConstruction>,
     admitted_graph: Option<SemanticHypergraph>,
     program: Option<Arc<crate::SemanticProgramAdmission>>,
+    model_context: Option<SemanticFrozenModelContext>,
     session: Option<SemanticTransitionSession>,
     completed: Option<Arc<Mutex<Option<SemanticTransitionSession>>>>,
     binding: Arc<actor_refresh::ActorRefreshConstructionBinding>,
@@ -22406,6 +22441,7 @@ impl SemanticTransitionSessionConstruction {
                 &mut self.admitted_graph,
                 self.program.as_deref(),
                 Arc::clone(&self.binding.issuer),
+                self.model_context.as_ref(),
             )?;
             session.actor_refresh_construction = Some(Arc::clone(&self.binding));
             if let Some(budget) = &self.replay_material_budget {
@@ -24197,7 +24233,7 @@ impl SemanticTransitionSession {
             .next_reader
             .checked_add(bound)
             .ok_or(SemanticTransitionError::GenerationExhausted)?;
-        let schema = SemanticFeedbackSchema::new(self.feedback_statement_bytes()?)?;
+        let schema = self.feedback_schema()?;
         let descriptor = self.descriptor();
         let input_plans = PreparedStepInputs::plan(&storage)?;
         let feedback_plan = FeedbackAllocationPlan::new(
@@ -38724,7 +38760,7 @@ impl SemanticTransitionSession {
         // The private prepared enqueue remains usable by the segment builder.
         let _ordinary = crate::cuda_graph::reserve_uncaptured_stream(&self.stream)
             .map_err(|error| runtime_error("feedback stream admission", error))?;
-        let schema = SemanticFeedbackSchema::new(self.feedback_statement_bytes()?)?;
+        let schema = self.feedback_schema()?;
         let storage = Arc::clone(
             self.publication
                 .as_ref()
@@ -40231,9 +40267,22 @@ impl SemanticTransitionSession {
         graph: SemanticHypergraph,
         program: Option<&crate::SemanticProgramAdmission>,
     ) -> Result<Self, SemanticTransitionError> {
+        Self::from_hypergraph_with_model_context(graph, program, None)
+    }
+
+    /// Project the original cold model rows before sizing resident buffers.
+    pub fn from_hypergraph_with_model_context(
+        graph: SemanticHypergraph,
+        program: Option<&crate::SemanticProgramAdmission>,
+        context: Option<&SemanticFrozenModelContext>,
+    ) -> Result<Self, SemanticTransitionError> {
         let mut graph = Some(graph);
-        let mut session =
-            Self::allocate_from_hypergraph_with_program(&mut graph, program, Arc::new(()))?;
+        let mut session = Self::allocate_from_hypergraph_with_program(
+            &mut graph,
+            program,
+            Arc::new(()),
+            context,
+        )?;
         session.upload_cold_codebooks()?;
         Ok(session)
     }
@@ -40242,6 +40291,7 @@ impl SemanticTransitionSession {
         original_graph: &mut Option<SemanticHypergraph>,
         program: Option<&crate::SemanticProgramAdmission>,
         publication_issuer: Arc<()>,
+        context: Option<&SemanticFrozenModelContext>,
     ) -> Result<Self, SemanticTransitionError> {
         let graph = original_graph
             .as_ref()
@@ -40263,7 +40313,11 @@ impl SemanticTransitionSession {
             .expect("transition owner validated admission");
         let root = admission.base();
         let base_snapshot = *admission.base_snapshot();
-        let codebooks = ActionCodebooks::derive(admission, graph.transition_arena()[1], program)?;
+        let mut codebooks =
+            ActionCodebooks::derive(admission, graph.transition_arena()[1], program)?;
+        if let Some(context) = context {
+            codebooks.project_model_catalogue(Arc::clone(&context.catalogue), context.member)?;
+        }
         let bytes = codebooks.input_cells * (size_of::<f32>() + size_of::<u8>())
             + SCRATCH_BYTES
             + OBSERVATION_BYTES
@@ -40302,19 +40356,31 @@ impl SemanticTransitionSession {
             .ok_or_else(|| runtime_error("stream resolution", "owned stream is unavailable"))?;
         let pinned = PinnedObservation::new(stream.clone())?;
         let writes = vec![
-            state_restoration::OriginalDeviceWrite::new(
+            state_restoration::OriginalDeviceWrite::new_with_owner(
                 &stream,
                 &codebooks.words,
                 device_codebooks.view(),
                 true,
+                codebooks
+                    .model_projection_reservation
+                    .as_ref()
+                    .map(Arc::clone),
             )?,
-            state_restoration::OriginalDeviceWrite::new(
+            state_restoration::OriginalDeviceWrite::new_with_owner(
                 &stream,
                 &codebooks.components,
                 device_components.view(),
                 true,
+                codebooks
+                    .model_projection_reservation
+                    .as_ref()
+                    .map(Arc::clone),
             )?,
         ];
+        let model_catalogue = codebooks
+            .model_catalogue
+            .as_ref()
+            .map(|(catalogue, _)| Arc::clone(catalogue));
         let session = Self {
             captured: None,
             graph_retirements: Vec::new(),
@@ -40332,6 +40398,8 @@ impl SemanticTransitionSession {
             task: None,
             task_ground: None,
             cold_content: None,
+            cold_statement_records: Vec::new(),
+            cold_statement_reservation: None,
             cold_observer_entered: false,
             cold_observer_completed: false,
             cold_canary_source: None,
@@ -40356,6 +40424,7 @@ impl SemanticTransitionSession {
                 poisoned: false,
                 complete: false,
                 retired: false,
+                _model_catalogue: model_catalogue,
             }))),
             construction_pending: Arc::new(AtomicBool::new(true)),
             #[cfg(feature = "semantic-policy")]
@@ -41164,6 +41233,18 @@ impl SemanticTransitionSession {
                 "cold task observer differs from the admitted edit grammar",
             ));
         }
+        let statement_reservation = self
+            .replay_material_budget
+            .as_ref()
+            .map(|budget| {
+                let bytes = statement_records
+                    .len()
+                    .checked_mul(size_of::<u32>())
+                    .and_then(|bytes| bytes.checked_add(size_of::<Vec<u32>>()))
+                    .ok_or(SemanticTransitionError::GenerationExhausted)?;
+                budget.reserve_auxiliary(bytes as u64)
+            })
+            .transpose()?;
         self.cold_observer_entered = true;
         let observation = program
             .observe(Arc::clone(&self.provider))
@@ -41202,6 +41283,8 @@ impl SemanticTransitionSession {
                 )));
         }
         self.cold_content = Some(content.clone());
+        self.cold_statement_records = statement_records.to_vec();
+        self.cold_statement_reservation = statement_reservation;
         Ok(content)
     }
 
@@ -42422,7 +42505,7 @@ impl SemanticTransitionSession {
             17 => &self.codebooks.leaves,
             _ => return None,
         };
-        entries.get(category.checked_sub(1)? as usize)
+        entries.get(self.codebooks.local_category(field, category)?)
     }
 
     pub fn host_io_stats(&self) -> SemanticTransitionHostIoStats {

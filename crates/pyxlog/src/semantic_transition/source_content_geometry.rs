@@ -706,7 +706,7 @@ impl PySemanticPreparedSourceContentGeometry {
                 law,
                 xlog_cuda::Identity256::from_bytes(self.source.binding.scoring_law),
             )?;
-            let policy = policy_layout_object(py, layout, binding)?;
+            let policy = policy_layout_object(py, layout, self.inner.model_catalogue_binding())?;
             let support = policy_support_layout_object(py, binding, spans.iter().cloned(), cells)?;
             let feedback = feedback_schema_object(py, schema)?;
             cache.task_metadata = Some(GeometryTuple {

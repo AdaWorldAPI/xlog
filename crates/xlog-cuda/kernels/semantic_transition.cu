@@ -3232,7 +3232,7 @@ struct PublicationCodebookBytes {
 };
 __device__ uint64_t publication_logical_codebook_digest(const uint64_t* words,uint64_t count,uint64_t* digest,
         semantic_graph::NativeWorkTally* work=nullptr) {
-    if(!words || count<25 || count>UINT64_MAX/8 || words[8]%8 || words[8]>count*8 ||
+    if(!words || count<42 || count>UINT64_MAX/8 || words[8]%8 || words[8]>count*8 ||
        words[9]>count*8-words[8] || (words[8]+words[9]+7)/8!=count)return 1;
     PublicationCodebookBytes bytes{};bytes.words=words;
     const char domain[]="xlog.semantic.logical-codebooks.v1";
@@ -4388,11 +4388,20 @@ __device__ bool retire_pending_roots(const Descriptor& d,
     return true;
 }
 
-__device__ bool supported(const Component* components,const uint8_t* support,uint32_t start,uint32_t field,uint32_t category,
+struct NativePrefixWork {
+    semantic_graph::NativeWorkTally* tally;
+    __device__ void operator()(semantic_rule_action::PrefixWorkEvent event) const {
+        semantic_graph::charge_native(tally,event==semantic_rule_action::PrefixWorkEvent::Category
+            ? semantic_graph::NativeWorkEvent::Category : semantic_graph::NativeWorkEvent::TableSlot,1);
+    }
+};
+__device__ bool supported(const uint64_t* books,const Component* components,const uint8_t* support,uint32_t start,uint32_t field,uint32_t category,
         semantic_graph::NativeWorkTally* work=nullptr) {
     semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::Category,1);
     const Component c=components[start+field];
-    return category<c.cardinality && support[c.offset+category];
+    return category<c.cardinality &&
+        semantic_rule_action::context_category(books,field,category,NativePrefixWork{work}) &&
+        support[c.offset+category];
 }
 __device__ bool operand_matches(const uint64_t* books,uint32_t target,uint32_t position,uint32_t operand,
         semantic_graph::NativeWorkTally* work=nullptr) {
@@ -4405,36 +4414,29 @@ __device__ bool operand_matches(const uint64_t* books,uint32_t target,uint32_t p
 }
 __device__ bool target_completes(const uint64_t* books,const Component* components,const uint8_t* support,uint32_t start,uint32_t target,
         semantic_graph::NativeWorkTally* work=nullptr) {
-    if(!target || !supported(components,support,start,2,target,work))return false;
+    if(!target || !supported(books,components,support,start,2,target,work))return false;
     if((books+books[0]+10*target)[1]==UINT64_MAX)return false;
     for(uint32_t position=0;position<4;++position) {
         bool found=false;
         for(uint32_t operand=0;operand<books[3];++operand)
-            if(supported(components,support,start,3+position,operand,work) && operand_matches(books,target,position,operand,work)){found=true;break;}
+            if(supported(books,components,support,start,3+position,operand,work) && operand_matches(books,target,position,operand,work)){found=true;break;}
         if(!found)return false;
     }
     return true;
 }
-struct NativePrefixWork {
-    semantic_graph::NativeWorkTally* tally;
-    __device__ void operator()(semantic_rule_action::PrefixWorkEvent event) const {
-        semantic_graph::charge_native(tally,event==semantic_rule_action::PrefixWorkEvent::Category
-            ? semantic_graph::NativeWorkEvent::Category : semantic_graph::NativeWorkEvent::TableSlot,1);
-    }
-};
 __device__ bool action_completes(const uint64_t* books,const Component* components,const uint8_t* support,
                                const uint32_t* viable,uint32_t start,uint32_t opcode,
                                const TaskProgramBank& program_bank,
                                semantic_graph::NativeWorkTally* work=nullptr) {
-    if(!supported(components,support,start,0,opcode==0 ? ACTION_NO_EDIT : ACTION_APPLY,work))return false;
+    if(!supported(books,components,support,start,0,opcode==0 ? ACTION_NO_EDIT : ACTION_APPLY,work))return false;
     if(opcode==0) {
-        for(uint32_t f=1;f<18;++f)if(!supported(components,support,start,f,0,work))return false;
+        for(uint32_t f=1;f<18;++f)if(!supported(books,components,support,start,f,0,work))return false;
         return true;
     }
     if(opcode==2) {
         if(!program_bank.editable ||
            uint64_t(program_bank.program.rule_count)+program_bank.selected_rule_count>=PROGRAM_RULE_CAPACITY ||
-           !supported(components,support,start,1,2,work))return false;
+           !supported(books,components,support,start,1,2,work))return false;
         uint32_t empty_choices[18]={};
         empty_choices[1]=2;
         return semantic_rule_action::prefix_completes(books,components,support,start,
@@ -4442,12 +4444,12 @@ __device__ bool action_completes(const uint64_t* books,const Component* componen
             NativePrefixWork{work});
     }
     if(opcode!=1 || program_bank.editable)return false;
-    if(!supported(components,support,start,1,1,work))return false;
+    if(!supported(books,components,support,start,1,1,work))return false;
     for(uint32_t f=1;f<18;++f)if((INSERT_SUPPORT_NULL_MASK>>f)&1)
-        if(!supported(components,support,start,f,0,work))return false;
+        if(!supported(books,components,support,start,f,0,work))return false;
     for(uint32_t f=11;f<=17;f+=6) {
         bool found=false;
-        for(uint32_t i=1;i<components[start+f].cardinality;++i)found |= supported(components,support,start,f,i,work);
+        for(uint32_t i=1;i<components[start+f].cardinality;++i)found |= supported(books,components,support,start,f,i,work);
         if(!found)return false;
     }
     for(uint32_t i=1;i<books[1];++i) {
@@ -4463,6 +4465,7 @@ __device__ bool legal_category(const Component c,uint32_t category,const uint64_
         semantic_graph::NativeWorkTally* work=nullptr) {
     semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::Category,1);
     if(c.kind==COMPONENT_KIND_TEXT)return true;
+    if(!semantic_rule_action::context_category(books,c.field,category,NativePrefixWork{work}))return false;
     if(c.field==0)return category==0 ? no_edit : category==1 && (apply_support || apply_rule);
     if(choices[0]==ACTION_NO_EDIT)return category==0;
     if(c.field==1)return category==1 ? apply_support : category==2 && apply_rule;

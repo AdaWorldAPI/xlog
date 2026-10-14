@@ -121,6 +121,32 @@ same source again and must reproduce the same identities and truths; a mismatch
 refuses the native session. Cold content observation does not run the model or
 prefill its cache.
 
+For two original executable contexts sharing one model, call
+`first_cold.freeze_model_contexts(next_cold)` before either task import, model
+allocation, capture or Proposal draw. Use the same context order during fresh
+preparation and restoration; an observed-only training canary is not a member.
+Both cold owners must already share the original allocator, serial stream and
+material capacity pool, device, memory limit, prefix/feedback capacities, padding
+and terminal tokens. Their actual prefix extents, programs, query selections,
+support rights and intent authorities remain independent.
+
+The native producer freezes both actual descriptor occurrence rosters, with one
+intrinsic NULL per field and at most 65536 categories. It retains each context's
+global-category-to-original-descriptor resolution; external support cannot
+authorize the other context's rows. `Session.policy_layout()` identifies the
+shared immutable model rows, while `Session.binding()` and
+`TaskUse.policy_support_layout()` identify that context's own authenticated
+bytes and support packing. Do not substitute either identity for the other.
+Both task uses expose the same `feedback_schema()`: its statement extent is
+the maximum actual learned payload length across the two original query rosters
+and its width is `9*extent+4`. Shorter statements retain their own real lengths
+and byte-presence masks; no query or statement is added for shape agreement.
+
+If freezing has unknown completion, retain both original cold owners and invoke
+the same method with the same ordered pair to resolve its retained DMA operation.
+Neither session can be used while that shared operation remains pending. This
+method neither transfers a numerical bank nor authorizes a task continuation.
+
 `observer_program` and import `task_program_source` are explicitly `None` for
 Coding; its actual initial program is compiled from the admitted theory and
 input facts. Import `statement_records` must equal the retained `query_records`.
@@ -1036,7 +1062,7 @@ does not retain that temporary permission.
 
 `SemanticTransitionSession.restore_checkpoint(checkpoint, *, device_ordinal,
 snapshot, restore_model, training_domain, training_canary_source,
-original_program=None)` validates every section and the retained
+original_program=None, original_task_use=None)` validates every section and the retained
 authority before allocating a fresh, never-reused native owner. `snapshot` must be newer than the
 snapshot sealed into the checkpoint. The application must project its original
 sealed input set and loader again into `training_domain`; it must exactly match
@@ -1057,6 +1083,18 @@ The original initial kit, byte limits and native-issued Proposal assignment map
 are restored from the same authenticated task capsule. An issued assignment whose
 full episode has not yet materialized remains unresolved; it cannot authorize an
 actor draw until joined with its exact original replay material and batch receipt.
+
+For a checkpoint with a paired model catalogue, `original_task_use` must be the
+native task use imported from that selected context's original cold recipe in
+the same material owner. In a fresh process, recreate both original cold tasks,
+freeze them in their original order, then import the selected task before this
+call. Native restores the common row domain before sizing the new session's
+resident buffers or invoking the model factory. It checks the checkpoint's
+shared row identity and its own complete context recipe; a missing, foreign or
+solo context cannot substitute for that domain. The process-local frozen token
+is not serialized as a Python object or CUDA handle. Internal private and
+intermediate restores retain the same native token through their existing task
+checkpoint seed.
 
 Phase custody uses this same loader with all four original cold proof
 keywords together: `learning_phase_issuer` is the independently pinned 32-byte

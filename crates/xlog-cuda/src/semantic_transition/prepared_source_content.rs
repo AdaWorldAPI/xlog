@@ -1490,6 +1490,38 @@ impl SemanticPreparedSourceContentGeometry {
         }
     }
 
+    pub fn model_catalogue_binding(&self) -> SemanticCatalogueBinding {
+        if self.owner.seed.proof.owner.codebook_header[40] == 0 {
+            return self.policy_binding();
+        }
+        SemanticCatalogueBinding {
+            generation: CATALOGUE_GENERATION,
+            digest: self.codebook_identity(25),
+        }
+    }
+
+    pub(super) fn frozen_model_context(
+        &self,
+        catalogue: Option<&Arc<model_catalogue::FrozenModelCatalogue>>,
+    ) -> Result<Option<SemanticFrozenModelContext>, SemanticTransitionError> {
+        if self.owner.seed.proof.owner.codebook_header[40] == 0 {
+            if catalogue.is_some() {
+                return Err(publication_input_error(
+                    "solo source geometry cannot replace a frozen model context",
+                ));
+            }
+            return Ok(None);
+        }
+        catalogue
+            .ok_or_else(|| {
+                publication_input_error(
+                    "source construction requires the original frozen model catalogue",
+                )
+            })?
+            .context_for_header(&self.owner.seed.proof.owner.codebook_header)
+            .map(Some)
+    }
+
     pub fn schema_generation(&self) -> Identity256 {
         self.codebook_identity(10)
     }
@@ -2272,7 +2304,11 @@ impl SourcePublicationGeometry {
                 .allocation_geometry
                 .iter()
                 .filter(|range| range.role == 16)
-                .map(|range| range.length),
+                .map(|range| range.length)
+                .chain(
+                    (original.codebook_header[37] != 0)
+                        .then_some(original.codebook_header[37] as usize),
+                ),
         )?;
         let (capacities, _) = seed
             .capacities
@@ -3784,7 +3820,7 @@ impl SemanticTransitionSession {
             .require_original_allocation(&storage, &inputs, &lease.directory)?;
         let feedback = FeedbackBuffers::allocate(
             &self.provider,
-            SemanticFeedbackSchema::new(self.feedback_statement_bytes()?)?,
+            self.feedback_schema()?,
             storage.contract_value.feedback_capacity,
             self.descriptor().arena[4],
         )?;

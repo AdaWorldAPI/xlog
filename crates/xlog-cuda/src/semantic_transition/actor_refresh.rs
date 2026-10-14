@@ -1074,6 +1074,12 @@ impl SemanticTransitionSession {
                 "cancelled actor cannot begin Session construction",
             ));
         }
+        let model_context = proof.inner.content_geometry[bank].frozen_model_context(
+            self.codebooks
+                .model_catalogue
+                .as_ref()
+                .map(|(catalogue, _)| catalogue),
+        )?;
         let graph = self
             .provider
             .prepare_semantic_graph_construction(
@@ -1107,6 +1113,7 @@ impl SemanticTransitionSession {
             graph: Some(graph),
             admitted_graph: None,
             program,
+            model_context,
             session: None,
             completed: None,
             binding,
