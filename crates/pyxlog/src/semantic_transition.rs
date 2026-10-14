@@ -85,6 +85,20 @@ pyo3::create_exception!(
     "Original training roster admission retains its owners; resolve without rematerializing."
 );
 
+pyo3::create_exception!(
+    pyxlog._native,
+    SemanticModelContextFreezePending,
+    PyRuntimeError,
+    "The original ordered cold pair retains its catalogue uploads; resolve that same pair."
+);
+
+pyo3::create_exception!(
+    pyxlog._native,
+    SemanticImportedTaskReleasePending,
+    PyRuntimeError,
+    "The original model-free import retains an unfinished terminal join; resolve that same release."
+);
+
 fn training_arena_pending_error(
     py: Python<'_>,
     controller: &Bound<'_, PySemanticTransitionController>,
@@ -407,6 +421,7 @@ pub(crate) struct PySemanticTransitionSession {
     learning_preparing: AtomicBool,
     learning_transition: Mutex<Option<Py<learning_phase::PySemanticLearningPhaseTransition>>>,
     checkpoint_custody: Mutex<Option<learning_phase::cold_restore::CheckpointCustody>>,
+    imported_task_release: Mutex<Option<ImportedTaskRelease>>,
     #[cfg(feature = "semantic-policy")]
     pending_content_binding: Mutex<Option<PendingPythonContentBinding>>,
     #[cfg(feature = "semantic-policy")]
@@ -432,6 +447,12 @@ pub(crate) struct PySemanticTransitionSession {
     capacities: (u32, u32, u32, u32),
     admission_limits: (u32, u32, u32, usize),
     memory_bytes: u64,
+}
+
+struct ImportedTaskRelease {
+    owner: xlog_cuda::SemanticImportedTaskRelease,
+    task_use: Py<PySemanticTransitionTaskUse>,
+    controller: Py<PySemanticTransitionController>,
 }
 
 struct SemanticSessionGuard<'a>(MutexGuard<'a, Option<SemanticTransitionSession>>);
@@ -680,6 +701,78 @@ impl PySemanticTransitionSession {
         Ok(())
     }
 
+    fn release_imported_task(
+        &self,
+        py: Python<'_>,
+        task_use: &Bound<'_, PySemanticTransitionTaskUse>,
+        controller: &Bound<'_, PySemanticTransitionController>,
+    ) -> PyResult<()> {
+        // Allocate Python custody before entering the terminal native wait.
+        let pending = SemanticImportedTaskReleasePending::new_err(
+            "retain controller and task_use, then repeat controller.close_imported_task(task_use); do not abort, import or replace that owner",
+        );
+        pending.value(py).setattr("controller", controller)?;
+        pending.value(py).setattr("task_use", task_use)?;
+        let mut retained = self
+            .imported_task_release
+            .lock()
+            .map_err(|_| invalid("original import release custody mutex is poisoned"))?;
+        if let Some(original) = retained.as_ref() {
+            if !original.task_use.bind(py).is(task_use)
+                || !original.controller.bind(py).is(controller)
+            {
+                return Err(invalid(
+                    "import release requires its retained original handles",
+                ));
+            }
+        } else {
+            let owner = {
+                let mut guard = self
+                    .inner
+                    .lock()
+                    .map_err(|_| invalid("native semantic session owner mutex is poisoned"))?;
+                let live = guard
+                    .as_mut()
+                    .ok_or_else(|| invalid("imported native Session was already released"))?;
+                task_use.borrow().require_original_identity(live)?;
+                if let Err(original) = live.join_imported_task_release() {
+                    let original = xlog_err(original);
+                    if live.imported_task_release_pending() {
+                        pending.set_cause(py, Some(original));
+                        return Err(pending);
+                    }
+                    return Err(original);
+                }
+                guard.take().expect("checked joined ordinary import")
+            };
+            let owner = owner.prepare_imported_task_release().map_err(xlog_err)?;
+            *retained = Some(ImportedTaskRelease {
+                owner,
+                task_use: task_use.clone().unbind(),
+                controller: controller.clone().unbind(),
+            });
+            self.issuance.fetch_add(1, Ordering::AcqRel);
+        }
+        if let Err(original) = retained
+            .as_mut()
+            .expect("retained original allocation retirement")
+            .owner
+            .resolve()
+        {
+            pending.set_cause(py, Some(xlog_err(original)));
+            return Err(pending);
+        }
+        self.training_canary_owner
+            .lock()
+            .map_err(|_| invalid("symbolic canary owner mutex is poisoned"))?
+            .take();
+        let released = retained.take();
+        drop(retained);
+        drop(released);
+        drain_export_owners();
+        Ok(())
+    }
+
     fn release_retired_publication(
         &self,
         py: Python<'_>,
@@ -890,6 +983,7 @@ impl PySemanticTransitionSession {
             checkpoint_custody: Mutex::new(Some(
                 learning_phase::cold_restore::CheckpointCustody::issue(),
             )),
+            imported_task_release: Mutex::new(None),
             #[cfg(feature = "semantic-policy")]
             pending_content_binding: Mutex::new(None),
             #[cfg(feature = "semantic-policy")]
@@ -22906,6 +23000,111 @@ impl PySemanticTransitionController {
         Ok(())
     }
 
+    /// Terminally release a genuine completed ordinary import that has never
+    /// allocated a model, bound a parent, or executed a segment. A retained
+    /// immutable model-context token does not retain this Session's GPU storage.
+    /// Unknown retains the original TaskUse and terminal join for the same call.
+    fn close_imported_task(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        task_use: Bound<'_, PySemanticTransitionTaskUse>,
+    ) -> PyResult<()> {
+        let controlled = slf.borrow();
+        let issued = task_use.borrow();
+        let session = controlled.session.borrow(py);
+        session.require_creator()?;
+        if issued.session.as_ptr() != controlled.session.as_ptr() {
+            return Err(invalid("import release requires its original Session"));
+        }
+        if session
+            .imported_task_release
+            .lock()
+            .map_err(|_| invalid("original import release custody mutex is poisoned"))?
+            .is_some()
+        {
+            return session.release_imported_task(py, &task_use, slf);
+        }
+        controlled.require_read_issued(&issued)?;
+        if !matches!(issued.state()?.phase, TaskUsePhase::Imported)
+            || issued
+                .delivery
+                .lock()
+                .map_err(|_| invalid("delivery binding mutex is poisoned"))?
+                .is_some()
+            || issued
+                .pending_delivery_receiver
+                .lock()
+                .map_err(|_| invalid("pending delivery receiver mutex is poisoned"))?
+                .is_some()
+            || session.importing.load(Ordering::Acquire)
+            || session.recording.load(Ordering::Acquire)
+            || session.retiring.load(Ordering::Acquire)
+            || session.learning_preparing.load(Ordering::Acquire)
+            || session
+                .learning_transition
+                .lock()
+                .map_err(|_| invalid("learning-phase retention mutex is poisoned"))?
+                .is_some()
+            || session
+                .prepared_segment
+                .lock()
+                .map_err(|_| invalid("prepared segment mutex is poisoned"))?
+                .is_some()
+            || session
+                .checkpoint_custody
+                .lock()
+                .map_err(|_| invalid("checkpoint custody mutex is poisoned"))?
+                .as_ref()
+                .is_some_and(|custody| {
+                    custody.closure.is_some()
+                        || custody.origin.is_some()
+                        || custody.pending_export.is_some()
+                })
+        {
+            return Err(invalid(
+                "import release requires its completed original TaskUse outside execution and callbacks",
+            ));
+        }
+        #[cfg(feature = "semantic-policy")]
+        if session.private_replay_custody()?.is_some()
+            || session
+                .actor_refresh_child
+                .lock()
+                .map_err(|_| invalid("actor construction custody mutex is poisoned"))?
+                .is_some()
+            || session
+                .segment_instruction
+                .lock()
+                .map_err(|_| invalid("original instruction owner mutex is poisoned"))?
+                .is_some()
+            || session
+                .prepared_task_import
+                .lock()
+                .map_err(|_| invalid("prepared import custody mutex is poisoned"))?
+                .is_some()
+            || session
+                .pending_content_binding
+                .lock()
+                .map_err(|_| invalid("pending content custody mutex is poisoned"))?
+                .is_some()
+            || session
+                .pending_evaluation_preparation
+                .lock()
+                .map_err(|_| invalid("pending evaluation custody mutex is poisoned"))?
+                .is_some()
+            || session
+                .active_cold_model_work
+                .lock()
+                .map_err(|_| invalid("active cold callback custody mutex is poisoned"))?
+                .is_some()
+        {
+            return Err(invalid(
+                "ordinary import release cannot interrupt original private or prepared custody",
+            ));
+        }
+        session.release_imported_task(py, &task_use, slf)
+    }
+
     /// Terminally release a Session only after its original publication,
     /// segments, executables and external aliases have fully retired. This
     /// performs the existing joined native deallocation; abort is not release.
@@ -29407,6 +29606,7 @@ mod tests {
             checkpoint_custody: Mutex::new(Some(
                 learning_phase::cold_restore::CheckpointCustody::issue(),
             )),
+            imported_task_release: Mutex::new(None),
             #[cfg(feature = "semantic-policy")]
             active_cold_model_work: Mutex::new(None),
             #[cfg(feature = "semantic-policy")]

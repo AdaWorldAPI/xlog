@@ -142,10 +142,34 @@ the maximum actual learned payload length across the two original query rosters
 and its width is `9*extent+4`. Shorter statements retain their own real lengths
 and byte-presence masks; no query or statement is added for shape agreement.
 
-If freezing has unknown completion, retain both original cold owners and invoke
-the same method with the same ordered pair to resolve its retained DMA operation.
+If freezing retains a confirmed original upload with unknown completion, it raises
+`SemanticModelContextFreezePending`. Its `source` and `target` attributes are the
+exact original cold owners. Retain that exception and both owners, then invoke
+the same method with that ordered pair to resolve its retained DMA operation.
+Known validation, allocation or DMA-work refusal is not this pending type, even
+if original allocations have already been installed. An entered but unconfirmed
+submission retains lifetime custody without authorizing a result retry. Do not
+retry an arbitrary `RuntimeError`.
 Neither session can be used while that shared operation remains pending. This
 method neither transfers a numerical bank nor authorizes a task continuation.
+
+After known successful checkpoint restoration, release an original import used
+only to supply its immutable model-context token with
+`controller.close_imported_task(task_use)`. It requires the genuine completed
+ordinary import, with no model, parent, prefill, graph, segment or private
+construction. The restored Session retains its own native allocations and the
+immutable catalogue token, not the imported template's GPU storage. Keep the
+input Runtime open while restoration is pending or fails before completion.
+
+Known release returns `None` only after the native join, alias invalidation,
+Session destruction and allocator retirement. `SemanticImportedTaskReleasePending`
+retains its exact `controller` and `task_use`; resolve by repeating that close
+with those handles. This resumes the original join or allocation retirement,
+including after alias invalidation, rather than starting another release. Do
+not replace, abort or drop a pending release. The native canary dependence ends
+with this Session's confirmed release; it does not close the shared canary or
+release other dependents. Observed-only `ColdTask.close()` and published-parent
+`controller.close(parent)` retain their separate ownership requirements.
 
 `observer_program` and import `task_program_source` are explicitly `None` for
 Coding; its actual initial program is compiled from the admitted theory and

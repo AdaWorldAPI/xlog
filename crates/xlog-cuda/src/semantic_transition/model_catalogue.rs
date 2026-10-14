@@ -558,6 +558,27 @@ impl SemanticTransitionSession {
         Ok(binding)
     }
 
+    /// Whether this exact ordered pair can resolve an entered original upload
+    /// with unknown completion. Known refusal cannot create a retry loop merely
+    /// because installation retained the original catalogue/allocations.
+    pub fn model_contexts_pending(&self, next: &Self) -> bool {
+        matches!(
+            (&self.codebooks.model_catalogue, &next.codebooks.model_catalogue),
+            (Some((left, 0)), Some((right, 1))) if Arc::ptr_eq(left, right)
+        ) && Arc::ptr_eq(&self.construction_pending, &next.construction_pending)
+            && self.construction_pending.load(Ordering::Acquire)
+            && self.construction_codebooks.as_ref().is_some_and(|owner| {
+                owner.lock().is_ok_and(|original| {
+                    !original.complete
+                        && !original.retired
+                        && original
+                            .writes
+                            .get(original.cursor)
+                            .is_some_and(|write| write.completion_pending())
+                })
+            })
+    }
+
     /// Model row identity is distinct from this context's authenticated bytes.
     pub fn model_catalogue_binding(&self) -> SemanticCatalogueBinding {
         self.codebooks

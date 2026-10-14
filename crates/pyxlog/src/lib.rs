@@ -1298,6 +1298,16 @@ fn pyxlog(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<semantic_transition::learning_phase::PySemanticLearningPhaseTransition>()?;
     m.add_class::<semantic_transition::PyNativeTensorAllocation>()?;
     m.add_class::<semantic_transition::PySemanticPreparedStep>()?;
+    m.add(
+        "SemanticModelContextFreezePending",
+        m.py()
+            .get_type::<semantic_transition::SemanticModelContextFreezePending>(),
+    )?;
+    m.add(
+        "SemanticImportedTaskReleasePending",
+        m.py()
+            .get_type::<semantic_transition::SemanticImportedTaskReleasePending>(),
+    )?;
     m.add_class::<semantic_transition::model_work_port::PySemanticModelWorkBufferPort>()?;
     #[cfg(feature = "semantic-policy")]
     {
