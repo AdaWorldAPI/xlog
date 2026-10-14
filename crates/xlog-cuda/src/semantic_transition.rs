@@ -1180,7 +1180,7 @@ impl TaskEvaluationBinding {
                 "native task observer omitted source or result custody",
             ));
         }
-        task_ground.validate(admission.records(), statement_records.len())?;
+        task_ground.validate(admission.records(), statement_records)?;
         if let Some(program) = editable {
             program
                 .validate()
