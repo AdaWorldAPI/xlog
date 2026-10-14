@@ -1319,7 +1319,7 @@ impl PySemanticPreparedSourceContentGeometry {
     }
 }
 
-fn add(left: usize, right: usize) -> PyResult<usize> {
+pub(super) fn add(left: usize, right: usize) -> PyResult<usize> {
     left.checked_add(right)
         .ok_or_else(|| invalid("original source metadata extent overflow"))
 }

@@ -1,8 +1,9 @@
 //! Original same-model preparation, dormant capture and acknowledged publication transfer.
 
+use super::source_content_geometry::add;
 use super::*;
-pub(super) mod declaration;
-pub(super) mod restored_prefill;
+pub(crate) mod declaration;
+pub(crate) mod restored_prefill;
 
 pyo3::create_exception!(
     pyxlog._native,
@@ -310,9 +311,10 @@ impl PySemanticModelContextContinuation {
         let source_owner = source.owner()?;
         task.require_current(&source_owner)?;
         let target_owner = target.owner()?;
-        source_owner
+        let result = source_owner
             .require_model_context_source_parent(&self.inner, &target_owner, &*current.lease()?)
-            .map_err(xlog_err)
+            .map_err(xlog_err);
+        result
     }
 
     /// Project the genuine restored SOURCE reader and already installed target.
@@ -597,7 +599,7 @@ impl PySemanticModelContextContinuation {
         let lease = source_parent.lease()?;
         let source_owner = source.owner()?;
         let mut target_owner = target.owner()?;
-        target_owner
+        let result = target_owner
             .prepare_model_context_parent(
                 &self.inner,
                 &source_owner,
@@ -606,7 +608,8 @@ impl PySemanticModelContextContinuation {
                 &source_work.borrow(py).custody(py)?.inner,
                 parent,
             )
-            .map_err(xlog_err)
+            .map_err(xlog_err);
+        result
     }
 
     fn project_prefill_stage(&self, py: Python<'_>) -> PyResult<Py<PySemanticInitialPrefillStage>> {
@@ -1544,10 +1547,11 @@ impl PySemanticModelContextContinuation {
                 ));
             }
             parent.require_task(py, &task)?;
-            session
+            let result = session
                 .owner()?
                 .require_model_context_published_model_basis(&self.inner, &*parent.lease()?)
-                .map_err(xlog_err)
+                .map_err(xlog_err);
+            result
         } else {
             Err(invalid(
                 "model basis requires its genuine frozen step or acquired TARGET parent",
@@ -2522,14 +2526,15 @@ impl PySemanticModelContextContinuation {
             let target_task = context.target_task.borrow(py);
             let target_session = target_task.session.borrow(py);
             let streams = context.state()?.activation_streams.clone();
-            target_session
+            let result = target_session
                 .owner()?
                 .finish_model_context_activation_callback(
                     &mut *source_session.owner()?,
                     &context.inner,
                     &*source_parent.borrow(py).lease()?,
                     &streams,
-                )
+                );
+            result
         };
         if let Err(error) = result {
             let task = context.target_task.borrow(py);

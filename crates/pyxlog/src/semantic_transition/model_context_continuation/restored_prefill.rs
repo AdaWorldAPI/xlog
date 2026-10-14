@@ -598,14 +598,15 @@ impl PySemanticRestoredModelContextPrefill {
         } else if target_parent_or_step.is_exact_instance_of::<PySemanticPublishedParent>() {
             let parent = target_parent_or_step.extract::<PyRef<'_, PySemanticPublishedParent>>()?;
             parent.require_task(py, &task)?;
-            session
+            let result = session
                 .owner()?
                 .require_model_context_initial_prefill_basis(
                     &self.custody.continuation,
                     &self.stage.borrow(py).lease,
                     &*parent.lease()?,
                 )
-                .map_err(xlog_err)
+                .map_err(xlog_err);
+            result
         } else {
             Err(invalid(
                 "restored prefill basis requires its genuine frozen step or acquired target parent",
