@@ -1,5 +1,12 @@
 use super::*;
 
+#[cfg(feature = "semantic-policy")]
+mod model_context_checkpoint;
+#[cfg(feature = "semantic-policy")]
+pub use model_context_checkpoint::{
+    SemanticPrivateModelContextCheckpointOrigin, SemanticPrivateModelContextCheckpointSave,
+};
+
 impl SemanticTransitionSession {
     #[cfg(feature = "semantic-policy")]
     pub(super) fn admit_original_model_context_preparation(
@@ -954,6 +961,20 @@ impl SemanticTransitionSession {
         } else {
             None
         };
+        #[cfg(feature = "semantic-policy")]
+        let checkpoint_boundary_metadata = self
+            .replay_material_budget
+            .as_ref()
+            .map(|budget| {
+                budget.reserve_auxiliary(
+                    u64::try_from(
+                        size_of::<Option<model_context_checkpoint::ModelContextCheckpointBoundary>>(
+                        ) + size_of::<Option<SemanticReplayMaterialReservation>>(),
+                    )
+                    .map_err(|_| SemanticTransitionError::GenerationExhausted)?,
+                )
+            })
+            .transpose()?;
         let owner = Arc::new(OriginalStateMaterialRestore {
             issuer: Arc::clone(&self.publication_issuer),
             issuance,
@@ -991,6 +1012,10 @@ impl SemanticTransitionSession {
                 append_next: 0,
                 result: None,
                 poisoned: false,
+                #[cfg(feature = "semantic-policy")]
+                checkpoint_boundary: None,
+                #[cfg(feature = "semantic-policy")]
+                _checkpoint_boundary_metadata: checkpoint_boundary_metadata,
                 _phase_metadata: phase_metadata,
             }),
         });
@@ -2111,6 +2136,10 @@ struct StateMaterialRestore {
     append_next: usize,
     result: Option<SemanticPublishedIdentity>,
     poisoned: bool,
+    #[cfg(feature = "semantic-policy")]
+    checkpoint_boundary: Option<model_context_checkpoint::ModelContextCheckpointBoundary>,
+    #[cfg(feature = "semantic-policy")]
+    _checkpoint_boundary_metadata: Option<SemanticReplayMaterialReservation>,
     // Data fields, including the grown history array, drop before this receipt.
     _phase_metadata: Option<Arc<SemanticReplayMaterialReservation>>,
 }

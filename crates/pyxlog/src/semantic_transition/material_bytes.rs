@@ -29,6 +29,9 @@ pub(super) struct OriginalCheckpointExport {
     #[cfg(feature = "semantic-policy")]
     pub(super) saved_completed_binding: Option<(Option<String>, Vec<u8>)>,
     #[cfg(feature = "semantic-policy")]
+    pub(super) private_model_context_save:
+        Option<xlog_cuda::SemanticPrivateModelContextCheckpointSave>,
+    #[cfg(feature = "semantic-policy")]
     pub(super) saved_model_binding: Option<(
         xlog_cuda::SemanticPublishedIdentity,
         Option<xlog_cuda::SemanticPublishedIdentity>,
@@ -107,6 +110,8 @@ impl OriginalCheckpointExport {
             saved_proposal_expense: None,
             #[cfg(feature = "semantic-policy")]
             saved_completed_binding: None,
+            #[cfg(feature = "semantic-policy")]
+            private_model_context_save: None,
             #[cfg(feature = "semantic-policy")]
             saved_model_binding: None,
             observation: None,

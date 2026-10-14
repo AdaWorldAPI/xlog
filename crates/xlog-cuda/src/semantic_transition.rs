@@ -77,6 +77,10 @@ pub use source_content_occurrences::{
     SemanticSourceContentOccurrence, SemanticSourceContentPhase, SemanticSourceTensorDescriptor,
 };
 pub(crate) mod state_restoration;
+#[cfg(feature = "semantic-policy")]
+pub use state_restoration::{
+    SemanticPrivateModelContextCheckpointOrigin, SemanticPrivateModelContextCheckpointSave,
+};
 mod task_ground;
 mod verification_receipts;
 #[cfg(feature = "semantic-policy")]

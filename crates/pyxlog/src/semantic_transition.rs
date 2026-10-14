@@ -2827,6 +2827,14 @@ impl PySemanticTransitionSession {
         if let Some(closure) = closure {
             session.install_checkpoint_custody(closure, origin)?;
         }
+        #[cfg(feature = "semantic-policy")]
+        session
+            .owner()?
+            .seal_restored_model_context_checkpoint(
+                &*restored_owner.parent.borrow(py).lease()?,
+                Identity256::from_bytes(origin),
+            )
+            .map_err(xlog_err)?;
         drop(session);
         drop(restored_owner);
         #[cfg(feature = "semantic-policy")]
@@ -3443,6 +3451,11 @@ impl PySemanticTransitionSession {
                 learning_transition,
             )?;
         }
+        #[cfg(feature = "semantic-policy")]
+        let private_checkpoint_origin = learning_owner
+            .map(|pending| pending.borrow(py).model_context_checkpoint_origin(py))
+            .transpose()?
+            .flatten();
         if !restore_model.is_callable() {
             return Err(invalid(
                 "checkpoint restore requires one trusted model factory",
@@ -4086,6 +4099,16 @@ impl PySemanticTransitionSession {
                     }
                 }
                 issued.state()?.snapshot = latest;
+            }
+            #[cfg(feature = "semantic-policy")]
+            if let Some(origin) = &private_checkpoint_origin {
+                owner
+                    .retain_private_model_context_checkpoint_origin(
+                        &*acquired.lease()?,
+                        Identity256::from_bytes(Sha256::digest(checkpoint).into()),
+                        origin,
+                    )
+                    .map_err(xlog_err)?;
             }
             Ok(())
         })();
@@ -24780,11 +24803,14 @@ impl PySemanticTransitionController {
         }
         parent.require_task(py, task_use)?;
         #[cfg(feature = "semantic-policy")]
-        if let Some(private) = private_execution_owner(py, &self.session.borrow(py))? {
-            private
-                .borrow(py)
-                .require_private_checkpoint_save(py, self, task_use, &parent)?;
-        }
+        let private_save = private_execution_owner(py, &self.session.borrow(py))?
+            .map(|private| {
+                private
+                    .borrow(py)
+                    .require_private_checkpoint_save(py, self, task_use, &parent)
+            })
+            .transpose()?
+            .flatten();
         #[cfg(feature = "semantic-policy")]
         let cancellation = private_execution_owner(py, &self.session.borrow(py))?
             .map(|private| {
@@ -24795,16 +24821,16 @@ impl PySemanticTransitionController {
             .transpose()?
             .flatten();
         #[cfg(feature = "semantic-policy")]
-        if cancellation.is_none() {
-            self.session
-                .borrow(py)
-                .owner()?
-                .require_model_context_checkpoint_attachment_presence(
-                    &*parent.lease()?,
-                    model_context_continuation.is_some(),
-                )
-                .map_err(xlog_err)?;
-        }
+        self.session
+            .borrow(py)
+            .owner()?
+            .require_model_context_checkpoint_attachment_presence(
+                &*parent.lease()?,
+                model_context_continuation.is_some(),
+                private_save.as_ref(),
+                cancellation.as_ref(),
+            )
+            .map_err(xlog_err)?;
         if !snapshot_model_state.is_callable() {
             return Err(invalid(
                 "checkpoint save requires one trusted model-state serializer",
@@ -24856,14 +24882,14 @@ impl PySemanticTransitionController {
                 drop(state);
                 let lease = parent.lease()?;
                 #[cfg(feature = "semantic-policy")]
-                if cancellation.is_none() {
-                    owner
-                        .require_model_context_checkpoint_attachment_presence(
-                            &lease,
-                            model_context_continuation.is_some(),
-                        )
-                        .map_err(xlog_err)?;
-                }
+                owner
+                    .require_model_context_checkpoint_attachment_presence(
+                        &lease,
+                        model_context_continuation.is_some(),
+                        private_save.as_ref(),
+                        cancellation.as_ref(),
+                    )
+                    .map_err(xlog_err)?;
                 #[cfg(feature = "semantic-policy")]
                 if let Some(proof) = &cancellation {
                     owner
@@ -24936,6 +24962,10 @@ impl PySemanticTransitionController {
             original.saved_phase = Some(phase);
             original.saved_task_binding = Some(binding);
             original.saved_proposal_expense = Some(expense);
+            #[cfg(feature = "semantic-policy")]
+            {
+                original.private_model_context_save = private_save.clone();
+            }
             original.native_capacity = native_capacity;
             original.prefill_extent = prefill_extent;
             original.config = Some(config);

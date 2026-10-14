@@ -175,6 +175,27 @@ pub(super) struct ActorRefreshProgram {
     admissions: Vec<InstructionAdmission>,
 }
 
+impl ActorRefreshProgram {
+    pub(super) fn checkpoint_owner_binding(&self) -> (Arc<()>, Identity256) {
+        (Arc::clone(&self.owner), self.identity)
+    }
+
+    pub(super) fn require_completed_checkpoint_prefix(
+        &self,
+    ) -> Result<(), SemanticTransitionError> {
+        if self
+            .admissions
+            .iter()
+            .any(|claim| claim.state != InstructionState::Completed)
+        {
+            return Err(publication_input_error(
+                "public checkpoint provenance requires its completed original instruction prefix",
+            ));
+        }
+        Ok(())
+    }
+}
+
 enum OriginalProgramContextSource {
     Live(SemanticSegmentInstructionAdmission),
     Restored(RestoredOriginalProgramContextSource),

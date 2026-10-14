@@ -1515,10 +1515,29 @@ impl SemanticTransitionSession {
         &self,
         parent: &SemanticPublishedLease,
         present: bool,
+        private: Option<&SemanticPrivateModelContextCheckpointSave>,
+        cancellation: Option<&SemanticPreparedSegmentNonSubmission>,
     ) -> Result<(), SemanticTransitionError> {
-        self.checked_step(parent)?;
+        if let Some(cancellation) = cancellation {
+            self.prepared_segment
+                .as_ref()
+                .ok_or(SemanticTransitionError::NotBound)?
+                .require_non_submission(cancellation)?;
+            self.checked_original_consumer_step(parent)?;
+            if !parent.active {
+                return Err(SemanticTransitionError::ObservationMismatch);
+            }
+        } else {
+            self.checked_step(parent)?;
+        }
         self.checked_reader(parent)?;
-        let expected = if let Some(owner) = &self.model_context_continuation {
+        let expected = if let Some(private) = private {
+            if self.model_context_continuation.is_some() {
+                return Err(SemanticTransitionError::ObservationMismatch);
+            }
+            self.require_restored_model_context_checkpoint_boundary(parent, Some(private))?;
+            false
+        } else if let Some(owner) = &self.model_context_continuation {
             if Arc::ptr_eq(&self.publication_issuer, &owner.source_issuer) {
                 self.require_model_context_acknowledgement_chain(owner, parent, false)?;
                 let original = owner
@@ -1563,6 +1582,9 @@ impl SemanticTransitionSession {
             match &self.codebooks.model_catalogue {
                 None => {}
                 Some((_, 0)) => self.require_initial_model_context_checkpoint_boundary(parent)?,
+                Some((_, 1)) => {
+                    self.require_restored_model_context_checkpoint_boundary(parent, None)?
+                }
                 Some(_) => return Err(SemanticTransitionError::ObservationMismatch),
             }
             false
