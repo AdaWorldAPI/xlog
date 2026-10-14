@@ -21,6 +21,25 @@ using FieldError = model_policy::FieldErrorView;
 using FieldCotangentAdjoint = model_policy::FieldCotangentAdjoint;
 using FieldDomain = model_policy::FieldDomainView;
 using FieldDomainAdjoint = model_policy::FieldDomainAdjoint;
+using WorkTally = model_policy::ScalarWorkTally;
+static_assert(std::is_standard_layout_v<WorkTally> && sizeof(WorkTally)==16 &&
+              alignof(WorkTally)==8 && offsetof(WorkTally,slots)==0 &&
+              offsetof(WorkTally,overflow)==8 &&
+              std::is_same_v<decltype(WorkTally::slots),std::uint64_t> &&
+              std::is_same_v<decltype(WorkTally::overflow),std::uint64_t>,
+              "invalid semantic policy scalar work tally");
+static_assert(std::is_same_v<decltype(model_policy::ReadoutVjpErrors::work),WorkTally*> &&
+              std::is_same_v<decltype(model_policy::AdvanceVjpErrors::work),WorkTally*>,
+              "invalid semantic policy scalar work contexts");
+static_assert(std::is_standard_layout_v<model_policy::ReadoutVjpErrors> &&
+              sizeof(model_policy::ReadoutVjpErrors)==80 &&
+              alignof(model_policy::ReadoutVjpErrors)==8 &&
+              offsetof(model_policy::ReadoutVjpErrors,work)==72 &&
+              std::is_standard_layout_v<model_policy::AdvanceVjpErrors> &&
+              sizeof(model_policy::AdvanceVjpErrors)==96 &&
+              alignof(model_policy::AdvanceVjpErrors)==8 &&
+              offsetof(model_policy::AdvanceVjpErrors,work)==88,
+              "invalid semantic policy scalar work context layouts");
 static_assert(std::is_standard_layout_v<Field> && sizeof(Field) == 24 && alignof(Field) == 8,
               "invalid semantic policy field layout");
 static_assert(offsetof(Field, embeddings) == 0 && offsetof(Field, biases) == 8 &&

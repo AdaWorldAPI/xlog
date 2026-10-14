@@ -54,9 +54,266 @@ pub struct Compiler {
     lowerer: Lowerer,
 }
 
+pub(crate) struct CompilationOutput<T, O = Arc<dyn Send + Sync>> {
+    pub(crate) value: T,
+    pub(crate) allocation_owner: O,
+}
+
+enum CompilationValue<T, O = Arc<dyn Send + Sync>> {
+    Unowned(T),
+    Owned(CompilationOutput<T, O>),
+}
+
+type CompilationProgram =
+    CompilationValue<Program, crate::program_custody::ProgramAllocationCustody>;
+
+impl<T, O> std::ops::Deref for CompilationValue<T, O> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        match self {
+            Self::Unowned(value) => value,
+            Self::Owned(output) => &output.value,
+        }
+    }
+}
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use xlog_core::{RelId, Schema};
+
+pub use xlog_core::{
+    btree_insert_allocation_bytes, hash_allocation_bytes, push_vector_allocation_bytes,
+    CompilationAllocationScope,
+};
+
+pub fn formatted_text_allocation_bytes(arguments: std::fmt::Arguments<'_>) -> Result<u64> {
+    xlog_core::error::formatted_text_allocation_bytes(arguments)
+}
+
+/// Capacity of the original compiler's scalar binary subset, before owned
+/// normalization, graph, schema, and physical-plan storage is allocated.
+/// The caller must first use its canonical binary-rule and ground-query
+/// validators; this helper is capacity metadata, not a source admission.
+pub fn positive_binary_compiler_allocation_bound(program: &Program) -> Result<u64> {
+    use crate::ast::{Atom, PredColumn, PredDecl, TypeRef};
+    use crate::stratify::{DepEdge, DependencyGraph, Stratum};
+    use std::mem::size_of;
+    let overflow = || XlogError::allocation_extent_overflow("binary compiler");
+    let add = |a: usize, b: usize| a.checked_add(b).ok_or_else(overflow);
+    let mul = |a: usize, b: usize| a.checked_mul(b).ok_or_else(overflow);
+    let vector = |count: usize, width: usize| mul(add(mul(count, 2)?, 4)?, width);
+    let table = |count: usize, width: usize| -> Result<usize> {
+        if count == 0 {
+            return Ok(0);
+        }
+        let buckets = add(mul(count, 8)?, 6)?
+            .checked_div(7)
+            .and_then(|n| n.max(8).checked_next_power_of_two())
+            .ok_or_else(overflow)?;
+        add(mul(buckets, add(width, 1)?)?, 16)
+    };
+    let mut ast = add(
+        size_of::<Program>(),
+        add(
+            vector(program.predicates.len(), size_of::<PredDecl>())?,
+            add(
+                vector(program.rules.len(), size_of::<AstRule>())?,
+                vector(program.queries.len(), size_of::<Query>())?,
+            )?,
+        )?,
+    )?;
+    let mut max_name = "__xlog_query_".len() + 20;
+    let mut names = 0usize;
+    for declaration in &program.predicates {
+        ast = add(ast, size_of::<PredDecl>())?;
+        ast = add(ast, declaration.name.len())?;
+        names = add(names, declaration.name.len())?;
+        max_name = max_name.max(declaration.name.len());
+        ast = add(ast, vector(declaration.types.len(), size_of::<TypeRef>())?)?;
+        {
+            ast = add(
+                ast,
+                vector(declaration.columns.len(), size_of::<PredColumn>())?,
+            )?;
+            for column in &declaration.columns {
+                if let Some(name) = &column.name {
+                    ast = add(ast, name.len())?;
+                    max_name = max_name.max(name.len());
+                }
+            }
+        }
+    }
+    let atom_bytes = |atom: &Atom| -> Result<usize> {
+        let mut bytes = add(size_of::<Atom>(), atom.predicate.len())?;
+        bytes = add(bytes, vector(atom.terms.len(), size_of::<Term>())?)?;
+        for term in &atom.terms {
+            match term {
+                Term::Variable(name) => bytes = add(bytes, name.len())?,
+                Term::Integer(_) | Term::Anonymous => {}
+                _ => {
+                    return Err(XlogError::Compilation(
+                        "binary compiler capacity requires the original scalar subset".into(),
+                    ));
+                }
+            }
+        }
+        Ok(bytes)
+    };
+    for rule in &program.rules {
+        ast = add(ast, add(size_of::<AstRule>(), atom_bytes(&rule.head)?)?)?;
+        names = add(names, rule.head.predicate.len())?;
+        max_name = max_name.max(rule.head.predicate.len());
+        if rule.body.len() > 2 {
+            return Err(XlogError::Compilation(
+                "binary compiler capacity requires at most two original body atoms".into(),
+            ));
+        }
+        ast = add(ast, vector(rule.body.len(), size_of::<BodyLiteral>())?)?;
+        for literal in &rule.body {
+            let BodyLiteral::Positive(atom) = literal else {
+                return Err(XlogError::Compilation(
+                    "binary compiler capacity requires positive original body atoms".into(),
+                ));
+            };
+            ast = add(ast, atom_bytes(atom)?)?;
+            names = add(names, atom.predicate.len())?;
+            max_name = max_name.max(atom.predicate.len());
+            for term in &atom.terms {
+                if let Term::Variable(name) = term {
+                    max_name = max_name.max(name.len());
+                }
+            }
+        }
+    }
+    for query in &program.queries {
+        ast = add(ast, add(size_of::<Query>(), atom_bytes(&query.atom)?)?)?;
+    }
+    let queries = program.queries.len();
+    let rules = add(program.rules.len(), queries)?;
+    let relations = add(program.predicates.len(), queries)?;
+    let edges = add(mul(program.rules.len(), 2)?, queries)?;
+    // Source snapshot, outer meta/list normalizers, prepared frontend clone,
+    // query desugaring, inner meta/list normalizers, and error/reference copies.
+    // These passes retain no generated finite lists or compound terms in the
+    // canonically validated scalar binary subset.
+    let mut bytes = mul(ast, 8)?;
+    let generated_ast = add(
+        size_of::<AstRule>(),
+        add(
+            size_of::<Atom>(),
+            add(size_of::<BodyLiteral>(), mul(3, size_of::<Term>())?)?,
+        )?,
+    )?;
+    bytes = add(
+        bytes,
+        mul(queries, mul(add(generated_ast, mul(max_name, 3)?)?, 8)?)?,
+    )?;
+    // Stratification and lowering each own a dependency graph. Tarjan's
+    // indices/lowlinks, stack/on-stack sets, successor arrays and SCC/stratum
+    // snapshots are included separately, not as a caller-supplied graph count.
+    let edge = add(size_of::<DepEdge>(), mul(max_name, 2)?)?;
+    let graph = add(
+        size_of::<DependencyGraph>(),
+        add(
+            add(vector(edges, edge)?, vector(edges, size_of::<usize>())?)?,
+            add(
+                table(relations, add(size_of::<String>(), max_name)?)?,
+                table(relations, add(size_of::<(String, Vec<usize>)>(), max_name)?)?,
+            )?,
+        )?,
+    )?;
+    let tarjan = add(
+        mul(
+            table(relations, add(size_of::<(String, usize)>(), max_name)?)?,
+            2,
+        )?,
+        add(
+            table(relations, add(size_of::<String>(), max_name)?)?,
+            add(
+                vector(relations, add(size_of::<String>(), max_name)?)?,
+                vector(edges, add(size_of::<String>(), max_name)?)?,
+            )?,
+        )?,
+    )?;
+    let strata = add(
+        vector(relations, size_of::<Stratum>())?,
+        add(
+            vector(relations, size_of::<Vec<String>>())?,
+            vector(relations, add(size_of::<String>(), max_name)?)?,
+        )?,
+    )?;
+    bytes = add(bytes, mul(add(add(graph, tarjan)?, strata)?, 4)?)?;
+    // Meta/list/safety environments, schema inference, relation ids and fact
+    // counters all use the original relation/coordinate rosters. Three
+    // optimizer schema snapshots plus outer returned schemas remain distinct.
+    let schema = add(
+        size_of::<Schema>(),
+        add(
+            vector(2, size_of::<(String, xlog_core::ScalarType)>())?,
+            add(
+                vector(2, size_of::<String>())?,
+                add(mul(max_name, 4)?, vector(2, size_of::<usize>())?)?,
+            )?,
+        )?,
+    )?;
+    bytes = add(
+        bytes,
+        mul(
+            table(relations, add(size_of::<String>(), add(max_name, schema)?)?)?,
+            8,
+        )?,
+    )?;
+    bytes = add(
+        bytes,
+        mul(
+            table(
+                relations,
+                add(size_of::<(String, xlog_core::RelId)>(), max_name)?,
+            )?,
+            4,
+        )?,
+    )?;
+    bytes = add(
+        bytes,
+        mul(
+            table(rules, add(size_of::<(String, Vec<usize>)>(), max_name)?)?,
+            4,
+        )?,
+    )?;
+    let coordinate = add(size_of::<(String, xlog_core::ScalarType)>(), max_name)?;
+    bytes = add(bytes, mul(table(4, coordinate)?, add(rules, 4)?)?)?;
+    bytes = add(
+        bytes,
+        table(
+            relations,
+            size_of::<(xlog_core::RelId, xlog_stats::RelationStats)>(),
+        )?,
+    )?;
+    bytes = add(
+        bytes,
+        crate::lower::positive_binary_lowering_allocation_bound(program, max_name)?,
+    )?;
+    // Generated-head provenance and sorting/reference arrays are live alongside
+    // the plan; a failed semantic check may format every original identifier.
+    bytes = add(
+        bytes,
+        vector(queries, size_of::<xlog_ir::GeneratedQueryRuleProvenance>())?,
+    )?;
+    bytes = add(bytes, vector(rules, size_of::<(usize, usize)>())?)?;
+    bytes = add(bytes, mul(names, 2)?)?;
+    bytes = add(
+        bytes,
+        add(
+            size_of::<Compiler>(),
+            add(
+                size_of::<Optimizer>(),
+                add(size_of::<StatsManager>(), 6 * size_of::<usize>())?,
+            )?,
+        )?,
+    )?;
+    u64::try_from(bytes).map_err(|_| overflow())
+}
 
 impl Default for Compiler {
     fn default() -> Self {
@@ -210,8 +467,30 @@ impl Compiler {
         program: &Program,
     ) -> Result<()> {
         program.validate_prepared_authored_constraint_identity()?;
-        let program = run_frontend_passes(program.clone())?;
+        let program =
+            run_frontend_passes_with_owner(CompilationValue::Unowned(program.clone()), &mut None)?;
         self.lowerer.validate_program_without_plan(&program)
+    }
+
+    pub(crate) fn validate_program_without_stratification_with_allocation_owner(
+        &mut self,
+        program: &Program,
+        scope: &mut CompilationAllocationScope<'_>,
+    ) -> Result<()> {
+        let mut stage = scope.child_scope();
+        let result = (|| {
+            program.validate_prepared_authored_constraint_identity_with_allocation_owner(
+                &mut |bytes| stage.reserve_allocation(bytes),
+            )?;
+            let input = clone_compilation_program(program, &mut stage)?;
+            let program = run_frontend_passes_with_owner(
+                CompilationValue::Owned(input),
+                &mut Some(&mut stage),
+            )?;
+            self.lowerer
+                .validate_program_without_plan_with_allocation_owner(&program, &mut stage)
+        })();
+        finish_compiler_stage(result, stage)
     }
 
     /// Composable program-level entry point.
@@ -266,6 +545,102 @@ impl Compiler {
         )
     }
 
+    /// Compile through the original complete pipeline. Persistent lowerer state
+    /// owns its receipts; discarded compiler data retires with its local stage.
+    ///
+    /// The protective input clone acquires its physical heap allocations and
+    /// typed custody metadata through the caller's original scope before birth.
+    /// Buffer and payload receipts move with their corresponding data through
+    /// every frontend pass. This does not transfer or divide the external
+    /// caller's original receipts.
+    pub fn compile_prepared_program_with_allocation_owner(
+        &mut self,
+        program: &Program,
+        scope: &mut CompilationAllocationScope<'_>,
+    ) -> Result<ExecutionPlan> {
+        self.compile_with_allocation_stage(scope, |compiler, stage| {
+            let input = clone_compilation_program(program, stage)?;
+            let output = compiler.compile_prepared_owned_program_core(
+                CompilationValue::Owned(input),
+                &CompilerConfig::default(),
+                None,
+                &mut Some(stage),
+            )?;
+            match output {
+                CompilationValue::Owned(output) => Ok(output),
+                CompilationValue::Unowned(_) => unreachable!("original owned compiler output"),
+            }
+        })
+    }
+
+    /// Statistics-aware form using the same original compilation owner.
+    pub fn compile_prepared_program_with_stats_snapshot_and_allocation_owner(
+        &mut self,
+        program: &Program,
+        stats_snapshot: Option<&StatsSnapshot>,
+        scope: &mut CompilationAllocationScope<'_>,
+    ) -> Result<ExecutionPlan> {
+        self.compile_with_allocation_stage(scope, |compiler, stage| {
+            let input = clone_compilation_program(program, stage)?;
+            let output = compiler.compile_prepared_owned_program_core(
+                CompilationValue::Owned(input),
+                &CompilerConfig::default(),
+                stats_snapshot,
+                &mut Some(stage),
+            )?;
+            match output {
+                CompilationValue::Owned(output) => Ok(output),
+                CompilationValue::Unowned(_) => unreachable!("original owned compiler output"),
+            }
+        })
+    }
+
+    /// Owned-AST form of the same allocation-aware compilation pipeline.
+    pub fn compile_prepared_owned_program_with_allocation_owner(
+        &mut self,
+        program: Program,
+        scope: &mut CompilationAllocationScope<'_>,
+    ) -> Result<ExecutionPlan> {
+        self.compile_with_allocation_stage(scope, |compiler, stage| {
+            // Incoming external custody belongs to the caller. A guarded
+            // local copy makes only this compiler's AST lifetime separable.
+            let input = clone_compilation_program(&program, stage)?;
+            drop(program);
+            let output = compiler.compile_prepared_owned_program_core(
+                CompilationValue::Owned(input),
+                &CompilerConfig::default(),
+                None,
+                &mut Some(stage),
+            )?;
+            match output {
+                CompilationValue::Owned(output) => Ok(output),
+                CompilationValue::Unowned(_) => unreachable!("original owned compiler output"),
+            }
+        })
+    }
+
+    fn compile_with_allocation_stage<F>(
+        &mut self,
+        scope: &mut CompilationAllocationScope<'_>,
+        compile: F,
+    ) -> Result<ExecutionPlan>
+    where
+        F: FnOnce(
+            &mut Self,
+            &mut CompilationAllocationScope<'_>,
+        ) -> Result<CompilationOutput<ExecutionPlan>>,
+    {
+        let output = {
+            let mut stage = scope.child_scope();
+            let result = compile(self, &mut stage);
+            finish_compiler_stage(result, stage)?
+        };
+        // Keep the temporary carrier alive if receipt-storage acquisition
+        // declines: its plan drops before its original allocation owner.
+        scope.retain(Arc::clone(&output.allocation_owner))?;
+        Ok(output.value)
+    }
+
     /// [`Self::compile_prepared_program_with_config_and_stats_snapshot`] for a
     /// program handed over by value.
     ///
@@ -278,180 +653,115 @@ impl Compiler {
         config: &CompilerConfig,
         stats_snapshot: Option<&StatsSnapshot>,
     ) -> Result<ExecutionPlan> {
-        program.validate_prepared_authored_constraint_identity()?;
-        let generated_query_heads = generated_query_heads_for_program(&program)?;
-        let program = run_frontend_passes(program)?;
-
-        // Phase 2: Stratify (analyze dependencies, detect cycles)
-        let strata = stratify(&program).map_err(map_stratification_to_naf_error)?;
-
-        // Convert strata to the format expected by the lowerer
-        let strata_preds: Vec<Vec<String>> = strata.into_iter().map(|s| s.predicates).collect();
-
-        // Phase 3: Lower AST to execution plan
-        self.lowerer.set_strata(strata_preds);
-
-        // If we have predicate names for the snapshot, use them to seed lowering-time
-        // join ordering with better cardinality estimates.
-        let mut cardinality_hints: HashMap<String, u64> = HashMap::new();
-        if let Some(snapshot) = stats_snapshot {
-            if !snapshot.rel_names.is_empty() {
-                let rel_name_by_id: HashMap<RelId, &str> = snapshot
-                    .rel_names
-                    .iter()
-                    .map(|(id, name)| (*id, name.as_str()))
-                    .collect();
-                for rel in &snapshot.relations {
-                    if let Some(name) = rel_name_by_id.get(&rel.rel_id) {
-                        cardinality_hints.insert((*name).to_string(), rel.cardinality);
-                    }
-                }
-            }
+        let output = self.compile_prepared_owned_program_core(
+            CompilationValue::Unowned(program),
+            config,
+            stats_snapshot,
+            &mut None,
+        )?;
+        match output {
+            CompilationValue::Unowned(plan) => Ok(plan),
+            CompilationValue::Owned(_) => unreachable!("ordinary unowned compiler output"),
         }
-        self.lowerer.set_cardinality_hints(cardinality_hints);
+    }
 
-        let mut plan = self.lowerer.lower_program(&program)?;
+    fn compile_prepared_owned_program_core(
+        &mut self,
+        program: CompilationProgram,
+        config: &CompilerConfig,
+        stats_snapshot: Option<&StatsSnapshot>,
+        scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+    ) -> Result<CompilationValue<ExecutionPlan>> {
+        match scope.as_deref_mut() {
+            Some(scope) => program
+                .validate_prepared_authored_constraint_identity_with_allocation_owner(
+                    &mut |bytes| scope.reserve_allocation(bytes),
+                ),
+            None => program.validate_prepared_authored_constraint_identity(),
+        }?;
+        let generated_query_heads = generated_query_heads_output_with_owner(&program, scope)?;
+        let program = run_frontend_passes_with_owner(program, scope)?;
 
-        // Phase 4: Optimize (predicate pushdown + cost-aware rewrites)
-        //
-        // Seed statistics with any known fact cardinalities so cost estimation has
-        // at least a baseline for EDB relations.
-        let mut mgr = StatsManager::new();
-        let mut fact_counts: HashMap<String, u64> = HashMap::new();
-        for fact in program.facts() {
-            *fact_counts.entry(fact.head.predicate.clone()).or_insert(0) += 1;
-        }
+        // Analyze dependencies and retain only the original lowerer state.
+        self.prepare_strata_with_owner(&program, scope)?;
 
-        for (pred, rel_id) in self.lowerer.rel_ids() {
-            mgr.register_relation(*rel_id);
-            let rows = fact_counts.get(pred).copied().unwrap_or(0);
-            if rows > 0 {
-                mgr.update_cardinality(*rel_id, rows);
-                if let Some(schema) = self.lowerer.schemas().get(pred) {
-                    mgr.update_byte_size(*rel_id, rows * schema.row_size_bytes() as u64);
-                }
-            }
-        }
+        set_compilation_cardinality_hints(&mut self.lowerer, stats_snapshot, scope)?;
 
-        if let Some(snapshot) = stats_snapshot {
-            if snapshot.rel_names.is_empty() {
-                mgr.merge_snapshot(snapshot);
-            } else {
-                let rel_name_by_id: HashMap<RelId, &str> = snapshot
-                    .rel_names
-                    .iter()
-                    .map(|(id, name)| (*id, name.as_str()))
-                    .collect();
+        let mut plan = match scope.as_deref_mut() {
+            Some(scope) => CompilationValue::Owned(
+                self.lowerer
+                    .lower_program_guarded_with_allocation_owner(&program, scope)?,
+            ),
+            None => CompilationValue::Unowned(self.lowerer.lower_program(&program)?),
+        };
 
-                for rel in &snapshot.relations {
-                    let Some(pred) = rel_name_by_id.get(&rel.rel_id) else {
-                        continue;
-                    };
-                    let Some(rel_id) = self.lowerer.rel_ids().get(*pred) else {
-                        continue;
-                    };
-
-                    let mut remapped = rel.clone();
-                    remapped.rel_id = *rel_id;
-
-                    if let Some(schema) = self.lowerer.schemas().get(*pred) {
-                        remapped.column_stats.retain(|col| {
-                            col.col_idx < schema.arity()
-                                && schema.column_type(col.col_idx) == Some(col.dtype)
-                        });
-                    } else {
-                        remapped.column_stats.clear();
-                    }
-
-                    mgr.register_relation(*rel_id);
-                    if let Some(stats) = mgr.get_relation_stats_mut(*rel_id) {
-                        *stats = remapped;
-                    }
-                }
-
-                for js in &snapshot.join_selectivities {
-                    if js.left_keys.len() != js.right_keys.len() {
-                        continue;
-                    }
-
-                    let Some(left_pred) = rel_name_by_id.get(&js.left_rel) else {
-                        continue;
-                    };
-                    let Some(right_pred) = rel_name_by_id.get(&js.right_rel) else {
-                        continue;
-                    };
-                    let Some(&left_id) = self.lowerer.rel_ids().get(*left_pred) else {
-                        continue;
-                    };
-                    let Some(&right_id) = self.lowerer.rel_ids().get(*right_pred) else {
-                        continue;
-                    };
-
-                    let Some(left_schema) = self.lowerer.schemas().get(*left_pred) else {
-                        continue;
-                    };
-                    let Some(right_schema) = self.lowerer.schemas().get(*right_pred) else {
-                        continue;
-                    };
-                    if js.left_keys.iter().any(|&k| k >= left_schema.arity())
-                        || js.right_keys.iter().any(|&k| k >= right_schema.arity())
-                    {
-                        continue;
-                    }
-
-                    mgr.set_join_selectivity(
-                        left_id,
-                        right_id,
-                        js.left_keys.clone(),
-                        js.right_keys.clone(),
-                        js.selectivity,
-                    );
-                }
-            }
-        }
+        let stats_arc =
+            compilation_statistics_with_owner(&self.lowerer, &program, stats_snapshot, scope)?;
+        drop(program);
 
         // Build schemas by RelId for the optimizer
-        let schemas_by_rel_id: HashMap<RelId, Schema> = self
-            .lowerer
-            .rel_ids()
-            .iter()
-            .filter_map(|(pred, rel_id)| {
-                self.lowerer
-                    .schemas()
-                    .get(pred)
-                    .map(|schema| (*rel_id, schema.clone()))
-            })
-            .collect();
+        let schemas_by_rel_id = schemas_snapshot_with_owner(&self.lowerer, scope)?;
 
-        let stats_arc = Arc::new(mgr);
-
-        crate::optimizer::helper_split_pass::run(
-            &mut plan,
-            &schemas_by_rel_id,
-            &stats_arc,
-            |schema| self.lowerer.create_helper_relation(schema),
-        );
-
-        let schemas_by_rel_id: HashMap<RelId, Schema> = self
-            .lowerer
-            .rel_ids()
-            .iter()
-            .filter_map(|(pred, rel_id)| {
-                self.lowerer
-                    .schemas()
-                    .get(pred)
-                    .map(|schema| (*rel_id, schema.clone()))
-            })
-            .collect();
-
-        let mut optimizer = Optimizer::new(Arc::clone(&stats_arc));
-        optimizer.set_schemas(schemas_by_rel_id);
-        for rules in &mut plan.rules_by_scc {
-            for rule in rules {
-                let body = std::mem::replace(&mut rule.body, xlog_ir::RirNode::Unit);
-                rule.body = optimizer.optimize(body);
+        plan = match (plan, scope.as_deref_mut()) {
+            (CompilationValue::Owned(input), Some(scope)) => {
+                CompilationValue::Owned(crate::optimizer::helper_split_pass::run_guarded_plan(
+                    input,
+                    &schemas_by_rel_id,
+                    &stats_arc,
+                    scope,
+                    |schema, scope| {
+                        self.lowerer
+                            .create_helper_relation_with_allocation_owner(schema, scope)
+                    },
+                )?)
             }
-        }
+            (CompilationValue::Unowned(mut plan), None) => {
+                crate::optimizer::helper_split_pass::run(
+                    &mut plan,
+                    &schemas_by_rel_id,
+                    &stats_arc,
+                    |schema| self.lowerer.create_helper_relation(schema),
+                );
+                CompilationValue::Unowned(plan)
+            }
+            _ => unreachable!("canonical plan allocation custody"),
+        };
+
+        drop(schemas_by_rel_id);
+        let schemas_by_rel_id = schemas_snapshot_with_owner(&self.lowerer, scope)?;
+
+        let optimizer = match schemas_by_rel_id {
+            CompilationValue::Owned(schemas) => {
+                let mut optimizer = Optimizer::new(Arc::clone(&stats_arc));
+                optimizer.set_schemas(schemas.value);
+                CompilationValue::Owned(CompilationOutput {
+                    value: optimizer,
+                    allocation_owner: schemas.allocation_owner,
+                })
+            }
+            CompilationValue::Unowned(schemas) => {
+                let mut optimizer = Optimizer::new(Arc::clone(&stats_arc));
+                optimizer.set_schemas(schemas);
+                CompilationValue::Unowned(optimizer)
+            }
+        };
+        plan = match (plan, scope.as_deref_mut()) {
+            (CompilationValue::Owned(input), Some(scope)) => {
+                CompilationValue::Owned(optimizer.optimize_guarded_plan(input, scope)?)
+            }
+            (CompilationValue::Unowned(mut plan), None) => {
+                for rules in &mut plan.rules_by_scc {
+                    for rule in rules {
+                        let body = std::mem::replace(&mut rule.body, xlog_ir::RirNode::Unit);
+                        rule.body = optimizer.optimize(body);
+                    }
+                }
+                CompilationValue::Unowned(plan)
+            }
+            _ => unreachable!("canonical plan allocation custody"),
+        };
+
+        drop(optimizer);
 
         // Selectivity-aware reordering pass. Runs BETWEEN the optimizer loop
         // and promote_multiway.
@@ -461,7 +771,25 @@ impl Compiler {
         // Takes `rel_ids` so per-body Scans can be resolved against
         // `StatsManager`. Behavior on empty stats / unseeded relations is
         // no-op (safety floor).
-        crate::optimizer::selectivity_pass::run(&mut plan, &stats_arc, self.lowerer.rel_ids());
+        plan = match (plan, scope.as_deref_mut()) {
+            (CompilationValue::Owned(input), Some(scope)) => {
+                CompilationValue::Owned(crate::optimizer::selectivity_pass::run_guarded_plan(
+                    input,
+                    &stats_arc,
+                    self.lowerer.rel_ids(),
+                    scope,
+                )?)
+            }
+            (CompilationValue::Unowned(mut plan), None) => {
+                crate::optimizer::selectivity_pass::run(
+                    &mut plan,
+                    &stats_arc,
+                    self.lowerer.rel_ids(),
+                );
+                CompilationValue::Unowned(plan)
+            }
+            _ => unreachable!("canonical plan allocation custody"),
+        };
 
         // Promote eligible triangle subtrees to RirNode::MultiWayJoin. Runs
         // *after* the optimizer so the optimizer never has to learn the new
@@ -475,58 +803,101 @@ impl Compiler {
         // Also pass `&stats_arc` and the caller-provided `&CompilerConfig`.
         // With `CompilerConfig::default()` (`Disabled`), the promoter never
         // sets `var_order` and default dispatch is bit-identical.
-        crate::promote::promote_multiway(&mut plan, self.lowerer.rel_ids(), &stats_arc, config);
+        plan = match (plan, scope.as_deref_mut()) {
+            (CompilationValue::Owned(input), Some(scope)) => {
+                CompilationValue::Owned(crate::promote::promote_multiway_guarded_plan(
+                    input,
+                    self.lowerer.rel_ids(),
+                    &stats_arc,
+                    config,
+                    scope,
+                )?)
+            }
+            (CompilationValue::Unowned(mut plan), None) => {
+                crate::promote::promote_multiway(
+                    &mut plan,
+                    self.lowerer.rel_ids(),
+                    &stats_arc,
+                    config,
+                );
+                CompilationValue::Unowned(plan)
+            }
+            _ => unreachable!("canonical plan allocation custody"),
+        };
 
-        let schemas_by_rel_id: HashMap<RelId, Schema> = self
-            .lowerer
-            .rel_ids()
-            .iter()
-            .filter_map(|(pred, rel_id)| {
-                self.lowerer
-                    .schemas()
-                    .get(pred)
-                    .map(|schema| (*rel_id, schema.clone()))
-            })
-            .collect();
+        drop(stats_arc);
+        let schemas_by_rel_id = schemas_snapshot_with_owner(&self.lowerer, scope)?;
 
-        crate::optimizer::helper_split_pass::run_kclique_specs(
-            &mut plan,
-            &schemas_by_rel_id,
-            |schema| self.lowerer.create_helper_relation(schema),
-        );
+        plan = match (plan, scope.as_deref_mut()) {
+            (CompilationValue::Owned(input), Some(scope)) => CompilationValue::Owned(
+                crate::optimizer::helper_split_pass::run_kclique_specs_guarded_plan(
+                    input,
+                    &schemas_by_rel_id,
+                    scope,
+                    |schema, scope| {
+                        self.lowerer
+                            .create_helper_relation_with_allocation_owner(schema, scope)
+                    },
+                )?,
+            ),
+            (CompilationValue::Unowned(mut plan), None) => {
+                crate::optimizer::helper_split_pass::run_kclique_specs(
+                    &mut plan,
+                    &schemas_by_rel_id,
+                    |schema| self.lowerer.create_helper_relation(schema),
+                );
+                CompilationValue::Unowned(plan)
+            }
+            _ => unreachable!("canonical plan allocation custody"),
+        };
 
-        plan.generated_query_rules = generated_query_heads
-            .iter()
-            .enumerate()
-            .map(|(query_index, head)| {
-                let positions = plan
-                    .rules_by_scc
-                    .iter()
-                    .enumerate()
-                    .flat_map(|(scc_index, rules)| {
-                        rules
-                            .iter()
-                            .enumerate()
-                            .filter_map(move |(rule_index, rule)| {
-                                (rule.head == *head).then_some((scc_index, rule_index))
-                            })
-                    })
-                    .collect::<Vec<_>>();
-                let [(scc_index, rule_index)] = positions.as_slice() else {
-                    return Err(XlogError::Compilation(format!(
-                        "generated query head {head} must have exactly one compiled rule, found {}",
-                        positions.len()
-                    )));
-                };
-                Ok(GeneratedQueryRuleProvenance {
-                    query_index,
-                    scc_index: *scc_index,
-                    rule_index: *rule_index,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+        drop(schemas_by_rel_id);
+
+        plan = attach_generated_query_provenance(plan, &generated_query_heads, scope)?;
+        drop(generated_query_heads);
 
         Ok(plan)
+    }
+
+    fn prepare_strata_with_owner(
+        &mut self,
+        program: &Program,
+        scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+    ) -> Result<()> {
+        match scope.as_deref_mut() {
+            Some(scope) => {
+                let mut stage = scope.child_scope();
+                let result = self.prepare_strata_core(program, &mut Some(&mut stage));
+                finish_compiler_stage(result, stage)
+            }
+            None => self.prepare_strata_core(program, scope),
+        }
+    }
+
+    fn prepare_strata_core(
+        &mut self,
+        program: &Program,
+        scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+    ) -> Result<()> {
+        let strata = match scope.as_deref_mut() {
+            Some(scope) => crate::stratify::stratify_with_allocation_owner(program, scope),
+            None => stratify(program),
+        }
+        .map_err(|error| map_stratification_to_naf_error_with_owner(error, scope))?;
+        acquire_frontend_vector::<Vec<String>>(scope, strata.len())?;
+        let strata_preds = strata
+            .into_iter()
+            .map(|stratum| stratum.predicates)
+            .collect();
+        match scope.as_deref_mut() {
+            Some(scope) => self
+                .lowerer
+                .set_strata_with_allocation_owner(strata_preds, scope),
+            None => {
+                self.lowerer.set_strata(strata_preds);
+                Ok(())
+            }
+        }
     }
 
     /// Reset the compiler state for a fresh compilation.
@@ -554,8 +925,476 @@ impl Compiler {
 }
 
 fn generated_query_heads_for_program(program: &Program) -> Result<Vec<String>> {
+    generated_query_heads_for_program_with_owner(program, &mut None)
+}
+
+// Every reached caller returns either inline validation state or the guarded
+// plan carrier. Canonical error producers own their diagnostic payloads; the
+// stratification cycle is mapped before this boundary. No discarded scratch
+// is transferred into either successful output or a diagnostic.
+pub(crate) fn finish_compiler_stage<T>(
+    result: Result<T>,
+    stage: CompilationAllocationScope<'_>,
+) -> Result<T> {
+    drop(stage);
+    result
+}
+
+fn schemas_snapshot_with_owner(
+    lowerer: &Lowerer,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<CompilationValue<HashMap<RelId, Schema>>> {
+    let count = lowerer
+        .rel_ids()
+        .keys()
+        .filter(|name| lowerer.schemas().contains_key(*name))
+        .count();
+    let allocation_owner = match scope.as_deref_mut() {
+        Some(scope) => {
+            let mut bytes = hash_allocation_bytes::<RelId, Schema>(count)?;
+            for name in lowerer.rel_ids().keys() {
+                if let Some(schema) = lowerer.schemas().get(name) {
+                    bytes = bytes
+                        .checked_add(schema.owned_allocation_bytes()?)
+                        .ok_or_else(|| XlogError::allocation_extent_overflow("schema snapshot"))?;
+                }
+            }
+            Some(scope.reserve_allocation(bytes)?)
+        }
+        None => None,
+    };
+    // The original roster is known before insertion. Reserve its one actual
+    // table so incremental collect growth creates no discarded hash buffers.
+    let mut schemas = HashMap::with_capacity(count);
+    for (name, id) in lowerer.rel_ids() {
+        if let Some(schema) = lowerer.schemas().get(name) {
+            schemas.insert(*id, schema.clone());
+        }
+    }
+    Ok(match allocation_owner {
+        Some(allocation_owner) => CompilationValue::Owned(CompilationOutput {
+            value: schemas,
+            allocation_owner,
+        }),
+        None => CompilationValue::Unowned(schemas),
+    })
+}
+
+fn set_compilation_cardinality_hints(
+    lowerer: &mut Lowerer,
+    stats_snapshot: Option<&StatsSnapshot>,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<()> {
+    match scope.as_deref_mut() {
+        Some(scope) => {
+            let mut stage = scope.child_scope();
+            let result = set_compilation_cardinality_hints_core(
+                lowerer,
+                stats_snapshot,
+                &mut Some(&mut stage),
+            );
+            finish_compiler_stage(result, stage)
+        }
+        None => set_compilation_cardinality_hints_core(lowerer, stats_snapshot, scope),
+    }
+}
+
+fn set_compilation_cardinality_hints_core(
+    lowerer: &mut Lowerer,
+    stats_snapshot: Option<&StatsSnapshot>,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<()> {
+    let mut cardinality_hints: HashMap<String, u64> = HashMap::new();
+    if let Some(snapshot) = stats_snapshot {
+        if !snapshot.rel_names.is_empty() {
+            let _lookup_owner = match scope.as_deref_mut() {
+                Some(scope) => Some(scope.reserve_allocation(hash_allocation_bytes::<
+                    RelId,
+                    &str,
+                >(
+                    snapshot.rel_names.len()
+                )?)?),
+                None => None,
+            };
+            let rel_name_by_id: HashMap<RelId, &str> = snapshot
+                .rel_names
+                .iter()
+                .map(|(id, name)| (*id, name.as_str()))
+                .collect();
+            for rel in &snapshot.relations {
+                if let Some(name) = rel_name_by_id.get(&rel.rel_id) {
+                    if scope.is_some() {
+                        if !cardinality_hints.contains_key(*name)
+                            && cardinality_hints.len() == cardinality_hints.capacity()
+                        {
+                            acquire_frontend(
+                                scope,
+                                hash_allocation_bytes::<String, u64>(cardinality_hints.len() + 1)?,
+                            )?;
+                        }
+                        acquire_frontend(
+                            scope,
+                            u64::try_from(name.len()).map_err(|_| {
+                                XlogError::allocation_extent_overflow("cardinality name")
+                            })?,
+                        )?;
+                    }
+                    cardinality_hints.insert((*name).to_string(), rel.cardinality);
+                }
+            }
+        }
+    }
+    match scope.as_deref_mut() {
+        Some(scope) => {
+            lowerer.set_cardinality_hints_with_allocation_owner(cardinality_hints, scope)?
+        }
+        None => lowerer.set_cardinality_hints(cardinality_hints),
+    }
+    Ok(())
+}
+
+fn compilation_statistics_with_owner(
+    lowerer: &Lowerer,
+    program: &Program,
+    stats_snapshot: Option<&StatsSnapshot>,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<CompilationValue<Arc<StatsManager>>> {
+    match scope.as_deref_mut() {
+        Some(scope) => {
+            let mut stage = scope.child_scope();
+            let manager = compilation_statistics_core(
+                lowerer,
+                program,
+                stats_snapshot,
+                &mut Some(&mut stage),
+            )?;
+            let bytes = manager
+                .clone_allocation_bytes()?
+                .checked_add(
+                    u64::try_from(
+                        std::mem::size_of::<StatsManager>() + 2 * std::mem::size_of::<usize>(),
+                    )
+                    .map_err(|_| XlogError::allocation_extent_overflow("statistics manager Arc"))?,
+                )
+                .ok_or_else(|| XlogError::allocation_extent_overflow("statistics manager clone"))?;
+            let allocation_owner = stage.reserve_allocation(bytes)?;
+            let value = Arc::new(manager.clone());
+            drop(manager);
+            drop(stage);
+            Ok(CompilationValue::Owned(CompilationOutput {
+                value,
+                allocation_owner,
+            }))
+        }
+        None => Ok(CompilationValue::Unowned(Arc::new(
+            compilation_statistics_core(lowerer, program, stats_snapshot, scope)?,
+        ))),
+    }
+}
+
+fn compilation_statistics_core(
+    lowerer: &Lowerer,
+    program: &Program,
+    stats_snapshot: Option<&StatsSnapshot>,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<StatsManager> {
+    if scope.is_some() {
+        acquire_frontend(
+            scope,
+            hash_allocation_bytes::<RelId, xlog_stats::RelationStats>(lowerer.rel_ids().len())?,
+        )?;
+    }
+    let mut mgr = StatsManager::new();
+    {
+        let fact_count = program.facts().count();
+        let _counts_owner = match scope.as_deref_mut() {
+            Some(scope) => {
+                Some(scope.reserve_allocation(hash_allocation_bytes::<&str, u64>(fact_count)?)?)
+            }
+            None => None,
+        };
+        let mut fact_counts: HashMap<&str, u64> = HashMap::with_capacity(fact_count);
+        for fact in program.facts() {
+            *fact_counts.entry(fact.head.predicate.as_str()).or_insert(0) += 1;
+        }
+
+        for (pred, rel_id) in lowerer.rel_ids() {
+            mgr.register_relation(*rel_id);
+            let rows = fact_counts.get(pred.as_str()).copied().unwrap_or(0);
+            if rows > 0 {
+                mgr.update_cardinality(*rel_id, rows);
+                if let Some(schema) = lowerer.schemas().get(pred) {
+                    mgr.update_byte_size(*rel_id, rows * schema.row_size_bytes() as u64);
+                }
+            }
+        }
+    }
+
+    if let Some(snapshot) = stats_snapshot {
+        reserve_stats_snapshot_merge(snapshot, lowerer.rel_ids().len(), scope)?;
+        if snapshot.rel_names.is_empty() {
+            mgr.merge_snapshot(snapshot);
+        } else {
+            let _lookup_owner = match scope.as_deref_mut() {
+                Some(scope) => Some(scope.reserve_allocation(hash_allocation_bytes::<
+                    RelId,
+                    &str,
+                >(
+                    snapshot.rel_names.len()
+                )?)?),
+                None => None,
+            };
+            let rel_name_by_id: HashMap<RelId, &str> = snapshot
+                .rel_names
+                .iter()
+                .map(|(id, name)| (*id, name.as_str()))
+                .collect();
+
+            for rel in &snapshot.relations {
+                let Some(pred) = rel_name_by_id.get(&rel.rel_id) else {
+                    continue;
+                };
+                let Some(rel_id) = lowerer.rel_ids().get(*pred) else {
+                    continue;
+                };
+
+                let mut remapped = rel.clone();
+                remapped.rel_id = *rel_id;
+
+                if let Some(schema) = lowerer.schemas().get(*pred) {
+                    remapped.column_stats.retain(|col| {
+                        col.col_idx < schema.arity()
+                            && schema.column_type(col.col_idx) == Some(col.dtype)
+                    });
+                } else {
+                    remapped.column_stats.clear();
+                }
+
+                mgr.register_relation(*rel_id);
+                if let Some(stats) = mgr.get_relation_stats_mut(*rel_id) {
+                    *stats = remapped;
+                }
+            }
+
+            for js in &snapshot.join_selectivities {
+                if js.left_keys.len() != js.right_keys.len() {
+                    continue;
+                }
+
+                let Some(left_pred) = rel_name_by_id.get(&js.left_rel) else {
+                    continue;
+                };
+                let Some(right_pred) = rel_name_by_id.get(&js.right_rel) else {
+                    continue;
+                };
+                let Some(&left_id) = lowerer.rel_ids().get(*left_pred) else {
+                    continue;
+                };
+                let Some(&right_id) = lowerer.rel_ids().get(*right_pred) else {
+                    continue;
+                };
+
+                let Some(left_schema) = lowerer.schemas().get(*left_pred) else {
+                    continue;
+                };
+                let Some(right_schema) = lowerer.schemas().get(*right_pred) else {
+                    continue;
+                };
+                if js.left_keys.iter().any(|&k| k >= left_schema.arity())
+                    || js.right_keys.iter().any(|&k| k >= right_schema.arity())
+                {
+                    continue;
+                }
+
+                mgr.set_join_selectivity(
+                    left_id,
+                    right_id,
+                    js.left_keys.clone(),
+                    js.right_keys.clone(),
+                    js.selectivity,
+                );
+            }
+        }
+    }
+    Ok(mgr)
+}
+
+fn reserve_stats_snapshot_merge(
+    snapshot: &StatsSnapshot,
+    original_relations: usize,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<()> {
+    if scope.is_none() {
+        return Ok(());
+    }
+    acquire_frontend(
+        scope,
+        hash_allocation_bytes::<RelId, xlog_stats::RelationStats>(
+            original_relations
+                .checked_add(snapshot.relations.len())
+                .ok_or_else(|| XlogError::allocation_extent_overflow("statistics registry"))?,
+        )?,
+    )?;
+    acquire_frontend(
+        scope,
+        hash_allocation_bytes::<(RelId, RelId), xlog_stats::JoinSelectivity>(
+            snapshot.join_selectivities.len(),
+        )?,
+    )?;
+    for relation in &snapshot.relations {
+        acquire_frontend_vector::<xlog_stats::ColumnStats>(scope, relation.column_stats.len())?;
+        acquire_frontend_vector::<xlog_stats::PrefixDegreeStats>(
+            scope,
+            relation.prefix_degrees.len(),
+        )?;
+        acquire_frontend_vector::<xlog_stats::KeyHeatStats>(scope, relation.key_heats.len())?;
+    }
+    for selectivity in &snapshot.join_selectivities {
+        // Caller key copies and the genuine cache entry's original key copies.
+        for _ in 0..2 {
+            acquire_frontend_vector::<usize>(scope, selectivity.left_keys.len())?;
+            acquire_frontend_vector::<usize>(scope, selectivity.right_keys.len())?;
+        }
+    }
+    Ok(())
+}
+
+struct QueryProvenanceAllocations {
+    _plan: Arc<dyn Send + Sync>,
+    _provenance: Arc<dyn Send + Sync>,
+    _metadata: Arc<dyn Send + Sync>,
+}
+
+fn attach_generated_query_provenance(
+    input: CompilationValue<ExecutionPlan>,
+    heads: &[String],
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<CompilationValue<ExecutionPlan>> {
+    match (input, scope.as_deref_mut()) {
+        (CompilationValue::Owned(mut input), Some(scope)) => {
+            // An empty query roster preserves the original empty plan vector.
+            if heads.is_empty() {
+                input.value.generated_query_rules =
+                    generated_query_provenance_core(&input.value, heads, &mut Some(scope))?;
+                return Ok(CompilationValue::Owned(input));
+            }
+            let provenance_owner = scope.reserve_allocation(push_vector_allocation_bytes::<
+                GeneratedQueryRuleProvenance,
+            >(heads.len())?)?;
+            let metadata_owner = scope.reserve_allocation(
+                u64::try_from(
+                    std::mem::size_of::<QueryProvenanceAllocations>()
+                        + 2 * std::mem::size_of::<usize>(),
+                )
+                .map_err(|_| XlogError::allocation_extent_overflow("query provenance owner"))?,
+            )?;
+            let provenance =
+                generated_query_provenance_core(&input.value, heads, &mut Some(scope))?;
+            // All fallible work is complete. The original plan and the new
+            // payload remain charged through this genuine owner transfer.
+            let allocation_owner = Arc::new(QueryProvenanceAllocations {
+                _plan: input.allocation_owner,
+                _provenance: provenance_owner,
+                _metadata: metadata_owner,
+            });
+            input.value.generated_query_rules = provenance;
+            Ok(CompilationValue::Owned(CompilationOutput {
+                value: input.value,
+                allocation_owner,
+            }))
+        }
+        (CompilationValue::Unowned(mut plan), None) => {
+            plan.generated_query_rules = generated_query_provenance_core(&plan, heads, &mut None)?;
+            Ok(CompilationValue::Unowned(plan))
+        }
+        _ => unreachable!("canonical query provenance allocation custody"),
+    }
+}
+
+fn generated_query_provenance_core(
+    plan: &ExecutionPlan,
+    heads: &[String],
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<Vec<GeneratedQueryRuleProvenance>> {
+    heads
+        .iter()
+        .enumerate()
+        .map(|(query_index, head)| {
+            let count = plan
+                .rules_by_scc
+                .iter()
+                .try_fold(0usize, |n, rules| n.checked_add(rules.len()))
+                .ok_or_else(|| XlogError::allocation_extent_overflow("query provenance"))?;
+            let _positions_receipt =
+                match scope.as_deref_mut() {
+                    Some(scope) => Some(scope.reserve_allocation(
+                        push_vector_allocation_bytes::<(usize, usize)>(count)?,
+                    )?),
+                    None => None,
+                };
+            let positions = plan
+                .rules_by_scc
+                .iter()
+                .enumerate()
+                .flat_map(|(scc_index, rules)| {
+                    rules
+                        .iter()
+                        .enumerate()
+                        .filter_map(move |(rule_index, rule)| {
+                            (rule.head == *head).then_some((scc_index, rule_index))
+                        })
+                })
+                .collect::<Vec<_>>();
+            let [(scc_index, rule_index)] = positions.as_slice() else {
+                return Err(frontend_compilation_error(
+                    format_args!(
+                        "generated query head {head} must have exactly one compiled rule, found {}",
+                        positions.len()
+                    ),
+                    scope,
+                ));
+            };
+            Ok(GeneratedQueryRuleProvenance {
+                query_index,
+                scc_index: *scc_index,
+                rule_index: *rule_index,
+            })
+        })
+        .collect::<Result<Vec<_>>>()
+}
+
+fn generated_query_heads_output_with_owner(
+    program: &Program,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<CompilationValue<Vec<String>>> {
+    match scope.as_deref_mut() {
+        Some(scope) => {
+            let mut output_scope = scope.child_scope();
+            output_scope.prepare_output_owner()?;
+            let value = generated_query_heads_for_program_with_owner(
+                program,
+                &mut Some(&mut output_scope),
+            )?;
+            let allocation_owner = output_scope.into_owner()?;
+            Ok(CompilationValue::Owned(CompilationOutput {
+                value,
+                allocation_owner,
+            }))
+        }
+        None => Ok(CompilationValue::Unowned(
+            generated_query_heads_for_program_with_owner(program, scope)?,
+        )),
+    }
+}
+
+fn generated_query_heads_for_program_with_owner(
+    program: &Program,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<Vec<String>> {
+    acquire_frontend_vector::<String>(scope, program.queries.len())?;
     (0..program.queries.len())
         .map(|query_index| {
+            acquire_frontend_format(scope, format_args!("__xlog_query_{query_index}"))?;
             let generated_head = format!("__xlog_query_{query_index}");
             let authored_collision = program
                 .predicates
@@ -570,33 +1409,263 @@ fn generated_query_heads_for_program(program: &Program) -> Result<Vec<String>> {
                     .iter()
                     .any(|rule| rule.head.predicate == generated_head);
             if authored_collision {
-                return Err(XlogError::Compilation(format!(
-                    "authored relation {generated_head} collides with generated query head"
-                )));
+                return Err(frontend_compilation_error(
+                    format_args!(
+                        "authored relation {generated_head} collides with generated query head"
+                    ),
+                    scope,
+                ));
             }
             Ok(generated_head)
         })
         .collect()
 }
 
-/// The source-level frontend passes shared by compilation and validation:
-/// desugar queries/constraints → meta normalization → list normalization →
-/// magic sets → negation-safety check. All by value, no AST clones.
-fn run_frontend_passes(program: Program) -> Result<Program> {
-    let program = desugar_queries_and_constraints(program)?;
-    let program = normalize_meta_builtins_owned(program)?;
-    let program = normalize_list_builtins_owned(program)?;
-    let program = rewrite_magic_sets_owned(program)?.program;
-    validate_negation_safety(&program)?;
-    Ok(program)
+#[derive(Clone, Copy)]
+enum FrontendPass {
+    Desugar,
+    Meta,
+    List,
+    Magic,
 }
 
-fn desugar_queries_and_constraints(program: Program) -> Result<Program> {
-    let mut out = program;
+impl FrontendPass {
+    fn run(
+        self,
+        program: Program,
+        scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+        custody: Option<&mut crate::program_custody::ProgramAllocationCustody>,
+    ) -> Result<Program> {
+        match (scope.as_deref_mut(), custody) {
+            (Some(scope), Some(custody)) => {
+                let mut input = crate::program_custody::RetainedProgram {
+                    value: program,
+                    custody: std::mem::take(custody),
+                };
+                let output = match self {
+                    Self::Desugar => {
+                        input.value = desugar_queries_and_constraints_with_owner(
+                            input.value,
+                            &mut Some(scope),
+                            Some(&mut input.custody),
+                        )?;
+                        input
+                    }
+                    Self::Meta => {
+                        crate::meta_normalize::normalize_meta_builtins_retained(input, scope)?
+                    }
+                    Self::List => {
+                        crate::list_normalize::normalize_list_builtins_retained(input, scope)?
+                    }
+                    Self::Magic => {
+                        let rewritten =
+                            crate::magic_sets::rewrite_magic_sets_retained(input, scope)?;
+                        drop(rewritten.report);
+                        rewritten.program
+                    }
+                };
+                *custody = output.custody;
+                Ok(output.value)
+            }
+            (None, None) => match self {
+                Self::Desugar => {
+                    desugar_queries_and_constraints_with_owner(program, &mut None, None)
+                }
+                Self::Meta => normalize_meta_builtins_owned(program),
+                Self::List => normalize_list_builtins_owned(program),
+                Self::Magic => {
+                    let rewritten = rewrite_magic_sets_owned(program)?;
+                    drop(rewritten.report);
+                    Ok(rewritten.program)
+                }
+            },
+            _ => unreachable!("canonical frontend allocation custody"),
+        }
+    }
+}
 
-    // Constraints: `:- body.` becomes `__xlog_constraint_i(1) :- body.`
+fn clone_compilation_program(
+    program: &Program,
+    scope: &mut CompilationAllocationScope<'_>,
+) -> Result<CompilationOutput<Program, crate::program_custody::ProgramAllocationCustody>> {
+    let retained = program.clone_with_allocation_custody(scope)?;
+    Ok(CompilationOutput {
+        value: retained.value,
+        allocation_owner: retained.custody,
+    })
+}
+
+fn run_frontend_passes_with_owner(
+    mut input: CompilationProgram,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<CompilationProgram> {
+    for pass in [
+        FrontendPass::Desugar,
+        FrontendPass::Meta,
+        FrontendPass::List,
+        FrontendPass::Magic,
+    ] {
+        input = match (input, scope.as_deref_mut()) {
+            (CompilationValue::Unowned(program), None) => {
+                let program = pass.run(program, &mut None, None)?;
+                CompilationValue::Unowned(program)
+            }
+            (CompilationValue::Owned(mut input), Some(scope)) => {
+                let mut stage = scope.child_scope();
+                let program = pass.run(
+                    input.value,
+                    &mut Some(&mut stage),
+                    Some(&mut input.allocation_owner),
+                )?;
+                // Every pass returns real data with its original typed custody;
+                // only the pass's independent scratch scope retires here.
+                drop(stage);
+                CompilationValue::Owned(CompilationOutput {
+                    value: program,
+                    allocation_owner: input.allocation_owner,
+                })
+            }
+            _ => unreachable!("canonical frontend allocation custody"),
+        };
+    }
+    match scope.as_deref_mut() {
+        Some(scope) => {
+            let mut stage = scope.child_scope();
+            let result = validate_negation_safety_with_owner(&input, &mut Some(&mut stage));
+            finish_compiler_stage(result, stage)?;
+        }
+        None => validate_negation_safety_with_owner(&input, scope)?,
+    }
+    Ok(input)
+}
+
+fn acquire_frontend(
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+    bytes: u64,
+) -> Result<()> {
+    if bytes != 0 {
+        if let Some(scope) = scope.as_deref_mut() {
+            scope.acquire(bytes)?;
+        }
+    }
+    Ok(())
+}
+
+fn acquire_frontend_vector<T>(
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+    count: usize,
+) -> Result<()> {
+    if scope.is_some() {
+        acquire_frontend(scope, push_vector_allocation_bytes::<T>(count)?)?;
+    }
+    Ok(())
+}
+
+fn acquire_frontend_format(
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+    arguments: std::fmt::Arguments<'_>,
+) -> Result<()> {
+    if scope.is_some() {
+        acquire_frontend(scope, formatted_text_allocation_bytes(arguments)?)?;
+    }
+    Ok(())
+}
+
+fn acquire_frontend_variables(
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+    literal: &BodyLiteral,
+) -> Result<()> {
+    if scope.is_none() {
+        return Ok(());
+    }
+    let mut count = 0usize;
+    let mut text = 0u64;
+    let mut overflow = false;
+    literal.visit_variables(&mut |name| {
+        if let Some(next) = count.checked_add(1) {
+            count = next;
+        } else {
+            overflow = true;
+        }
+        if let Some(next) = text.checked_add(name.len() as u64) {
+            text = next;
+        } else {
+            overflow = true;
+        }
+    });
+    if overflow {
+        return Err(XlogError::allocation_extent_overflow("frontend variable"));
+    }
+    acquire_frontend_vector::<&str>(scope, count)?;
+    acquire_frontend(scope, text)?;
+    Ok(())
+}
+
+fn desugar_queries_and_constraints_with_owner(
+    program: Program,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+    mut custody: Option<&mut crate::program_custody::ProgramAllocationCustody>,
+) -> Result<Program> {
+    let mut out = program;
+    let final_rules = out
+        .rules
+        .len()
+        .checked_add(out.constraints.len())
+        .and_then(|n| n.checked_add(out.queries.len()))
+        .ok_or_else(|| XlogError::allocation_extent_overflow("frontend rule"))?;
+    if let Some(custody) = custody.as_deref_mut() {
+        let scope = scope
+            .as_deref_mut()
+            .expect("original Program custody scope");
+        custody
+            .rules
+            .prepare_elements(final_rules - out.rules.len(), scope)?;
+        if final_rules > out.rules.capacity() {
+            let bytes = final_rules
+                .checked_mul(std::mem::size_of::<AstRule>())
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .ok_or_else(|| XlogError::allocation_extent_overflow("frontend rule"))?;
+            let owner = scope.reserve_allocation(bytes)?;
+            out.rules.reserve_exact(final_rules - out.rules.len());
+            custody.rules.backing_owner = Some(owner);
+        }
+    } else if final_rules > out.rules.capacity() {
+        acquire_frontend_vector::<AstRule>(scope, final_rules)?;
+    }
     for constraint in &out.constraints {
-        let authored_index = constraint.require_authored_index()?;
+        let authored_index = match scope.as_deref_mut() {
+            Some(scope) => constraint.require_authored_index_with_allocation_owner(&mut |bytes| {
+                scope.reserve_allocation(bytes)
+            }),
+            None => constraint.require_authored_index(),
+        }?;
+        let mut payload = custody
+            .as_ref()
+            .map(|_| crate::program_custody::PayloadCustody::default());
+        if let Some(payload) = payload.as_mut() {
+            let scope = scope
+                .as_deref_mut()
+                .expect("original Program custody scope");
+            payload.reserve_unit(
+                formatted_text_allocation_bytes(format_args!(
+                    "__xlog_constraint_{authored_index}"
+                ))?,
+                scope,
+            )?;
+            payload.reserve_unit(std::mem::size_of::<Term>() as u64, scope)?;
+            let mut body =
+                crate::program_custody::PayloadCustody::for_body_clone(&constraint.body, scope)?;
+            payload.append_from(&mut body, scope)?;
+        } else {
+            acquire_frontend_format(scope, format_args!("__xlog_constraint_{authored_index}"))?;
+            acquire_frontend_vector::<Term>(scope, 1)?;
+        }
+        if payload.is_none() && scope.is_some() {
+            acquire_frontend_vector::<BodyLiteral>(scope, constraint.body.len())?;
+            for literal in &constraint.body {
+                acquire_frontend(scope, literal.owned_allocation_bytes()?)?;
+            }
+        }
         let pred = format!("__xlog_constraint_{authored_index}");
         out.rules.push(AstRule {
             head: crate::ast::Atom {
@@ -605,27 +1674,133 @@ fn desugar_queries_and_constraints(program: Program) -> Result<Program> {
             },
             body: constraint.body.clone(),
         });
+        if let Some(payload) = payload {
+            custody
+                .as_deref_mut()
+                .expect("original Program custody")
+                .rules
+                .elements
+                .push(payload);
+        }
     }
-
-    // Queries: `?- atom.` becomes `__xlog_query_i(Vars...) :- atom.`
-    for (i, Query { atom }) in out.queries.iter().enumerate() {
-        let pred = format!("__xlog_query_{}", i);
-
-        let mut head_terms: Vec<Term> = Vec::new();
-        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-
+    for (index, Query { atom }) in out.queries.iter().enumerate() {
+        let mut payload = custody
+            .as_ref()
+            .map(|_| crate::program_custody::PayloadCustody::default());
+        if let Some(payload) = payload.as_mut() {
+            payload.reserve_unit(
+                formatted_text_allocation_bytes(format_args!("__xlog_query_{index}"))?,
+                scope
+                    .as_deref_mut()
+                    .expect("original Program custody scope"),
+            )?;
+        } else {
+            acquire_frontend_format(scope, format_args!("__xlog_query_{index}"))?;
+        }
+        let pred = format!("__xlog_query_{index}");
+        let mut head_terms_owner = None;
+        let mut head_terms = Vec::new();
+        let mut seen_owner = None;
+        let mut seen = HashSet::new();
         for term in &atom.terms {
+            let _variables_owner = if let Some(scope) = scope.as_deref_mut() {
+                let mut count = Some(0usize);
+                term.visit_variables(&mut |_| count = count.and_then(|n| n.checked_add(1)));
+                let count =
+                    count.ok_or_else(|| XlogError::allocation_extent_overflow("query variable"))?;
+                if count == 0 {
+                    None
+                } else {
+                    Some(scope.reserve_allocation(push_vector_allocation_bytes::<&str>(count)?)?)
+                }
+            } else {
+                None
+            };
             for name in term.variables() {
-                if seen.insert(name) {
-                    head_terms.push(Term::Variable(name.to_string()));
+                if seen.contains(name) {
+                    continue;
+                }
+                let next_seen_owner =
+                    if seen.len() == seen.capacity() {
+                        match scope.as_deref_mut() {
+                            Some(scope) => Some(scope.reserve_allocation(
+                                hash_allocation_bytes::<&str, ()>(seen.len() + 1)?,
+                            )?),
+                            None => None,
+                        }
+                    } else {
+                        None
+                    };
+                let next_head_terms_owner = if head_terms.len() == head_terms.capacity() {
+                    if payload.is_some() {
+                        Some(
+                            scope
+                                .as_deref_mut()
+                                .expect("original Program custody scope")
+                                .reserve_allocation(
+                                    xlog_core::push_vector_storage_bytes::<Term>(
+                                        head_terms.len() + 1,
+                                    )?,
+                                )?,
+                        )
+                    } else {
+                        acquire_frontend_vector::<Term>(scope, head_terms.len() + 1)?;
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(payload) = payload.as_mut() {
+                    payload.reserve_unit(
+                        name.len() as u64,
+                        scope
+                            .as_deref_mut()
+                            .expect("original Program custody scope"),
+                    )?;
+                } else {
+                    acquire_frontend(scope, name.len() as u64)?;
+                }
+                seen.insert(name);
+                if let Some(owner) = next_seen_owner {
+                    seen_owner = Some(owner);
+                }
+                head_terms.push(Term::Variable(name.to_string()));
+                if let Some(owner) = next_head_terms_owner {
+                    head_terms_owner = Some(owner);
                 }
             }
         }
-
+        drop(seen);
+        drop(seen_owner);
         if head_terms.is_empty() {
+            if payload.is_some() {
+                head_terms_owner = Some(
+                    scope
+                        .as_deref_mut()
+                        .expect("original Program custody scope")
+                        .reserve_allocation(xlog_core::push_vector_storage_bytes::<Term>(1)?)?,
+                );
+            } else {
+                acquire_frontend_vector::<Term>(scope, 1)?;
+            }
             head_terms.push(Term::Integer(1));
         }
-
+        if let Some(payload) = payload.as_mut() {
+            let scope = scope
+                .as_deref_mut()
+                .expect("original Program custody scope");
+            if let Some(owner) = head_terms_owner.as_ref() {
+                payload.retain_original(owner, scope)?;
+            }
+            payload.reserve_unit(std::mem::size_of::<BodyLiteral>() as u64, scope)?;
+            let mut atom = crate::program_custody::PayloadCustody::for_atom_clone(atom, scope)?;
+            payload.append_from(&mut atom, scope)?;
+        } else {
+            acquire_frontend_vector::<BodyLiteral>(scope, 1)?;
+        }
+        if payload.is_none() && scope.is_some() {
+            acquire_frontend(scope, atom.owned_allocation_bytes()?)?;
+        }
         out.rules.push(AstRule {
             head: crate::ast::Atom {
                 predicate: pred,
@@ -633,28 +1808,99 @@ fn desugar_queries_and_constraints(program: Program) -> Result<Program> {
             },
             body: vec![BodyLiteral::Positive(atom.clone())],
         });
+        if let Some(payload) = payload {
+            custody
+                .as_deref_mut()
+                .expect("original Program custody")
+                .rules
+                .elements
+                .push(payload);
+        }
     }
-
     Ok(out)
 }
 
-fn validate_negation_safety(program: &Program) -> Result<()> {
+fn validate_negation_safety_with_owner(
+    program: &Program,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<()> {
     for rule in &program.rules {
-        validate_body_naf_safety(&rule.body, &format!("rule {}", rule.head.predicate))?;
-    }
-    for constraint in &program.constraints {
-        validate_body_naf_safety(
-            &constraint.body,
-            &format!("constraint {}", constraint.require_authored_index()?),
+        acquire_frontend_format(scope, format_args!("rule {}", rule.head.predicate))?;
+        validate_body_naf_safety_with_owner(
+            &rule.body,
+            &format!("rule {}", rule.head.predicate),
+            scope,
         )?;
     }
-    for (idx, learnable) in program.learnable_rules.iter().enumerate() {
-        validate_body_naf_safety(&learnable.body, &format!("learnable rule {}", idx))?;
+    for constraint in &program.constraints {
+        let index = match scope.as_deref_mut() {
+            Some(scope) => constraint.require_authored_index_with_allocation_owner(&mut |bytes| {
+                scope.reserve_allocation(bytes)
+            }),
+            None => constraint.require_authored_index(),
+        }?;
+        acquire_frontend_format(scope, format_args!("constraint {index}"))?;
+        validate_body_naf_safety_with_owner(
+            &constraint.body,
+            &format!("constraint {index}"),
+            scope,
+        )?;
+    }
+    for (index, rule) in program.learnable_rules.iter().enumerate() {
+        acquire_frontend_format(scope, format_args!("learnable rule {index}"))?;
+        validate_body_naf_safety_with_owner(&rule.body, &format!("learnable rule {index}"), scope)?;
     }
     Ok(())
 }
 
+fn validate_body_naf_safety_with_owner(
+    body: &[BodyLiteral],
+    context: &str,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<()> {
+    match scope.as_deref_mut() {
+        Some(scope) => {
+            let mut stage = scope.child_scope();
+            let result = validate_body_naf_safety_prepared(body, context, &mut Some(&mut stage));
+            finish_compiler_stage(result, stage)
+        }
+        None => validate_body_naf_safety(body, context),
+    }
+}
+
+fn validate_body_naf_safety_prepared(
+    body: &[BodyLiteral],
+    context: &str,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<()> {
+    if scope.is_some() {
+        let mut count = Some(0usize);
+        for literal in body {
+            acquire_frontend_variables(scope, literal)?;
+            match literal {
+                BodyLiteral::Positive(atom) => {
+                    atom.visit_variables(&mut |_| count = count.and_then(|n| n.checked_add(1)))
+                }
+                BodyLiteral::IsExpr(_) => count = count.and_then(|n| n.checked_add(1)),
+                _ => {}
+            }
+        }
+        let count =
+            count.ok_or_else(|| XlogError::allocation_extent_overflow("negation variable"))?;
+        acquire_frontend(scope, hash_allocation_bytes::<String, ()>(count)?)?;
+    }
+    validate_body_naf_safety_core(body, context, scope)
+}
+
 fn validate_body_naf_safety(body: &[BodyLiteral], context: &str) -> Result<()> {
+    validate_body_naf_safety_core(body, context, &mut None)
+}
+
+fn validate_body_naf_safety_core(
+    body: &[BodyLiteral],
+    context: &str,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<()> {
     let mut bound: HashSet<String> = HashSet::new();
     for lit in body {
         match lit {
@@ -666,13 +1912,13 @@ fn validate_body_naf_safety(body: &[BodyLiteral], context: &str) -> Result<()> {
             BodyLiteral::Negated(atom) => {
                 for name in atom.variables() {
                     if !bound.contains(name) {
-                        return Err(naf_error(format!(
+                        return Err(naf_error_with_owner(format_args!(
                             "unbound variable {} in negated atom {}/{} in {}; bind it before not with a positive atom or deterministic is expression, or use '_' for existential positions",
                             name,
                             atom.predicate,
                             atom.arity(),
                             context
-                        )));
+                        ), scope));
                     }
                 }
             }
@@ -693,6 +1939,91 @@ fn map_stratification_to_naf_error(err: XlogError) -> XlogError {
             cycle.join(" -> ")
         )),
         other => other,
+    }
+}
+
+fn map_stratification_to_naf_error_with_owner(
+    error: XlogError,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> XlogError {
+    if scope.is_none() {
+        return map_stratification_to_naf_error(error);
+    }
+    let XlogError::StratificationCycle(cycle) = error.unowned() else {
+        return error;
+    };
+    let bytes = cycle
+        .iter()
+        .try_fold(0u64, |bytes, name| bytes.checked_add(name.len() as u64))
+        .and_then(|bytes| {
+            bytes.checked_add((cycle.len().saturating_sub(1) as u64).checked_mul(4)?)
+        });
+    let receipt = match bytes
+        .ok_or_else(|| XlogError::allocation_extent_overflow("negation cycle"))
+        .and_then(|bytes| {
+            scope
+                .as_deref_mut()
+                .expect("original cycle scope")
+                .reserve_allocation(bytes)
+        }) {
+        Ok(receipt) => receipt,
+        Err(error) => return error,
+    };
+    let joined = cycle.join(" -> ");
+    let mapped = naf_error_with_owner(
+        format_args!(
+            "deterministic not atom must be stratified; cycle through negation or aggregation: {}",
+            joined
+        ),
+        scope,
+    );
+    drop(joined);
+    drop(receipt);
+    mapped
+}
+
+fn naf_error_with_owner(
+    message: std::fmt::Arguments<'_>,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> XlogError {
+    let _message_receipt = match scope.as_deref_mut() {
+        Some(scope) => match formatted_text_allocation_bytes(message)
+            .and_then(|bytes| scope.reserve_allocation(bytes))
+        {
+            Ok(receipt) => Some(receipt),
+            Err(error) => return error,
+        },
+        None => None,
+    };
+    let bytes = formatted_text_allocation_bytes(format_args!("negation safety error: {}", message));
+    let producer = match scope.as_deref_mut() {
+        Some(scope) => CompilationAllocationScope::prepare_diagnostic(
+            bytes,
+            Some(&mut |bytes| scope.reserve_allocation(bytes)),
+        ),
+        None => CompilationAllocationScope::prepare_diagnostic(bytes, None),
+    };
+    match producer {
+        Ok(producer) => producer.finish(|| naf_error(std::fmt::format(message))),
+        Err(error) => error,
+    }
+}
+
+fn frontend_compilation_error(
+    arguments: std::fmt::Arguments<'_>,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> XlogError {
+    let bytes = formatted_text_allocation_bytes(arguments);
+    let producer = match scope.as_deref_mut() {
+        Some(scope) => CompilationAllocationScope::prepare_diagnostic(
+            bytes,
+            Some(&mut |bytes| scope.reserve_allocation(bytes)),
+        ),
+        None => CompilationAllocationScope::prepare_diagnostic(bytes, None),
+    };
+    match producer {
+        Ok(producer) => producer.finish(|| XlogError::Compilation(std::fmt::format(arguments))),
+        Err(error) => error,
     }
 }
 

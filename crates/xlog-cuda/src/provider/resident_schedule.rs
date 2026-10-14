@@ -1045,7 +1045,6 @@ impl ResidentExecutionDomain {
         self.stream_id
     }
 
-    #[cfg(feature = "semantic-policy")]
     pub(crate) fn execution_stream(&self) -> &Arc<CudaStream> {
         &self.stream
     }

@@ -12,6 +12,12 @@ from __future__ import annotations
 from os import PathLike
 from typing import Any, Callable, Literal, NoReturn, Optional, Sequence, TypedDict, Union
 
+_SealedReplayMaterialSource = tuple[
+    tuple[int, int], tuple[tuple[str, int], ...],
+    Callable[[str, int, SemanticMaterialWriter], SemanticMaterialBytes],
+]
+_ReplayMaterialSource = SemanticMaterialSource
+
 # ---------------------------------------------------------------------------
 # Module-level constant
 # ---------------------------------------------------------------------------
@@ -174,10 +180,28 @@ class SemanticPreparedActorRefresh:
         """
         ...
     def group_update_vjp(self, update_step: SemanticPreparedStep, bank: int, *, consumer_stream: int) -> tuple[Any, ...]: ...
+    def group_update_vjp_layouts(
+        self, update_step: SemanticPreparedStep, bank: int, *, consumer_stream: int,
+    ) -> tuple[_PolicyOutputLayout, ...]:
+        """Nine original adjoint allocation layouts, without recording or capsules."""
+        ...
 
 class SemanticPreparedStep:
-    def prepare_actor_refresh(self, member_ordinal: int, *, refresh_snapshot: Any) -> SemanticPreparedActorRefresh: ...
     """Session-issued original step; construction is not public."""
+
+    def retirement_consumer_streams(self) -> tuple[int, ...]:
+        """Same native joined final-use roster, only in original finish_segment."""
+        ...
+    def prepare_actor_refresh(
+        self, member_ordinal: int, *, refresh_snapshot: Any,
+        content_geometry: tuple[
+            SemanticPreparedSourceContentGeometry, SemanticPreparedSourceContentGeometry
+        ],
+    ) -> SemanticPreparedActorRefresh: ...
+
+    def model_work_buffer_port(self, *, consumer_stream: int) -> SemanticModelWorkBufferPort:
+        """Original step counter shared by both banks; export only after finalization."""
+        ...
 
     def register_gradient_delivery(
         self, bank: int, phase: _SemanticTensorInput,
@@ -197,9 +221,20 @@ class SemanticPreparedStep:
     def requested_transition(self) -> Literal["proposal", "recompute", "update"]: ...
 
     def prepare_cold_model_work(
-        self, prepare_callback: Callable[[], Any], *, consumer_streams: Sequence[int]
+        self, prepare_callback: Callable[[], Any], *,
+        initialize_callback: Callable[[], None], consumer_streams: Sequence[int]
     ) -> Any:
-        """Prepare once under this original Update's native cold-work owner."""
+        """Prepare metadata once and retain the mandatory original initializer."""
+        ...
+
+    def initialize_cold_model_work(self) -> None:
+        """Run only that retained initializer, once after the complete plan freeze."""
+        ...
+
+    def group_critic_scalar_layout(
+        self, bank: int, *, consumer_stream: int,
+    ) -> _PolicyOutputLayout:
+        """The original FP32[1] critic destination, without reduction."""
         ...
 
     @property
@@ -221,8 +256,11 @@ class SemanticPreparedStep:
     ) -> tuple[_PublishedIdentity, Optional[_PublishedIdentity], int, bytes, bytes, Any]: ...
 
     def save_checkpoint(
-        self, *, consumer_streams: Sequence[int], snapshot_model_state: Callable[[], bytes]
-    ) -> bytes:
+        self, *, consumer_streams: Sequence[int],
+        snapshot_model_state: Callable[[SemanticMaterialWriter], SemanticMaterialBytes],
+        model_material_capacity: int, model_material_working_bytes: int,
+        original_writer: Optional[SemanticMaterialWriter] = None,
+    ) -> SemanticMaterialBytes:
         """Seal this late Proposal's full pre-action custody before retirement."""
         ...
 
@@ -249,6 +287,10 @@ class SemanticRetainedReplayMember:
         self, update_step: SemanticPreparedStep, bank: int, *,
         consumer_stream: int, edit_only: bool = False,
     ) -> tuple[Any, ...]: ...
+    def group_update_vjp_layouts(
+        self, update_step: SemanticPreparedStep, bank: int, *,
+        consumer_stream: int, edit_only: bool = False,
+    ) -> tuple[_PolicyOutputLayout, ...]: ...
     def confirm_published_target(self) -> None: ...
     def confirm_unpublished_target(self, update_step: SemanticPreparedStep) -> None: ...
     def finish(self) -> None: ...
@@ -264,6 +306,199 @@ _SourceModelMemoryGeometry = tuple[
     ], ...],
 ]
 
+_SourceContentTensorDescriptor = tuple[
+    _SemanticTensorLayout, int, int, int, Optional[int], int, int
+]
+_SourceContentAllocationDescriptor = tuple[
+    int, int, Optional[Union[NativeTensorAllocation, SemanticSourceGeometryAllocation]]
+]
+_SourceContentAllocationLayout = tuple[int, int]
+
+class SemanticSourceGeometryAllocation:
+    """Original opaque allocation identity before a physical native export."""
+    def span_bytes(self) -> int: ...
+    def same_allocation(self, other: SemanticSourceGeometryAllocation) -> bool: ...
+
+_SourceGeometryTensor = tuple[
+    _SemanticTensorLayout, int, int, SemanticSourceGeometryAllocation, int
+]
+_SourceGeometryModelMemory = tuple[
+    tuple[tuple[SemanticSourceGeometryAllocation, int], ...],
+    tuple[tuple[int, int, int], ...],
+    tuple[tuple[_SemanticTensorLayout, int, int], ...],
+]
+
+class SemanticModelInputGenerationPort:
+    """Original per-Update input backing declaration shared by TARGET/CURRENT.
+
+    No public constructor. Retain this owner with all projected metadata.
+    Late native allocation binds the same declaration to the preceding Update
+    output, or the admitted parent for the first Update. Shape never proves it.
+    """
+    def same_port(self, other: SemanticModelInputGenerationPort) -> bool: ...
+    def step_index(self) -> int: ...
+    def preceding_update(self) -> Optional[int]: ...
+    def model_memory_layouts(self) -> _SourceGeometryModelMemory: ...
+    def allocation_matches(
+        self, declared: SemanticSourceGeometryAllocation, actual: NativeTensorAllocation,
+    ) -> bool:
+        """Unbound future is an error; a valid foreign physical owner is unequal."""
+        ...
+
+class SemanticPreparedSourceContentGeometry:
+    """Original admitted SOURCE geometry before factories or tensor exports.
+
+    CURRENT carries structural proof only. Its numerical identity belongs to
+    the original Actor/bank; historical restore context cannot substitute it.
+    """
+    def kind(self) -> Literal["historical", "current"]: ...
+    def step_index(self) -> int: ...
+    def member_ordinal(self) -> int: ...
+    def bank(self) -> Optional[int]: ...
+    def restore_material_mode(self) -> Literal["checkpoint-model"]:
+        """Historical only; CURRENT requires its genuine Actor materialization."""
+        ...
+    def source_task(self) -> tuple[Any, Any]: ...
+    def task_training_domain(self) -> Optional[tuple[bytes, Any]]:
+        """Same native domain identity and original child-task projection."""
+        ...
+    def task_objective_law(self) -> tuple[
+        bytes, tuple[int, int], tuple[int, ...], tuple[bytes, int]
+    ]: ...
+    def learning_feedback_intervention(self) -> None:
+        """Authenticated fresh-child baseline, checked again on original binding.
+
+        Not a default for an absent phase or an ordinary restored phase owner.
+        """
+        ...
+    def policy_layout(self) -> tuple[Any, ...]: ...
+    def policy_support_layout(self) -> tuple[
+        tuple[int, bytes], list[tuple[int, int]], int
+    ]: ...
+    def feedback_schema(self) -> tuple[
+        int, bytes, bytes, int, int, int, tuple[tuple[str, int, int, bool], ...]
+    ]: ...
+    def prefix_capacity(self) -> int: ...
+    def feedback_capacity(self) -> int: ...
+    def schema_generation(self) -> bytes: ...
+    def structural_capacities(self) -> tuple[int, int, int]: ...
+    def position_table_identity(self) -> bytes: ...
+    def model_input_generation_port(self) -> SemanticModelInputGenerationPort:
+        """CURRENT only; same original per-Update port as its TARGET declaration."""
+        ...
+    def model_contract_material(self) -> SemanticMaterialBytes: ...
+    def model_restore_context(self) -> tuple[
+        _PublishedIdentity, int, tuple[int, int, int], tuple[bytes, bytes]
+    ]:
+        """Independent original historical context; unavailable for CURRENT."""
+        ...
+    def model_memory_layouts(self) -> _SourceGeometryModelMemory: ...
+    def input_tensor_layouts(
+        self, *, prepared_kind: Optional[Literal["recompute", "proposal"]] = None,
+        prepared_bank: Optional[Literal[0, 1]] = None,
+    ) -> tuple[_SourceGeometryTensor, ...]: ...
+    def feedback_tensor_layouts(
+        self, *, prepared_kind: Optional[Literal["recompute", "proposal"]] = None,
+        prepared_bank: Optional[Literal[0, 1]] = None,
+    ) -> tuple[_SourceGeometryTensor, ...]: ...
+    def policy_tensor_layouts(
+        self, *, prepared_kind: Optional[Literal["recompute", "proposal"]] = None,
+        prepared_bank: Optional[Literal[0, 1]] = None,
+    ) -> tuple[_SemanticTensorLayout, ...]:
+        """Typed external outputs only; no native allocation or version owner."""
+        ...
+    def policy_numerical_domain_layouts(
+        self, *, prepared_kind: Optional[Literal["recompute", "proposal"]] = None,
+        prepared_bank: Optional[Literal[0, 1]] = None,
+    ) -> tuple[
+        _SourceGeometryTensor, _SourceGeometryTensor, _SourceGeometryTensor
+    ]:
+        """Three genuine FP64 uniform allocations, not policy-logit snapshots.
+
+        Historical omits both section keywords. CURRENT requires its original
+        Proposal and bank; its two actual uniform buffer sets are distinct.
+        """
+        ...
+    def continuation_capacity(self) -> int: ...
+    def continuation_blocks(self) -> Optional[int]: ...
+    def content_family(
+        self, phase: Literal["model", "pack-policy", "finalize-continuation"],
+        kind: Literal["bind-model", "capture", "verify"],
+        *, prepared_kind: Optional[Literal["recompute", "proposal"]] = None,
+        prepared_bank: Optional[Literal[0, 1]] = None,
+    ) -> SemanticSourceContentFamily: ...
+    def freeze_content_occurrences(
+        self, *, events: tuple[_SourceContentEvent, ...],
+    ) -> tuple[SemanticSourceContentOccurrence, ...]:
+        """Freeze the complete original roster once before factory effects."""
+        ...
+
+class SemanticSourceContentFamily:
+    """Native-issued original command family; no public construction."""
+    def kind(self) -> str: ...
+    def phase(self) -> str: ...
+    def prepared_kind(self) -> Optional[Literal["recompute", "proposal"]]: ...
+    def prepared_bank(self) -> Optional[Literal[0, 1]]: ...
+
+class SemanticSourceContentOccurrence:
+    """One original frozen event, not a caller-provided native price."""
+    def kind(self) -> str: ...
+    def phase(self) -> str: ...
+    def prepared_kind(self) -> Optional[Literal["recompute", "proposal"]]: ...
+    def prepared_bank(self) -> Optional[Literal[0, 1]]: ...
+    def receiver_slot(self) -> int: ...
+    def output_slot(self) -> Optional[int]: ...
+    def tensor_layouts(self) -> tuple[_SourceContentTensorDescriptor, ...]: ...
+    def allocation_layouts(self) -> tuple[_SourceContentAllocationLayout, ...]: ...
+
+_SourceContentEvent = tuple[
+    SemanticSourceContentFamily, int, Optional[int],
+    tuple[_SourceContentTensorDescriptor, ...],
+    tuple[_SourceContentAllocationDescriptor, ...],
+]
+
+class SemanticPreparedSourceContent:
+    """Original SOURCE structural ports, not numerical content authority.
+
+    Created only by the original prepared import and retained with the same
+    resident carrier. Getters return the original capsules without re-export.
+    Retain this recipe while any returned structural metadata remains held,
+    including consumed capsules; physical retirement does not release its
+    projection receipt or grant later numerical access.
+    """
+
+    def model_context(self) -> tuple[Any, ...]: ...
+    def prefix(self) -> tuple[_PublishedIdentity, Any]: ...
+    def terminal_state(self) -> Any: ...
+    def terminal_state_allocation(self) -> NativeTensorAllocation:
+        """Original terminal view provenance, without exporting its full header."""
+        ...
+    def feedback(self) -> tuple[Any, ...]: ...
+    def tensor(self, role: int, index: int) -> Any: ...
+    def tensor_allocation(self, role: int, index: int) -> tuple[NativeTensorAllocation, Any]: ...
+    def activate(self, *, consumer_stream: int) -> None:
+        """Prepare original SOURCE contents under the same admitted recorder."""
+        ...
+    def content_family(
+        self, phase: Literal["model", "pack-policy", "finalize-continuation"],
+        kind: Literal["bind-model", "capture", "verify"],
+    ) -> SemanticSourceContentFamily: ...
+    def freeze_content_occurrences(
+        self, *, events: tuple[_SourceContentEvent, ...],
+    ) -> tuple[SemanticSourceContentOccurrence, ...]:
+        """Return the same already-frozen early original expression roster.
+
+        Tensor fields are layout, logical begin/end, storage slot, version slot,
+        allocation slot and byte offset. Allocation fields are slot, full byte
+        extent and original native provenance when already physically present.
+        A missing version slot makes no counter claim; it does not assert a new
+        or independent counter. Known partitions require authentic producer tokens.
+        No count, work ceiling or native tariff is accepted.
+        """
+        ...
+    def pack_policy_occurrences(self) -> tuple[SemanticSourceContentOccurrence, ...]: ...
+    def finalize_continuation_occurrences(self) -> tuple[SemanticSourceContentOccurrence, ...]: ...
+
 class SemanticPreparedTaskImport:
     """Original SOURCE import before its sole numerical invocation.
 
@@ -275,8 +510,21 @@ class SemanticPreparedTaskImport:
     def task_use(self) -> SemanticTransitionTaskUse: ...
     @property
     def parent(self) -> SemanticPublishedParent: ...
+    def prepare_source_content(
+        self, *, consumer_stream: int,
+        resident_memory: SemanticPreparedResidentModelMemory,
+        content_geometry: SemanticPreparedSourceContentGeometry,
+    ) -> SemanticPreparedSourceContent:
+        """Reuse this original resident carrier; no second stage or effects."""
+        ...
     def source_model_contract_metadata(self) -> _SourceModelContractMetadata: ...
     def source_model_memory_geometry(self) -> _SourceModelMemoryGeometry: ...
+    def group_update_vjp_layouts(
+        self, update_step: SemanticPreparedStep, bank: int, *,
+        consumer_stream: int, edit_only: bool = False,
+    ) -> tuple[_PolicyOutputLayout, ...]:
+        """Future SOURCE requires its original registered edit_only=True delivery."""
+        ...
     def group_update_vjp(
         self, update_step: SemanticPreparedStep, bank: int, *,
         consumer_stream: int, edit_only: bool = False,
@@ -294,7 +542,7 @@ class SemanticSegmentInstructionAdmission:
     def parent_identity(self) -> _PublishedIdentity: ...
     def resolve_parent_handoff(self) -> None: ...
     @property
-    def cancelled_checkpoint(self) -> Optional[bytes]:
+    def cancelled_checkpoint(self) -> Optional[SemanticMaterialBytes]:
         """Cached terminal capsule only after genuine cancellation retirement."""
         ...
     @property
@@ -313,10 +561,43 @@ class SemanticPrivateReplayChild:
 
     def source_task(
         self, *, refresh_snapshot: Callable[[], Any]
-    ) -> tuple[bytes, tuple[Any, ...], tuple[Any, ...]]: ...
+    ) -> tuple[Any, Any]: ...
 
 class SemanticColdModelWork:
-    """Original native cold registrar, available only in its admitted callback."""
+    """Original registrar; numerical rights remain callback-scoped."""
+
+    def restore_material_mode(self) -> Literal["phase-reset", "checkpoint-model"]:
+        """Original decoded restoration mode, without invoking its factory."""
+        ...
+    def prepare_checkpoint_writer(
+        self, *, region_ordinal: int, model_material_capacity: int,
+        model_material_working_bytes: int,
+        resident_read: SemanticResidentModelRead, codec_staging_bytes: int,
+    ) -> SemanticMaterialWriter:
+        """Original region's retained metadata-only writer, also for future parents.
+
+        Pass this same object into the compiled snapshot and later callback.
+        resident_read is the same already-bound opaque region occurrence;
+        codec_staging_bytes is the original encoder's chunk extent, not a price.
+        Inspection grants no storage allocation, numerical read or write.
+        """
+        ...
+    def prepare_resident_model_restoration(
+        self, memory: SemanticPreparedResidentModelMemory,
+    ) -> SemanticPreparedResidentModelRestoration:
+        """Same planned Snapshot0 producer and future native restore issuance."""
+        ...
+    def report_cursor(self) -> tuple[
+        int, int, int, int, tuple[tuple[int, int], ...], tuple[int, ...], bool, bool,
+    ]:
+        """Native region bounds, declared cursor, physical slots, proven skips,
+        skipped region ordinals, recording closure and actual report completion.
+
+        Pending, Unknown and stopped live work cannot authorize continuation.
+        The same original handle retains final native proof after Session release;
+        a completed refusal may retain a partial declared prefix.
+        """
+        ...
 
     @property
     def plan_admitted(self) -> bool: ...
@@ -337,12 +618,26 @@ class SemanticColdModelWork:
         evaluation_content: Optional[tuple[
             tuple[_SemanticTensorInput, ...], tuple[_SemanticTensorInput, ...]
         ]] = None,
+        source_content: tuple[
+            Union[SemanticPreparedSourceContent, SemanticPreparedSourceContentGeometry], ...
+        ] = (),
+        resident_reads: tuple[tuple[int, SemanticResidentModelRead], ...] = (),
     ) -> tuple[int, int, int]:
         """Admit once before any original buffer/view export or numerical producer.
 
         Evaluation content is the actual output-three and objective-eight roster,
         using the existing five-field tensor inputs, not caller native prices.
+        Source recipes contribute their complete frozen original occurrences
+        to this same admission, not a second caller-provided cost or allowance.
+        Historical geometry resolves its existing live recipe in original order;
+        missing, expired and CURRENT bindings are rejected without another freeze.
         """
+        ...
+    def model_work_buffer_layout(self, *, consumer_stream: int) -> _NativeWorkBufferLayout:
+        """Genuine finalized scratch geometry; unavailable before plan admission."""
+        ...
+    def model_work_buffer_port(self, *, consumer_stream: int) -> SemanticModelWorkBufferPort:
+        """Original report counter owner without an early event extent or allocation."""
         ...
     def model_work_buffer(self, *, consumer_stream: int) -> Any: ...
     def begin(self) -> None: ...
@@ -405,6 +700,18 @@ class SemanticModelEvaluation:
     def cohort(self) -> SemanticEvaluationCohort: ...
     @property
     def consumer_stream(self) -> int: ...
+    def training_view_layouts(self, *, consumer_stream: int) -> tuple[_TrainingViewLayout, ...]:
+        """All seventeen original allocation-backed ports without preparation or export."""
+        ...
+    def model_work_buffer_layout(self, *, consumer_stream: int) -> _NativeWorkBufferLayout:
+        """Actual numerical U64 scratch geometry, separate from cold-report scratch."""
+        ...
+    def model_work_buffer_port(self, *, consumer_stream: int) -> SemanticModelWorkBufferPort:
+        """Distinct original capture counter, not the cold report counter."""
+        ...
+    def admit_plan(self, operations: tuple[tuple[int, tuple[int, ...]], ...]) -> tuple[int, int, int]:
+        """Finalize the complete original capture plan before numerical effects."""
+        ...
     def training_view(self, *, consumer_stream: int) -> tuple[Any, ...]: ...
     def model_work_buffer(self, *, consumer_stream: int) -> Any: ...
     def capture(
@@ -429,6 +736,17 @@ class SemanticModelEvaluation:
         """
         ...
     def cancel(self, *, consumer_streams: Sequence[int]) -> None: ...
+    def cancellation_proof(self) -> SemanticCancelledModelEvaluation:
+        """Known native non-submission; unavailable for Pending or Unknown."""
+        ...
+
+class SemanticCancelledModelEvaluation:
+    """Original known cancel proof, not a successful numerical evaluation."""
+    @property
+    def capture_disposition(self) -> Literal[
+        "not-entered", "entered-aborted", "recorded-and-cancelled",
+    ]: ...
+    def belongs_to(self, original: SemanticModelEvaluation) -> bool: ...
 
 class SemanticTransitionColdTask:
     """Original admitted statement roster and its explicit ordered query selection."""
@@ -447,7 +765,9 @@ class SemanticTransitionColdTask:
         acknowledgement_payload_capacity_bytes: int,
         authority_decisions_capacity_bytes: int, generations: tuple[int, int, int, int],
         training_cursor: int, training_rng: tuple[int, int, int, int], fuel: int,
-        rng: tuple[int, int, int], private_replay_child: Any = None,
+        rng: tuple[int, int, int], material_source: Optional[SemanticMaterialSource] = None,
+        private_replay_child: Any = None, prepared_actor_refresh: Any = None,
+        actor_refresh_bank: Optional[int] = None,
     ) -> None: ...
 
     @property
@@ -474,6 +794,41 @@ class NativeTensorAllocation:
     @property
     def view_bytes(self) -> int: ...
 
+class SemanticModelWorkBufferPort:
+    """Native-issued original counter owner; no public constructor or early E."""
+
+    @property
+    def original_owner(self) -> Union[SemanticPreparedStep, SemanticColdModelWork, SemanticModelEvaluation]: ...
+    @property
+    def device_ordinal(self) -> int: ...
+    @property
+    def consumer_stream(self) -> int: ...
+    @property
+    def dtype(self) -> tuple[Literal[1], Literal[64]]: ...
+    @property
+    def row_width(self) -> Literal[3]: ...
+    @property
+    def finalized_extent(self) -> int:
+        """Original admitted E after known initialization; no allocation or resume."""
+        ...
+    def same_counter(self, other: SemanticModelWorkBufferPort) -> bool: ...
+    def export(self) -> tuple[
+        NativeTensorAllocation, tuple[int, int], tuple[int, int],
+        tuple[Literal[1], Literal[64]], int, int, Any,
+    ]:
+        """Same cached genuine finalized allocation/layout paired with its capsule.
+
+        A consumed capsule is never replaced with a second counter import.
+        """
+        ...
+
+_NativeWorkBufferLayout = tuple[
+    NativeTensorAllocation, tuple[int, int], tuple[int, int],
+    tuple[Literal[1], Literal[64]],
+]
+_TrainingViewLayout = tuple[
+    NativeTensorAllocation, tuple[int, ...], tuple[int, ...], tuple[int, int],
+]
 _PolicyNumericalDomainLayout = tuple[
     NativeTensorAllocation, tuple[int, ...], tuple[int, ...],
     tuple[Literal[2], Literal[64]],
@@ -482,9 +837,35 @@ _PolicyNumericalDomainLayouts = tuple[
     _PolicyNumericalDomainLayout, _PolicyNumericalDomainLayout,
     _PolicyNumericalDomainLayout,
 ]
+_PolicyOutputLayout = tuple[
+    NativeTensorAllocation, tuple[int, ...], tuple[int, ...],
+    tuple[Literal[2], Literal[32, 64]],
+]
 
 class SemanticTransitionTaskUse:
     """Native-issued task; no public constructor."""
+
+    def learning_feedback_intervention(
+        self, parent: Union[SemanticPublishedParent, SemanticPreparedStep],
+    ) -> Optional[tuple[bytes, bool]]:
+        """Original phase planning metadata, without a numerical model witness.
+
+        Private evaluation requires its genuine entered Preparation callback;
+        metadata does not grant admission, bind, capture or verify authority.
+        """
+        ...
+
+    def cold_model_work_report_layouts(self) -> tuple[
+        tuple[SemanticColdModelWork, _NativeWorkBufferLayout, int], ...,
+    ]:
+        """Complete original region roster, identical scratch layout and stream.
+
+        Metadata only during the genuine callback. Future region handles retain
+        identity without activation, buffer export or a fabricated parent.
+        Lazy adoption must already have issued its original callback through
+        active_cold_model_work; this getter never advances that transition.
+        """
+        ...
 
     @property
     def original_program(self) -> Optional[bytes]:
@@ -560,7 +941,7 @@ class SemanticPreparedSegmentCancelled(RuntimeError):
 class SemanticTransitionCheckpointCancelled(RuntimeError):
     """Authenticated terminal checkpoint; no further request can be admitted."""
 
-    checkpoint: bytes
+    checkpoint: SemanticMaterialBytes
     task_identity: bytes
     first_program_ordinal: int
     end_program_ordinal: int
@@ -568,7 +949,8 @@ class SemanticTransitionCheckpointCancelled(RuntimeError):
     parent_identity: _PublishedIdentity
 
 def restore_cancelled_checkpoint(
-    checkpoint: bytes, *, program_bytes: bytes,
+    checkpoint: SemanticMaterialBytes, *, program_bytes: bytes,
+    material_source: _ReplayMaterialSource, max_resolved_material_bytes: int,
     snapshot: Any = None, learning_phase_issuer: Any = None,
     learning_phase_records: Any = None, learning_phase_record_limits: Any = None,
     learning_phase_fence: Any = None, learning_phase_checkpoint_issuer: Any = None,
@@ -576,7 +958,8 @@ def restore_cancelled_checkpoint(
     """Authenticate without CUDA and raise SemanticTransitionCheckpointCancelled.
 
     Invalid or nonterminal material raises ValueError instead. The original
-    Program and independently pinned Session checkpoint issuer are required;
+    Program, original material source and saved resolved-memory cap, and
+    independently pinned Session checkpoint issuer are required;
     the authenticated native task identity is returned only in the exception.
     """
     ...
@@ -588,12 +971,144 @@ class SemanticRetainedFinalUsePending(RuntimeError):
     historical import, or numerical work after this exception.
     """
 
+class _OwnedCompilerDiagnostic:
+    """Immutable original compiler payload; no public constructor.
+
+    These exact native types are exported for authenticated error recognition.
+    Acquire the projection workspace before str/encode/JSON and retain it with
+    every derived object. Scalar extent getters share pre-acquired metadata:
+    retain this payload while using those scalars. The returned workspace also
+    retains the authentic payload, not only the original capacity pool.
+    """
+    def __str__(self) -> str: ...
+    def text_utf8_bytes(self) -> int: ...
+    def format_workspace_bytes(self) -> int: ...
+    def reserve_projection_workspace(
+        self, material_source: SemanticMaterialSource, allocation_bytes: int,
+    ) -> SemanticMaterialReadWorkspace: ...
+
+class _OwnedCompilerError(RuntimeError):
+    """Original args[0] is _OwnedCompilerDiagnostic, not a copied string.
+
+    Native custody survives reassignment of args. Standard traceback, cause,
+    context and notes remain mutable; none grant early allocation retirement.
+    """
+
+class SemanticMaterialBytes:
+    """Immutable byte-buffer view retaining the original bounded native allocation.
+
+    No public constructor. Slices and read-only memoryviews share that owner;
+    converting to a separate bytes object is not a bounded checkpoint handoff.
+    """
+    def __len__(self) -> int: ...
+    def slice(self, begin: int, end: int) -> SemanticMaterialBytes: ...
+    def range_equals(self, begin: int, end: int, source: Any) -> bool: ...
+    def reserve_read_workspace(self, allocation_bytes: int) -> SemanticMaterialReadWorkspace: ...
+
+class SemanticMaterialReadWorkspace:
+    """Original-pool auxiliary lease; no public constructor or early release.
+
+    Reserve a finite parser/container bound before creating those objects.
+    Retain this issuer with every derived object until its last use. The issuer
+    retains the same immutable material, including its original slice range.
+    """
+    ...
+
+class SemanticPublicationMaterialProjection:
+    """Immutable native projection retaining its original decoding/packing leases.
+
+    No public constructor. Retain this owner with every derived field until its
+    last use; cache logical_bytes retain their original guarded byte allocation.
+    """
+    def __getitem__(self, key: str) -> Any: ...
+    def get(self, key: str, default: Any = None) -> Any: ...
+
+class SemanticMaterialSource:
+    """Original process/store owner; no public constructor."""
+    @property
+    def store_identity(self) -> tuple[int, int]: ...
+    def extend(self, material_source: _SealedReplayMaterialSource) -> None: ...
+    def prepare_checkpoint_writer(self, capacity: int, working_bytes: int) -> SemanticMaterialWriter: ...
+    def resolve_stored(self, sha256_hex: str, size: int) -> SemanticMaterialBytes: ...
+    def reserve_read_workspace(self, allocation_bytes: int) -> SemanticMaterialReadWorkspace: ...
+
+def prepare_material_source(
+    material_source: _SealedReplayMaterialSource, max_material_bytes: int,
+    max_material_store_bytes: int, max_resolved_material_bytes: int,
+) -> SemanticMaterialSource: ...
+
+class SemanticMaterialWriter:
+    """Original pre-reserved producer output; no public constructor.
+
+    Freeze a complete non-overlapping span partition before writing. Each span
+    advances in order, while distinct spans may be produced in any order.
+    Seal succeeds only once every byte in the declared extent is initialized.
+    """
+    @property
+    def region_ordinal(self) -> int:
+        """Original cold region; unavailable for writers without a cold report."""
+        ...
+    @property
+    def model_material_capacity(self) -> int: ...
+    @property
+    def model_material_working_bytes(self) -> int: ...
+    def declare_spans(self, extent: int, spans: tuple[tuple[int, int], ...]) -> None: ...
+    def write(self, offset: int, source: Any) -> None: ...
+    def seal(self) -> SemanticMaterialBytes: ...
+
+class SemanticResidentModelRead:
+    """Opaque original ordered occurrence; no constructor or numerical authority."""
+    ...
+
+class SemanticPreparedResidentModelRestoration:
+    """Original planned snapshot issuance carried into the one native restore."""
+    @property
+    def training_domain(self) -> Any: ...
+    @property
+    def objective_law(self) -> tuple[Any, ...]: ...
+    @property
+    def feedback_intervention(self) -> tuple[Any, ...]: ...
+    @property
+    def restore_read(self) -> SemanticResidentModelRead: ...
+    @property
+    def snapshot_read(self) -> SemanticResidentModelRead: ...
+
+class SemanticPreparedResidentModelMemory:
+    """Original structural aliases with separately admitted numerical activation.
+
+    Retain this carrier through cold use, then release it before its parent.
+    Framework aliases retain their native generation independently. Preparing
+    or inspecting this object grants no numerical access.
+    """
+    @property
+    def memory(self) -> tuple[Any, Any, Any, tuple[Any, ...], tuple[Any, ...], tuple[Any, ...]]:
+        """Cached original six-field envelope; genuine capsules issued once."""
+        ...
+    @property
+    def model_contract_metadata(self) -> _SourceModelContractMetadata: ...
+    def prepare_resident_read(self, work: SemanticColdModelWork) -> SemanticResidentModelRead:
+        """Associate the real parent and exact region before sole admission."""
+        ...
+    def activate(self, *, consumer_stream: int) -> None:
+        """Guard each original occurrence, or resume its identical pending owner."""
+        ...
+
 class SemanticPublishedParent:
+    def prepare_resident_model_memory(self, *, consumer_stream: int) -> SemanticPreparedResidentModelMemory:
+        """Structural aliases only, without guards, copies or stream effects."""
+        ...
+    def resident_model_memory(self, *, consumer_stream: int) -> tuple[Any, Any, Any, tuple[Any, ...], tuple[Any, ...], tuple[Any, ...]]:
+        """Ordinary export with immediate original content activation."""
+        ...
     def original_prepared_import(self) -> SemanticPreparedTaskImport:
         """The genuine retained owner for this same SOURCE parent and task."""
         ...
     def source_model_contract_metadata(self) -> _SourceModelContractMetadata:
-        """Authenticated original host record and six layout byte offsets."""
+        """Complete seal-authenticated host contract of this acquired parent.
+
+        Returns record bytes and six layout byte offsets without a device read.
+        Planning metadata does not grant numerical or SOURCE import access.
+        """
         ...
     def source_model_memory_geometry(self) -> _SourceModelMemoryGeometry:
         """Original full model allocation, storage, view and tensor geometry."""
@@ -603,6 +1118,19 @@ class SemanticPublishedParent:
         ...
 
 class SemanticTransitionSession:
+    @staticmethod
+    def inspect_publication_material(
+        material: SemanticMaterialBytes,
+    ) -> SemanticPublicationMaterialProjection: ...
+    @staticmethod
+    def checkpoint_referent(
+        checkpoint: SemanticMaterialBytes, *, material_source: SemanticMaterialSource,
+    ) -> bytes: ...
+    @staticmethod
+    def verify_checkpoint_referent(
+        referent: bytes, checkpoint: SemanticMaterialBytes, *,
+        material_source: SemanticMaterialSource,
+    ) -> None: ...
     @property
     def prepared_task_import(self) -> Optional[SemanticPreparedTaskImport]:
         """Recover the identical retained owner, without repeating callbacks."""
@@ -619,8 +1147,9 @@ class SemanticTransitionSession:
 
     @staticmethod
     def restore_checkpoint(
-        checkpoint: bytes, *, device_ordinal: int, snapshot: Any,
+        checkpoint: SemanticMaterialBytes, *, device_ordinal: int, snapshot: Any,
         restore_model: Any, training_domain: Any, training_canary_source: Any,
+        material_source: _ReplayMaterialSource, max_resolved_material_bytes: int,
         original_program: Optional[bytes] = None, referent: Any = None,
         resolve_checkpoint: Any = None, max_checkpoint_bytes: Any = None,
         max_total_checkpoint_bytes: Any = None, refresh_snapshot: Any = None,
@@ -629,7 +1158,120 @@ class SemanticTransitionSession:
         learning_phase_checkpoint_issuer: Any = None,
     ) -> Any: ...
 
+class SemanticTensorContentWitness:
+    def verify(
+        self, *, tensors: Any, consumer_stream: int,
+        occurrence: Optional[SemanticSourceContentOccurrence] = None,
+    ) -> None:
+        """Use the same original frozen handle for every SOURCE verification."""
+        ...
+
+_LearningPhase = Literal["alignment", "fast", "consolidation"]
+_LearningPhaseView = tuple[
+    int, int, Literal["preserve", "zero", "master-from-effective", "phase"], int, int
+]
+
+class SemanticLearningPhaseRecipe:
+    def __init__(
+        self, *, source: _LearningPhase, target: _LearningPhase,
+        phase_index: int, completed_updates_index: int,
+        views: Sequence[_LearningPhaseView],
+    ) -> None: ...
+    @property
+    def recipe_digest(self) -> bytes: ...
+    @property
+    def source(self) -> _LearningPhase: ...
+    @property
+    def target(self) -> _LearningPhase: ...
+    @property
+    def phase_index(self) -> int: ...
+    @property
+    def completed_updates_index(self) -> int: ...
+    @property
+    def views(self) -> tuple[_LearningPhaseView, ...]: ...
+
+class SemanticLearningPhaseTransition:
+    """Native-issued private attempt retained through unknown completion."""
+    @property
+    def phase_id(self) -> bytes: ...
+    @property
+    def issuer_anchor(self) -> bytes: ...
+    @property
+    def phase_record_limits(self) -> tuple[int, int, int]: ...
+    @property
+    def status(self) -> Literal[
+        "preparing", "unknown", "prepared", "refusal-pending", "refused", "committed"
+    ]: ...
+    @property
+    def checkpoint_sha256(self) -> bytes: ...
+    @property
+    def refusal_outcome(self) -> Optional[tuple[Any, ...]]: ...
+    @property
+    def refusal_checkpoint_custody(self) -> Optional[
+        tuple[bytes, tuple[bytes, bytes, bytes]]
+    ]: ...
+    def commit_checkpoint(self, durable_owner: Any) -> SemanticTransitionRestoredCheckpoint: ...
+    def resolve_checkpoint(self) -> Optional[SemanticTransitionRestoredCheckpoint]: ...
+    def continue_preparation(self) -> SemanticLearningPhaseTransition: ...
+    def abandon_prepared(self) -> None: ...
+
 class SemanticTransitionController:
+    def prepare_learning_phase_transition(
+        self, task_use: SemanticTransitionTaskUse, *,
+        parent: SemanticPublishedParent, recipe: SemanticLearningPhaseRecipe,
+        source_checkpoint: SemanticMaterialBytes,
+        consumer_streams: Sequence[int], snapshot: Any,
+        scientific_owner: Any, scientific_refusal_type: type[BaseException],
+        source_model: Any,
+        prepare_checkpoint_writer: Callable[
+            [Any, SemanticColdModelWork], SemanticMaterialWriter
+        ],
+        execute_phase_instruction: Callable[..., Any],
+        release_cancelled_phase_execution: Callable[..., Any],
+        resource_observer: Any, feedback_interventions: Any,
+        learning_grant_ref: Any, checkpoint_destination: Any,
+        snapshot_model_state: Callable[[SemanticMaterialWriter], SemanticMaterialBytes],
+        restore_model: Callable[..., Any],
+        snapshot_restored_model: Callable[[Any, SemanticMaterialWriter], SemanticMaterialBytes],
+        retire_restored_model: Callable[[Any], None],
+        cancelled_retirement_context: Callable[..., Any],
+        retire_source_model: Callable[[], None], refresh_snapshot: Callable[..., Any],
+        phase_record_owner: Any, phase_record_limits: tuple[int, int, int],
+        frozen_program_bytes: bytes, resolve_checkpoint: Optional[Callable[..., Any]] = None,
+        max_checkpoint_bytes: Optional[int] = None,
+        max_total_checkpoint_bytes: Optional[int] = None,
+    ) -> SemanticLearningPhaseTransition:
+        """Prepare metadata before looking up each original regional writer.
+
+        The metadata callback receives the selected model and original work.
+        Serialization consumes the returned writer separately and only once.
+        """
+        ...
+    def pending_learning_phase_transition(self) -> Optional[SemanticLearningPhaseTransition]: ...
+    def save_checkpoint(
+        self, task_use: SemanticTransitionTaskUse, *,
+        parent: SemanticPublishedParent, consumer_streams: Sequence[int],
+        snapshot: Any,
+        snapshot_model_state: Callable[[SemanticMaterialWriter], SemanticMaterialBytes],
+        model_material_capacity: int, model_material_working_bytes: int,
+        original_writer: Optional[SemanticMaterialWriter] = None,
+    ) -> SemanticMaterialBytes:
+        """Seal one original output and retain it across Unknown completion.
+
+        Compiled cold paths pass their preissued region writer explicitly.
+        The serializer receives that exact object, never a replacement writer.
+        """
+        ...
+    def bind_model_content(
+        self, task_use: SemanticTransitionTaskUse, *, parent: Any,
+        tensors: Any, consumer_stream: int, bank: Optional[int] = None,
+        occurrence: Optional[SemanticSourceContentOccurrence] = None,
+    ) -> SemanticTensorContentWitness: ...
+    def capture_tensor_content(
+        self, task_use: SemanticTransitionTaskUse, *, parent: Any,
+        tensors: Any, consumer_stream: int,
+        occurrence: Optional[SemanticSourceContentOccurrence] = None,
+    ) -> SemanticTensorContentWitness: ...
     def task_observation_roots(
         self, *, task_scope: Sequence[str], live_authorities: Any,
         statement_records: Sequence[int], allowed_support_records: Sequence[int],
@@ -638,6 +1280,7 @@ class SemanticTransitionController:
         actor_eligible: bool, task_ground: Any, replay_rows: Any,
         replay_selection: Any, max_material_bytes: int,
         max_total_material_bytes: int, max_evidence_bytes: int,
+        material_source: _ReplayMaterialSource, max_resolved_material_bytes: int,
     ) -> tuple[
         bytes, tuple[int, ...], tuple[int, ...],
         tuple[tuple[int, Optional[int], Union[
@@ -666,6 +1309,7 @@ class SemanticTransitionController:
         training_canary_source: Any, replay_capacity: Any,
         max_material_bytes: Any, max_total_material_bytes: Any,
         max_evidence_bytes: Any, dependencies: Any, feedback_roots: Any,
+        material_source: _ReplayMaterialSource, max_resolved_material_bytes: int,
         publication_grants: Any, inference_grants: Any, training_grants: Any,
         initial_sources: Any, source_mapping: Any, snapshot: Any,
         replay_selection: Any, replay_operation: Any, restore_invocation: Any,
@@ -677,6 +1321,25 @@ class SemanticTransitionController:
         max_total_checkpoint_bytes: Any = None, retain_policy: bool = False,
         prepare_invocation: Optional[Callable[[SemanticTransitionTaskUse, SemanticPublishedParent], None]] = None,
     ) -> Union[SemanticTransitionTaskUse, tuple[SemanticTransitionTaskUse, Any], SemanticPreparedTaskImport]: ...
+
+    def admit_training_arena(
+        self, task_use: SemanticTransitionTaskUse, *, parent: SemanticPublishedParent,
+        consumer_streams: Sequence[int], snapshot: Any, replay_rows: Any,
+        material_source: _ReplayMaterialSource, training_objective: Any,
+        training_domain: Any, refresh_snapshot: Any,
+        resolve_checkpoint: Any = None, max_checkpoint_bytes: Any = None,
+        max_total_checkpoint_bytes: Any = None,
+    ) -> SemanticPublishedParent:
+        """Retain the original source and inherit its fixed payload pool."""
+        ...
+
+    def acknowledge_replay_delivery(
+        self, task_use: SemanticTransitionTaskUse, *, parent: SemanticPublishedParent,
+        snapshot: Any, delivery_receipt: bytes, result_receipt: bytes,
+        replay_row: Any, material_source: _ReplayMaterialSource,
+    ) -> tuple[Any, ...]:
+        """Use the original material source without replacing its retained cap."""
+        ...
 
     def execute_task_import(
         self, prepared_import: SemanticPreparedTaskImport,
@@ -701,9 +1364,38 @@ class SemanticTransitionController:
         step_index: int, replay_ordinal: int,
     ) -> SemanticPrivateReplayChild: ...
 
+    def prepare_source_content_geometry(
+        self, task_use: SemanticTransitionTaskUse, *,
+        instruction_admission: SemanticSegmentInstructionAdmission,
+    ) -> tuple[SemanticPreparedSourceContentGeometry, ...]:
+        """Issue the original full SOURCE roster before numerical preparation."""
+        ...
+
+    def model_input_generation_port(
+        self, task_use: SemanticTransitionTaskUse, *,
+        instruction_admission: SemanticSegmentInstructionAdmission, step_index: int,
+    ) -> SemanticModelInputGenerationPort:
+        """TARGET input-generation port from the already-issued original roster.
+
+        Shares the same native declaration with every CURRENT member/bank of
+        this Update; does not allocate/export tensors or grant numerical access.
+        """
+        ...
+
+    def finalize_segment_layout(
+        self, task_use: SemanticTransitionTaskUse, *,
+        layouts: tuple[tuple[SemanticPreparedStep, int, int], ...],
+    ) -> None:
+        """Seal every original ordered step's (capture rows, bank event count).
+
+        Derived layout is finalized once before original initialization/capture.
+        A refused allocation preserves this child and never permits a new plan.
+        """
+        ...
+
     def build_segment(
         self, task_use: SemanticTransitionTaskUse, *, transitions: Any,
-        producer: Any, tensor_content_capacity: int, model_work_capacity: int,
+        producer: Any,
         segment_capacity_bytes: int, other_external_cuda_bytes: int,
         instruction_admission: Optional[SemanticSegmentInstructionAdmission],
         consumer_streams: Sequence[int],
@@ -721,7 +1413,7 @@ class SemanticTransitionController:
         ...
 
     def prepare_model_evaluation(
-        self, task_use: Any, parent: Any, *, model_work_capacity: int,
+        self, task_use: Any, parent: Any, *, model_work_capacity: Optional[int] = None,
         cohort: Optional[SemanticEvaluationCohort] = None,
     ) -> SemanticModelEvaluation: ...
 

@@ -1,10 +1,252 @@
 //! Magic-set rewriting for the deterministic language-completeness subset.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 use xlog_core::{Result, XlogError};
 
 use crate::ast::{Atom, BodyLiteral, MagicSetsMode, Program, Rule, Term};
+use crate::program_custody::{
+    PayloadCustody, ProgramAllocationCustody, RetainedProgram, RetainedVectorCustody,
+};
+
+struct RetainedMagicValue<T> {
+    value: T,
+    custody: PayloadCustody,
+}
+
+struct RetainedMagicRules {
+    value: Vec<Rule>,
+    custody: RetainedVectorCustody<PayloadCustody>,
+}
+
+pub(crate) struct RetainedMagicSetRewrite {
+    pub(crate) program: RetainedProgram,
+    pub(crate) report: MagicSetReport,
+}
+
+struct ScopedMagicCustody {
+    _custody: ProgramAllocationCustody,
+    _storage_owner: Arc<dyn Send + Sync>,
+}
+
+struct ScopedMagicRewrite {
+    value: MagicSetRewrite,
+    owner: Arc<ScopedMagicCustody>,
+}
+
+fn magic_storage_bytes<T>(count: usize) -> Result<u64> {
+    count
+        .checked_mul(std::mem::size_of::<T>())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(|| XlogError::allocation_extent_overflow("magic vector storage"))
+}
+
+struct MagicAllocations<'a, 'b> {
+    scope: Option<&'a mut crate::compile::CompilationAllocationScope<'b>>,
+    retained_input: bool,
+}
+
+impl MagicAllocations<'_, '_> {
+    fn output_unit(&mut self, custody: &mut PayloadCustody, bytes: u64) -> Result<()> {
+        if let Some(scope) = self.scope.as_deref_mut() {
+            custody.reserve_unit(bytes, scope)?;
+        }
+        Ok(())
+    }
+
+    fn append_custody(
+        &mut self,
+        into: &mut PayloadCustody,
+        from: &mut PayloadCustody,
+    ) -> Result<()> {
+        if let Some(scope) = self.scope.as_deref_mut() {
+            into.append_from(from, scope)?;
+        }
+        Ok(())
+    }
+
+    fn clone_atom(&mut self, atom: &Atom) -> Result<RetainedMagicValue<Atom>> {
+        let custody = match self.scope.as_deref_mut() {
+            Some(scope) => PayloadCustody::for_atom_clone(atom, scope)?,
+            None => PayloadCustody::default(),
+        };
+        Ok(RetainedMagicValue {
+            value: atom.clone(),
+            custody,
+        })
+    }
+
+    fn clone_body(&mut self, body: &[BodyLiteral]) -> Result<RetainedMagicValue<Vec<BodyLiteral>>> {
+        let custody = match self.scope.as_deref_mut() {
+            Some(scope) => PayloadCustody::for_body_clone(body, scope)?,
+            None => PayloadCustody::default(),
+        };
+        Ok(RetainedMagicValue {
+            value: body.to_vec(),
+            custody,
+        })
+    }
+
+    fn term_custody(&mut self, term: &Term) -> Result<PayloadCustody> {
+        match self.scope.as_deref_mut() {
+            Some(scope) => PayloadCustody::for_term_clone(term, scope),
+            None => Ok(PayloadCustody::default()),
+        }
+    }
+
+    fn body_buffer(&mut self, count: usize) -> Result<RetainedMagicValue<Vec<BodyLiteral>>> {
+        let mut custody = PayloadCustody::default();
+        self.output_unit(&mut custody, magic_storage_bytes::<BodyLiteral>(count)?)?;
+        Ok(RetainedMagicValue {
+            value: Vec::with_capacity(count),
+            custody,
+        })
+    }
+
+    fn push_literal(
+        &mut self,
+        body: &mut RetainedMagicValue<Vec<BodyLiteral>>,
+        literal: &BodyLiteral,
+    ) -> Result<()> {
+        let mut custody = match self.scope.as_deref_mut() {
+            Some(scope) => PayloadCustody::for_literal_clone(literal, scope)?,
+            None => PayloadCustody::default(),
+        };
+        self.append_custody(&mut body.custody, &mut custody)?;
+        body.value.push(literal.clone());
+        Ok(())
+    }
+
+    fn rules_buffer(&mut self, count: usize) -> Result<RetainedMagicRules> {
+        let custody = match self.scope.as_deref_mut() {
+            Some(scope) => RetainedVectorCustody::for_capacity::<Rule>(count, scope)?,
+            None => RetainedVectorCustody::default(),
+        };
+        Ok(RetainedMagicRules {
+            value: Vec::with_capacity(count),
+            custody,
+        })
+    }
+
+    fn push_rule(
+        &mut self,
+        out: &mut RetainedMagicRules,
+        rule: RetainedMagicValue<Rule>,
+    ) -> Result<()> {
+        if let Some(scope) = self.scope.as_deref_mut() {
+            out.custody.prepare_elements(1, scope)?;
+        }
+        if self.scope.is_some() && out.value.len() == out.value.capacity() {
+            let count = out
+                .value
+                .len()
+                .checked_add(1)
+                .ok_or_else(|| XlogError::allocation_extent_overflow("magic rule vector"))?;
+            let owner = match self.scope.as_deref_mut() {
+                Some(scope) => Some(scope.reserve_allocation(magic_storage_bytes::<Rule>(count)?)?),
+                None => None,
+            };
+            out.value.reserve_exact(1);
+            out.custody.backing_owner = owner;
+        }
+        out.value.push(rule.value);
+        if self.scope.is_some() {
+            out.custody.elements.push(rule.custody);
+        }
+        Ok(())
+    }
+
+    fn retained_rule(
+        &mut self,
+        mut head: RetainedMagicValue<Atom>,
+        mut body: RetainedMagicValue<Vec<BodyLiteral>>,
+    ) -> Result<RetainedMagicValue<Rule>> {
+        self.append_custody(&mut head.custody, &mut body.custody)?;
+        Ok(RetainedMagicValue {
+            value: Rule {
+                head: head.value,
+                body: body.value,
+            },
+            custody: head.custody,
+        })
+    }
+
+    fn acquire(&mut self, bytes: u64) -> Result<()> {
+        if bytes != 0 {
+            if let Some(scope) = self.scope.as_deref_mut() {
+                scope.acquire(bytes)?;
+            }
+        }
+        Ok(())
+    }
+    fn vector<T>(&mut self, count: usize) -> Result<()> {
+        if self.scope.is_some() {
+            self.acquire(crate::compile::push_vector_allocation_bytes::<T>(count)?)?;
+        }
+        Ok(())
+    }
+    fn reserve_vector<T>(&mut self, vector: &mut Vec<T>, additional: usize) -> Result<()> {
+        if self.scope.is_some() && vector.capacity() - vector.len() < additional {
+            let count = vector
+                .len()
+                .checked_add(additional)
+                .ok_or_else(|| XlogError::allocation_extent_overflow("magic vector"))?;
+            self.vector::<T>(count)?;
+            vector.reserve_exact(additional);
+        }
+        Ok(())
+    }
+    fn format(&mut self, args: std::fmt::Arguments<'_>) -> Result<()> {
+        if self.scope.is_some() {
+            self.acquire(crate::compile::formatted_text_allocation_bytes(args)?)?;
+        }
+        Ok(())
+    }
+    fn atom(&mut self, atom: &Atom) -> Result<()> {
+        if self.scope.is_some() {
+            self.acquire(atom.owned_allocation_bytes()?)?;
+        }
+        Ok(())
+    }
+    fn tree<K, V>(&mut self, length: usize) -> Result<()> {
+        if self.scope.is_some() {
+            self.acquire(crate::compile::btree_insert_allocation_bytes::<K, V>(
+                length,
+            )?)?;
+        }
+        Ok(())
+    }
+    fn hash<K, V>(&mut self, length: usize, capacity: usize) -> Result<()> {
+        if self.scope.is_some() && length == capacity {
+            self.acquire(
+                crate::compile::hash_allocation_bytes::<K, V>(
+                    length
+                        .checked_add(1)
+                        .ok_or_else(|| XlogError::allocation_extent_overflow("magic table"))?,
+                )?
+                .checked_mul(2)
+                .ok_or_else(|| XlogError::allocation_extent_overflow("magic table"))?,
+            )?;
+        }
+        Ok(())
+    }
+    fn variables(&mut self, atom: &Atom) -> Result<()> {
+        if self.scope.is_some() {
+            let mut extent = Some((0usize, 0u64));
+            atom.visit_variables(&mut |name| {
+                extent = extent
+                    .and_then(|(n, b)| Some((n.checked_add(1)?, b.checked_add(name.len() as u64)?)))
+            });
+            let (count, text) =
+                extent.ok_or_else(|| XlogError::allocation_extent_overflow("magic variable"))?;
+            self.vector::<&str>(count)?;
+            self.acquire(text)?;
+            self.acquire(crate::compile::hash_allocation_bytes::<String, ()>(count)?)?;
+        }
+        Ok(())
+    }
+}
 
 /// Status of a magic-set rewrite attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,13 +294,19 @@ struct Seed {
     terms: Vec<Term>,
 }
 
+struct AdornmentText<'a>(&'a [bool]);
+impl std::fmt::Display for AdornmentText<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for bound in self.0 {
+            f.write_str(if *bound { "b" } else { "f" })?;
+        }
+        Ok(())
+    }
+}
+
 /// Rewrite supported bound recursive queries with magic predicates.
 pub fn rewrite_magic_sets(program: &Program) -> Result<MagicSetRewrite> {
-    let mode = program.directives.magic_sets;
-    if mode.is_none() || mode == Some(MagicSetsMode::Off) {
-        return Ok(with_status(program.clone(), MagicSetStatus::Disabled));
-    }
-    rewrite_enabled(program)
+    rewrite_magic_sets_owned(program.clone())
 }
 
 /// [`rewrite_magic_sets`] taking the program by value: when magic sets are
@@ -68,43 +316,139 @@ pub fn rewrite_magic_sets_owned(program: Program) -> Result<MagicSetRewrite> {
     if mode.is_none() || mode == Some(MagicSetsMode::Off) {
         return Ok(with_status(program, MagicSetStatus::Disabled));
     }
-    rewrite_enabled(&program)
+    let output = rewrite_enabled_with_owner(
+        RetainedProgram {
+            value: program,
+            custody: ProgramAllocationCustody::default(),
+        },
+        &mut MagicAllocations {
+            scope: None,
+            retained_input: false,
+        },
+    )?;
+    Ok(MagicSetRewrite {
+        program: output.program.value,
+        report: output.report,
+    })
 }
 
-fn rewrite_enabled(program: &Program) -> Result<MagicSetRewrite> {
+/// Rewrite through the original reachable-adornment closure with custody.
+pub fn rewrite_magic_sets_owned_with_allocation_owner(
+    program: Program,
+    scope: &mut crate::compile::CompilationAllocationScope<'_>,
+) -> Result<MagicSetRewrite> {
     let mode = program.directives.magic_sets;
+    if mode.is_none() || mode == Some(MagicSetsMode::Off) {
+        return Ok(with_status(program, MagicSetStatus::Disabled));
+    }
+    let output = rewrite_enabled_with_owner(
+        RetainedProgram {
+            value: program,
+            custody: ProgramAllocationCustody::default(),
+        },
+        &mut MagicAllocations {
+            scope: Some(scope),
+            retained_input: false,
+        },
+    )?;
+    if output.report.status != MagicSetStatus::Applied {
+        return Ok(MagicSetRewrite {
+            program: output.program.value,
+            report: output.report,
+        });
+    }
+    let bytes = std::mem::size_of::<ScopedMagicCustody>()
+        .checked_add(2 * std::mem::size_of::<usize>())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(|| XlogError::allocation_extent_overflow("magic custody storage"))?;
+    let storage_owner = scope.reserve_allocation(bytes)?;
+    let output = ScopedMagicRewrite {
+        value: MagicSetRewrite {
+            program: output.program.value,
+            report: output.report,
+        },
+        owner: Arc::new(ScopedMagicCustody {
+            _custody: output.program.custody,
+            _storage_owner: storage_owner,
+        }),
+    };
+    scope.retain(Arc::clone(&output.owner) as Arc<dyn Send + Sync>)?;
+    Ok(output.value)
+}
+
+/// Move the compiler-owned program and its original physical receipts through
+/// the same reachable-adornment generator used by the public entry points.
+pub(crate) fn rewrite_magic_sets_retained(
+    program: RetainedProgram,
+    scope: &mut crate::compile::CompilationAllocationScope<'_>,
+) -> Result<RetainedMagicSetRewrite> {
+    let mode = program.value.directives.magic_sets;
+    if mode.is_none() || mode == Some(MagicSetsMode::Off) {
+        return Ok(with_retained_status(program, MagicSetStatus::Disabled));
+    }
+    rewrite_enabled_with_owner(
+        program,
+        &mut MagicAllocations {
+            scope: Some(scope),
+            retained_input: true,
+        },
+    )
+}
+
+fn rewrite_enabled_with_owner(
+    mut program: RetainedProgram,
+    allocations: &mut MagicAllocations<'_, '_>,
+) -> Result<RetainedMagicSetRewrite> {
+    let mode = program.value.directives.magic_sets;
     let mode = mode.expect("checked above");
 
-    let recursive = recursive_predicates(program);
-    let seeds = collect_query_seeds(program, &recursive);
+    let recursive = recursive_predicates(&program.value, allocations)?;
+    let seeds = collect_query_seeds(&program.value, &recursive, allocations)?;
     if seeds.is_empty() {
-        return decline_or_error(
-            program,
-            mode,
-            vec!["no bound recursive query eligible for magic_sets".to_string()],
-        );
+        let reason = "no bound recursive query eligible for magic_sets";
+        allocations.vector::<String>(1)?;
+        allocations.acquire(reason.len() as u64)?;
+        return decline_or_error(program, mode, vec![reason.to_string()], allocations);
     }
 
-    if program.is_probabilistic_profile() {
-        return decline_or_error(
-            program,
-            mode,
-            vec!["probabilistic profiles are handled outside deterministic magic_sets".to_string()],
-        );
+    if program.value.is_probabilistic_profile() {
+        let reason = "probabilistic profiles are handled outside deterministic magic_sets";
+        allocations.vector::<String>(1)?;
+        allocations.acquire(reason.len() as u64)?;
+        return decline_or_error(program, mode, vec![reason.to_string()], allocations);
     }
 
-    let target_preds: BTreeSet<String> = seeds.iter().map(|seed| seed.pred.clone()).collect();
-    let unsafe_reasons = unsupported_target_reasons(program, &target_preds, &recursive);
+    let mut target_preds: BTreeSet<String> = BTreeSet::new();
+    for seed in &seeds {
+        allocations.acquire(seed.pred.len() as u64)?;
+        allocations.tree::<String, ()>(target_preds.len())?;
+        target_preds.insert(seed.pred.clone());
+    }
+    let unsafe_reasons =
+        unsupported_target_reasons(&program.value, &target_preds, &recursive, allocations)?;
     if !unsafe_reasons.is_empty() {
-        return decline_or_error(program, mode, unsafe_reasons);
+        return decline_or_error(program, mode, unsafe_reasons, allocations);
     }
 
-    let mut adornments = initial_adornments(&seeds);
-    expand_adornments(program, &target_preds, &mut adornments)?;
+    let mut adornments = initial_adornments(&seeds, allocations)?;
+    expand_adornments(&program.value, &target_preds, &mut adornments, allocations)?;
 
     let mut generated_predicates: BTreeSet<String> = BTreeSet::new();
     let mut adorned_predicates: BTreeSet<String> = BTreeSet::new();
     for adornment in &adornments {
+        allocations.tree::<String, ()>(generated_predicates.len())?;
+        allocations.tree::<String, ()>(adorned_predicates.len())?;
+        allocations.format(format_args!(
+            "__xlog_magic_{}_{}",
+            adornment.pred,
+            AdornmentText(&adornment.pattern)
+        ))?;
+        allocations.vector::<u8>(adornment.pattern.len())?;
+        allocations.format(format_args!(
+            "{}/{}",
+            adornment.pred,
+            AdornmentText(&adornment.pattern)
+        ))?;
         generated_predicates.insert(magic_predicate(&adornment.pred, &adornment.pattern));
         adorned_predicates.insert(format!(
             "{}/{}",
@@ -113,18 +457,23 @@ fn rewrite_enabled(program: &Program) -> Result<MagicSetRewrite> {
         ));
     }
 
-    let mut rewritten = program.clone();
-    rewritten.rules = rewrite_rules(program, &target_preds, &adornments, &seeds)?;
+    allocations.vector::<String>(generated_predicates.len())?;
+    allocations.vector::<String>(adorned_predicates.len())?;
+    let report = MagicSetReport {
+        status: MagicSetStatus::Applied,
+        generated_predicates: generated_predicates.into_iter().collect(),
+        adorned_predicates: adorned_predicates.into_iter().collect(),
+        declined_reasons: Vec::new(),
+    };
+    rewrite_rules(
+        &mut program,
+        &target_preds,
+        &adornments,
+        &seeds,
+        allocations,
+    )?;
 
-    Ok(MagicSetRewrite {
-        program: rewritten,
-        report: MagicSetReport {
-            status: MagicSetStatus::Applied,
-            generated_predicates: generated_predicates.into_iter().collect(),
-            adorned_predicates: adorned_predicates.into_iter().collect(),
-            declined_reasons: Vec::new(),
-        },
-    })
+    Ok(RetainedMagicSetRewrite { program, report })
 }
 
 fn with_status(program: Program, status: MagicSetStatus) -> MagicSetRewrite {
@@ -139,16 +488,35 @@ fn with_status(program: Program, status: MagicSetStatus) -> MagicSetRewrite {
     }
 }
 
+fn with_retained_status(
+    program: RetainedProgram,
+    status: MagicSetStatus,
+) -> RetainedMagicSetRewrite {
+    RetainedMagicSetRewrite {
+        program,
+        report: MagicSetReport {
+            status,
+            generated_predicates: Vec::new(),
+            adorned_predicates: Vec::new(),
+            declined_reasons: Vec::new(),
+        },
+    }
+}
+
 fn decline_or_error(
-    program: &Program,
+    program: RetainedProgram,
     mode: MagicSetsMode,
     reasons: Vec<String>,
-) -> Result<MagicSetRewrite> {
+    allocations: &mut MagicAllocations<'_, '_>,
+) -> Result<RetainedMagicSetRewrite> {
     if mode == MagicSetsMode::On {
-        return Err(magic_error(reasons.join("; ")));
+        return Err(magic_error(
+            format_args!("{}", MagicReasons(&reasons)),
+            allocations,
+        ));
     }
-    Ok(MagicSetRewrite {
-        program: program.clone(),
+    Ok(RetainedMagicSetRewrite {
+        program,
         report: MagicSetReport {
             status: MagicSetStatus::Declined,
             generated_predicates: Vec::new(),
@@ -158,17 +526,54 @@ fn decline_or_error(
     })
 }
 
-fn magic_error(message: impl Into<String>) -> XlogError {
-    XlogError::Compilation(format!("magic_sets error: {}", message.into()))
+struct MagicReasons<'a>(&'a [String]);
+
+impl std::fmt::Display for MagicReasons<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (index, reason) in self.0.iter().enumerate() {
+            if index != 0 {
+                formatter.write_str("; ")?;
+            }
+            formatter.write_str(reason)?;
+        }
+        Ok(())
+    }
 }
 
-fn collect_query_seeds(program: &Program, recursive: &HashSet<String>) -> Vec<Seed> {
+fn magic_error(
+    message: std::fmt::Arguments<'_>,
+    allocations: &mut MagicAllocations<'_, '_>,
+) -> XlogError {
+    let bytes = xlog_core::error::formatted_text_allocation_bytes(format_args!(
+        "magic_sets error: {message}"
+    ));
+    let producer = match allocations.scope.as_deref_mut() {
+        Some(scope) => {
+            let mut reserve = |bytes| scope.reserve_allocation(bytes);
+            xlog_core::CompilationAllocationScope::prepare_diagnostic(bytes, Some(&mut reserve))
+        }
+        None => xlog_core::CompilationAllocationScope::prepare_diagnostic(bytes, None),
+    };
+    match producer {
+        Ok(producer) => {
+            producer.finish(|| XlogError::Compilation(format!("magic_sets error: {message}")))
+        }
+        Err(error) => error,
+    }
+}
+
+fn collect_query_seeds(
+    program: &Program,
+    recursive: &HashSet<String>,
+    allocations: &mut MagicAllocations<'_, '_>,
+) -> Result<Vec<Seed>> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for query in &program.queries {
         if !recursive.contains(&query.atom.predicate) {
             continue;
         }
+        allocations.vector::<bool>(query.atom.terms.len())?;
         let pattern: Vec<bool> = query.atom.terms.iter().map(is_seed_term).collect();
         if !pattern.iter().any(|bound| *bound) {
             continue;
@@ -182,14 +587,25 @@ fn collect_query_seeds(program: &Program, recursive: &HashSet<String>) -> Vec<Se
         {
             continue;
         }
+        allocations.atom(&query.atom)?;
         let terms = bound_terms(&query.atom, &pattern);
+        allocations.vector::<u8>(pattern.len())?;
+        allocations.format(format_args!(
+            "{}:{}:{:?}",
+            query.atom.predicate,
+            AdornmentText(&pattern),
+            terms
+        ))?;
         let key = format!(
             "{}:{}:{:?}",
             query.atom.predicate,
             adornment_key(&pattern),
             terms
         );
+        allocations.hash::<String, ()>(seen.len(), seen.capacity())?;
         if seen.insert(key) {
+            allocations.acquire(query.atom.predicate.len() as u64)?;
+            allocations.reserve_vector(&mut out, 1)?;
             out.push(Seed {
                 pred: query.atom.predicate.clone(),
                 pattern,
@@ -197,27 +613,40 @@ fn collect_query_seeds(program: &Program, recursive: &HashSet<String>) -> Vec<Se
             });
         }
     }
-    out
+    Ok(out)
 }
 
-fn initial_adornments(seeds: &[Seed]) -> BTreeSet<Adornment> {
-    seeds
-        .iter()
-        .map(|seed| Adornment {
+fn initial_adornments(
+    seeds: &[Seed],
+    allocations: &mut MagicAllocations<'_, '_>,
+) -> Result<BTreeSet<Adornment>> {
+    let mut out = BTreeSet::new();
+    for seed in seeds {
+        allocations.tree::<Adornment, ()>(out.len())?;
+        allocations.acquire(seed.pred.len() as u64)?;
+        allocations.vector::<bool>(seed.pattern.len())?;
+        out.insert(Adornment {
             pred: seed.pred.clone(),
             pattern: seed.pattern.clone(),
-        })
-        .collect()
+        });
+    }
+    Ok(out)
 }
 
 fn expand_adornments(
     program: &Program,
     target_preds: &BTreeSet<String>,
     adornments: &mut BTreeSet<Adornment>,
+    allocations: &mut MagicAllocations<'_, '_>,
 ) -> Result<()> {
     let mut changed = true;
     while changed {
         changed = false;
+        allocations.vector::<Adornment>(adornments.len())?;
+        for adornment in adornments.iter() {
+            allocations.acquire(adornment.pred.len() as u64)?;
+            allocations.vector::<bool>(adornment.pattern.len())?;
+        }
         let snapshot: Vec<Adornment> = adornments.iter().cloned().collect();
         for adornment in snapshot {
             for rule in program
@@ -225,8 +654,12 @@ fn expand_adornments(
                 .iter()
                 .filter(|rule| rule.head.predicate == adornment.pred)
             {
-                for discovered in discover_body_adornments(rule, &adornment.pattern, target_preds)?
+                for discovered in
+                    discover_body_adornments(rule, &adornment.pattern, target_preds, allocations)?
                 {
+                    if !adornments.contains(&discovered) {
+                        allocations.tree::<Adornment, ()>(adornments.len())?;
+                    }
                     changed |= adornments.insert(discovered);
                 }
             }
@@ -239,27 +672,35 @@ fn discover_body_adornments(
     rule: &Rule,
     head_pattern: &[bool],
     target_preds: &BTreeSet<String>,
+    allocations: &mut MagicAllocations<'_, '_>,
 ) -> Result<Vec<Adornment>> {
+    allocations.variables(&rule.head)?;
     let mut bound = head_bound_variables(&rule.head, head_pattern);
     let mut out = Vec::new();
     for lit in &rule.body {
         match lit {
             BodyLiteral::Positive(atom) => {
                 if target_preds.contains(&atom.predicate) {
+                    allocations.vector::<bool>(atom.terms.len())?;
                     let pattern = atom_adornment(atom, &bound);
                     if !pattern.iter().any(|is_bound| *is_bound) {
-                        return Err(magic_error(format!(
-                            "recursive call {}/{} has no bound argument under supported SIPS",
-                            atom.predicate,
-                            atom.arity()
-                        )));
+                        return Err(magic_error(
+                            format_args!(
+                                "recursive call {}/{} has no bound argument under supported SIPS",
+                                atom.predicate,
+                                atom.arity()
+                            ),
+                            allocations,
+                        ));
                     }
+                    allocations.acquire(atom.predicate.len() as u64)?;
+                    allocations.reserve_vector(&mut out, 1)?;
                     out.push(Adornment {
                         pred: atom.predicate.clone(),
                         pattern,
                     });
                 }
-                bind_atom_variables(atom, &mut bound);
+                bind_atom_variables(atom, &mut bound, allocations)?;
             }
             BodyLiteral::Comparison(_)
             | BodyLiteral::Epistemic(_)
@@ -272,98 +713,163 @@ fn discover_body_adornments(
 }
 
 fn rewrite_rules(
-    program: &Program,
+    program: &mut RetainedProgram,
     target_preds: &BTreeSet<String>,
     adornments: &BTreeSet<Adornment>,
     seeds: &[Seed],
-) -> Result<Vec<Rule>> {
-    let mut out: Vec<Rule> = program
-        .rules
-        .iter()
-        .filter(|rule| !target_preds.contains(&rule.head.predicate))
-        .cloned()
-        .collect();
+    allocations: &mut MagicAllocations<'_, '_>,
+) -> Result<()> {
+    let mut out = allocations.rules_buffer(program.value.rules.len())?;
 
     let mut emitted = HashSet::new();
     for seed in seeds {
-        let rule = Rule {
-            head: Atom {
-                predicate: magic_predicate(&seed.pred, &seed.pattern),
-                terms: seed.terms.clone(),
-            },
-            body: Vec::new(),
+        let head = retained_magic_atom(&seed.pred, &seed.pattern, &seed.terms, None, allocations)?;
+        let body = RetainedMagicValue {
+            value: Vec::new(),
+            custody: PayloadCustody::default(),
         };
-        push_unique_rule(&mut out, &mut emitted, rule);
+        let rule = allocations.retained_rule(head, body)?;
+        push_unique_rule(&mut out, &mut emitted, rule, allocations)?;
     }
 
     for adornment in adornments {
         for rule in program
+            .value
             .rules
             .iter()
             .filter(|rule| rule.head.predicate == adornment.pred)
         {
-            for magic_rule in propagation_rules(rule, &adornment.pattern, target_preds)? {
-                push_unique_rule(&mut out, &mut emitted, magic_rule);
+            let generated = propagation_rules(rule, &adornment.pattern, target_preds, allocations)?;
+            let generated_custody = generated.custody;
+            let payloads = generated_custody.elements.into_iter();
+            let values = generated.value.into_iter();
+            if allocations.scope.is_some() {
+                for (value, custody) in values.zip(payloads) {
+                    push_unique_rule(
+                        &mut out,
+                        &mut emitted,
+                        RetainedMagicValue { value, custody },
+                        allocations,
+                    )?;
+                }
+            } else {
+                for value in values {
+                    push_unique_rule(
+                        &mut out,
+                        &mut emitted,
+                        RetainedMagicValue {
+                            value,
+                            custody: PayloadCustody::default(),
+                        },
+                        allocations,
+                    )?;
+                }
             }
         }
     }
 
     for adornment in adornments {
         for rule in program
+            .value
             .rules
             .iter()
             .filter(|rule| rule.head.predicate == adornment.pred)
         {
-            let mut body = vec![BodyLiteral::Positive(magic_atom_for(
-                &rule.head,
-                &adornment.pattern,
-            ))];
-            body.extend(rule.body.clone());
-            out.push(Rule {
-                head: rule.head.clone(),
-                body,
-            });
+            let mut magic = retained_magic_atom_for(&rule.head, &adornment.pattern, allocations)?;
+            let count = rule
+                .body
+                .len()
+                .checked_add(1)
+                .ok_or_else(|| XlogError::allocation_extent_overflow("magic rule body"))?;
+            let mut body = allocations.body_buffer(count)?;
+            allocations.append_custody(&mut body.custody, &mut magic.custody)?;
+            body.value.push(BodyLiteral::Positive(magic.value));
+            for literal in &rule.body {
+                allocations.push_literal(&mut body, literal)?;
+            }
+            let head = allocations.clone_atom(&rule.head)?;
+            let rewritten = allocations.retained_rule(head, body)?;
+            allocations.push_rule(&mut out, rewritten)?;
         }
     }
 
-    Ok(out)
+    let original_custody = std::mem::take(&mut program.custody.rules);
+    let mut payloads = original_custody.elements.into_iter();
+    let values = std::mem::take(&mut program.value.rules).into_iter();
+    let mut moved = 0;
+    for value in values {
+        let custody = if allocations.retained_input {
+            payloads
+                .next()
+                .expect("compiler-owned rule has original allocation custody")
+        } else {
+            PayloadCustody::default()
+        };
+        let rule = RetainedMagicValue { value, custody };
+        if !target_preds.contains(&rule.value.head.predicate) {
+            allocations.push_rule(&mut out, rule)?;
+            moved += 1;
+        }
+    }
+    // The original generator emits unchanged rules first. Appending them only
+    // after the borrowed generation phase lets their original payloads move;
+    // rotating both real buffers restores that exact order without allocation.
+    out.value.rotate_right(moved);
+    if allocations.scope.is_some() {
+        out.custody.elements.rotate_right(moved);
+    }
+    program.value.rules = out.value;
+    program.custody.rules = out.custody;
+    Ok(())
 }
 
 fn propagation_rules(
     rule: &Rule,
     head_pattern: &[bool],
     target_preds: &BTreeSet<String>,
-) -> Result<Vec<Rule>> {
-    let caller_magic = magic_atom_for(&rule.head, head_pattern);
-    let mut prefix = vec![BodyLiteral::Positive(caller_magic.clone())];
+    allocations: &mut MagicAllocations<'_, '_>,
+) -> Result<RetainedMagicRules> {
+    let mut caller_magic = retained_magic_atom_for(&rule.head, head_pattern, allocations)?;
+    let count = rule
+        .body
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| XlogError::allocation_extent_overflow("magic prefix body"))?;
+    let mut prefix = allocations.body_buffer(count)?;
+    allocations.append_custody(&mut prefix.custody, &mut caller_magic.custody)?;
+    prefix.value.push(BodyLiteral::Positive(caller_magic.value));
+    allocations.variables(&rule.head)?;
     let mut bound = head_bound_variables(&rule.head, head_pattern);
-    let mut out = Vec::new();
+    let mut out = allocations.rules_buffer(0)?;
 
     for lit in &rule.body {
         let BodyLiteral::Positive(atom) = lit else {
             continue;
         };
         if target_preds.contains(&atom.predicate) {
+            allocations.vector::<bool>(atom.terms.len())?;
             let pattern = atom_adornment(atom, &bound);
             if !pattern.iter().any(|is_bound| *is_bound) {
-                return Err(magic_error(format!(
-                    "recursive call {}/{} has no bound argument under supported SIPS",
-                    atom.predicate,
-                    atom.arity()
-                )));
+                return Err(magic_error(
+                    format_args!(
+                        "recursive call {}/{} has no bound argument under supported SIPS",
+                        atom.predicate,
+                        atom.arity()
+                    ),
+                    allocations,
+                ));
             }
-            let head = magic_atom_for(atom, &pattern);
-            let is_trivial = prefix.len() == 1
-                && matches!(&prefix[0], BodyLiteral::Positive(prefix_atom) if *prefix_atom == head);
+            let head = retained_magic_atom_for(atom, &pattern, allocations)?;
+            let is_trivial = prefix.value.len() == 1
+                && matches!(&prefix.value[0], BodyLiteral::Positive(prefix_atom) if *prefix_atom == head.value);
             if !is_trivial {
-                out.push(Rule {
-                    head,
-                    body: prefix.clone(),
-                });
+                let body = allocations.clone_body(&prefix.value)?;
+                let generated = allocations.retained_rule(head, body)?;
+                allocations.push_rule(&mut out, generated)?;
             }
         }
-        bind_atom_variables(atom, &mut bound);
-        prefix.push(lit.clone());
+        bind_atom_variables(atom, &mut bound, allocations)?;
+        allocations.push_literal(&mut prefix, lit)?;
     }
 
     Ok(out)
@@ -373,11 +879,52 @@ fn unsupported_target_reasons(
     program: &Program,
     target_preds: &BTreeSet<String>,
     recursive: &HashSet<String>,
-) -> Vec<String> {
+    allocations: &mut MagicAllocations<'_, '_>,
+) -> Result<Vec<String>> {
     let mut reasons = BTreeSet::new();
     for rule in &program.rules {
         if !target_preds.contains(&rule.head.predicate) {
             continue;
+        }
+        if allocations.scope.is_some() {
+            let count = rule
+                .body
+                .len()
+                .checked_mul(2)
+                .ok_or_else(|| XlogError::allocation_extent_overflow("magic reason"))?
+                .checked_add(2)
+                .ok_or_else(|| XlogError::allocation_extent_overflow("magic reason"))?;
+            let mut bytes = 0u64;
+            let mut longest = rule.head.predicate.len();
+            for literal in &rule.body {
+                if let BodyLiteral::Positive(atom) = literal {
+                    longest = longest.max(atom.predicate.len());
+                }
+            }
+            // The original loop emits at most two head reasons and two per
+            // reached positive literal. The fixed diagnostic prefix is the longest
+            // spelling in this same routine, not a source-size tariff.
+            let text=crate::compile::formatted_text_allocation_bytes(format_args!(
+                "non-positive literal in recursive rule for {} is outside the supported magic_sets subset",rule.head.predicate))?;
+            bytes = bytes
+                .checked_add(
+                    (longest - rule.head.predicate.len())
+                        .try_into()
+                        .ok()
+                        .and_then(|length: u64| length.checked_mul(6))
+                        .and_then(|extra| text.checked_add(extra))
+                        .and_then(|n| n.checked_mul(count as u64))
+                        .ok_or_else(|| XlogError::allocation_extent_overflow("magic reason"))?,
+                )
+                .ok_or_else(|| XlogError::allocation_extent_overflow("magic reason"))?;
+            for offset in 0..count {
+                bytes = bytes
+                    .checked_add(crate::compile::btree_insert_allocation_bytes::<String, ()>(
+                        reasons.len() + offset,
+                    )?)
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("magic reason"))?;
+            }
+            allocations.acquire(bytes)?;
         }
         if rule.has_negation() {
             reasons.insert(format!(
@@ -423,21 +970,61 @@ fn unsupported_target_reasons(
             }
         }
     }
-    reasons.into_iter().collect()
+    allocations.vector::<String>(reasons.len())?;
+    Ok(reasons.into_iter().collect())
 }
 
-fn recursive_predicates(program: &Program) -> HashSet<String> {
+fn recursive_predicates(
+    program: &Program,
+    allocations: &mut MagicAllocations<'_, '_>,
+) -> Result<HashSet<String>> {
     let mut deps: HashMap<String, HashSet<String>> = HashMap::new();
     for rule in &program.rules {
+        allocations.acquire(rule.head.predicate.len() as u64)?;
+        if !deps.contains_key(&rule.head.predicate) {
+            allocations.hash::<String, HashSet<String>>(deps.len(), deps.capacity())?;
+        }
+        allocations.vector::<&str>(rule.body.len())?;
         let entry = deps.entry(rule.head.predicate.clone()).or_default();
         for pred in rule.body_predicates() {
+            allocations.acquire(pred.len() as u64)?;
+            if !entry.contains(pred) {
+                allocations.hash::<String, ()>(entry.len(), entry.capacity())?;
+            }
             entry.insert(pred.to_string());
         }
     }
-    deps.keys()
+    if allocations.scope.is_some() {
+        let count = deps
+            .values()
+            .try_fold(deps.len(), |n, preds| n.checked_add(preds.len()))
+            .ok_or_else(|| XlogError::allocation_extent_overflow("magic dependency"))?;
+        let mut bytes = crate::compile::hash_allocation_bytes::<String, ()>(count)?
+            .checked_mul(2)
+            .ok_or_else(|| XlogError::allocation_extent_overflow("magic dependency"))?;
+        for (name, preds) in &deps {
+            bytes = bytes
+                .checked_add(name.len() as u64)
+                .ok_or_else(|| XlogError::allocation_extent_overflow("magic dependency"))?;
+            for pred in preds {
+                bytes = bytes
+                    .checked_add(pred.len() as u64)
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("magic dependency"))?;
+            }
+        }
+        // The reachability search has one original seen set at a time; the
+        // result set coexists with it. Both use this actual dependency roster.
+        allocations.acquire(
+            bytes
+                .checked_mul(2)
+                .ok_or_else(|| XlogError::allocation_extent_overflow("magic dependency"))?,
+        )?;
+    }
+    Ok(deps
+        .keys()
         .filter(|pred| reaches(pred, pred, &deps, &mut HashSet::new()))
         .cloned()
-        .collect()
+        .collect())
 }
 
 fn reaches(
@@ -492,10 +1079,19 @@ fn term_is_bound(term: &Term, bound: &HashSet<String>) -> bool {
     }
 }
 
-fn bind_atom_variables(atom: &Atom, bound: &mut HashSet<String>) {
+fn bind_atom_variables(
+    atom: &Atom,
+    bound: &mut HashSet<String>,
+    allocations: &mut MagicAllocations<'_, '_>,
+) -> Result<()> {
+    allocations.variables(atom)?;
     for name in atom.variables() {
+        if !bound.contains(name) {
+            allocations.hash::<String, ()>(bound.len(), bound.capacity())?;
+        }
         bound.insert(name.to_string());
     }
+    Ok(())
 }
 
 fn body_literal_has_aggregate(lit: &BodyLiteral) -> bool {
@@ -552,15 +1148,68 @@ fn bound_terms(atom: &Atom, pattern: &[bool]) -> Vec<Term> {
         .collect()
 }
 
-fn magic_atom_for(atom: &Atom, pattern: &[bool]) -> Atom {
-    Atom {
-        predicate: magic_predicate(&atom.predicate, pattern),
-        terms: bound_terms(atom, pattern),
+fn retained_magic_atom_for(
+    atom: &Atom,
+    pattern: &[bool],
+    allocations: &mut MagicAllocations<'_, '_>,
+) -> Result<RetainedMagicValue<Atom>> {
+    retained_magic_atom(
+        &atom.predicate,
+        pattern,
+        &atom.terms,
+        Some(pattern),
+        allocations,
+    )
+}
+
+fn retained_magic_atom(
+    predicate: &str,
+    pattern: &[bool],
+    terms: &[Term],
+    selected: Option<&[bool]>,
+    allocations: &mut MagicAllocations<'_, '_>,
+) -> Result<RetainedMagicValue<Atom>> {
+    let count = match selected {
+        Some(selected) => terms
+            .iter()
+            .zip(selected)
+            .filter(|(_, bound)| **bound)
+            .count(),
+        None => terms.len(),
+    };
+    let mut custody = PayloadCustody::default();
+    allocations.output_unit(&mut custody, magic_storage_bytes::<Term>(count)?)?;
+    let mut out = RetainedMagicValue {
+        value: Vec::with_capacity(count),
+        custody,
+    };
+    for (index, term) in terms.iter().enumerate() {
+        if selected.is_some_and(|selected| !selected.get(index).copied().unwrap_or(false)) {
+            continue;
+        }
+        let mut custody = allocations.term_custody(term)?;
+        allocations.append_custody(&mut out.custody, &mut custody)?;
+        out.value.push(term.clone());
     }
+    allocations.output_unit(
+        &mut out.custody,
+        crate::compile::formatted_text_allocation_bytes(format_args!(
+            "__xlog_magic_{}_{}",
+            predicate,
+            AdornmentText(pattern)
+        ))?,
+    )?;
+    Ok(RetainedMagicValue {
+        value: Atom {
+            predicate: magic_predicate(predicate, pattern),
+            terms: out.value,
+        },
+        custody: out.custody,
+    })
 }
 
 fn magic_predicate(pred: &str, pattern: &[bool]) -> String {
-    format!("__xlog_magic_{}_{}", pred, adornment_key(pattern))
+    format!("__xlog_magic_{}_{}", pred, AdornmentText(pattern))
 }
 
 fn adornment_key(pattern: &[bool]) -> String {
@@ -570,9 +1219,17 @@ fn adornment_key(pattern: &[bool]) -> String {
         .collect()
 }
 
-fn push_unique_rule(out: &mut Vec<Rule>, emitted: &mut HashSet<String>, rule: Rule) {
-    let key = format!("{:?}", rule);
+fn push_unique_rule(
+    out: &mut RetainedMagicRules,
+    emitted: &mut HashSet<String>,
+    rule: RetainedMagicValue<Rule>,
+    allocations: &mut MagicAllocations<'_, '_>,
+) -> Result<()> {
+    allocations.format(format_args!("{:?}", rule.value))?;
+    let key = format!("{:?}", rule.value);
+    allocations.hash::<String, ()>(emitted.len(), emitted.capacity())?;
     if emitted.insert(key) {
-        out.push(rule);
+        allocations.push_rule(out, rule)?;
     }
+    Ok(())
 }

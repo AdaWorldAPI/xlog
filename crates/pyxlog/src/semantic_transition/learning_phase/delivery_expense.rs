@@ -58,6 +58,77 @@ pub(super) struct DeliveryExpense {
 }
 
 impl PySemanticLearningPhaseTransition {
+    pub(super) fn require_delivery_cold_callback(
+        &self,
+        py: Python<'_>,
+        work: &PySemanticColdModelWork,
+    ) -> PyResult<bool> {
+        let retained = self.delivery_expense()?;
+        let Some(current) = retained.as_ref() else {
+            return Ok(false);
+        };
+        let Some(index) = current
+            .regions
+            .iter()
+            .position(|region| std::ptr::eq(&*region.borrow(py), work))
+        else {
+            return Ok(false);
+        };
+        let call = &current.calls[index];
+        let custody = work.custody(py)?;
+        let expected = if current.refusal.as_ref().is_some_and(|tail| tail.handed_off)
+            && (index == 8 || index % 2 == 1)
+            || index % 2 == 1
+        {
+            &current
+                .owners
+                .as_ref()
+                .ok_or_else(|| invalid("delivery callback lost its original private owners"))?
+                .parent
+        } else {
+            &self.parent
+        };
+        if !current.ready
+            || current.work_closed
+            || current.source_retired
+            || !call.entered
+            || call.result.is_some()
+            || call.error.is_some()
+            || custody.parent()?.as_ptr() != expected.as_ptr()
+            || custody.reader.as_ptr() != current.reader.as_ptr()
+        {
+            return Err(invalid(
+                "delivery cold callback changed its actual original region or owners",
+            ));
+        }
+        Ok(true)
+    }
+
+    pub(super) fn delivery_cold_report_regions(
+        &self,
+        py: Python<'_>,
+        work: &PySemanticColdModelWork,
+    ) -> PyResult<Option<Vec<Py<PySemanticColdModelWork>>>> {
+        let retained = self.delivery_expense()?;
+        let Some(current) = retained.as_ref() else {
+            return Ok(None);
+        };
+        if !current
+            .regions
+            .iter()
+            .any(|region| std::ptr::eq(&*region.borrow(py), work))
+        {
+            return Ok(None);
+        }
+        Ok(Some(
+            current
+                .regions
+                .iter()
+                .map(|region| region.clone_ref(py))
+                .collect(),
+        ))
+    }
+
     pub(super) fn terminal_refusal_retained(&self) -> PyResult<bool> {
         Ok(self.readonly_terminal_refusal_retained()?
             || self
@@ -80,7 +151,7 @@ impl PySemanticLearningPhaseTransition {
             || tail.retired
             || !current.calls[8].entered
             || !std::ptr::eq(&*current.regions[8].borrow(py), work)
-            || current.reader.as_ptr() != work.reader.as_ptr()
+            || current.reader.as_ptr() != work.custody(py)?.reader.as_ptr()
         {
             return Err(invalid(
                 "terminal private retirement changed its original admitted region",
@@ -103,7 +174,8 @@ impl PySemanticLearningPhaseTransition {
             AuthoritySnapshot::parse(&ColdValue::read(&refreshed, &mut (16 * 1024 * 1024), 0)?)?;
         snapshot.newer_than(&task.state()?.snapshot)?;
         check_learning_grant(&task, &self.grant_reference, &snapshot)?;
-        let manifest = SemanticCheckpointManifest::decode(&self.source_checkpoint)?;
+        let manifest =
+            SemanticCheckpointManifest::decode_borrowed(self.source_checkpoint.as_bytes())?;
         let parent = self.parent.borrow(py);
         verify_phase_native(py, &task, &parent, &manifest.native, true)?;
         if serialize {
@@ -328,25 +400,24 @@ impl PySemanticLearningPhaseTransition {
     }
 
     fn install_terminal_source_custody(&self, py: Python<'_>) -> PyResult<()> {
-        let (phase_id, admission, record) = {
+        let (phase_id, issuer, limits, original_records, record_count, prepared) = {
             let records = self.records()?;
             if !records.refusal_known {
                 return Err(invalid(
                     "Source checkpoint custody precedes known terminal readback",
                 ));
             }
+            let (original, count) = records.completed_lifecycle()?;
             (
                 records.phase_id,
-                records.confirmed_admission()?,
-                Arc::clone(
-                    records
-                        .refusal_record
-                        .as_ref()
-                        .expect("known terminal record"),
-                ),
+                records.issuer(),
+                records.limits,
+                original,
+                count,
+                records.preparation_outcome_known,
             )
         };
-        let (cause, history, result, payload) = {
+        {
             let retained = self.delivery_expense()?;
             let current = retained.as_ref().expect("original delivery");
             let refusal = current.refusal.as_ref().expect("original refusal");
@@ -355,50 +426,48 @@ impl PySemanticLearningPhaseTransition {
                     "Source checkpoint custody precedes complete original terminal release",
                 ));
             }
-            (
-                refusal.cause,
-                Arc::clone(refusal.history.as_ref().expect("known terminal history")),
-                Arc::clone(&refusal.result),
-                Arc::clone(current.payload.as_ref().expect("known terminal payload")),
-            )
+        }
+        let material_sources = Arc::clone(&self.task_use.borrow(py).checkpoint.material_sources);
+        let source_issuer = self
+            .source
+            .borrow(py)
+            .checkpoint_custody()?
+            .as_ref()
+            .ok_or_else(|| invalid("terminal Source lost its original Session signer"))?
+            .issuer();
+        let target = if prepared {
+            Some(Sha256::digest(self.candidate_checkpoint()?.as_bytes()).into())
+        } else {
+            None
         };
-        let source_manifest = SemanticCheckpointManifest::decode(&self.source_checkpoint)?;
-        let private_manifest = SemanticCheckpointManifest::decode(&self.candidate_checkpoint()?)?;
-        let (private_seed, _, _, _) = TaskCheckpointSeed::decode(&private_manifest.task)?;
-        let expense = private_seed.proposal_expense()?;
-        if expense != self.task_use.borrow(py).checkpoint.proposal_expense()? {
+        let closure = cold_restore::VerifiedClosure::read_retained(
+            py,
+            self.source_checkpoint.as_bytes(),
+            &source_issuer,
+            &original_records,
+            record_count,
+            issuer,
+            phase_id,
+            limits,
+            self.source_checkpoint.as_bytes(),
+            target,
+            &self.destination,
+            self.recipe.borrow(py).inner.source,
+            self.preparation_inputs.final_phase,
+            &material_sources,
+        )?;
+        if closure
+            .refusal
+            .as_ref()
+            .expect("verified original terminal refusal")
+            .expense
+            != self.task_use.borrow(py).checkpoint.proposal_expense()?
+        {
             return Err(invalid(
                 "terminal Source changed its signed cumulative Proposal expense",
             ));
         }
-        let mut reader = phase_record::RecordReader(
-            payload
-                .strip_prefix(b"xlog.learning-phase.refusal.v1\0")
-                .ok_or_else(|| invalid("known terminal payload lost its original domain"))?,
-        );
-        for _ in 0..8 {
-            reader.field()?;
-        }
-        let snapshot =
-            AuthoritySnapshot::parse(&ColdValue::from_canonical_bytes(reader.field()?)?)?;
-        reader.field()?;
-        reader.finish()?;
-        let closure = Arc::new(cold_restore::VerifiedClosure {
-            phase_id,
-            completion_digest: Sha256::digest(&record).into(),
-            admission,
-            program: Arc::from(self.preparation_inputs.frozen_program.as_slice()),
-            history,
-            acceptance: result,
-            snapshot,
-            refusal: Some(cold_restore::RefusalClosure {
-                cause: Arc::from(cause),
-                record,
-                expense,
-                source_native: Arc::from(source_manifest.native.as_slice()),
-            }),
-        });
-        self.install_source_checkpoint_custody(py, closure)
+        self.install_source_checkpoint_custody(py, Arc::new(closure))
     }
 
     fn install_source_checkpoint_custody(
@@ -406,7 +475,7 @@ impl PySemanticLearningPhaseTransition {
         py: Python<'_>,
         closure: Arc<cold_restore::VerifiedClosure>,
     ) -> PyResult<()> {
-        let origin: [u8; 32] = Sha256::digest(&self.source_checkpoint).into();
+        let origin: [u8; 32] = Sha256::digest(self.source_checkpoint.as_bytes()).into();
         let source = self.source.borrow(py);
         let mut custody = source.checkpoint_custody()?;
         let current = custody
@@ -507,34 +576,40 @@ impl PySemanticLearningPhaseTransition {
                         .expect("original region states"),
                 )
             };
-            let mut original = Vec::with_capacity(regions.len());
-            for (index, region) in regions.into_iter().enumerate() {
-                original.push(Py::new(
-                    py,
-                    PySemanticColdModelWork {
-                        parent: if index == 8 || index % 2 == 1 {
-                            parent.clone_ref(py)
-                        } else {
-                            self.parent.clone_ref(py)
-                        },
-                        reader: self.parent.clone_ref(py),
-                        inner: work.clone(),
-                        region: Some(region),
-                        active: AtomicBool::new(false),
-                    },
-                )?);
-            }
-            let replaced = {
-                let mut retained = self.delivery_expense()?;
-                let current = retained.as_mut().expect("original delivery");
-                current
-                    .refusal
-                    .as_mut()
-                    .expect("original refusal")
-                    .transferred_regions = None;
-                std::mem::replace(&mut current.regions, original)
+            let original = {
+                let retained = self.delivery_expense()?;
+                retained
+                    .as_ref()
+                    .expect("original delivery")
+                    .regions
+                    .iter()
+                    .map(|region| region.clone_ref(py))
+                    .collect::<Vec<_>>()
             };
-            drop(replaced);
+            if original.len() != regions.len() {
+                return Err(invalid("report handoff changed its original region roster"));
+            }
+            for (index, (original, region)) in original.iter().zip(regions).enumerate() {
+                let callback_parent = if index == 8 || index % 2 == 1 {
+                    parent.clone_ref(py)
+                } else {
+                    self.parent.clone_ref(py)
+                };
+                original.borrow(py).handoff_custody(
+                    py,
+                    callback_parent,
+                    self.parent.clone_ref(py),
+                    work.clone(),
+                    Some(region),
+                )?;
+            }
+            self.delivery_expense()?
+                .as_mut()
+                .expect("original delivery")
+                .refusal
+                .as_mut()
+                .expect("original refusal")
+                .transferred_regions = None;
         }
         Ok(())
     }
@@ -780,7 +855,7 @@ impl PySemanticLearningPhaseTransition {
                     let usage: Vec<u8> = usage.into_iter().flat_map(u64::to_le_bytes).collect();
                     let payload = phase_record::refusal_payload([
                         cause.as_bytes(),
-                        self.source_checkpoint.as_slice(),
+                        self.source_checkpoint.as_bytes(),
                         checkpoint.as_ref(),
                         prefix.as_ref(),
                         result.as_ref(),
@@ -850,7 +925,16 @@ impl PySemanticLearningPhaseTransition {
     }
 
     pub(super) fn terminal_refusal_outcome(&self, py: Python<'_>) -> PyResult<Option<Py<PyTuple>>> {
-        let record = self.records()?.refusal_record.as_ref().map(Arc::clone);
+        let record = self
+            .records()?
+            .refusal_record
+            .as_ref()
+            .map(|record| {
+                record
+                    .slice_payload(0..record.as_bytes().len())
+                    .map_err(xlog_err)
+            })
+            .transpose()?;
         let Some(record) = record else {
             return Ok(None);
         };
@@ -869,7 +953,16 @@ impl PySemanticLearningPhaseTransition {
                 tail.cause,
                 PyBytes::new(py, &tail.result),
                 PyBytes::new(py, tail.history.as_ref().expect("known terminal history")),
-                PyBytes::new(py, &record),
+                material_bytes::PySemanticMaterialBytes::from_native(
+                    py,
+                    record,
+                    &self
+                        .task_use
+                        .borrow(py)
+                        .checkpoint
+                        .material_sources
+                        .native_budget()?,
+                )?,
             )
                 .into_pyobject(py)?
                 .unbind(),
@@ -879,52 +972,47 @@ impl PySemanticLearningPhaseTransition {
     /// Known signed Delivery binds completed-phase ancestry to the original
     /// Session signer without repeating model work or entering another region.
     pub(super) fn install_delivered_checkpoint_custody(&self, py: Python<'_>) -> PyResult<()> {
-        let (phase_id, delivery_digest, admission) = self.records()?.delivered_identity()?;
-        let payload = self
-            .delivery_expense()?
+        let (phase_id, issuer, limits, original_records, record_count) = {
+            let records = self.records()?;
+            records.delivered_identity()?;
+            let (original, count) = records.completed_lifecycle()?;
+            (
+                records.phase_id,
+                records.issuer(),
+                records.limits,
+                original,
+                count,
+            )
+        };
+        let (candidate, checkpoint) = self.candidate(py)?;
+        let controller = candidate.borrow(py).session.clone_ref(py);
+        let checkpoint_issuer = controller
+            .borrow(py)
+            .checkpoint_custody()?
             .as_ref()
-            .and_then(|delivery| delivery.payload.as_ref().map(Arc::clone))
-            .ok_or_else(|| invalid("known signed Delivery lost its original payload"))?;
-        let mut reader = phase_record::RecordReader(
-            payload
-                .strip_prefix(b"xlog.learning-phase.delivery.v1\0")
-                .ok_or_else(|| invalid("known signed Delivery lost its original domain"))?,
-        );
-        let checkpoint = reader.field()?;
-        let history: Arc<[u8]> = Arc::from(reader.field()?);
-        reader.field()?;
-        reader.field()?;
-        let snapshot =
-            AuthoritySnapshot::parse(&ColdValue::from_canonical_bytes(reader.field()?)?)?;
-        reader.field()?;
-        reader.finish()?;
-        let acceptance = self.acceptance()?;
-        let accepted = acceptance
-            .as_ref()
-            .and_then(|accepted| accepted.result.as_ref())
-            .ok_or_else(|| invalid("known signed Delivery lost its original accepted result"))?;
-        let acceptance = Arc::from(accepted.bind(py).cast::<PyBytes>()?.as_bytes());
-        let (candidate, original) = self.candidate(py)?;
-        if original.as_ref() != checkpoint {
-            return Err(invalid(
-                "known signed Delivery changed its original candidate checkpoint",
-            ));
-        }
-        let closure = Arc::new(cold_restore::VerifiedClosure {
+            .ok_or_else(|| invalid("known Delivery lost its original candidate Session signer"))?
+            .issuer();
+        let closure = Arc::new(cold_restore::VerifiedClosure::read_retained(
+            py,
+            checkpoint.as_bytes(),
+            &checkpoint_issuer,
+            &original_records,
+            record_count,
+            issuer,
             phase_id,
-            completion_digest: delivery_digest,
-            admission,
-            program: Arc::from(self.preparation_inputs.frozen_program.as_slice()),
-            history,
-            acceptance,
-            snapshot,
-            refusal: None,
-        });
+            limits,
+            self.source_checkpoint.as_bytes(),
+            Some(Sha256::digest(checkpoint.as_bytes()).into()),
+            &self.destination,
+            self.recipe.borrow(py).inner.source,
+            self.preparation_inputs.final_phase,
+            &self.task_use.borrow(py).checkpoint.material_sources,
+        )?);
         let result = candidate
             .borrow(py)
             .session
             .borrow(py)
-            .install_checkpoint_custody(closure, Sha256::digest(checkpoint).into());
+            .install_checkpoint_custody(closure, Sha256::digest(checkpoint.as_bytes()).into());
         result
     }
 
@@ -1052,9 +1140,8 @@ impl PySemanticLearningPhaseTransition {
             let session = parent.session.borrow(py);
             let work = session
                 .owner()?
-                .prepare_cold_model_work(
+                .prepare_cold_model_work_deferred(
                     &*parent.lease()?,
-                    self.preparation_inputs.cold_model_work_capacity,
                     ordinal,
                     self.records()?.confirmed_admission()?,
                     xlog_cuda::SemanticColdModelWorkPurpose::Delivery,
@@ -1084,17 +1171,17 @@ impl PySemanticLearningPhaseTransition {
             for (index, region) in native_regions.into_iter().enumerate() {
                 let original = Py::new(
                     py,
-                    PySemanticColdModelWork {
-                        parent: if index % 2 == 0 {
+                    PySemanticColdModelWork::new(
+                        Some(if index % 2 == 0 {
                             self.parent.clone_ref(py)
                         } else {
                             selected.parent.clone_ref(py)
-                        },
-                        reader: selected.parent.clone_ref(py),
-                        inner: work.clone(),
-                        region: Some(region),
-                        active: AtomicBool::new(false),
-                    },
+                        }),
+                        selected.parent.clone_ref(py),
+                        work.clone(),
+                        Some(region),
+                        false,
+                    ),
                 )?;
                 self.delivery_expense()?
                     .as_mut()
@@ -1150,7 +1237,8 @@ impl PySemanticLearningPhaseTransition {
             result
         } else {
             let source_call = index % 2 == 0;
-            let parent = region.borrow(py).parent.clone_ref(py);
+            let region_custody = region.borrow(py).custody(py)?;
+            let parent = region_custody.parent()?.clone_ref(py);
             let published = parent.borrow(py);
             let session = published.session.borrow(py);
             let task = published.task_use.borrow(py);
@@ -1171,6 +1259,23 @@ impl PySemanticLearningPhaseTransition {
                 PhaseModelOwner::SerializeCandidate
             };
             let callback = self.model_owner(py, callback_kind)?;
+            let comparison_writer = if index == 8 {
+                None
+            } else {
+                let (selected, checkpoint) = if source_call {
+                    (
+                        self.model_owner(py, PhaseModelOwner::Source)?,
+                        self.source_checkpoint
+                            .slice_payload(0..self.source_checkpoint.as_bytes().len())
+                            .map_err(xlog_err)?,
+                    )
+                } else {
+                    let (candidate, checkpoint) = self.candidate(py)?;
+                    let model = candidate.borrow(py).model.clone_ref(py);
+                    (model, checkpoint)
+                };
+                Some(self.prepare_model_comparison_writer(py, &selected, &region, &checkpoint)?)
+            };
             let arguments = if refusal_retirement {
                 let (candidate, _) = self.candidate(py)?;
                 let model = candidate.borrow(py).model.clone_ref(py);
@@ -1180,11 +1285,28 @@ impl PySemanticLearningPhaseTransition {
                 let (candidate, _) = self.candidate(py)?;
                 Some((source, candidate).into_pyobject(py)?.unbind())
             } else if source_call {
-                None
+                Some(
+                    (comparison_writer
+                        .as_ref()
+                        .expect("original Source comparison writer")
+                        .clone_ref(py),)
+                        .into_pyobject(py)?
+                        .unbind(),
+                )
             } else {
                 let (candidate, _) = self.candidate(py)?;
                 let model = candidate.borrow(py).model.clone_ref(py);
-                Some((model,).into_pyobject(py)?.unbind())
+                Some(
+                    (
+                        model,
+                        comparison_writer
+                            .as_ref()
+                            .expect("original candidate comparison writer")
+                            .clone_ref(py),
+                    )
+                        .into_pyobject(py)?
+                        .unbind(),
+                )
             };
             let _reads = if refusal_retirement {
                 None
@@ -1218,9 +1340,9 @@ impl PySemanticLearningPhaseTransition {
                 }
             }
         };
-        let reader = region.borrow(py).reader.clone_ref(py);
-        let original = region
-            .borrow(py)
+        let region_custody = region.borrow(py).custody(py)?;
+        let reader = region_custody.reader.clone_ref(py);
+        let original = region_custody
             .region
             .clone()
             .expect("original delivery region");
@@ -1231,6 +1353,9 @@ impl PySemanticLearningPhaseTransition {
             .owner()?
             .require_closed_cold_model_work_region(&original)
             .map_err(xlog_err)?;
+        if index != 8 {
+            self.require_original_model_comparison(py, &region, result.bind(py))?;
+        }
         Ok(result)
     }
 
@@ -1492,7 +1617,7 @@ impl PySemanticLearningPhaseTransition {
             let parent = reader.borrow(py);
             if !verified && !refusing {
                 let (_, checkpoint) = self.candidate(py)?;
-                let manifest = SemanticCheckpointManifest::decode(&checkpoint)?;
+                let manifest = SemanticCheckpointManifest::decode(checkpoint.as_bytes())?;
                 let (_, saved_snapshot, _, _) = TaskCheckpointSeed::decode(&manifest.task)?;
                 verify_phase_checkpoint(
                     py,
@@ -1587,7 +1712,7 @@ impl PySemanticLearningPhaseTransition {
             arguments.set_item("instruction_bytes", PyBytes::new(py, &instruction))?;
             arguments.set_item("operation_ordinal", ordinal)?;
             arguments.set_item("published_parent", identity.bind(py))?;
-            arguments.set_item("full_checkpoint", PyBytes::new(py, &checkpoint))?;
+            arguments.set_item("full_checkpoint", PyBytes::new(py, checkpoint.as_bytes()))?;
             arguments.set_item("resource_usage", (expenditure, peak, report.model_calls))?;
             self.preparation_inputs
                 .resource_observer

@@ -70,12 +70,12 @@ pub struct SemanticLearningPhaseTransition {
     pub phase_index: u64,
     pub completed_updates_index: u64,
     pub recipe: Vec<SemanticLearningCopyReset>,
-    pub admission: Vec<u8>,
+    pub admission: Option<SemanticLearningPhaseAdmission>,
 }
 
 /// Retained evidence for one actual native cold phase change. Ordinary Update and
 /// restore preserve this history; neither can reset the cumulative progress.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct SemanticLearningPhaseRecord {
     pub source: SemanticLearningPhase,
     pub target: SemanticLearningPhase,
@@ -85,45 +85,153 @@ pub struct SemanticLearningPhaseRecord {
     pub model_generation: u64,
     pub completed_updates: u64,
     pub recipe_digest: Identity256,
-    pub recipe: Vec<SemanticLearningCopyReset>,
-    pub admission: Vec<u8>,
+    recipe: Arc<[SemanticLearningCopyReset]>,
+    admission: SemanticLearningPhaseAdmission,
+    _metadata: Option<Arc<SemanticReplayMaterialReservation>>,
+}
+
+impl SemanticLearningPhaseRecord {
+    pub fn recipe(&self) -> &[SemanticLearningCopyReset] {
+        &self.recipe
+    }
+
+    pub fn admission(&self) -> &SemanticLearningPhaseAdmission {
+        &self.admission
+    }
+}
+
+impl std::fmt::Debug for SemanticLearningPhaseRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SemanticLearningPhaseRecord")
+            .field("source", &self.source)
+            .field("target", &self.target)
+            .field("phase_index", &self.phase_index)
+            .field("completed_updates_index", &self.completed_updates_index)
+            .field("predecessor", &self.predecessor)
+            .field("model_generation", &self.model_generation)
+            .field("completed_updates", &self.completed_updates)
+            .field("recipe_digest", &self.recipe_digest)
+            .field("recipe", &self.recipe())
+            .field("admission", &self.admission)
+            .finish()
+    }
+}
+
+impl PartialEq for SemanticLearningPhaseRecord {
+    fn eq(&self, other: &Self) -> bool {
+        (
+            self.source,
+            self.target,
+            self.phase_index,
+            self.completed_updates_index,
+            self.predecessor,
+            self.model_generation,
+            self.completed_updates,
+            self.recipe_digest,
+            self.recipe(),
+            self.admission.as_bytes(),
+        ) == (
+            other.source,
+            other.target,
+            other.phase_index,
+            other.completed_updates_index,
+            other.predecessor,
+            other.model_generation,
+            other.completed_updates,
+            other.recipe_digest,
+            other.recipe(),
+            other.admission.as_bytes(),
+        )
+    }
+}
+
+impl Eq for SemanticLearningPhaseRecord {}
+
+pub(super) fn record_allocation_bound(
+    recipe: &[SemanticLearningCopyReset],
+    history_length: usize,
+    history_capacity: usize,
+) -> Result<u64, SemanticTransitionError> {
+    let mut bytes = recipe
+        .len()
+        .checked_mul(size_of::<SemanticLearningCopyReset>())
+        .and_then(|bytes| bytes.checked_add(2 * size_of::<usize>()))
+        .and_then(|bytes| {
+            bytes.checked_add(
+                size_of::<SemanticReplayMaterialReservation>() + 2 * size_of::<usize>(),
+            )
+        })
+        .ok_or(SemanticTransitionError::GenerationExhausted)?;
+    let history_bytes = history_length
+        .checked_add(1)
+        .and_then(|count| count.checked_mul(size_of::<SemanticLearningPhaseRecord>()))
+        .ok_or(SemanticTransitionError::GenerationExhausted)?;
+    // The restored Session owns a distinct record array, even though each
+    // record shares its original recipe, admission and allocation receipt.
+    bytes = bytes
+        .checked_add(history_bytes)
+        .ok_or(SemanticTransitionError::GenerationExhausted)?;
+    if history_length == history_capacity {
+        bytes = bytes
+            .checked_add(history_bytes)
+            .ok_or(SemanticTransitionError::GenerationExhausted)?;
+    }
+    u64::try_from(bytes).map_err(|_| SemanticTransitionError::GenerationExhausted)
+}
+
+fn learning_recipe_digest(
+    source: SemanticLearningPhase,
+    target: SemanticLearningPhase,
+    phase_index: u64,
+    completed_updates_index: u64,
+    recipe: &[SemanticLearningCopyReset],
+) -> Identity256 {
+    let mut digest = Sha256::new();
+    digest.update(b"xlog.learning-phase.copy-reset.v1\0");
+    for value in [
+        source as u64,
+        target as u64,
+        phase_index,
+        completed_updates_index,
+        recipe.len() as u64,
+    ] {
+        digest.update(value.to_le_bytes());
+    }
+    for operation in recipe {
+        let (role, index) = operation.key();
+        let (code, source_role, source_index) = match *operation {
+            SemanticLearningCopyReset::Preserve { .. } => (0, 0, 0),
+            SemanticLearningCopyReset::Zero { .. } => (1, 0, 0),
+            SemanticLearningCopyReset::MasterFromEffective {
+                effective_role,
+                effective_index,
+                ..
+            } => (2, effective_role, effective_index),
+            SemanticLearningCopyReset::Phase { .. } => (3, 0, 0),
+        };
+        for value in [role, index, code, source_role, source_index] {
+            digest.update(value.to_le_bytes());
+        }
+    }
+    Identity256::from_bytes(digest.finalize().into())
 }
 
 impl SemanticLearningPhaseTransition {
     pub fn recipe_digest(&self) -> Identity256 {
-        let mut digest = Sha256::new();
-        digest.update(b"xlog.learning-phase.copy-reset.v1\0");
-        for value in [
-            self.source as u64,
-            self.target as u64,
+        learning_recipe_digest(
+            self.source,
+            self.target,
             self.phase_index,
             self.completed_updates_index,
-            self.recipe.len() as u64,
-        ] {
-            digest.update(value.to_le_bytes());
-        }
-        for operation in &self.recipe {
-            let (role, index) = operation.key();
-            let (code, source_role, source_index) = match *operation {
-                SemanticLearningCopyReset::Preserve { .. } => (0, 0, 0),
-                SemanticLearningCopyReset::Zero { .. } => (1, 0, 0),
-                SemanticLearningCopyReset::MasterFromEffective {
-                    effective_role,
-                    effective_index,
-                    ..
-                } => (2, effective_role, effective_index),
-                SemanticLearningCopyReset::Phase { .. } => (3, 0, 0),
-            };
-            for value in [role, index, code, source_role, source_index] {
-                digest.update(value.to_le_bytes());
-            }
-        }
-        Identity256::from_bytes(digest.finalize().into())
+            &self.recipe,
+        )
     }
 
-    pub(super) fn apply(
+    pub(super) fn apply<B: PublicationByteStorage>(
         &self,
-        material: &mut PublicationMaterial,
+        material: &mut PublicationMaterialStorage<B>,
+        metadata: Arc<SemanticReplayMaterialReservation>,
     ) -> Result<(SemanticLearningPhaseRecord, Option<LearningFoldPlan>), SemanticTransitionError>
     {
         if !matches!(
@@ -138,7 +246,10 @@ impl SemanticLearningPhaseTransition {
                 SemanticLearningPhase::Consolidation,
                 SemanticLearningPhase::Fast
             )
-        ) || self.admission.is_empty()
+        ) || self
+            .admission
+            .as_ref()
+            .is_none_or(SemanticLearningPhaseAdmission::is_empty)
             || self.phase_index == self.completed_updates_index
         {
             return Err(publication_input_error(
@@ -202,7 +313,10 @@ impl SemanticLearningPhaseTransition {
         // particular, its masters must not be reset from pre-absorption values.
         if fold.is_none() {
             let original = &material.model_allocations;
-            let mut allocations = original.clone();
+            let mut allocations = original
+                .iter()
+                .map(PublicationByteStorage::copy_owned)
+                .collect::<Result<Vec<_>, _>>()?;
             for operation in &self.recipe {
                 if matches!(operation, SemanticLearningCopyReset::Preserve { .. }) {
                     continue;
@@ -213,7 +327,7 @@ impl SemanticLearningPhaseTransition {
                     self.target,
                     self.phase_index,
                     |allocation, offset, value| {
-                        allocations[allocation][offset..offset + value.len()]
+                        allocations[allocation].writable_bytes()?[offset..offset + value.len()]
                             .copy_from_slice(value);
                         Ok(())
                     },
@@ -242,8 +356,7 @@ impl SemanticLearningPhaseTransition {
                         .model_memory
                         .location(range.range.role, range.range.index)?;
                     range.bytes = material.model_allocations[allocation]
-                        [offset..offset + range.bytes.len()]
-                        .to_vec();
+                        .slice_bytes(offset..offset + range.bytes.len())?;
                 }
             }
         }
@@ -263,16 +376,21 @@ impl SemanticLearningPhaseTransition {
                 model_generation: header.model_generation,
                 completed_updates: updates as u64,
                 recipe_digest: self.recipe_digest(),
-                recipe: self.recipe.clone(),
-                admission: self.admission.clone(),
+                recipe: Arc::from(self.recipe.as_slice()),
+                admission: self
+                    .admission
+                    .as_ref()
+                    .expect("checked original learning admission")
+                    .clone(),
+                _metadata: Some(metadata),
             },
             fold,
         ))
     }
 }
 
-fn scalar_i64(
-    material: &PublicationMaterial,
+fn scalar_i64<B: PublicationByteStorage>(
+    material: &PublicationMaterialStorage<B>,
     key: (u64, u64),
 ) -> Result<i64, SemanticTransitionError> {
     let layout = material
@@ -293,8 +411,8 @@ fn scalar_i64(
     })?))
 }
 
-fn element_offsets<'a>(
-    material: &'a PublicationMaterial,
+fn element_offsets<'a, B: PublicationByteStorage>(
+    material: &'a PublicationMaterialStorage<B>,
     key: (u64, u64),
 ) -> Result<
     (
@@ -340,8 +458,8 @@ fn element_offsets<'a>(
     Ok((allocation, offsets))
 }
 
-fn visit_expected_values(
-    material: &PublicationMaterial,
+fn visit_expected_values<B: PublicationByteStorage>(
+    material: &PublicationMaterialStorage<B>,
     operation: &SemanticLearningCopyReset,
     target: SemanticLearningPhase,
     phase_index: u64,
@@ -489,9 +607,9 @@ fn original_float(value: &serde_json::Value) -> Result<f32, SemanticTransitionEr
     Ok(value)
 }
 
-fn view_key(
+fn view_key<B: PublicationByteStorage>(
     value: &serde_json::Value,
-    material: &PublicationMaterial,
+    material: &PublicationMaterialStorage<B>,
 ) -> Result<(u64, u64), SemanticTransitionError> {
     let fields = schema_array(&value["layout"])?;
     if fields.len() != 8 {
@@ -527,8 +645,8 @@ fn view_key(
 }
 
 impl LearningFoldPlan {
-    fn prepare(
-        material: &PublicationMaterial,
+    fn prepare<B: PublicationByteStorage>(
+        material: &PublicationMaterialStorage<B>,
         transition: &SemanticLearningPhaseTransition,
     ) -> Result<Self, SemanticTransitionError> {
         let record = material
@@ -1316,10 +1434,10 @@ pub(super) fn encode_history(
         }
         material_u32(
             bytes,
-            u32::try_from(record.recipe.len())
+            u32::try_from(record.recipe().len())
                 .map_err(|_| SemanticTransitionError::GenerationExhausted)?,
         );
-        for operation in &record.recipe {
+        for operation in record.recipe() {
             let (role, index) = operation.key();
             let (code, source_role, source_index) = match *operation {
                 SemanticLearningCopyReset::Preserve { .. } => (0, 0, 0),
@@ -1335,13 +1453,18 @@ pub(super) fn encode_history(
                 material_u64(bytes, value);
             }
         }
-        material_bytes(bytes, &record.admission).map_err(SemanticTransitionError::Semantic)?;
+        material_bytes(bytes, record.admission.as_bytes())
+            .map_err(SemanticTransitionError::Semantic)?;
     }
     Ok(())
 }
 
 pub(super) fn decode_history(
     reader: &mut SemanticMaterialReader<'_>,
+    mut admission_owner: impl FnMut(
+        &[u8],
+    )
+        -> Result<SemanticLearningPhaseAdmission, SemanticTransitionError>,
 ) -> Result<Vec<SemanticLearningPhaseRecord>, SemanticTransitionError> {
     let count = reader
         .count(7 * 8 + 4 * 32 + 4)
@@ -1401,10 +1524,8 @@ pub(super) fn decode_history(
                 }
             });
         }
-        let admission = reader
-            .bytes()
-            .map_err(SemanticTransitionError::Semantic)?
-            .to_vec();
+        let admission =
+            admission_owner(reader.bytes().map_err(SemanticTransitionError::Semantic)?)?;
         history.push(SemanticLearningPhaseRecord {
             source,
             target,
@@ -1419,15 +1540,16 @@ pub(super) fn decode_history(
             model_generation,
             completed_updates,
             recipe_digest,
-            recipe,
+            recipe: Arc::from(recipe),
             admission,
+            _metadata: None,
         });
     }
     Ok(history)
 }
 
-pub(super) fn validate_history(
-    material: &PublicationMaterial,
+pub(super) fn validate_history<B: PublicationByteStorage>(
+    material: &PublicationMaterialStorage<B>,
 ) -> Result<(), SemanticTransitionError> {
     let mut previous: Option<&SemanticLearningPhaseRecord> = None;
     for record in &material.learning_phases {
@@ -1436,14 +1558,6 @@ pub(super) fn validate_history(
             .iter()
             .map(SemanticLearningCopyReset::key)
             .collect::<Vec<_>>();
-        let recipe = SemanticLearningPhaseTransition {
-            source: record.source,
-            target: record.target,
-            phase_index: record.phase_index,
-            completed_updates_index: record.completed_updates_index,
-            recipe: record.recipe.clone(),
-            admission: record.admission.clone(),
-        };
         if record.admission.is_empty()
             || record.phase_index == record.completed_updates_index
             || keys.windows(2).any(|pair| pair[0] >= pair[1])
@@ -1470,7 +1584,14 @@ pub(super) fn validate_history(
             || record.model_generation > material.bank.header.model_generation
             || record.predecessor.instance == Identity256::default()
             || record.recipe_digest == Identity256::default()
-            || record.recipe_digest != recipe.recipe_digest()
+            || record.recipe_digest
+                != learning_recipe_digest(
+                    record.source,
+                    record.target,
+                    record.phase_index,
+                    record.completed_updates_index,
+                    record.recipe(),
+                )
             || !matches!(
                 (record.source, record.target),
                 (

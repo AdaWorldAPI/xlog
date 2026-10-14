@@ -9,6 +9,14 @@ use xlog_core::RelId;
 
 use crate::stats::{ColumnStats, JoinSelectivity, RelationStats};
 
+fn cloned_vector_allocation_bytes<T>(count: usize) -> Option<usize> {
+    if count == 0 {
+        Some(0)
+    } else {
+        count.max(4).checked_mul(std::mem::size_of::<T>())
+    }
+}
+
 /// Serializable snapshot of collected statistics.
 ///
 /// This is intended for feeding runtime observations back into the compiler/optimizer.
@@ -67,6 +75,31 @@ pub struct StatsManager {
     join_selectivities: HashMap<(RelId, RelId), JoinSelectivity>,
 }
 
+impl Clone for StatsManager {
+    fn clone(&self) -> Self {
+        // Copy the original records directly, including their cached estimates.
+        // Fresh tables retain the original hashers but not retired buckets.
+        let mut relations = HashMap::with_capacity_and_hasher(
+            self.relations.len(),
+            self.relations.hasher().clone(),
+        );
+        for (rel, statistics) in &self.relations {
+            relations.insert(*rel, statistics.clone());
+        }
+        let mut join_selectivities = HashMap::with_capacity_and_hasher(
+            self.join_selectivities.len(),
+            self.join_selectivities.hasher().clone(),
+        );
+        for (key, selectivity) in &self.join_selectivities {
+            join_selectivities.insert(*key, selectivity.clone());
+        }
+        Self {
+            relations,
+            join_selectivities,
+        }
+    }
+}
+
 impl StatsManager {
     /// Creates a new empty statistics manager.
     ///
@@ -97,6 +130,85 @@ impl StatsManager {
             join_selectivities: self.join_selectivities.values().cloned().collect(),
             rel_names: Vec::new(),
         }
+    }
+
+    /// Checked clone geometry of the original complete snapshot roster.
+    /// This does not snapshot, update, or synthesize any statistics.
+    pub fn snapshot_allocation_bytes(&self) -> xlog_core::Result<u64> {
+        let overflow = || xlog_core::XlogError::allocation_extent_overflow("statistics snapshot");
+        let roster = cloned_vector_allocation_bytes::<RelationStats>(self.relations.len())
+            .and_then(|n| {
+                n.checked_add(cloned_vector_allocation_bytes::<JoinSelectivity>(
+                    self.join_selectivities.len(),
+                )?)
+            })
+            .ok_or_else(overflow)?;
+        roster
+            .checked_add(self.cloned_record_allocation_bytes("statistics snapshot")?)
+            .and_then(|n| u64::try_from(n).ok())
+            .ok_or_else(overflow)
+    }
+
+    /// Checked heap-storage geometry of a clone of this original manager.
+    ///
+    /// Includes both fresh hash tables sized from their live entries and every
+    /// nested statistics vector. Excludes the inline manager and any outer
+    /// owning allocation.
+    /// This does not snapshot, merge, update, or allocate statistics.
+    pub fn clone_allocation_bytes(&self) -> xlog_core::Result<u64> {
+        let overflow = || xlog_core::XlogError::allocation_extent_overflow("statistics clone");
+        let records = u64::try_from(self.cloned_record_allocation_bytes("statistics clone")?)
+            .map_err(|_| overflow())?;
+        xlog_core::hash_allocation_bytes::<RelId, RelationStats>(self.relations.len())?
+            .checked_add(xlog_core::hash_allocation_bytes::<
+                (RelId, RelId),
+                JoinSelectivity,
+            >(self.join_selectivities.len())?)
+            .and_then(|n| n.checked_add(records))
+            .ok_or_else(overflow)
+    }
+
+    fn cloned_record_allocation_bytes(&self, operation: &'static str) -> xlog_core::Result<usize> {
+        let overflow = || xlog_core::XlogError::allocation_extent_overflow(operation);
+        let mut bytes = 0usize;
+        for relation in self.relations.values() {
+            bytes = bytes
+                .checked_add(
+                    cloned_vector_allocation_bytes::<ColumnStats>(relation.column_stats.len())
+                        .ok_or_else(overflow)?,
+                )
+                .ok_or_else(overflow)?;
+            bytes = bytes
+                .checked_add(
+                    cloned_vector_allocation_bytes::<crate::stats::PrefixDegreeStats>(
+                        relation.prefix_degrees.len(),
+                    )
+                    .ok_or_else(overflow)?,
+                )
+                .ok_or_else(overflow)?;
+            bytes = bytes
+                .checked_add(
+                    cloned_vector_allocation_bytes::<crate::stats::KeyHeatStats>(
+                        relation.key_heats.len(),
+                    )
+                    .ok_or_else(overflow)?,
+                )
+                .ok_or_else(overflow)?;
+        }
+        for selectivity in self.join_selectivities.values() {
+            bytes = bytes
+                .checked_add(
+                    cloned_vector_allocation_bytes::<usize>(selectivity.left_keys.len())
+                        .ok_or_else(overflow)?,
+                )
+                .and_then(|n| {
+                    n.checked_add(cloned_vector_allocation_bytes::<usize>(
+                        selectivity.right_keys.len(),
+                    )?)
+                })
+                .ok_or_else(overflow)?;
+        }
+        Ok(bytes)
     }
 
     /// Merge a previously captured snapshot into this manager.

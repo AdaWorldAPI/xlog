@@ -58,38 +58,195 @@ pub struct SemanticTaskVerificationBinding {
     pub measurement: Option<SemanticTaskMeasurementBinding>,
 }
 
+/// Explicit immutable prerequisites for one query's attainment. Observation
+/// ordinals refer to the original verification roster, not to its goal labels.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SemanticTaskAttainmentRequirement {
+    pub query: u32,
+    pub required_goal_ordinals: Vec<u32>,
+    pub required_binding_ordinals: Vec<u32>,
+}
+
 /// The single task-ground carrier retained from cold admission through restore.
 /// Logical tasks retain their original reference semantics. Coding tasks have
 /// no reference result: each external observation is absent until acquired.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SemanticTaskGround {
     Logical,
-    Coding(Vec<SemanticTaskVerificationBinding>),
+    Coding {
+        bindings: Vec<SemanticTaskVerificationBinding>,
+        requirements: Vec<SemanticTaskAttainmentRequirement>,
+    },
 }
 
 impl SemanticTaskGround {
     pub const fn code(&self) -> u64 {
         match self {
             Self::Logical => 0,
-            Self::Coding(_) => 1,
+            Self::Coding { .. } => 1,
         }
     }
 
     pub fn bindings(&self) -> &[SemanticTaskVerificationBinding] {
         match self {
             Self::Logical => &[],
-            Self::Coding(bindings) => bindings,
+            Self::Coding { bindings, .. } => bindings,
         }
+    }
+
+    pub fn requirements(&self) -> &[SemanticTaskAttainmentRequirement] {
+        match self {
+            Self::Logical => &[],
+            Self::Coding { requirements, .. } => requirements,
+        }
+    }
+
+    /// One canonical framing shared by content commitments, goal witnesses and
+    /// completed material. No consumer invents a second graph representation.
+    pub fn visit_requirement_words(&self, mut visit: impl FnMut(u64)) {
+        visit(self.requirements().len() as u64);
+        for row in self.requirements() {
+            visit(u64::from(row.query));
+            visit(row.required_goal_ordinals.len() as u64);
+            visit(row.required_binding_ordinals.len() as u64);
+            for &index in row
+                .required_goal_ordinals
+                .iter()
+                .chain(&row.required_binding_ordinals)
+            {
+                visit(u64::from(index));
+            }
+        }
+    }
+
+    pub fn mandatory_edge_count(&self) -> Result<u64, SemanticTransitionError> {
+        self.requirements().iter().try_fold(0u64, |count, row| {
+            count
+                .checked_add(row.required_goal_ordinals.len() as u64)
+                .and_then(|count| count.checked_add(row.required_binding_ordinals.len() as u64))
+                .ok_or(SemanticTransitionError::GenerationExhausted)
+        })
+    }
+
+    pub(super) fn requirement_word_count(&self) -> Result<usize, SemanticTransitionError> {
+        self.requirements().iter().try_fold(1usize, |count, row| {
+            count
+                .checked_add(3)
+                .and_then(|count| count.checked_add(row.required_goal_ordinals.len()))
+                .and_then(|count| count.checked_add(row.required_binding_ordinals.len()))
+                .ok_or(SemanticTransitionError::GenerationExhausted)
+        })
+    }
+
+    pub(super) fn requirement_allocation_bytes(&self) -> Result<u64, SemanticTransitionError> {
+        let rows = self.requirements();
+        (rows.len() as u64)
+            .checked_mul(std::mem::size_of::<SemanticTaskAttainmentRequirement>() as u64)
+            .and_then(|bytes| bytes.checked_add(self.mandatory_edge_count().ok()?.checked_mul(4)?))
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    std::mem::size_of::<Vec<SemanticTaskAttainmentRequirement>>() as u64,
+                )
+            })
+            .ok_or(SemanticTransitionError::GenerationExhausted)
+    }
+
+    pub(super) fn requirement_workspace_bytes(&self) -> Result<u64, SemanticTransitionError> {
+        let words = self
+            .requirement_word_count()?
+            .checked_add(
+                self.requirements()
+                    .len()
+                    .checked_mul(2)
+                    .ok_or(SemanticTransitionError::GenerationExhausted)?,
+            )
+            .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        // Device-bank staging and the containing task-word vector overlap.
+        (words as u64)
+            .checked_mul(2 * std::mem::size_of::<u64>() as u64)
+            .and_then(|bytes| {
+                bytes.checked_add((self.requirements().len() as u64).checked_mul(
+                    (std::mem::size_of::<u32>() + std::mem::size_of::<bool>()) as u64,
+                )?)
+            })
+            .ok_or(SemanticTransitionError::GenerationExhausted)
+    }
+
+    fn topological_queries(&self) -> Result<Vec<u32>, SemanticTransitionError> {
+        let rows = self.requirements();
+        let mut complete = vec![false; rows.len()];
+        let mut order = Vec::with_capacity(rows.len());
+        for _ in rows {
+            let next = rows
+                .iter()
+                .enumerate()
+                .find(|(query, row)| {
+                    !complete[*query]
+                        && row
+                            .required_goal_ordinals
+                            .iter()
+                            .all(|&dependency| complete.get(dependency as usize) == Some(&true))
+                })
+                .map(|(query, _)| query);
+            let Some(query) = next else {
+                return Err(publication_input_error(
+                    "task attainment dependencies contain a cycle",
+                ));
+            };
+            complete[query] = true;
+            order.push(query as u32);
+        }
+        Ok(order)
+    }
+
+    /// Bounded device bank derived from the original graph. Offsets and the
+    /// stable topological schedule are accelerators, never independent custody.
+    pub(super) fn device_requirement_words(&self) -> Result<Vec<u64>, SemanticTransitionError> {
+        if self.requirements().is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = self.requirements();
+        let count = self
+            .requirement_word_count()?
+            .checked_add(
+                rows.len()
+                    .checked_mul(2)
+                    .ok_or(SemanticTransitionError::GenerationExhausted)?,
+            )
+            .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        let order = self.topological_queries()?;
+        let mut words = Vec::with_capacity(count);
+        words.push(rows.len() as u64);
+        let mut offset = 1 + 2 * rows.len();
+        for row in rows {
+            words.push(offset as u64);
+            offset += 3 + row.required_goal_ordinals.len() + row.required_binding_ordinals.len();
+        }
+        words.extend(order.into_iter().map(u64::from));
+        let mut header = true;
+        self.visit_requirement_words(|word| {
+            if header {
+                header = false;
+            } else {
+                words.push(word);
+            }
+        });
+        Ok(words)
     }
 
     pub(super) fn validate(
         &self,
         records: &SemanticAdmissionRecords,
-        query_count: usize,
+        query_records: &[u32],
     ) -> Result<(), SemanticTransitionError> {
-        let Self::Coding(bindings) = self else {
+        let Self::Coding {
+            bindings,
+            requirements,
+        } = self
+        else {
             return Ok(());
         };
+        let query_count = query_records.len();
         if bindings.is_empty() || bindings.len() > u32::MAX as usize {
             return Err(publication_input_error(
                 "coding task requires a finite nonempty verification roster",
@@ -151,6 +308,39 @@ impl SemanticTaskGround {
                 "coding verification roster must cover all five original families",
             ));
         }
+        if requirements.len() != query_count || query_count > u32::MAX as usize {
+            return Err(publication_input_error(
+                "coding attainment requires the complete ordered query graph",
+            ));
+        }
+        for (query, row) in requirements.iter().enumerate() {
+            if row.query as usize != query
+                || (row.required_goal_ordinals.is_empty()
+                    && row.required_binding_ordinals.is_empty())
+                || row
+                    .required_goal_ordinals
+                    .windows(2)
+                    .any(|pair| pair[0] >= pair[1])
+                || row
+                    .required_binding_ordinals
+                    .windows(2)
+                    .any(|pair| pair[0] >= pair[1])
+                || row
+                    .required_goal_ordinals
+                    .iter()
+                    .any(|&index| index as usize >= query_count || index as usize == query)
+                || row.required_binding_ordinals.iter().any(|&index| {
+                    bindings
+                        .get(index as usize)
+                        .is_none_or(|binding| binding.observation_record != query_records[query])
+                })
+            {
+                return Err(publication_input_error("task attainment prerequisites differ from their original query or verification roster"));
+            }
+        }
+        self.mandatory_edge_count()?;
+        self.requirement_word_count()?;
+        self.topological_queries()?;
         Ok(())
     }
 }
@@ -158,36 +348,43 @@ impl SemanticTaskGround {
 impl SemanticTaskVerificationBinding {
     /// Exact fixed-width device representation of the original eight fields.
     /// The presence word distinguishes an absent measurement from any identity.
-    pub(super) fn words(&self) -> Vec<u64> {
-        let mut words = vec![u64::from(self.query), u64::from(self.observation_record)];
-        for identity in [
+    pub(super) fn words(&self) -> [u64; 36] {
+        let mut words = [0; 36];
+        words[..2].copy_from_slice(&[u64::from(self.query), u64::from(self.observation_record)]);
+        for (index, identity) in [
             self.obligation_identity,
             self.requirement_identity,
             self.verifier_plan_identity,
             self.acceptance_condition_identity,
-        ] {
-            words.extend(super::identity_words(*identity.as_bytes()));
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            words[2 + 4 * index..6 + 4 * index]
+                .copy_from_slice(&super::identity_words(*identity.as_bytes()));
         }
-        words.push(self.receipt_family.code());
-        words.push(u64::from(self.measurement.is_some()));
+        words[18] = self.receipt_family.code();
+        words[19] = u64::from(self.measurement.is_some());
         if let Some(measurement) = &self.measurement {
-            for identity in [
+            for (index, identity) in [
                 measurement.metric_identity,
                 measurement.comparator_identity,
                 measurement.tolerance_identity,
                 measurement.environment_identity,
-            ] {
-                words.extend(super::identity_words(*identity.as_bytes()));
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                words[20 + 4 * index..24 + 4 * index]
+                    .copy_from_slice(&super::identity_words(*identity.as_bytes()));
             }
-        } else {
-            words.extend([0; 16]);
         }
         words
     }
 }
 
 pub(super) const TASK_GROUND_MAGIC: u64 = 0x584c4f4754475244;
-pub(super) const TASK_GROUND_VERSION: u64 = 1;
+pub(super) const TASK_GROUND_VERSION: u64 = 2;
 
 /// One result from the original numerical candidate/query invocation.
 #[repr(C)]

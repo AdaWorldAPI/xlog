@@ -16,9 +16,344 @@ use crate::ast::{
     EpistemicOp, Program, Term,
 };
 use crate::build_eir;
-use crate::compile::Compiler;
+use crate::compile::{CompilationAllocationScope, Compiler};
 use crate::eir::convert_term;
 use crate::lower::{positive_body_bound_variables, Lowerer};
+
+type AllocationScope<'a, 'b> = Option<&'a mut CompilationAllocationScope<'b>>;
+
+fn allocation_extent_overflow(operation: &'static str) -> XlogError {
+    XlogError::AllocationRefused {
+        operation,
+        reason: xlog_core::error::AllocationRefusal::ExtentOverflow,
+    }
+}
+
+fn unsupported_diagnostic(
+    scope: &mut AllocationScope<'_, '_>,
+    construct: &str,
+    context: std::fmt::Arguments<'_>,
+) -> Result<XlogError> {
+    if scope.is_some() {
+        acquire(scope, construct.len() as u64)?;
+        acquire(
+            scope,
+            crate::compile::formatted_text_allocation_bytes(context)?,
+        )?;
+    }
+    Ok(XlogError::UnsupportedEpistemicConstruct {
+        construct: construct.to_owned(),
+        context: format!("{context}"),
+    })
+}
+
+fn compilation_diagnostic(
+    scope: &mut AllocationScope<'_, '_>,
+    context: std::fmt::Arguments<'_>,
+) -> Result<XlogError> {
+    if scope.is_some() {
+        acquire(
+            scope,
+            crate::compile::formatted_text_allocation_bytes(context)?,
+        )?;
+    }
+    Ok(XlogError::Compilation(format!("{context}")))
+}
+
+fn validate_authored_constraint_identity_with_scope(
+    program: &Program,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<()> {
+    match scope.as_deref_mut() {
+        Some(scope) => program
+            .validate_prepared_authored_constraint_identity_with_allocation_owner(&mut |bytes| {
+                scope.reserve_allocation(bytes)
+            }),
+        None => program.validate_prepared_authored_constraint_identity(),
+    }
+}
+
+fn prepare_authored_constraint_identity_with_scope(
+    program: &mut Program,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<()> {
+    match scope.as_deref_mut() {
+        Some(scope) => program.prepare_authored_constraint_identity_at_root_with_allocation_owner(
+            &mut |bytes| scope.reserve_allocation(bytes),
+        ),
+        None => program.prepare_authored_constraint_identity_at_root(),
+    }
+}
+
+fn acquire(scope: &mut AllocationScope<'_, '_>, bytes: u64) -> Result<()> {
+    if let Some(scope) = scope.as_deref_mut() {
+        scope.acquire(bytes)?;
+    }
+    Ok(())
+}
+
+fn acquire_vector<T>(scope: &mut AllocationScope<'_, '_>, count: usize) -> Result<()> {
+    if scope.is_some() {
+        acquire(
+            scope,
+            crate::compile::push_vector_allocation_bytes::<T>(count)?,
+        )?;
+    }
+    Ok(())
+}
+
+fn clone_program(program: &Program, scope: &mut AllocationScope<'_, '_>) -> Result<Program> {
+    acquire(scope, program.owned_allocation_bytes()?)?;
+    Ok(program.clone())
+}
+
+fn build_eir_with_scope(
+    program: &Program,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<EirProgram> {
+    match scope.as_deref_mut() {
+        Some(scope) => crate::eir::build_eir_with_allocation_owner(program, scope),
+        None => build_eir(program),
+    }
+}
+
+fn acquire_eir_terms(terms: &[EirTerm], scope: &mut AllocationScope<'_, '_>) -> Result<()> {
+    acquire_vector::<EirTerm>(scope, terms.len())?;
+    for term in terms {
+        acquire(scope, crate::eir::term_clone_allocation_bytes(term)?)?;
+    }
+    Ok(())
+}
+
+fn acquire_eir_atom(atom: &xlog_ir::EirAtom, scope: &mut AllocationScope<'_, '_>) -> Result<()> {
+    acquire(scope, atom.predicate.len() as u64)?;
+    acquire_eir_terms(&atom.terms, scope)
+}
+
+fn acquire_push<T>(
+    values: &[T],
+    capacity: usize,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<()> {
+    if values.len() == capacity {
+        acquire_vector::<T>(
+            scope,
+            values
+                .len()
+                .checked_add(1)
+                .ok_or_else(|| allocation_extent_overflow("epistemic vector count overflow"))?,
+        )?;
+    }
+    Ok(())
+}
+
+fn tree_allocation_bytes<K, V>(count: usize) -> Result<u64> {
+    (0..count).try_fold(0u64, |bytes, length| {
+        bytes
+            .checked_add(crate::compile::btree_insert_allocation_bytes::<K, V>(
+                length,
+            )?)
+            .ok_or_else(|| allocation_extent_overflow("epistemic tree allocation overflow"))
+    })
+}
+
+fn reserve_scratch(
+    scope: &mut AllocationScope<'_, '_>,
+    bytes: u64,
+) -> Result<Option<std::sync::Arc<dyn Send + Sync>>> {
+    match scope.as_deref_mut() {
+        Some(scope) => Ok(Some(scope.reserve_allocation(bytes)?)),
+        None => Ok(None),
+    }
+}
+
+struct RetainedEpistemicAllocation<T> {
+    value: T,
+    _owner: Option<std::sync::Arc<dyn Send + Sync>>,
+}
+
+fn ephemeral_compilation<T>(
+    scope: &mut AllocationScope<'_, '_>,
+    build: impl FnOnce(&mut AllocationScope<'_, '_>) -> Result<T>,
+) -> Result<RetainedEpistemicAllocation<T>> {
+    match scope.as_deref_mut() {
+        Some(scope) => {
+            let mut child = scope.child_scope();
+            child.prepare_owner()?;
+            let value = match build(&mut Some(&mut child)) {
+                Ok(value) => value,
+                Err(error) => return Err(child.into_failure(error)),
+            };
+            let owner = child.into_owner()?;
+            Ok(RetainedEpistemicAllocation {
+                value,
+                _owner: Some(owner),
+            })
+        }
+        None => Ok(RetainedEpistemicAllocation {
+            value: build(&mut None)?,
+            _owner: None,
+        }),
+    }
+}
+
+fn signature_stack_push(
+    stack: &mut Vec<(String, usize)>,
+    storage_owner: &mut Option<std::sync::Arc<dyn Send + Sync>>,
+    atom: &xlog_ir::EirAtom,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<Option<std::sync::Arc<dyn Send + Sync>>> {
+    let key_owner = reserve_scratch(scope, atom.predicate.len() as u64)?;
+    let replacement = if stack.len() == stack.capacity() {
+        reserve_scratch(
+            scope,
+            crate::compile::push_vector_allocation_bytes::<(String, usize)>(
+                stack.len().checked_add(1).ok_or_else(|| {
+                    allocation_extent_overflow("foundedness stack count overflow")
+                })?,
+            )?,
+        )?
+    } else {
+        None
+    };
+    let previous = if replacement.is_some() {
+        std::mem::replace(storage_owner, replacement)
+    } else {
+        None
+    };
+    stack.push((atom.predicate.clone(), atom.arity));
+    drop(previous);
+    Ok(key_owner)
+}
+
+fn substitution_clone_bytes(
+    term: &EirTerm,
+    substitution: &BTreeMap<String, EirTerm>,
+) -> Result<u64> {
+    let overflow = || allocation_extent_overflow("foundedness substitution allocation overflow");
+    match term {
+        EirTerm::Variable(name) => {
+            crate::eir::term_clone_allocation_bytes(substitution.get(name).unwrap_or(term))
+        }
+        EirTerm::List(items) | EirTerm::Compound { args: items, .. } => {
+            let mut bytes = crate::compile::push_vector_allocation_bytes::<EirTerm>(items.len())?;
+            if let EirTerm::Compound { functor, .. } = term {
+                bytes = bytes
+                    .checked_add(functor.len() as u64)
+                    .ok_or_else(overflow)?;
+            }
+            for item in items {
+                bytes = bytes
+                    .checked_add(substitution_clone_bytes(item, substitution)?)
+                    .ok_or_else(overflow)?;
+            }
+            Ok(bytes)
+        }
+        EirTerm::Cons { head, tail } => (2 * std::mem::size_of::<EirTerm>() as u64)
+            .checked_add(substitution_clone_bytes(head, substitution)?)
+            .and_then(|bytes| bytes.checked_add(substitution_clone_bytes(tail, substitution).ok()?))
+            .ok_or_else(overflow),
+        other => crate::eir::term_clone_allocation_bytes(other),
+    }
+}
+
+fn head_substitution_to_atom_with_scope(
+    head: &xlog_ir::EirAtom,
+    atom: &xlog_ir::EirAtom,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<Option<RetainedEpistemicAllocation<BTreeMap<String, EirTerm>>>> {
+    if head.predicate != atom.predicate || head.arity != atom.arity {
+        return Ok(None);
+    }
+    let mut bytes = tree_allocation_bytes::<String, EirTerm>(head.terms.len())?;
+    for (head_term, atom_term) in head.terms.iter().zip(&atom.terms) {
+        if let EirTerm::Variable(name) = head_term {
+            bytes = bytes
+                .checked_add(name.len() as u64)
+                .and_then(|bytes| {
+                    bytes.checked_add(crate::eir::term_clone_allocation_bytes(atom_term).ok()?)
+                })
+                .ok_or_else(|| {
+                    allocation_extent_overflow("foundedness head binding allocation overflow")
+                })?;
+        }
+    }
+    let owner = reserve_scratch(scope, bytes)?;
+    Ok(
+        head_substitution_to_atom(head, atom).map(|value| RetainedEpistemicAllocation {
+            value,
+            _owner: owner,
+        }),
+    )
+}
+
+fn substitute_eir_atom_with_scope(
+    atom: &xlog_ir::EirAtom,
+    substitution: &BTreeMap<String, EirTerm>,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<Option<RetainedEpistemicAllocation<xlog_ir::EirAtom>>> {
+    let mut bytes = crate::compile::push_vector_allocation_bytes::<EirTerm>(atom.terms.len())?
+        .checked_add(atom.predicate.len() as u64)
+        .ok_or_else(|| allocation_extent_overflow("foundedness atom allocation overflow"))?;
+    for term in &atom.terms {
+        bytes = bytes
+            .checked_add(substitution_clone_bytes(term, substitution)?)
+            .ok_or_else(|| allocation_extent_overflow("foundedness atom allocation overflow"))?;
+    }
+    let owner = reserve_scratch(scope, bytes)?;
+    Ok(
+        substitute_eir_atom(atom, substitution).map(|value| RetainedEpistemicAllocation {
+            value,
+            _owner: owner,
+        }),
+    )
+}
+
+fn dependency_graph_allocation_bytes(program: &Program) -> Result<u64> {
+    let overflow = || allocation_extent_overflow("epistemic dependency allocation overflow");
+    let mut ordinary_count = 0usize;
+    let mut all_count = 0usize;
+    for rule in &program.rules {
+        for literal in &rule.body {
+            match literal {
+                BodyLiteral::Positive(_) | BodyLiteral::Negated(_) => {
+                    ordinary_count = ordinary_count.checked_add(1).ok_or_else(overflow)?;
+                    all_count = all_count.checked_add(1).ok_or_else(overflow)?;
+                }
+                BodyLiteral::Epistemic(_) => {
+                    all_count = all_count.checked_add(1).ok_or_else(overflow)?
+                }
+                BodyLiteral::Comparison(_) | BodyLiteral::IsExpr(_) | BodyLiteral::Univ(_) => {}
+            }
+        }
+    }
+    let mut bytes = tree_allocation_bytes::<&str, BTreeSet<&str>>(program.rules.len())?
+        .checked_mul(2)
+        .ok_or_else(overflow)?;
+    bytes = bytes
+        .checked_add(tree_allocation_bytes::<&str, ()>(ordinary_count)?)
+        .and_then(|bytes| bytes.checked_add(tree_allocation_bytes::<&str, ()>(all_count).ok()?))
+        .ok_or_else(overflow)?;
+    // Both recursive-predicate censuses coexist with the dependency maps.
+    bytes = bytes
+        .checked_add(
+            tree_allocation_bytes::<&str, ()>(program.rules.len())?
+                .checked_mul(2)
+                .ok_or_else(overflow)?,
+        )
+        .ok_or_else(overflow)?;
+    // One reachability traversal is live at a time; recursive calls share its
+    // original visited set, whose possible keys come from these actual edges.
+    bytes
+        .checked_add(tree_allocation_bytes::<&str, ()>(
+            program
+                .rules
+                .len()
+                .checked_add(all_count)
+                .ok_or_else(overflow)?,
+        )?)
+        .ok_or_else(overflow)
+}
 
 /// Boolean truth value for bounded epistemic fixture evaluation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -336,10 +671,21 @@ pub fn plan_epistemic_gpu_execution(program: &Program) -> Result<EpistemicGpuPla
 }
 
 fn plan_prepared_epistemic_gpu_execution(program: &Program) -> Result<EpistemicGpuPlan> {
-    program.validate_prepared_authored_constraint_identity()?;
-    reject_recursive_epistemic_program(program)?;
-    validate_epistemic_relation_shapes(program, &BTreeSet::new())?;
-    let eir = build_eir(program)?;
+    plan_prepared_epistemic_gpu_execution_core(program, &mut None)
+}
+
+fn plan_prepared_epistemic_gpu_execution_core(
+    program: &Program,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<EpistemicGpuPlan> {
+    validate_authored_constraint_identity_with_scope(&program, scope)?;
+    drop(ephemeral_compilation(scope, |scope| {
+        reject_recursive_epistemic_program_core(program, scope)
+    })?);
+    drop(ephemeral_compilation(scope, |scope| {
+        validate_epistemic_relation_shapes_core(program, &BTreeSet::new(), scope)
+    })?);
+    let eir = ephemeral_compilation(scope, |scope| build_eir_with_scope(program, scope))?;
     // Modal dependency cycles are intercepted by the recursive reduction before this
     // single-pass boundary. The remaining EIR has no co-evolving cycle, so one
     // candidate enumeration and world-view validation is sufficient.
@@ -348,27 +694,48 @@ fn plan_prepared_epistemic_gpu_execution(program: &Program) -> Result<EpistemicG
     let mut tuple_membership_bindings = Vec::new();
     let mut solver_assumption_bindings = Vec::new();
 
-    for (rule_index, rule) in eir.rules.iter().enumerate() {
-        let mut rule_epistemic_literals = Vec::new();
-        let mut positive_relational_atoms = Vec::new();
-        let mut has_negated_relational_atom = false;
+    for (rule_index, rule) in eir.value.rules.iter().enumerate() {
+        let rule_inputs = ephemeral_compilation(scope, |scope| {
+            let mut rule_epistemic_literals = Vec::new();
+            let mut positive_relational_atoms = Vec::new();
+            let mut has_negated_relational_atom = false;
 
-        for lit in &rule.body {
-            match lit {
-                EirBodyLiteral::Relational { negated, atom } => {
-                    if *negated {
-                        has_negated_relational_atom = true;
-                    } else {
-                        positive_relational_atoms.push(atom.clone());
+            for lit in &rule.body {
+                match lit {
+                    EirBodyLiteral::Relational { negated, atom } => {
+                        if *negated {
+                            has_negated_relational_atom = true;
+                        } else {
+                            acquire_eir_atom(atom, scope)?;
+                            acquire_push(
+                                &positive_relational_atoms,
+                                positive_relational_atoms.capacity(),
+                                scope,
+                            )?;
+                            positive_relational_atoms.push(atom.clone());
+                        }
                     }
+                    EirBodyLiteral::Epistemic(lit) => {
+                        acquire_eir_atom(&lit.atom, scope)?;
+                        acquire_push(
+                            &rule_epistemic_literals,
+                            rule_epistemic_literals.capacity(),
+                            scope,
+                        )?;
+                        rule_epistemic_literals.push(lit.clone());
+                    }
+                    EirBodyLiteral::Constraint | EirBodyLiteral::Binding => {}
                 }
-                EirBodyLiteral::Epistemic(lit) => {
-                    rule_epistemic_literals.push(lit.clone());
-                }
-                EirBodyLiteral::Constraint | EirBodyLiteral::Binding => {}
             }
-        }
 
+            Ok((
+                rule_epistemic_literals,
+                positive_relational_atoms,
+                has_negated_relational_atom,
+            ))
+        })?;
+        let (rule_epistemic_literals, positive_relational_atoms, has_negated_relational_atom) =
+            &rule_inputs.value;
         if rule_epistemic_literals.is_empty() {
             continue;
         }
@@ -382,9 +749,19 @@ fn plan_prepared_epistemic_gpu_execution(program: &Program) -> Result<EpistemicG
             // (the plan validators and runtime read the same flattened shape).
             // Scalar keys pass through unchanged; unbounded/untyped structured
             // forms fail closed here with a precise finiteness diagnostic.
-            let lit = flatten_epistemic_literal(&lit)?;
+            let lit = flatten_epistemic_literal_core(lit, scope)?;
             let literal_index = epistemic_literals.len();
-            let augmented_head_terms = augmented_eir_head_terms(rule);
+            let augmented_head_terms =
+                ephemeral_compilation(scope, |scope| augmented_eir_head_terms_core(rule, scope))?;
+            acquire_push(
+                &tuple_membership_bindings,
+                tuple_membership_bindings.capacity(),
+                scope,
+            )?;
+            acquire(scope, lit.atom.predicate.len() as u64)?;
+            acquire_vector::<usize>(scope, lit.atom.arity)?;
+            acquire_vector::<Option<usize>>(scope, lit.atom.terms.len())?;
+            acquire_eir_terms(&lit.atom.terms, scope)?;
             tuple_membership_bindings.push(EpistemicTupleMembershipBinding {
                 literal_index,
                 reduction_index,
@@ -393,12 +770,19 @@ fn plan_prepared_epistemic_gpu_execution(program: &Program) -> Result<EpistemicG
                 key_columns: (0..lit.atom.arity).collect(),
                 bound_output_columns: bound_output_columns_for_terms(
                     &lit.atom.terms,
-                    &augmented_head_terms,
+                    &augmented_head_terms.value,
                 ),
                 key_terms: lit.atom.terms.clone(),
                 op: lit.op,
                 negated: lit.negated,
             });
+            acquire_push(
+                &solver_assumption_bindings,
+                solver_assumption_bindings.capacity(),
+                scope,
+            )?;
+            acquire(scope, lit.atom.predicate.len() as u64)?;
+            acquire_eir_terms(&lit.atom.terms, scope)?;
             solver_assumption_bindings.push(EpistemicSolverAssumptionBinding {
                 literal_index,
                 reduction_index,
@@ -408,25 +792,30 @@ fn plan_prepared_epistemic_gpu_execution(program: &Program) -> Result<EpistemicG
                 op: lit.op,
                 negated: lit.negated,
             });
+            acquire_push(&epistemic_literals, epistemic_literals.capacity(), scope)?;
             epistemic_literals.push(lit);
         }
+        acquire_push(&reductions, reductions.capacity(), scope)?;
+        acquire(scope, rule.head.predicate.len() as u64)?;
         reductions.push(EpistemicReductionPlan {
             rule_index,
             head_predicate: rule.head.predicate.clone(),
             public_head_arity: rule.head.terms.len(),
             relational_body_atoms: positive_relational_atoms.len(),
-            wcoj_status: wcoj_status_for_reduction(
-                &positive_relational_atoms,
-                has_negated_relational_atom,
-            ),
+            wcoj_status: wcoj_status_for_reduction_core(
+                positive_relational_atoms,
+                *has_negated_relational_atom,
+                scope,
+            )?,
         });
     }
 
     if epistemic_literals.is_empty() {
-        return Err(xlog_core::XlogError::UnsupportedEpistemicConstruct {
-            construct: "epistemic GPU execution plan".to_string(),
-            context: "requires at least one epistemic literal".to_string(),
-        });
+        return Err(unsupported_diagnostic(
+            scope,
+            "epistemic GPU execution plan",
+            format_args!("{}", "requires at least one epistemic literal"),
+        )?);
     }
 
     // World-view integrity constraints constrain accepted candidate world views.
@@ -435,24 +824,62 @@ fn plan_prepared_epistemic_gpu_execution(program: &Program) -> Result<EpistemicG
     // its modal value is evaluated by the same GPU world-view validation path as
     // rule-body modal literals. Out-of-fragment constraint shapes fail closed.
     let constraints = lower_epistemic_constraints(
-        &eir,
+        &eir.value,
         &mut epistemic_literals,
         &reductions,
         &mut tuple_membership_bindings,
         &mut solver_assumption_bindings,
+        scope,
     )?;
 
-    let final_output_columns = final_output_columns_for_eir(&eir);
-    let gpu_plan = EpistemicGpuPlan::new(eir.mode, epistemic_literals, reductions)
-        .with_tuple_membership_bindings(tuple_membership_bindings)
-        .with_constraints(constraints)
-        .with_final_output_columns(final_output_columns)
-        .with_solver_contract(EpistemicSolverServiceContract::production_default(
-            solver_assumption_bindings,
-        ));
-    gpu_plan.validate_tuple_membership_bindings()?;
-    gpu_plan.validate_solver_contract()?;
-    gpu_plan.validate_constraints()?;
+    let final_output_columns = final_output_columns_for_eir_core(&eir.value, scope)?;
+    let gpu_plan = match scope.as_deref_mut() {
+        Some(scope) => {
+            let solver_contract =
+                EpistemicSolverServiceContract::production_default_with_allocation_owner(
+                    solver_assumption_bindings,
+                    &mut |bytes| scope.acquire(bytes),
+                )?;
+            EpistemicGpuPlan::new_with_prepared_bindings_and_allocation_owner(
+                eir.value.mode,
+                epistemic_literals,
+                reductions,
+                tuple_membership_bindings,
+                solver_contract,
+                &mut |bytes| scope.acquire(bytes),
+            )?
+            .with_constraints(constraints)
+            .with_final_output_columns(final_output_columns)
+        }
+        None => EpistemicGpuPlan::new(eir.value.mode, epistemic_literals, reductions)
+            .with_tuple_membership_bindings(tuple_membership_bindings)
+            .with_constraints(constraints)
+            .with_final_output_columns(final_output_columns)
+            .with_solver_contract(EpistemicSolverServiceContract::production_default(
+                solver_assumption_bindings,
+            )),
+    };
+    drop(ephemeral_compilation(scope, |scope| {
+        match scope.as_deref_mut() {
+            Some(scope) => {
+                gpu_plan.validate_tuple_membership_bindings_with_allocation_owner(
+                    &mut |bytes| scope.reserve_allocation(bytes),
+                )?;
+                gpu_plan.validate_solver_contract_with_allocation_owner(&mut |bytes| {
+                    scope.reserve_allocation(bytes)
+                })?;
+                gpu_plan.validate_constraints_with_allocation_owner(&mut |bytes| {
+                    scope.reserve_allocation(bytes)
+                })?;
+            }
+            None => {
+                gpu_plan.validate_tuple_membership_bindings()?;
+                gpu_plan.validate_solver_contract()?;
+                gpu_plan.validate_constraints()?;
+            }
+        }
+        Ok(())
+    })?);
     Ok(gpu_plan)
 }
 
@@ -477,14 +904,19 @@ fn lower_epistemic_constraints(
     reductions: &[EpistemicReductionPlan],
     tuple_membership_bindings: &mut Vec<EpistemicTupleMembershipBinding>,
     solver_assumption_bindings: &mut Vec<EpistemicSolverAssumptionBinding>,
+    scope: &mut AllocationScope<'_, '_>,
 ) -> Result<Vec<EpistemicConstraintPlan>> {
     let mut constraint_plans = Vec::new();
     for constraint in &eir.constraints {
-        let constraint_index = constraint.authored_index.ok_or_else(|| {
-            XlogError::Compilation(
-                "prepared constraint compilation requires authored identities".to_string(),
-            )
-        })?;
+        let constraint_index = match constraint.authored_index {
+            Some(index) => index,
+            None => {
+                return Err(compilation_diagnostic(
+                    scope,
+                    format_args!("prepared constraint compilation requires authored identities"),
+                )?)
+            }
+        };
         let has_epistemic = constraint
             .body
             .iter()
@@ -496,15 +928,16 @@ fn lower_epistemic_constraints(
         }
 
         if reductions.is_empty() {
-            return Err(XlogError::UnsupportedEpistemicConstruct {
-                construct: "epistemic GPU world-view constraint".to_string(),
-                context: format!(
+            return Err(unsupported_diagnostic(
+                scope,
+                "epistemic GPU world-view constraint",
+                format_args!(
                     "constraint[{constraint_index}] is an epistemic integrity constraint but the \
                      program has no epistemic rule to host its world-view evaluation; add an \
                      epistemic rule whose reduced model provides the accepted world view, or \
                      express the constraint over an existing epistemic rule"
                 ),
-            });
+            )?);
         }
         // Attach constraint modal evaluation to the final rule reduction's
         // active-model context. The reduction's reduced output drives the
@@ -516,27 +949,33 @@ fn lower_epistemic_constraints(
         // non-epistemic body literal up front, so variable-multiplicity counting
         // below sees the final flattened key shape. A non-epistemic literal makes
         // the whole constraint out of fragment.
-        let mut flattened_literals = Vec::new();
-        for lit in &constraint.body {
-            match lit {
-                EirBodyLiteral::Epistemic(lit) => {
-                    flattened_literals.push(flatten_epistemic_literal(lit)?);
-                }
-                EirBodyLiteral::Relational { .. }
-                | EirBodyLiteral::Constraint
-                | EirBodyLiteral::Binding => {
-                    return Err(XlogError::UnsupportedEpistemicConstruct {
-                        construct: "epistemic GPU world-view constraint".to_string(),
-                        context: format!(
+        let flattened_literals = ephemeral_compilation(scope, |scope| {
+            let mut flattened_literals = Vec::new();
+            for lit in &constraint.body {
+                match lit {
+                    EirBodyLiteral::Epistemic(lit) => {
+                        acquire_push(&flattened_literals, flattened_literals.capacity(), scope)?;
+                        flattened_literals.push(flatten_epistemic_literal_core(lit, scope)?);
+                    }
+                    EirBodyLiteral::Relational { .. }
+                    | EirBodyLiteral::Constraint
+                    | EirBodyLiteral::Binding => {
+                        return Err(unsupported_diagnostic(
+                            scope,
+                            "epistemic GPU world-view constraint",
+                            format_args!(
                             "constraint[{constraint_index}] mixes non-epistemic body literals with \
                              modal literals; world-view integrity constraints currently support \
                              pure know/possible conjunctions so the constraint can be evaluated \
                              against accepted world views without an ordinary-RIR rewrite"
                         ),
-                    });
+                        )?);
+                    }
                 }
             }
-        }
+
+            Ok(flattened_literals)
+        })?;
 
         // Variable-keyed world-view constraints (`:- know p(X).`) range the key
         // variable EXISTENTIALLY over the modal relation's tuple-key domain: the
@@ -554,9 +993,31 @@ fn lower_epistemic_constraints(
         // scope. This is finite+typed, NOT a finiteness/resource bound: the
         // diagnostic stays a plain UnsupportedEpistemicConstruct, never a
         // ResourceExhausted, so it is not mistaken for an unbounded-domain wall.
+        let variable_count = flattened_literals
+            .value
+            .iter()
+            .try_fold(0usize, |count, lit| {
+                count
+                    .checked_add(lit.atom.terms.len())
+                    .ok_or_else(|| allocation_extent_overflow("constraint variable count overflow"))
+            })?;
+        let mut variable_bytes = tree_allocation_bytes::<String, usize>(variable_count)?;
+        for lit in &flattened_literals.value {
+            for term in &lit.atom.terms {
+                if let EirTerm::Variable(name) = term {
+                    variable_bytes =
+                        variable_bytes
+                            .checked_add(name.len() as u64)
+                            .ok_or_else(|| {
+                                allocation_extent_overflow("constraint variable text overflow")
+                            })?;
+                }
+            }
+        }
+        let _variables_owner = reserve_scratch(scope, variable_bytes)?;
         let mut variable_occurrences: std::collections::BTreeMap<String, usize> =
             std::collections::BTreeMap::new();
-        for lit in &flattened_literals {
+        for lit in &flattened_literals.value {
             for term in &lit.atom.terms {
                 if let EirTerm::Variable(name) = term {
                     *variable_occurrences.entry(name.clone()).or_insert(0) += 1;
@@ -565,9 +1026,10 @@ fn lower_epistemic_constraints(
         }
 
         let mut literal_indices = Vec::new();
-        for lit in flattened_literals {
+        for lit in &flattened_literals.value {
             // Anonymize single-occurrence constraint-local variables into wildcard
             // key columns; reject shared/repeated variables (multiplicity > 1).
+            acquire_vector::<EirTerm>(scope, lit.atom.terms.len())?;
             let mut anonymized_terms = Vec::with_capacity(lit.atom.terms.len());
             for term in &lit.atom.terms {
                 match term {
@@ -576,17 +1038,14 @@ fn lower_epistemic_constraints(
                     }
                     EirTerm::Variable(name) => {
                         if variable_occurrences.get(name).copied().unwrap_or(0) > 1 {
-                            return Err(XlogError::UnsupportedEpistemicConstruct {
-                                construct: "epistemic GPU world-view constraint".to_string(),
-                                context: format!(
+                            return Err(unsupported_diagnostic(scope, "epistemic GPU world-view constraint", format_args!(
                                     "constraint[{constraint_index}] reuses tuple-key variable \
                                      {name} across literals/positions; shared-variable epistemic \
                                      constraint joins (`:- know p(X), q(X).` / diagonal \
                                      `:- know p(X, X).`) are not yet implemented for GPU world-view \
                                      pruning. Single-occurrence variable keys (`:- know p(X).`) are \
                                      supported and range existentially over the modal relation"
-                                ),
-                            });
+                                ))?);
                         }
                         // A NEGATED variable-keyed literal cannot collapse to a
                         // wildcard: the wildcard computes `not (EXISTS X: know p(X))`
@@ -608,12 +1067,15 @@ fn lower_epistemic_constraints(
                         // positive literal (multiplicity > 1) and exits via the shared-variable
                         // path above, so it never reaches this branch.
                         if lit.negated {
-                            return Err(XlogError::Compilation(format!(
+                            return Err(compilation_diagnostic(
+                                scope,
+                                format_args!(
                                 "v0.8.5 naf error: unbound variable {name} in negated modal atom \
                                  {}/{} in constraint[{constraint_index}]; bind it before not with \
                                  a positive atom, or use '_' for existential positions",
                                 lit.atom.predicate, lit.atom.arity
-                            )));
+                            ),
+                            )?);
                         }
                         // Single occurrence, POSITIVE: existential over the relation
                         // domain == wildcard. Drop the variable identity (no join, no
@@ -622,9 +1084,10 @@ fn lower_epistemic_constraints(
                         anonymized_terms.push(EirTerm::Anonymous);
                     }
                     other => {
-                        return Err(XlogError::UnsupportedEpistemicConstruct {
-                            construct: "epistemic GPU world-view constraint".to_string(),
-                            context: format!(
+                        return Err(unsupported_diagnostic(
+                            scope,
+                            "epistemic GPU world-view constraint",
+                            format_args!(
                                 "constraint[{constraint_index}] uses {} {}/{} with an unsupported \
                                  tuple-key term {other:?}; headless world-view constraints support \
                                  ground (integer/symbol) and single-occurrence variable/anonymous \
@@ -633,7 +1096,7 @@ fn lower_epistemic_constraints(
                                 lit.atom.predicate,
                                 lit.atom.arity
                             ),
-                        });
+                        )?);
                     }
                 }
             }
@@ -641,11 +1104,28 @@ fn lower_epistemic_constraints(
             // tuple-membership binding key_terms, and its solver assumption binding
             // terms all carry the SAME shape (the plan validator requires
             // binding.key_terms == literal.atom.terms).
-            let mut lit = lit;
-            lit.atom.terms = anonymized_terms;
+            acquire(scope, lit.atom.predicate.len() as u64)?;
+            let lit = EirEpistemicLiteral {
+                op: lit.op,
+                negated: lit.negated,
+                atom: xlog_ir::EirAtom {
+                    predicate: lit.atom.predicate.clone(),
+                    arity: lit.atom.arity,
+                    terms: anonymized_terms,
+                },
+            };
 
             let literal_index = epistemic_literals.len();
+            acquire_vector::<Option<usize>>(scope, lit.atom.arity)?;
             let bound_output_columns = vec![None; lit.atom.arity];
+            acquire_push(
+                tuple_membership_bindings,
+                tuple_membership_bindings.capacity(),
+                scope,
+            )?;
+            acquire(scope, lit.atom.predicate.len() as u64)?;
+            acquire_vector::<usize>(scope, lit.atom.arity)?;
+            acquire_eir_terms(&lit.atom.terms, scope)?;
             tuple_membership_bindings.push(EpistemicTupleMembershipBinding {
                 literal_index,
                 reduction_index,
@@ -657,6 +1137,13 @@ fn lower_epistemic_constraints(
                 op: lit.op,
                 negated: lit.negated,
             });
+            acquire_push(
+                solver_assumption_bindings,
+                solver_assumption_bindings.capacity(),
+                scope,
+            )?;
+            acquire(scope, lit.atom.predicate.len() as u64)?;
+            acquire_eir_terms(&lit.atom.terms, scope)?;
             solver_assumption_bindings.push(EpistemicSolverAssumptionBinding {
                 literal_index,
                 reduction_index,
@@ -666,10 +1153,13 @@ fn lower_epistemic_constraints(
                 op: lit.op,
                 negated: lit.negated,
             });
+            acquire_push(epistemic_literals, epistemic_literals.capacity(), scope)?;
             epistemic_literals.push(lit);
+            acquire_push(&literal_indices, literal_indices.capacity(), scope)?;
             literal_indices.push(literal_index);
         }
 
+        acquire_push(&constraint_plans, constraint_plans.capacity(), scope)?;
         constraint_plans.push(EpistemicConstraintPlan {
             constraint_index,
             literal_indices,
@@ -739,18 +1229,26 @@ pub enum RecursiveEpistemicClass {
 /// fixpoint. This guard remains defense-in-depth for direct callers of the single-pass
 /// planner.
 fn reject_recursive_epistemic_program(program: &Program) -> Result<()> {
-    match classify_recursive_epistemic_program(program) {
+    reject_recursive_epistemic_program_core(program, &mut None)
+}
+
+fn reject_recursive_epistemic_program_core(
+    program: &Program,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<()> {
+    match classify_recursive_epistemic_program_core(program, scope) {
         Ok(RecursiveEpistemicClass::NonRecursive) => Ok(()),
         Ok(
             RecursiveEpistemicClass::CaseA
             | RecursiveEpistemicClass::CaseB
             | RecursiveEpistemicClass::ModalCycle,
-        ) => Err(recursive_epistemic_rejection(
+        ) => Err(recursive_epistemic_rejection_core(
             "an epistemic program contains an ordinary or modal dependency cycle; the \
                  single-pass epistemic GPU planner cannot iterate a fixpoint. Admissible \
                  recursive epistemic programs require recursive source preparation and an \
                  iterative execution plan, not this planner.",
-        )),
+            scope,
+        )?),
         // Recursive shapes outside the admissible fragment already carry a specific
         // typed diagnostic.
         Err(err) => Err(err),
@@ -762,6 +1260,13 @@ fn reject_recursive_epistemic_program(program: &Program) -> Result<()> {
 /// Returns a typed [`XlogError::UnsupportedEpistemicConstruct`] for a recursive shape
 /// outside the supported ordinary, co-evolving, or modal-cycle fragments.
 pub fn classify_recursive_epistemic_program(program: &Program) -> Result<RecursiveEpistemicClass> {
+    classify_recursive_epistemic_program_core(program, &mut None)
+}
+
+fn classify_recursive_epistemic_program_core(
+    program: &Program,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<RecursiveEpistemicClass> {
     let has_epistemic = program.rules.iter().any(|rule| {
         rule.body
             .iter()
@@ -777,6 +1282,7 @@ pub fn classify_recursive_epistemic_program(program: &Program) -> Result<Recursi
     // co-evolution graph because a modal dependency cycle must be solved as a
     // fixpoint: treating it as single-pass either fabricates an unfounded tuple cycle
     // or drops a valid transition from a founded predecessor.
+    let _dependency_owner = reserve_scratch(scope, dependency_graph_allocation_bytes(program)?)?;
     let (ordinary_deps, deps) = epistemic_dependency_graphs(program);
 
     let ordinary_recursive_predicates: BTreeSet<&str> = ordinary_deps
@@ -832,7 +1338,7 @@ pub fn classify_recursive_epistemic_program(program: &Program) -> Result<Recursi
     //     `possible` remains the founded least fixpoint. A cycle carried only by modal
     //     dependencies is classified as `ModalCycle`; execution then selects the
     //     semantic reduction before it can reach the single-pass path.
-    let invariant = InvariantRelations::analyze(program);
+    let invariant = InvariantRelations::analyze_with_scope(program, scope)?;
     let mut saw_case_b = false;
     // A NEGATED modal over a NON-invariant target is admissible after reduction. The
     // high-level executor chooses ordinary stratified execution or GPU-backed WFS based
@@ -895,7 +1401,9 @@ pub fn classify_recursive_epistemic_program(program: &Program) -> Result<Recursi
         // Stratified reduced programs continue through the ordinary semi-naive path.
         // Non-monotone reduced programs are handled by the high-level GPU compiler's
         // WFS plan; host WFS is not an accepted execution fallback.
-        let _reduced = reduce_case_a_epistemic_program_to_ordinary(program);
+        drop(ephemeral_compilation(scope, |scope| {
+            reduce_case_a_epistemic_program_to_ordinary_core(program, scope)
+        })?);
     }
 
     // SOUNDNESS GUARD: a recursive epistemic program (Case A/B) routes through the PURE
@@ -916,7 +1424,7 @@ pub fn classify_recursive_epistemic_program(program: &Program) -> Result<Recursi
             .any(|lit| matches!(lit, BodyLiteral::Epistemic(_)))
     });
     if has_epistemic_constraint {
-        return Err(recursive_epistemic_rejection(
+        return Err(recursive_epistemic_rejection_core(
             "a recursive epistemic program carries an epistemic integrity constraint \
              (`:- know ...` / `:- not know ...`). Recursive reductions do not run the \
              single-pass world-view constraint kernel and would otherwise drop the \
@@ -924,7 +1432,8 @@ pub fn classify_recursive_epistemic_program(program: &Program) -> Result<Recursi
              this fails closed rather than silently dropping the constraint. \
              Remove the recursion or express the integrity constraint over a \
              non-recursive (single-pass) epistemic relation.",
-        ));
+            scope,
+        )?);
     }
 
     if modal_only_recursion {
@@ -995,6 +1504,15 @@ fn predicate_dependency_reaches<'a>(
 /// component. The modal literal itself supplies the head-to-target edge; a return
 /// path from target to head proves SCC membership.
 fn recursive_modal_dependency_edges(program: &Program) -> BTreeSet<(String, String)> {
+    recursive_modal_dependency_edges_core(program, &mut None)
+        .expect("unbounded modal dependency census has no owner refusal")
+}
+
+fn recursive_modal_dependency_edges_core(
+    program: &Program,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<BTreeSet<(String, String)>> {
+    let _dependency_owner = reserve_scratch(scope, dependency_graph_allocation_bytes(program)?)?;
     let (_, dependencies) = epistemic_dependency_graphs(program);
     let mut edges = BTreeSet::new();
     for rule in &program.rules {
@@ -1010,18 +1528,30 @@ fn recursive_modal_dependency_edges(program: &Program) -> BTreeSet<(String, Stri
                     &mut BTreeSet::new(),
                 )
             {
+                acquire(
+                    scope,
+                    crate::compile::btree_insert_allocation_bytes::<(String, String), ()>(
+                        edges.len(),
+                    )?,
+                )?;
+                acquire(scope, rule.head.predicate.len() as u64)?;
+                acquire(scope, modal.atom.predicate.len() as u64)?;
                 edges.insert((rule.head.predicate.clone(), modal.atom.predicate.clone()));
             }
         }
     }
-    edges
+    Ok(edges)
 }
 
-fn recursive_epistemic_rejection(context: &str) -> XlogError {
-    XlogError::UnsupportedEpistemicConstruct {
-        construct: "recursive epistemic program".to_string(),
-        context: context.to_string(),
-    }
+fn recursive_epistemic_rejection_core(
+    context: &str,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<XlogError> {
+    unsupported_diagnostic(
+        scope,
+        "recursive epistemic program",
+        format_args!("{context}"),
+    )
 }
 
 /// Predicates whose extension is fixed independent of any ordinary recursion or
@@ -1040,10 +1570,52 @@ struct InvariantRelations<'a> {
     epistemic_heads: BTreeSet<&'a str>,
     /// Predicates defined by at least one non-fact rule (i.e. not pure EDB).
     derived_heads: BTreeSet<&'a str>,
+    _allocation_owner: Option<std::sync::Arc<dyn Send + Sync>>,
 }
 
 impl<'a> InvariantRelations<'a> {
     fn analyze(program: &'a Program) -> Self {
+        Self::analyze_with_scope(program, &mut None)
+            .expect("unbounded invariant analysis has no owner refusal")
+    }
+
+    fn analyze_with_scope(
+        program: &'a Program,
+        scope: &mut AllocationScope<'_, '_>,
+    ) -> Result<Self> {
+        let count = program
+            .rules
+            .iter()
+            .filter(|rule| !rule.body.is_empty())
+            .count();
+        let mut bytes = tree_allocation_bytes::<&str, BTreeSet<&str>>(count)?;
+        for _ in 0..3 {
+            bytes = bytes
+                .checked_add(tree_allocation_bytes::<&str, ()>(count)?)
+                .ok_or_else(|| allocation_extent_overflow("invariant tree allocation overflow"))?;
+        }
+        let dependencies = program.rules.iter().try_fold(0usize, |count, rule| {
+            count
+                .checked_add(
+                    rule.body
+                        .iter()
+                        .filter(|literal| {
+                            matches!(literal, BodyLiteral::Positive(_) | BodyLiteral::Negated(_))
+                        })
+                        .count(),
+                )
+                .ok_or_else(|| {
+                    allocation_extent_overflow("invariant dependency allocation overflow")
+                })
+        })?;
+        // A head can accumulate dependencies from several authored rules. The
+        // whole edge roster covers the largest of those actual child trees.
+        bytes = bytes
+            .checked_add(tree_allocation_bytes::<&str, ()>(dependencies)?)
+            .ok_or_else(|| {
+                allocation_extent_overflow("invariant dependency allocation overflow")
+            })?;
+        let allocation_owner = reserve_scratch(scope, bytes)?;
         let mut ordinary_deps: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
         let mut epistemic_heads: BTreeSet<&str> = BTreeSet::new();
         let mut derived_heads: BTreeSet<&str> = BTreeSet::new();
@@ -1066,11 +1638,12 @@ impl<'a> InvariantRelations<'a> {
                 }
             }
         }
-        Self {
+        Ok(Self {
             ordinary_deps,
             epistemic_heads,
             derived_heads,
-        }
+            _allocation_owner: allocation_owner,
+        })
     }
 
     /// Whether `predicate`'s extension is fixed independent of the recursion.
@@ -1114,12 +1687,28 @@ fn eir_epistemic_literal_label(lit: &xlog_ir::EirEpistemicLiteral) -> &'static s
 }
 
 fn has_independent_founded_support(eir: &EirProgram, atom: &xlog_ir::EirAtom) -> bool {
+    has_independent_founded_support_core(eir, atom, &mut None)
+        .expect("unbounded foundedness analysis has no owner refusal")
+}
+
+fn has_independent_founded_support_core(
+    eir: &EirProgram,
+    atom: &xlog_ir::EirAtom,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<bool> {
     if atom.arity > 0 && !atom.terms.iter().all(eir_term_is_ground) {
-        return false;
+        return Ok(false);
     }
 
+    let mut storage_owner = None;
     let mut support_stack = Vec::new();
-    has_independent_founded_support_inner(eir, atom, &mut support_stack)
+    has_independent_founded_support_inner_core(
+        eir,
+        atom,
+        &mut support_stack,
+        &mut storage_owner,
+        scope,
+    )
 }
 
 /// Whether a ground atom is unconditionally derived by the authored ordinary rules.
@@ -1131,12 +1720,28 @@ fn has_independent_founded_support(eir: &EirProgram, atom: &xlog_ir::EirAtom) ->
 /// ordinary rule, and constraints/bindings are rejected because EIR intentionally
 /// erases the expression needed to prove them at this boundary.
 fn has_unconditional_ground_founded_support(eir: &EirProgram, atom: &xlog_ir::EirAtom) -> bool {
+    has_unconditional_ground_founded_support_core(eir, atom, &mut None)
+        .expect("unbounded ground foundedness analysis has no owner refusal")
+}
+
+fn has_unconditional_ground_founded_support_core(
+    eir: &EirProgram,
+    atom: &xlog_ir::EirAtom,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<bool> {
     if !atom.terms.iter().all(eir_term_is_ground) {
-        return false;
+        return Ok(false);
     }
 
+    let mut storage_owner = None;
     let mut support_stack = Vec::new();
-    has_unconditional_ground_founded_support_inner(eir, atom, &mut support_stack)
+    has_unconditional_ground_founded_support_inner_core(
+        eir,
+        atom,
+        &mut support_stack,
+        &mut storage_owner,
+        scope,
+    )
 }
 
 fn has_unconditional_ground_founded_support_inner(
@@ -1144,30 +1749,102 @@ fn has_unconditional_ground_founded_support_inner(
     atom: &xlog_ir::EirAtom,
     support_stack: &mut Vec<(String, Vec<EirTerm>)>,
 ) -> bool {
-    let key = (atom.predicate.clone(), atom.terms.clone());
-    if support_stack.iter().any(|ancestor| ancestor == &key) {
-        return false;
-    }
-    support_stack.push(key);
+    has_unconditional_ground_founded_support_inner_core(
+        eir,
+        atom,
+        support_stack,
+        &mut None,
+        &mut None,
+    )
+    .expect("unbounded ground foundedness analysis has no owner refusal")
+}
 
-    let supported = eir.rules.iter().any(|rule| {
-        let Some(substitution) = head_substitution_to_atom(&rule.head, atom) else {
-            return false;
-        };
-        rule.body.iter().all(|literal| match literal {
-            EirBodyLiteral::Relational {
-                negated: false,
-                atom,
-            } => substitute_eir_atom(atom, &substitution).is_some_and(|atom| {
-                atom.terms.iter().all(eir_term_is_ground)
-                    && has_unconditional_ground_founded_support_inner(eir, &atom, support_stack)
-            }),
-            EirBodyLiteral::Epistemic(_)
-            | EirBodyLiteral::Relational { negated: true, .. }
-            | EirBodyLiteral::Constraint
-            | EirBodyLiteral::Binding => false,
-        })
-    });
+fn has_unconditional_ground_founded_support_inner_core(
+    eir: &EirProgram,
+    atom: &xlog_ir::EirAtom,
+    support_stack: &mut Vec<(String, Vec<EirTerm>)>,
+    storage_owner: &mut Option<std::sync::Arc<dyn Send + Sync>>,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<bool> {
+    if support_stack
+        .iter()
+        .any(|ancestor| ancestor.0 == atom.predicate && ancestor.1 == atom.terms)
+    {
+        return Ok(false);
+    }
+    let mut key_bytes = (atom.predicate.len() as u64)
+        .checked_add(crate::compile::push_vector_allocation_bytes::<EirTerm>(
+            atom.terms.len(),
+        )?)
+        .ok_or_else(|| allocation_extent_overflow("ground foundedness key allocation overflow"))?;
+    for term in &atom.terms {
+        key_bytes = key_bytes
+            .checked_add(crate::eir::term_clone_allocation_bytes(term)?)
+            .ok_or_else(|| {
+                allocation_extent_overflow("ground foundedness key allocation overflow")
+            })?;
+    }
+    let _key_owner = reserve_scratch(scope, key_bytes)?;
+    let replacement = if support_stack.len() == support_stack.capacity() {
+        reserve_scratch(
+            scope,
+            crate::compile::push_vector_allocation_bytes::<(String, Vec<EirTerm>)>(
+                support_stack.len().checked_add(1).ok_or_else(|| {
+                    allocation_extent_overflow("ground foundedness stack count overflow")
+                })?,
+            )?,
+        )?
+    } else {
+        None
+    };
+    let previous = if replacement.is_some() {
+        std::mem::replace(storage_owner, replacement)
+    } else {
+        None
+    };
+    support_stack.push((atom.predicate.clone(), atom.terms.clone()));
+    drop(previous);
+
+    let supported = (|| -> Result<bool> {
+        for rule in &eir.rules {
+            let Some(substitution) = head_substitution_to_atom_with_scope(&rule.head, atom, scope)?
+            else {
+                continue;
+            };
+            let mut supported = true;
+            for literal in &rule.body {
+                let EirBodyLiteral::Relational {
+                    negated: false,
+                    atom,
+                } = literal
+                else {
+                    supported = false;
+                    break;
+                };
+                let Some(atom) = substitute_eir_atom_with_scope(atom, &substitution.value, scope)?
+                else {
+                    supported = false;
+                    break;
+                };
+                if !atom.value.terms.iter().all(eir_term_is_ground)
+                    || !has_unconditional_ground_founded_support_inner_core(
+                        eir,
+                        &atom.value,
+                        support_stack,
+                        storage_owner,
+                        scope,
+                    )?
+                {
+                    supported = false;
+                    break;
+                }
+            }
+            if supported {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    })();
 
     support_stack.pop();
     supported
@@ -1178,39 +1855,119 @@ fn has_tuple_level_independent_founded_support(
     modal_rule: &xlog_ir::EirRule,
     atom: &xlog_ir::EirAtom,
 ) -> bool {
+    has_tuple_level_independent_founded_support_core(eir, modal_rule, atom, &mut None)
+        .expect("unbounded tuple foundedness analysis has no owner refusal")
+}
+
+fn positive_relational_body_atoms_with_scope(
+    rule: &xlog_ir::EirRule,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<RetainedEpistemicAllocation<Vec<xlog_ir::EirAtom>>> {
+    let count = rule
+        .body
+        .iter()
+        .filter(|literal| matches!(literal, EirBodyLiteral::Relational { negated: false, .. }))
+        .count();
+    let mut bytes = crate::compile::push_vector_allocation_bytes::<xlog_ir::EirAtom>(count)?;
+    for literal in &rule.body {
+        if let EirBodyLiteral::Relational {
+            negated: false,
+            atom,
+        } = literal
+        {
+            bytes = bytes
+                .checked_add(atom.predicate.len() as u64)
+                .and_then(|bytes| {
+                    bytes.checked_add(
+                        crate::compile::push_vector_allocation_bytes::<EirTerm>(atom.terms.len())
+                            .ok()?,
+                    )
+                })
+                .ok_or_else(|| {
+                    allocation_extent_overflow("foundedness domain allocation overflow")
+                })?;
+            for term in &atom.terms {
+                bytes = bytes
+                    .checked_add(crate::eir::term_clone_allocation_bytes(term)?)
+                    .ok_or_else(|| {
+                        allocation_extent_overflow("foundedness domain allocation overflow")
+                    })?;
+            }
+        }
+    }
+    let owner = reserve_scratch(scope, bytes)?;
+    Ok(RetainedEpistemicAllocation {
+        value: positive_relational_body_atoms(rule),
+        _owner: owner,
+    })
+}
+
+fn has_tuple_level_independent_founded_support_core(
+    eir: &EirProgram,
+    modal_rule: &xlog_ir::EirRule,
+    atom: &xlog_ir::EirAtom,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<bool> {
     if atom.arity == 0 {
-        return false;
+        return Ok(false);
     }
 
-    let modal_domain = positive_relational_body_atoms(modal_rule);
-    eir.rules.iter().any(|support_rule| {
-        if !support_rule_head_matches_modal_atom(support_rule, atom) {
-            return false;
-        }
-        let mut support_stack = vec![(atom.predicate.clone(), atom.arity)];
-        if !eir_rule_has_independent_founded_body(eir, support_rule, &mut support_stack) {
-            return false;
-        }
-        let Some(substitution) = head_substitution_to_atom(&support_rule.head, atom) else {
-            return false;
-        };
-        let support_domain = positive_relational_body_atoms(support_rule);
-        if support_domain.is_empty() {
-            return false;
-        }
-        let Some(substituted_support_domain) = support_domain
-            .iter()
-            .map(|atom| substitute_eir_atom(atom, &substitution))
-            .collect::<Option<Vec<_>>>()
+    let modal_domain = positive_relational_body_atoms_with_scope(modal_rule, scope)?;
+    for support_rule in &eir.rules {
+        let Some(substitution) =
+            head_substitution_to_atom_with_scope(&support_rule.head, atom, scope)?
         else {
-            return false;
+            continue;
         };
-        substituted_support_domain.iter().all(|support_atom| {
-            modal_domain
-                .iter()
-                .any(|modal_atom| modal_atom == support_atom)
-        })
-    })
+        let _initial_key_owner = reserve_scratch(
+            scope,
+            atom.predicate.len() as u64 + std::mem::size_of::<(String, usize)>() as u64,
+        )?;
+        let mut storage_owner = None;
+        let mut support_stack = vec![(atom.predicate.clone(), atom.arity)];
+        if !eir_rule_has_independent_founded_body_with_substitution_core(
+            eir,
+            support_rule,
+            &BTreeMap::new(),
+            &mut support_stack,
+            &mut storage_owner,
+            scope,
+        )? {
+            continue;
+        }
+        let support_domain = positive_relational_body_atoms_with_scope(support_rule, scope)?;
+        if support_domain.value.is_empty() {
+            continue;
+        }
+        let _substituted_storage_owner = reserve_scratch(
+            scope,
+            crate::compile::push_vector_allocation_bytes::<
+                RetainedEpistemicAllocation<xlog_ir::EirAtom>,
+            >(support_domain.value.len())?,
+        )?;
+        let mut substituted_support_domain = Vec::with_capacity(support_domain.value.len());
+        let mut complete = true;
+        for support_atom in &support_domain.value {
+            match substitute_eir_atom_with_scope(support_atom, &substitution.value, scope)? {
+                Some(atom) => substituted_support_domain.push(atom),
+                None => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        if complete
+            && substituted_support_domain.iter().all(|support_atom| {
+                modal_domain
+                    .value
+                    .iter()
+                    .any(|modal_atom| modal_atom == &support_atom.value)
+            })
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn positive_relational_body_atoms(rule: &xlog_ir::EirRule) -> Vec<xlog_ir::EirAtom> {
@@ -1315,27 +2072,48 @@ fn has_independent_founded_support_inner(
     atom: &xlog_ir::EirAtom,
     support_stack: &mut Vec<(String, usize)>,
 ) -> bool {
+    has_independent_founded_support_inner_core(eir, atom, support_stack, &mut None, &mut None)
+        .expect("unbounded foundedness analysis has no owner refusal")
+}
+
+fn has_independent_founded_support_inner_core(
+    eir: &EirProgram,
+    atom: &xlog_ir::EirAtom,
+    support_stack: &mut Vec<(String, usize)>,
+    storage_owner: &mut Option<std::sync::Arc<dyn Send + Sync>>,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<bool> {
     if atom.arity > 0 && !atom.terms.iter().all(eir_term_is_ground) {
-        return false;
+        return Ok(false);
     }
 
-    let key = (atom.predicate.clone(), atom.arity);
-    if support_stack.iter().any(|ancestor| ancestor == &key) {
-        return false;
+    if support_stack
+        .iter()
+        .any(|ancestor| ancestor.0 == atom.predicate && ancestor.1 == atom.arity)
+    {
+        return Ok(false);
     }
-    support_stack.push(key);
+    let _key_owner = signature_stack_push(support_stack, storage_owner, atom, scope)?;
 
-    let supported = eir.rules.iter().any(|rule| {
-        let Some(substitution) = head_substitution_to_atom(&rule.head, atom) else {
-            return false;
-        };
-        eir_rule_has_independent_founded_body_with_substitution(
-            eir,
-            rule,
-            &substitution,
-            support_stack,
-        )
-    });
+    let supported = (|| -> Result<bool> {
+        for rule in &eir.rules {
+            let Some(substitution) = head_substitution_to_atom_with_scope(&rule.head, atom, scope)?
+            else {
+                continue;
+            };
+            if eir_rule_has_independent_founded_body_with_substitution_core(
+                eir,
+                rule,
+                &substitution.value,
+                support_stack,
+                storage_owner,
+                scope,
+            )? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    })();
 
     support_stack.pop();
     supported
@@ -1360,40 +2138,73 @@ fn eir_rule_has_independent_founded_body_with_substitution(
     substitution: &BTreeMap<String, EirTerm>,
     support_stack: &mut Vec<(String, usize)>,
 ) -> bool {
-    rule.body.iter().all(|lit| match lit {
-        EirBodyLiteral::Epistemic(_) => false,
-        EirBodyLiteral::Relational { negated: true, .. } => false,
-        EirBodyLiteral::Relational {
-            negated: false,
-            atom,
-        } => {
-            let Some(atom) = substitute_eir_atom(atom, substitution) else {
-                return false;
-            };
-            let dependency_key = (atom.predicate.clone(), atom.arity);
-            if support_stack
-                .iter()
-                .any(|ancestor| ancestor == &dependency_key)
-            {
-                return false;
+    eir_rule_has_independent_founded_body_with_substitution_core(
+        eir,
+        rule,
+        substitution,
+        support_stack,
+        &mut None,
+        &mut None,
+    )
+    .expect("unbounded foundedness analysis has no owner refusal")
+}
+
+fn eir_rule_has_independent_founded_body_with_substitution_core(
+    eir: &EirProgram,
+    rule: &xlog_ir::EirRule,
+    substitution: &BTreeMap<String, EirTerm>,
+    support_stack: &mut Vec<(String, usize)>,
+    storage_owner: &mut Option<std::sync::Arc<dyn Send + Sync>>,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<bool> {
+    for lit in &rule.body {
+        match lit {
+            EirBodyLiteral::Epistemic(_) => return Ok(false),
+            EirBodyLiteral::Relational { negated: true, .. } => return Ok(false),
+            EirBodyLiteral::Relational {
+                negated: false,
+                atom,
+            } => {
+                let Some(atom) = substitute_eir_atom_with_scope(atom, substitution, scope)? else {
+                    return Ok(false);
+                };
+                let atom = &atom.value;
+                if support_stack
+                    .iter()
+                    .any(|ancestor| ancestor.0 == atom.predicate && ancestor.1 == atom.arity)
+                {
+                    return Ok(false);
+                }
+                let mut has_defining_rule = false;
+                for candidate in &eir.rules {
+                    if head_substitution_to_atom_with_scope(&candidate.head, atom, scope)?.is_some()
+                    {
+                        has_defining_rule = true;
+                        break;
+                    }
+                }
+                if has_defining_rule
+                    && !has_independent_founded_support_inner_core(
+                        eir,
+                        atom,
+                        support_stack,
+                        storage_owner,
+                        scope,
+                    )?
+                {
+                    return Ok(false);
+                }
             }
-            if !eir
-                .rules
-                .iter()
-                .any(|rule| head_substitution_to_atom(&rule.head, &atom).is_some())
-            {
-                return true;
-            }
-            has_independent_founded_support_inner(eir, &atom, support_stack)
+            // EIR preserves only the presence of comparisons and bindings, not the
+            // expression needed to prove that they hold for every tuple in the modal
+            // rule's domain. Treating them as unconditional would let a restricted
+            // support rule (for example `X = 1`) found unrelated tuples. A richer proof
+            // may admit such rules later; this structural foundedness check must remain
+            // conservative until then.
+            EirBodyLiteral::Constraint | EirBodyLiteral::Binding => return Ok(false),
         }
-        // EIR preserves only the presence of comparisons and bindings, not the
-        // expression needed to prove that they hold for every tuple in the modal
-        // rule's domain. Treating them as unconditional would let a restricted
-        // support rule (for example `X = 1`) found unrelated tuples. A richer proof
-        // may admit such rules later; this structural foundedness check must remain
-        // conservative until then.
-        EirBodyLiteral::Constraint | EirBodyLiteral::Binding => false,
-    })
+    }
+    Ok(true)
 }
 
 fn eir_term_is_ground(term: &EirTerm) -> bool {
@@ -1430,20 +2241,39 @@ pub fn compile_epistemic_gpu_execution_with_stats_snapshot(
     program: &Program,
     stats_snapshot: Option<&StatsSnapshot>,
 ) -> Result<EpistemicExecutablePlan> {
-    let mut prepared = program.clone();
-    if prepared.authored_constraint_source_bound.is_some() {
-        prepared.validate_prepared_authored_constraint_identity()?;
-    } else {
-        prepared.prepare_authored_constraint_identity_at_root()?;
-    }
-    compile_epistemic_gpu_execution_inner(&prepared, stats_snapshot, false)
+    compile_epistemic_gpu_execution_core(program, stats_snapshot, &mut None)
+}
+
+/// Compile the same production epistemic plan under the original allocation owner.
+pub fn compile_epistemic_gpu_execution_with_allocation_owner(
+    program: &Program,
+    scope: &mut CompilationAllocationScope<'_>,
+) -> Result<EpistemicExecutablePlan> {
+    compile_epistemic_gpu_execution_core(program, None, &mut Some(scope))
+}
+
+fn compile_epistemic_gpu_execution_core(
+    program: &Program,
+    stats_snapshot: Option<&StatsSnapshot>,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<EpistemicExecutablePlan> {
+    let prepared = ephemeral_compilation(scope, |scope| {
+        let mut prepared = clone_program(program, scope)?;
+        if prepared.authored_constraint_source_bound.is_some() {
+            validate_authored_constraint_identity_with_scope(&prepared, scope)?;
+        } else {
+            prepare_authored_constraint_identity_with_scope(&mut prepared, scope)?;
+        }
+        Ok(prepared)
+    })?;
+    compile_epistemic_gpu_execution_inner(&prepared.value, stats_snapshot, false, scope)
 }
 
 /// Lower an epistemic program to its GPU contract and reduced runtime plan.
 ///
 /// When `allow_multiple_output_heads` is false (the default monolithic and
 /// single-head split path) the single-output-buffer contract
-/// ([`require_single_epistemic_output_relation`]) is enforced. When true, the
+/// ([`require_single_epistemic_output_relation_core`]) is enforced. When true, the
 /// caller has proven the component is a JOINT-SOLVABLE coalesced multi-head
 /// component (see [`classify_cross_component_modal_coupling`]): one candidate
 /// enumeration + world-view validation over the combined modal literals, with
@@ -1452,11 +2282,12 @@ fn compile_epistemic_gpu_execution_inner(
     program: &Program,
     stats_snapshot: Option<&StatsSnapshot>,
     allow_multiple_output_heads: bool,
+    scope: &mut AllocationScope<'_, '_>,
 ) -> Result<EpistemicExecutablePlan> {
-    program.validate_prepared_authored_constraint_identity()?;
-    let gpu_plan = plan_prepared_epistemic_gpu_execution(program)?;
+    validate_authored_constraint_identity_with_scope(&program, scope)?;
+    let gpu_plan = plan_prepared_epistemic_gpu_execution_core(program, scope)?;
     if !allow_multiple_output_heads {
-        require_single_epistemic_output_relation(&gpu_plan)?;
+        require_single_epistemic_output_relation_core(&gpu_plan, scope)?;
     }
     // JOINT-SOLVING multi-head materialization now projects each coupled head by ITS
     // OWN `public_head_arity` (see `final_output_columns_for_materialization`): each
@@ -1466,10 +2297,23 @@ fn compile_epistemic_gpu_execution_inner(
     // projects every head's public tuple shape soundly, including coupled heads of
     // DIFFERING arity. The former blanket fail-closed guard on
     // `final_output_columns.is_some()` over multiple heads is no longer needed.
-    let reduced_program = reduce_epistemic_program_to_ordinary(program)?;
+    let reduced_program = ephemeral_compilation(scope, |scope| {
+        reduce_epistemic_program_to_ordinary_core(program, scope)
+    })?;
     let mut compiler = Compiler::new();
-    let reduced_runtime_plan =
-        compiler.compile_prepared_program_with_stats_snapshot(&reduced_program, stats_snapshot)?;
+    let reduced_runtime_plan = match scope.as_deref_mut() {
+        Some(scope) => compiler.compile_prepared_program_with_stats_snapshot_and_allocation_owner(
+            &reduced_program.value,
+            stats_snapshot,
+            scope,
+        )?,
+        None => compiler
+            .compile_prepared_program_with_stats_snapshot(&reduced_program.value, stats_snapshot)?,
+    };
+    acquire_vector::<(String, xlog_core::RelId)>(scope, compiler.rel_ids().len())?;
+    for name in compiler.rel_ids().keys() {
+        acquire(scope, name.len() as u64)?;
+    }
     let relation_ids = compiler
         .rel_ids()
         .iter()
@@ -1547,12 +2391,37 @@ impl PreparedEpistemicProgram {
 /// Validate authored contracts before semantics can remove a rule, then exclude only
 /// positive exact-tuple FAEEL self-support with no independent founded support.
 pub fn prepare_epistemic_program(program: &Program) -> Result<PreparedEpistemicProgram> {
-    let prepared = prepare_root_authored_constraint_identity(program)?;
-    validate_prepared_epistemic_source_program(&prepared)?;
-    let removed_rule_indices = faeel_unfounded_exact_tuple_self_support_rule_indices(&prepared);
+    prepare_epistemic_program_core(program, &mut None)
+}
+
+/// Preserve authored validation and foundedness filtering under one allocation owner.
+pub fn prepare_epistemic_program_with_allocation_owner(
+    program: &Program,
+    scope: &mut CompilationAllocationScope<'_>,
+) -> Result<PreparedEpistemicProgram> {
+    prepare_epistemic_program_core(program, &mut Some(scope))
+}
+
+fn prepare_epistemic_program_core(
+    program: &Program,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<PreparedEpistemicProgram> {
+    let prepared = ephemeral_compilation(scope, |scope| {
+        prepare_root_authored_constraint_identity_core(program, scope)
+    })?;
+    drop(ephemeral_compilation(scope, |scope| {
+        validate_prepared_epistemic_source_program_core(&prepared.value, scope)
+    })?);
+    let removed_rule_indices = ephemeral_compilation(scope, |scope| {
+        faeel_unfounded_exact_tuple_self_support_rule_indices_core(&prepared.value, scope)
+    })?;
     Ok(PreparedEpistemicProgram {
-        active_program: program_without_rule_indices(&prepared, &removed_rule_indices),
-        removed_unfounded_rule_count: removed_rule_indices.len(),
+        active_program: program_without_rule_indices_core(
+            &prepared.value,
+            &removed_rule_indices.value,
+            scope,
+        )?,
+        removed_unfounded_rule_count: removed_rule_indices.value.len(),
     })
 }
 
@@ -1567,68 +2436,129 @@ struct G91CompatibilityLiteralLocation {
 pub fn try_prepare_g91_compatibility_reduction(
     prepared: &PreparedEpistemicProgram,
 ) -> Result<Option<G91CompatibilityReduction>> {
+    try_prepare_g91_compatibility_reduction_core(prepared, &mut None)
+}
+
+/// Build the canonical compatibility reduction with custody of its program storage.
+pub fn try_prepare_g91_compatibility_reduction_with_allocation_owner(
+    prepared: &PreparedEpistemicProgram,
+    scope: &mut CompilationAllocationScope<'_>,
+) -> Result<Option<G91CompatibilityReduction>> {
+    try_prepare_g91_compatibility_reduction_core(prepared, &mut Some(scope))
+}
+
+fn try_prepare_g91_compatibility_reduction_core(
+    prepared: &PreparedEpistemicProgram,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<Option<G91CompatibilityReduction>> {
     let program = prepared.active_program();
     if program.directives.epistemic_mode_or_default() != EpistemicMode::G91 {
         return Ok(None);
     }
-    if classify_recursive_epistemic_program(program)? == RecursiveEpistemicClass::NonRecursive {
+    if ephemeral_compilation(scope, |scope| {
+        classify_recursive_epistemic_program_core(program, scope)
+    })?
+    .value
+        == RecursiveEpistemicClass::NonRecursive
+    {
         return Ok(None);
     }
 
-    validate_epistemic_derived_relation_identity(program, &BTreeSet::new())?;
-    let recursive_modal_edges = recursive_modal_dependency_edges(program);
-    let invariant = InvariantRelations::analyze(program);
-    let mut locations = BTreeSet::new();
-    let mut target_arities = BTreeMap::new();
-    for (rule_index, rule) in program.rules.iter().enumerate() {
-        for (literal_index, literal) in rule.body.iter().enumerate() {
-            let BodyLiteral::Epistemic(modal) = literal else {
-                continue;
-            };
-            if !is_g91_compatibility_literal(rule, modal, &invariant, &recursive_modal_edges) {
-                continue;
+    drop(ephemeral_compilation(scope, |scope| {
+        validate_epistemic_derived_relation_identity_core(program, &BTreeSet::new(), scope)
+    })?);
+    let recursive_modal_edges = ephemeral_compilation(scope, |scope| {
+        recursive_modal_dependency_edges_core(program, scope)
+    })?;
+    let invariant = InvariantRelations::analyze_with_scope(program, scope)?;
+    let location_inputs = ephemeral_compilation(scope, |scope| {
+        let mut locations = BTreeSet::new();
+        let mut target_arities = BTreeMap::new();
+        for (rule_index, rule) in program.rules.iter().enumerate() {
+            for (literal_index, literal) in rule.body.iter().enumerate() {
+                let BodyLiteral::Epistemic(modal) = literal else {
+                    continue;
+                };
+                if !is_g91_compatibility_literal_core(
+                    rule,
+                    modal,
+                    &invariant,
+                    &recursive_modal_edges.value,
+                    scope,
+                )? {
+                    continue;
+                }
+                acquire(
+                    scope,
+                    crate::compile::btree_insert_allocation_bytes::<
+                        G91CompatibilityLiteralLocation,
+                        (),
+                    >(locations.len())?,
+                )?;
+                locations.insert(G91CompatibilityLiteralLocation {
+                    rule_index,
+                    literal_index,
+                });
+                acquire(scope, modal.atom.predicate.len() as u64)?;
+                if !target_arities.contains_key(&modal.atom.predicate) {
+                    acquire(
+                        scope,
+                        crate::compile::btree_insert_allocation_bytes::<String, usize>(
+                            target_arities.len(),
+                        )?,
+                    )?;
+                }
+                target_arities
+                    .entry(modal.atom.predicate.clone())
+                    .and_modify(|arity| {
+                        debug_assert_eq!(*arity, modal.atom.arity());
+                    })
+                    .or_insert(modal.atom.arity());
             }
-            locations.insert(G91CompatibilityLiteralLocation {
-                rule_index,
-                literal_index,
-            });
-            target_arities
-                .entry(modal.atom.predicate.clone())
-                .and_modify(|arity| {
-                    debug_assert_eq!(*arity, modal.atom.arity());
-                })
-                .or_insert(modal.atom.arity());
         }
-    }
+        Ok((locations, target_arities))
+    })?;
+    let (locations, target_arities) = &location_inputs.value;
     if locations.is_empty() {
         return Ok(None);
     }
 
-    reject_nonmonotone_g91_compatibility_components(program, &locations)?;
-    let snapshot_relations = g91_snapshot_relation_names(program, target_arities.keys());
-    let upper_bound_program = transform_g91_compatibility_program(
+    reject_nonmonotone_g91_compatibility_components_core(program, locations, scope)?;
+    let snapshot_relations =
+        g91_snapshot_relation_names_core(program, target_arities.keys(), scope)?;
+    let upper_bound_program = transform_g91_compatibility_program_core(
         program,
-        &locations,
+        locations,
         G91CompatibilityTransform::UpperBound,
-    );
-    let mut refinement_program = transform_g91_compatibility_program(
+        scope,
+    )?;
+    let mut refinement_program = transform_g91_compatibility_program_core(
         program,
-        &locations,
+        locations,
         G91CompatibilityTransform::Snapshot(&snapshot_relations),
-    );
-    add_declared_g91_snapshot_relations(
+        scope,
+    )?;
+    add_declared_g91_snapshot_relations_core(
         &mut refinement_program,
         program,
         &snapshot_relations,
-        &target_arities,
-    );
+        target_arities,
+        scope,
+    )?;
 
-    let convergence_predicates = program
-        .proper_rules()
-        .map(|rule| rule.head.predicate.clone())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
+    acquire_vector::<String>(scope, program.rules.len())?;
+    let _convergence_owner = reserve_scratch(
+        scope,
+        tree_allocation_bytes::<String, ()>(program.rules.len())?,
+    )?;
+    let mut convergence = BTreeSet::new();
+    for rule in program.proper_rules() {
+        if !convergence.contains(rule.head.predicate.as_str()) {
+            acquire(scope, rule.head.predicate.len() as u64)?;
+            convergence.insert(rule.head.predicate.clone());
+        }
+    }
+    let convergence_predicates = convergence.into_iter().collect();
     Ok(Some(G91CompatibilityReduction {
         upper_bound_program,
         refinement_program,
@@ -1643,12 +2573,34 @@ fn is_g91_compatibility_literal(
     invariant: &InvariantRelations<'_>,
     recursive_modal_edges: &BTreeSet<(String, String)>,
 ) -> bool {
-    modal.op == EpistemicOp::Possible
-        && !modal.negated
-        && !invariant.is_invariant(&modal.atom.predicate)
-        && recursive_modal_edges
+    is_g91_compatibility_literal_core(rule, modal, invariant, recursive_modal_edges, &mut None)
+        .expect("unbounded compatibility classification has no owner refusal")
+}
+
+fn is_g91_compatibility_literal_core(
+    rule: &crate::ast::Rule,
+    modal: &EpistemicLiteral,
+    invariant: &InvariantRelations<'_>,
+    recursive_modal_edges: &BTreeSet<(String, String)>,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<bool> {
+    if modal.op != EpistemicOp::Possible
+        || modal.negated
+        || invariant.is_invariant(&modal.atom.predicate)
+    {
+        return Ok(false);
+    }
+    let _key_owner = reserve_scratch(
+        scope,
+        (rule.head.predicate.len() as u64)
+            .checked_add(modal.atom.predicate.len() as u64)
+            .ok_or_else(|| allocation_extent_overflow("compatibility edge allocation overflow"))?,
+    )?;
+    Ok(
+        recursive_modal_edges
             .contains(&(rule.head.predicate.clone(), modal.atom.predicate.clone()))
-        && modal.atom.terms == rule.head.terms
+            && modal.atom.terms == rule.head.terms,
+    )
 }
 
 enum G91CompatibilityTransform<'a> {
@@ -1661,7 +2613,17 @@ fn transform_g91_compatibility_program(
     locations: &BTreeSet<G91CompatibilityLiteralLocation>,
     transform: G91CompatibilityTransform<'_>,
 ) -> Program {
-    let mut reduced = program.clone();
+    transform_g91_compatibility_program_core(program, locations, transform, &mut None)
+        .expect("unbounded compatibility transform has no owner refusal")
+}
+
+fn transform_g91_compatibility_program_core(
+    program: &Program,
+    locations: &BTreeSet<G91CompatibilityLiteralLocation>,
+    transform: G91CompatibilityTransform<'_>,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<Program> {
+    let mut reduced = clone_program(program, scope)?;
     for (rule_index, rule) in reduced.rules.iter_mut().enumerate() {
         for (literal_index, literal) in rule.body.iter_mut().enumerate() {
             let BodyLiteral::Epistemic(modal) = literal else {
@@ -1678,7 +2640,15 @@ fn transform_g91_compatibility_program(
                         right: Term::Integer(1),
                     }),
                     G91CompatibilityTransform::Snapshot(snapshot_relations) => {
+                        acquire(scope, modal.atom.owned_allocation_bytes()?)?;
                         let mut atom = modal.atom.clone();
+                        acquire(
+                            scope,
+                            snapshot_relations
+                                .get(&atom.predicate)
+                                .expect("selected compatibility target has a snapshot name")
+                                .len() as u64,
+                        )?;
                         atom.predicate = snapshot_relations
                             .get(&atom.predicate)
                             .expect("selected compatibility target has a snapshot name")
@@ -1687,6 +2657,7 @@ fn transform_g91_compatibility_program(
                     }
                 };
             } else {
+                acquire(scope, modal.atom.owned_allocation_bytes()?)?;
                 *literal = if modal.negated {
                     BodyLiteral::Negated(modal.atom.clone())
                 } else {
@@ -1701,41 +2672,121 @@ fn transform_g91_compatibility_program(
             .iter()
             .any(|literal| matches!(literal, BodyLiteral::Epistemic(_)))
     });
-    qualify_extensional_multi_arity_predicates(&mut reduced, program, &BTreeSet::new());
-    reduced
+    qualify_extensional_multi_arity_predicates_core(
+        &mut reduced,
+        program,
+        &BTreeSet::new(),
+        scope,
+    )?;
+    Ok(reduced)
 }
 
 fn g91_snapshot_relation_names<'a>(
     program: &Program,
     targets: impl Iterator<Item = &'a String>,
 ) -> BTreeMap<String, String> {
-    let mut reserved = collect_epistemic_relation_identities(program, &BTreeSet::new())
-        .0
-        .into_keys()
-        .collect::<BTreeSet<_>>();
+    g91_snapshot_relation_names_core(program, targets, &mut None)
+        .expect("unbounded snapshot naming has no owner refusal")
+}
+
+fn g91_snapshot_relation_names_core<'a>(
+    program: &Program,
+    targets: impl Iterator<Item = &'a String>,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<BTreeMap<String, String>> {
+    let targets = ephemeral_compilation(scope, |scope| {
+        let mut roster = Vec::new();
+        for target in targets {
+            acquire_push(&roster, roster.capacity(), scope)?;
+            roster.push(target);
+        }
+        Ok(roster)
+    })?;
+    let _receipt_storage = reserve_scratch(
+        scope,
+        crate::compile::push_vector_allocation_bytes::<std::sync::Arc<dyn Send + Sync>>(
+            targets.value.len(),
+        )?,
+    )?;
+    let mut reserved_insert_owners = Vec::with_capacity(if scope.is_some() {
+        targets.value.len()
+    } else {
+        0
+    });
+    let mut reserved = ephemeral_compilation(scope, |scope| {
+        let identities =
+            collect_epistemic_relation_identities_core(program, &BTreeSet::new(), scope)?.0;
+        acquire(
+            scope,
+            tree_allocation_bytes::<String, ()>(identities.len())?,
+        )?;
+        Ok(identities.into_keys().collect::<BTreeSet<_>>())
+    })?;
     let mut names = BTreeMap::new();
-    for target in targets {
-        let stem = target
-            .chars()
-            .map(|character| {
-                if character.is_ascii_alphanumeric() || character == '_' {
-                    character
-                } else {
-                    '_'
-                }
-            })
-            .collect::<String>();
-        let base = format!("__xlog_g91_snapshot_{stem}");
-        let mut candidate = base.clone();
+    for target in &targets.value {
+        let stem = ephemeral_compilation(scope, |scope| {
+            acquire(
+                scope,
+                crate::compile::push_vector_allocation_bytes::<u8>(target.len())?,
+            )?;
+            Ok(target
+                .chars()
+                .map(|character| {
+                    if character.is_ascii_alphanumeric() || character == '_' {
+                        character
+                    } else {
+                        '_'
+                    }
+                })
+                .collect::<String>())
+        })?;
+        let base = ephemeral_compilation(scope, |scope| {
+            acquire(
+                scope,
+                crate::compile::formatted_text_allocation_bytes(format_args!(
+                    "__xlog_g91_snapshot_{}",
+                    stem.value
+                ))?,
+            )?;
+            Ok(format!("__xlog_g91_snapshot_{}", stem.value))
+        })?;
+        let mut candidate = ephemeral_compilation(scope, |scope| {
+            acquire(scope, base.value.len() as u64)?;
+            Ok(base.value.clone())
+        })?;
         let mut suffix = 0usize;
-        while reserved.contains(&candidate) {
-            candidate = format!("{base}_{suffix}");
+        while reserved.value.contains(&candidate.value) {
+            candidate = ephemeral_compilation(scope, |scope| {
+                acquire(
+                    scope,
+                    crate::compile::formatted_text_allocation_bytes(format_args!(
+                        "{}_{suffix}",
+                        base.value
+                    ))?,
+                )?;
+                Ok(format!("{}_{suffix}", base.value))
+            })?;
             suffix += 1;
         }
-        reserved.insert(candidate.clone());
-        names.insert(target.clone(), candidate);
+        let reserved_bytes =
+            crate::compile::btree_insert_allocation_bytes::<String, ()>(reserved.value.len())?
+                .checked_add(candidate.value.len() as u64)
+                .ok_or_else(|| allocation_extent_overflow("snapshot name storage overflow"))?;
+        if let Some(owner) = reserve_scratch(scope, reserved_bytes)? {
+            reserved_insert_owners.push(owner);
+        }
+        reserved.value.insert(candidate.value.clone());
+        acquire(
+            scope,
+            crate::compile::btree_insert_allocation_bytes::<String, String>(names.len())?,
+        )?;
+        acquire(scope, target.len() as u64)?;
+        if let (Some(scope), Some(owner)) = (scope.as_deref_mut(), candidate._owner.as_ref()) {
+            scope.retain(std::sync::Arc::clone(owner))?;
+        }
+        names.insert((*target).clone(), candidate.value);
     }
-    names
+    Ok(names)
 }
 
 fn add_declared_g91_snapshot_relations(
@@ -1744,6 +2795,23 @@ fn add_declared_g91_snapshot_relations(
     snapshots: &BTreeMap<String, String>,
     target_arities: &BTreeMap<String, usize>,
 ) {
+    add_declared_g91_snapshot_relations_core(
+        refinement,
+        source,
+        snapshots,
+        target_arities,
+        &mut None,
+    )
+    .expect("unbounded snapshot declarations have no owner refusal")
+}
+
+fn add_declared_g91_snapshot_relations_core(
+    refinement: &mut Program,
+    source: &Program,
+    snapshots: &BTreeMap<String, String>,
+    target_arities: &BTreeMap<String, usize>,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<()> {
     for (target, snapshot) in snapshots {
         let expected_arity = target_arities
             .get(target)
@@ -1751,18 +2819,37 @@ fn add_declared_g91_snapshot_relations(
         if let Some(declaration) = source.predicates.iter().find(|declaration| {
             declaration.name == *target && declaration.arity() == *expected_arity
         }) {
+            acquire(scope, declaration.owned_allocation_bytes()?)?;
             let mut declaration = declaration.clone();
+            acquire(scope, snapshot.len() as u64)?;
             declaration.name = snapshot.clone();
             declaration.is_private = false;
+            acquire_push(
+                &refinement.predicates,
+                refinement.predicates.capacity(),
+                scope,
+            )?;
             refinement.predicates.push(declaration);
         }
     }
+    Ok(())
 }
 
 fn reject_nonmonotone_g91_compatibility_components(
     program: &Program,
     locations: &BTreeSet<G91CompatibilityLiteralLocation>,
 ) -> Result<()> {
+    reject_nonmonotone_g91_compatibility_components_core(program, locations, &mut None)
+}
+
+fn reject_nonmonotone_g91_compatibility_components_core(
+    program: &Program,
+    locations: &BTreeSet<G91CompatibilityLiteralLocation>,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<()> {
+    let _dependency_owner = reserve_scratch(scope, dependency_graph_allocation_bytes(program)?)?;
+    let _selected_owner =
+        reserve_scratch(scope, tree_allocation_bytes::<&str, ()>(locations.len())?)?;
     let (_, dependencies) = epistemic_dependency_graphs(program);
     let selected_heads = locations
         .iter()
@@ -1787,15 +2874,16 @@ fn reject_nonmonotone_g91_compatibility_components(
             continue;
         }
         if rule.has_aggregation() {
-            return Err(XlogError::UnsupportedEpistemicConstruct {
-                construct: "Gelfond-1991 compatibility cycle through aggregation".to_string(),
-                context: format!(
+            return Err(unsupported_diagnostic(
+                scope,
+                "Gelfond-1991 compatibility cycle through aggregation",
+                format_args!(
                     "aggregate predicate `{}` belongs to a positive `possible` compatibility \
                      component; the tuple-level greatest fixpoint requires every dependency in \
                      that component to be monotone",
                     rule.head.predicate
                 ),
-            });
+            )?);
         }
         if rule
             .body
@@ -1818,15 +2906,16 @@ fn reject_nonmonotone_g91_compatibility_components(
                 )
             })
         {
-            return Err(XlogError::UnsupportedEpistemicConstruct {
-                construct: "Gelfond-1991 compatibility cycle through negation".to_string(),
-                context: format!(
+            return Err(unsupported_diagnostic(
+                scope,
+                "Gelfond-1991 compatibility cycle through negation",
+                format_args!(
                     "predicate `{}` belongs to a positive `possible` compatibility component \
                      that also has a recursive negated dependency; the tuple-level greatest \
                      fixpoint requires a monotone component",
                     rule.head.predicate
                 ),
-            });
+            )?);
         }
     }
     Ok(())
@@ -1836,28 +2925,49 @@ fn reject_nonmonotone_g91_compatibility_components(
 pub fn try_reduce_prepared_recursive_epistemic_program(
     prepared: &PreparedEpistemicProgram,
 ) -> Result<Option<Program>> {
-    if try_prepare_g91_compatibility_reduction(prepared)?.is_some() {
-        return Err(XlogError::UnsupportedEpistemicConstruct {
-            construct: "Gelfond-1991 tuple compatibility ordinary reduction".to_string(),
-            context: "positive `possible` compatibility cycles require the explicit upper-bound \
+    try_reduce_prepared_recursive_epistemic_program_core(prepared, &mut None)
+}
+
+/// Select the original recursive reduction while retaining its allocation receipts.
+pub fn try_reduce_prepared_recursive_epistemic_program_with_allocation_owner(
+    prepared: &PreparedEpistemicProgram,
+    scope: &mut CompilationAllocationScope<'_>,
+) -> Result<Option<Program>> {
+    try_reduce_prepared_recursive_epistemic_program_core(prepared, &mut Some(scope))
+}
+
+fn try_reduce_prepared_recursive_epistemic_program_core(
+    prepared: &PreparedEpistemicProgram,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<Option<Program>> {
+    let compatibility = ephemeral_compilation(scope, |scope| {
+        try_prepare_g91_compatibility_reduction_core(prepared, scope)
+    })?;
+    if compatibility.value.is_some() {
+        return Err(unsupported_diagnostic(
+            scope,
+            "Gelfond-1991 tuple compatibility ordinary reduction",
+            format_args!(
+                "{}",
+                "positive `possible` compatibility cycles require the explicit upper-bound \
                       and frozen-snapshot greatest-fixpoint plan returned by \
                       `try_prepare_g91_compatibility_reduction`; they cannot be represented by \
                       one ordinary least-fixpoint program"
-                .to_string(),
-        });
+            ),
+        )?);
     }
     let active_program = prepared.active_program();
-    let recursive_class = classify_recursive_epistemic_program(active_program)?;
+    let recursive_class = classify_recursive_epistemic_program_core(active_program, scope)?;
     if recursive_class == RecursiveEpistemicClass::NonRecursive
         && !prepared.removed_unfounded_rules()
     {
         return Ok(None);
     }
 
-    validate_epistemic_derived_relation_identity(active_program, &BTreeSet::new())?;
+    validate_epistemic_derived_relation_identity_core(active_program, &BTreeSet::new(), scope)?;
     match recursive_class {
         RecursiveEpistemicClass::NonRecursive => Ok(Some(
-            reduce_founded_epistemic_program_to_ordinary(active_program),
+            reduce_founded_epistemic_program_to_ordinary_core(active_program, scope)?,
         )),
         // After explicit G91 compatibility cycles have been intercepted above, every
         // remaining admitted class shares the same reduction: each positive
@@ -1867,7 +2977,7 @@ pub fn try_reduce_prepared_recursive_epistemic_program(
         RecursiveEpistemicClass::CaseA
         | RecursiveEpistemicClass::CaseB
         | RecursiveEpistemicClass::ModalCycle => Ok(Some(
-            reduce_case_a_epistemic_program_to_ordinary(active_program),
+            reduce_case_a_epistemic_program_to_ordinary_core(active_program, scope)?,
         )),
     }
 }
@@ -1892,28 +3002,32 @@ pub fn try_reduce_case_a_recursive_epistemic_program(program: &Program) -> Resul
     try_reduce_prepared_recursive_epistemic_program(&prepared)
 }
 
-fn require_single_epistemic_output_relation(gpu_plan: &EpistemicGpuPlan) -> Result<()> {
+fn require_single_epistemic_output_relation_core(
+    gpu_plan: &EpistemicGpuPlan,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<()> {
+    let _relations_owner = reserve_scratch(
+        scope,
+        tree_allocation_bytes::<&str, ()>(gpu_plan.reductions.len())?,
+    )?;
     let output_relations: BTreeSet<&str> = gpu_plan
         .reductions
         .iter()
         .map(|reduction| reduction.head_predicate.as_str())
         .collect();
     if output_relations.len() > 1 {
-        return Err(XlogError::UnsupportedEpistemicConstruct {
-            construct: "epistemic GPU final output relation".to_string(),
-            context: format!(
+        return Err(unsupported_diagnostic(
+            scope,
+            "epistemic GPU final output relation",
+            format_args!(
                 "single-plan GPU execution materializes one final output buffer, but reductions \
                  target multiple head predicates {:?}; use split GPU execution for independent \
                  epistemic outputs",
                 output_relations
             ),
-        });
+        )?);
     }
     Ok(())
-}
-
-fn reject_epistemic_constraints(program: &Program) -> Result<()> {
-    reject_epistemic_constraints_for_boundary(program, "epistemic GPU constraint", "GPU lowering")
 }
 
 fn reject_gpt_epistemic_constraints(program: &Program) -> Result<()> {
@@ -1929,21 +3043,34 @@ fn reject_epistemic_constraints_for_boundary(
     construct: &str,
     boundary: &str,
 ) -> Result<()> {
+    reject_epistemic_constraints_for_boundary_core(program, construct, boundary, &mut None)
+}
+
+fn reject_epistemic_constraints_for_boundary_core(
+    program: &Program,
+    construct: &str,
+    boundary: &str,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<()> {
     for constraint in &program.constraints {
-        let constraint_index = constraint.require_authored_index()?;
+        let constraint_index = match scope.as_deref_mut() {
+            Some(scope) => {
+                constraint.require_authored_index_with_allocation_owner(&mut |bytes| {
+                    scope.reserve_allocation(bytes)
+                })?
+            }
+            None => constraint.require_authored_index()?,
+        };
         for lit in &constraint.body {
             let BodyLiteral::Epistemic(lit) = lit else {
                 continue;
             };
-            return Err(XlogError::UnsupportedEpistemicConstruct {
-                construct: construct.to_string(),
-                context: format!(
+            return Err(unsupported_diagnostic(scope, construct, format_args!(
                     "constraint[{constraint_index}] contains unsupported {} {}/{}; epistemic integrity constraints must be represented explicitly before {boundary}",
                     epistemic_literal_label(lit),
                     lit.atom.predicate,
                     lit.atom.arity()
-                ),
-            });
+                ))?);
         }
     }
     Ok(())
@@ -1968,8 +3095,16 @@ fn epistemic_literal_label(lit: &EpistemicLiteral) -> &'static str {
 /// literal.atom.terms`) stay consistent and the runtime matches the modal
 /// relation's real column tuple. Scalar-only keys are returned unchanged.
 fn flatten_epistemic_literal(lit: &EirEpistemicLiteral) -> Result<EirEpistemicLiteral> {
+    flatten_epistemic_literal_core(lit, &mut None)
+}
+
+fn flatten_epistemic_literal_core(
+    lit: &EirEpistemicLiteral,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<EirEpistemicLiteral> {
     let (arity, terms, _key_columns) =
-        flatten_structured_key_terms(&lit.atom.predicate, &lit.atom.terms)?;
+        flatten_structured_key_terms_core(&lit.atom.predicate, &lit.atom.terms, scope)?;
+    acquire(scope, lit.atom.predicate.len() as u64)?;
     Ok(EirEpistemicLiteral {
         op: lit.op,
         negated: lit.negated,
@@ -2014,53 +3149,81 @@ fn flatten_structured_key_terms(
     predicate: &str,
     terms: &[EirTerm],
 ) -> Result<(usize, Vec<EirTerm>, Vec<usize>)> {
+    flatten_structured_key_terms_core(predicate, terms, &mut None)
+}
+
+fn flatten_structured_key_terms_core(
+    predicate: &str,
+    terms: &[EirTerm],
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<(usize, Vec<EirTerm>, Vec<usize>)> {
+    acquire_vector::<EirTerm>(scope, terms.len())?;
     let mut flattened: Vec<EirTerm> = Vec::with_capacity(terms.len());
     for term in terms {
         match term {
             EirTerm::List(items) => {
-                flatten_structured_elements(predicate, "list", items, &mut flattened)?;
+                flatten_structured_elements_core(predicate, "list", items, &mut flattened, scope)?;
             }
             EirTerm::Compound { functor, args } => {
-                flatten_structured_elements(
+                let shape = ephemeral_compilation(scope, |scope| {
+                    acquire(
+                        scope,
+                        crate::compile::formatted_text_allocation_bytes(format_args!(
+                            "compound {functor}/{}",
+                            args.len()
+                        ))?,
+                    )?;
+                    Ok(format!("compound {functor}/{}", args.len()))
+                })?;
+                flatten_structured_elements_core(
                     predicate,
-                    &format!("compound {functor}/{}", args.len()),
+                    &shape.value,
                     args,
                     &mut flattened,
+                    scope,
                 )?;
             }
             EirTerm::Cons { .. } => {
-                return Err(XlogError::UnsupportedEpistemicConstruct {
-                    construct: "modal tuple-key cons pattern".to_string(),
-                    context: format!(
+                return Err(unsupported_diagnostic(
+                    scope,
+                    "modal tuple-key cons pattern",
+                    format_args!(
                         "modal tuple-key for {predicate} uses a `cons` pattern whose tail length \
                          is not statically fixed, so it has no finite, typed GPU key-column set; \
                          bind it to a fixed-arity list literal `[a, b, ...]` instead"
                     ),
-                });
+                )?);
             }
             EirTerm::PredRef(name) => {
-                return Err(XlogError::UnsupportedEpistemicConstruct {
-                    construct: "modal tuple-key predicate reference".to_string(),
-                    context: format!(
+                return Err(unsupported_diagnostic(
+                    scope,
+                    "modal tuple-key predicate reference",
+                    format_args!(
                         "modal tuple-key for {predicate} uses predref `{name}`, which has no \
                          finite, typed GPU key-column encoding"
                     ),
-                });
+                )?);
             }
             EirTerm::Aggregate { op, variable } => {
-                return Err(XlogError::UnsupportedEpistemicConstruct {
-                    construct: "modal tuple-key aggregate".to_string(),
-                    context: format!(
+                return Err(unsupported_diagnostic(
+                    scope,
+                    "modal tuple-key aggregate",
+                    format_args!(
                         "modal tuple-key for {predicate} uses aggregate `{op}({variable})`, whose \
                          value is not a finite, typed GPU key-column tuple"
                     ),
-                });
+                )?);
             }
-            scalar => flattened.push(scalar.clone()),
+            scalar => {
+                acquire(scope, crate::eir::term_clone_allocation_bytes(scalar)?)?;
+                acquire_push(&flattened, flattened.capacity(), scope)?;
+                flattened.push(scalar.clone());
+            }
         }
     }
 
     let arity = flattened.len();
+    acquire_vector::<usize>(scope, arity)?;
     let key_columns = (0..arity).collect();
     Ok((arity, flattened, key_columns))
 }
@@ -2076,18 +3239,31 @@ fn flatten_structured_elements(
     elements: &[EirTerm],
     flattened: &mut Vec<EirTerm>,
 ) -> Result<()> {
+    flatten_structured_elements_core(predicate, shape, elements, flattened, &mut None)
+}
+
+fn flatten_structured_elements_core(
+    predicate: &str,
+    shape: &str,
+    elements: &[EirTerm],
+    flattened: &mut Vec<EirTerm>,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<()> {
     for element in elements {
         if eir_term_is_scalar_key_element(element) {
+            acquire(scope, crate::eir::term_clone_allocation_bytes(element)?)?;
+            acquire_push(flattened, flattened.capacity(), scope)?;
             flattened.push(element.clone());
         } else {
-            return Err(XlogError::UnsupportedEpistemicConstruct {
-                construct: "nested modal tuple-key structure".to_string(),
-                context: format!(
+            return Err(unsupported_diagnostic(
+                scope,
+                "nested modal tuple-key structure",
+                format_args!(
                     "modal tuple-key for {predicate} nests a non-scalar element {element:?} inside \
                      a {shape}; only fixed-arity structures of scalar/Symbol-typed elements have a \
                      finite, typed GPU key-column encoding"
                 ),
-            });
+            )?);
         }
     }
     Ok(())
@@ -2109,6 +3285,15 @@ fn bound_output_columns_for_terms(
 }
 
 fn augmented_eir_head_terms(rule: &xlog_ir::EirRule) -> Vec<EirTerm> {
+    augmented_eir_head_terms_core(rule, &mut None)
+        .expect("unbounded head-term collection has no owner refusal")
+}
+
+fn augmented_eir_head_terms_core(
+    rule: &xlog_ir::EirRule,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<Vec<EirTerm>> {
+    acquire_eir_terms(&rule.head.terms, scope)?;
     let mut output_terms = rule.head.terms.clone();
     for lit in &rule.body {
         let EirBodyLiteral::Epistemic(lit) = lit else {
@@ -2119,9 +3304,12 @@ fn augmented_eir_head_terms(rule: &xlog_ir::EirRule) -> Vec<EirTerm> {
         // reduced output column to bind against. Flattening failures are surfaced
         // by the binding-construction path; here we fall back to the raw terms so
         // diagnostics remain anchored at that site.
-        let key_terms = flatten_structured_key_terms(&lit.atom.predicate, &lit.atom.terms)
-            .map(|(_, terms, _)| terms)
-            .unwrap_or_else(|_| lit.atom.terms.clone());
+        let key_terms =
+            match flatten_structured_key_terms_core(&lit.atom.predicate, &lit.atom.terms, scope) {
+                Ok((_, terms, _)) => terms,
+                Err(error) if scope.is_some() => return Err(error),
+                Err(_) => lit.atom.terms.clone(),
+            };
         for term in &key_terms {
             let EirTerm::Variable(variable) = term else {
                 continue;
@@ -2130,14 +3318,24 @@ fn augmented_eir_head_terms(rule: &xlog_ir::EirRule) -> Vec<EirTerm> {
                 .iter()
                 .any(|head_term| matches!(head_term, EirTerm::Variable(name) if name == variable))
             {
+                acquire(scope, variable.len() as u64)?;
+                acquire_push(&output_terms, output_terms.capacity(), scope)?;
                 output_terms.push(EirTerm::Variable(variable.clone()));
             }
         }
     }
-    output_terms
+    Ok(output_terms)
 }
 
 fn final_output_columns_for_eir(eir: &EirProgram) -> Option<Vec<usize>> {
+    final_output_columns_for_eir_core(eir, &mut None)
+        .expect("unbounded projection collection has no owner refusal")
+}
+
+fn final_output_columns_for_eir_core(
+    eir: &EirProgram,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<Option<Vec<usize>>> {
     let mut final_columns = Vec::new();
     let mut needs_projection = false;
     for rule in &eir.rules {
@@ -2148,18 +3346,19 @@ fn final_output_columns_for_eir(eir: &EirProgram) -> Option<Vec<usize>> {
         {
             continue;
         }
-        let augmented_len = augmented_eir_head_terms(rule).len();
+        let augmented_len = augmented_eir_head_terms_core(rule, scope)?.len();
         if augmented_len > rule.head.terms.len() {
             needs_projection = true;
         }
         if final_columns.is_empty() {
+            acquire_vector::<usize>(scope, rule.head.terms.len())?;
             final_columns = (0..rule.head.terms.len()).collect();
         }
     }
     if needs_projection {
-        Some(final_columns)
+        Ok(Some(final_columns))
     } else {
-        None
+        Ok(None)
     }
 }
 
@@ -2181,32 +3380,54 @@ fn final_output_columns_for_eir(eir: &EirProgram) -> Option<Vec<usize>> {
 /// this same decision so no broader predicate-level approximation can erase live
 /// support.
 fn faeel_unfounded_exact_tuple_self_support_rule_indices(program: &Program) -> Vec<usize> {
-    let Ok(eir) = build_eir(program) else {
-        return Vec::new();
+    faeel_unfounded_exact_tuple_self_support_rule_indices_core(program, &mut None)
+        .expect("unbounded foundedness filtering has no owner refusal")
+}
+
+fn faeel_unfounded_exact_tuple_self_support_rule_indices_core(
+    program: &Program,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<Vec<usize>> {
+    let eir_source = ephemeral_compilation(scope, |scope| {
+        Ok(match scope.as_deref_mut() {
+            Some(scope) => Some(crate::eir::build_eir_with_allocation_owner(program, scope)?),
+            None => build_eir(program).ok(),
+        })
+    })?;
+    let Some(eir) = eir_source.value.as_ref() else {
+        return Ok(Vec::new());
     };
     if eir.mode != EirEpistemicMode::Faeel {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let mut indices = Vec::new();
     for (index, (rule, eir_rule)) in program.rules.iter().zip(&eir.rules).enumerate() {
-        let modal_only_output_variables = modal_only_bound_output_variables(rule);
-        let drop = eir_rule.body.iter().any(|lit| {
+        let modal_only_output_variables = ephemeral_compilation(scope, |scope| {
+            modal_only_bound_output_variables_core(rule, scope)
+        })?;
+        let mut drop = false;
+        for lit in &eir_rule.body {
             let EirBodyLiteral::Epistemic(modal) = lit else {
-                return false;
+                continue;
             };
             if modal.negated
                 || modal.atom.predicate != eir_rule.head.predicate
                 || modal.atom.arity != eir_rule.head.arity
                 || modal.atom.terms != eir_rule.head.terms
             {
-                return false;
+                continue;
             }
             // Founded by an independent (non-circular) derivation: keep the rule; the
             // founded support proves the head, so it stays in the model.
-            if has_independent_founded_support(&eir, &modal.atom)
-                || has_tuple_level_independent_founded_support(&eir, eir_rule, &modal.atom)
+            if has_independent_founded_support_core(&eir, &modal.atom, scope)?
+                || has_tuple_level_independent_founded_support_core(
+                    &eir,
+                    eir_rule,
+                    &modal.atom,
+                    scope,
+                )?
             {
-                return false;
+                continue;
             }
             // A head variable bound ONLY by this self-supporting modal would be unbound
             // (`UnsafeVariable`) in every mode once the modal is stripped: do NOT drop,
@@ -2215,29 +3436,50 @@ fn faeel_unfounded_exact_tuple_self_support_rule_indices(program: &Program) -> V
                 .atom
                 .terms
                 .iter()
-                .any(|term| matches!(term, EirTerm::Variable(name) if modal_only_output_variables.contains(name)))
+                .any(|term| matches!(term, EirTerm::Variable(name) if modal_only_output_variables.value.contains(name)))
             {
-                return false;
+                continue;
             }
-            true
-        });
+            drop = true;
+            break;
+        }
         if drop {
+            acquire_push(&indices, indices.capacity(), scope)?;
             indices.push(index);
         }
     }
-    indices
+    Ok(indices)
 }
 
 fn program_without_rule_indices(program: &Program, removed_rule_indices: &[usize]) -> Program {
+    program_without_rule_indices_core(program, removed_rule_indices, &mut None)
+        .expect("unbounded foundedness filtering has no owner refusal")
+}
+
+fn program_without_rule_indices_core(
+    program: &Program,
+    removed_rule_indices: &[usize],
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<Program> {
     if removed_rule_indices.is_empty() {
-        return program.clone();
+        return clone_program(program, scope);
     }
 
+    let _removed_owner = reserve_scratch(
+        scope,
+        tree_allocation_bytes::<usize, ()>(removed_rule_indices.len())?,
+    )?;
     let removed_rule_indices = removed_rule_indices
         .iter()
         .copied()
         .collect::<BTreeSet<_>>();
-    let mut filtered = program.clone();
+    let mut filtered = clone_program(program, scope)?;
+    acquire_vector::<crate::ast::Rule>(scope, program.rules.len())?;
+    for (index, rule) in program.rules.iter().enumerate() {
+        if !removed_rule_indices.contains(&index) {
+            acquire(scope, rule.owned_allocation_bytes()?)?;
+        }
+    }
     filtered.rules = program
         .rules
         .iter()
@@ -2245,7 +3487,7 @@ fn program_without_rule_indices(program: &Program, removed_rule_indices: &[usize
         .filter(|(index, _)| !removed_rule_indices.contains(index))
         .map(|(_, rule)| rule.clone())
         .collect();
-    filtered
+    Ok(filtered)
 }
 
 /// Validate the complete authored epistemic program before foundedness can elide a rule.
@@ -2263,27 +3505,52 @@ pub fn validate_epistemic_source_program(program: &Program) -> Result<()> {
 }
 
 fn validate_prepared_epistemic_source_program(program: &Program) -> Result<()> {
-    validate_authored_modal_key_shapes(program)?;
-    let invariant = InvariantRelations::analyze(program);
-    let determined = EpistemicallyDeterminedPredicates::analyze(program);
+    validate_prepared_epistemic_source_program_core(program, &mut None)
+}
+
+fn validate_prepared_epistemic_source_program_core(
+    program: &Program,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<()> {
+    validate_authored_modal_key_shapes_core(program, scope)?;
+    let invariant = InvariantRelations::analyze_with_scope(program, scope)?;
+    let determined = EpistemicallyDeterminedPredicates::analyze_with_scope(program, scope)?;
     for rule in &program.rules {
-        validate_modal_variable_bindings(&rule.body, &invariant, &determined)?;
+        drop(ephemeral_compilation(scope, |scope| {
+            validate_modal_variable_bindings_core(&rule.body, &invariant, &determined, scope)
+        })?);
     }
     for constraint in &program.constraints {
-        validate_modal_variable_bindings(&constraint.body, &invariant, &determined)?;
+        drop(ephemeral_compilation(scope, |scope| {
+            validate_modal_variable_bindings_core(&constraint.body, &invariant, &determined, scope)
+        })?);
     }
 
-    let mut validation = program.clone();
+    let mut validation = clone_program(program, scope)?;
     for rule in &mut validation.rules {
-        rewrite_modal_literals_for_source_validation(&mut rule.body, &invariant, &determined);
+        rewrite_modal_literals_for_source_validation_core(
+            &mut rule.body,
+            &invariant,
+            &determined,
+            scope,
+        )?;
     }
     for constraint in &mut validation.constraints {
-        rewrite_modal_literals_for_source_validation(&mut constraint.body, &invariant, &determined);
+        rewrite_modal_literals_for_source_validation_core(
+            &mut constraint.body,
+            &invariant,
+            &determined,
+            scope,
+        )?;
     }
 
-    let multi_arity_predicates = all_multi_arity_predicates(program);
-    qualify_predicate_signatures(&mut validation, &multi_arity_predicates);
-    Compiler::new().validate_program_without_stratification(&validation)
+    let multi_arity_predicates = all_multi_arity_predicates_core(program, scope)?;
+    qualify_predicate_signatures_core(&mut validation, &multi_arity_predicates, scope)?;
+    match scope.as_deref_mut() {
+        Some(scope) => Compiler::new()
+            .validate_program_without_stratification_with_allocation_owner(&validation, scope),
+        None => Compiler::new().validate_program_without_stratification(&validation),
+    }
 }
 
 /// Validate every authored modal tuple key against the relation signatures it can
@@ -2296,14 +3563,25 @@ fn validate_prepared_epistemic_source_program(program: &Program) -> Result<()> {
 /// source boundary. This also preserves the precise finiteness diagnostic for an
 /// unbounded structured key instead of allowing semantic elision to hide it.
 fn validate_authored_modal_key_shapes(program: &Program) -> Result<()> {
-    let target_arities = non_modal_relation_arities(program);
-    let eir = build_eir(program)?;
+    validate_authored_modal_key_shapes_core(program, &mut None)
+}
+
+fn validate_authored_modal_key_shapes_core(
+    program: &Program,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<()> {
+    let target_arities = ephemeral_compilation(scope, |scope| {
+        non_modal_relation_arities_core(program, scope)
+    })?;
+    let eir = ephemeral_compilation(scope, |scope| build_eir_with_scope(program, scope))?;
     for modal in eir
+        .value
         .rules
         .iter()
         .flat_map(|rule| &rule.body)
         .chain(
-            eir.constraints
+            eir.value
+                .constraints
                 .iter()
                 .flat_map(|constraint| &constraint.body),
         )
@@ -2314,87 +3592,121 @@ fn validate_authored_modal_key_shapes(program: &Program) -> Result<()> {
             | EirBodyLiteral::Binding => None,
         })
     {
-        let flattened = flatten_epistemic_literal(modal)?;
-        let Some(expected) = target_arities.get(&flattened.atom.predicate) else {
+        let flattened =
+            ephemeral_compilation(scope, |scope| flatten_epistemic_literal_core(modal, scope))?;
+        let Some(expected) = target_arities.value.get(&flattened.value.atom.predicate) else {
             // An undeclared relation with no non-modal occurrence may be supplied as
             // an external relation. Its schema is established by the caller.
             continue;
         };
-        if expected.contains(&flattened.atom.arity) {
+        if expected.contains(&flattened.value.atom.arity) {
             continue;
         }
 
-        let expected_description = if expected.len() == 1 {
-            format!(
-                "target arity {}",
-                expected.first().expect("one target arity")
-            )
-        } else {
-            format!("target arities {expected:?}")
-        };
-        return Err(XlogError::UnsupportedEpistemicConstruct {
-            construct: "epistemic modal tuple key".to_string(),
-            context: format!(
-                "modal target `{}` has {expected_description}, but its tuple key flattens to \
+        let expected_description = ephemeral_compilation(scope, |scope| {
+            Ok(if expected.len() == 1 {
+                acquire(
+                    scope,
+                    crate::compile::formatted_text_allocation_bytes(format_args!(
+                        "target arity {}",
+                        expected.first().expect("one target arity")
+                    ))?,
+                )?;
+                format!(
+                    "target arity {}",
+                    expected.first().expect("one target arity")
+                )
+            } else {
+                acquire(
+                    scope,
+                    crate::compile::formatted_text_allocation_bytes(format_args!(
+                        "target arities {expected:?}"
+                    ))?,
+                )?;
+                format!("target arities {expected:?}")
+            })
+        })?;
+        return Err(unsupported_diagnostic(
+            scope,
+            "epistemic modal tuple key",
+            format_args!(
+                "modal target `{}` has {}, but its tuple key flattens to \
                  binding arity {}; use one scalar key term per target column",
-                flattened.atom.predicate, flattened.atom.arity
+                flattened.value.atom.predicate,
+                expected_description.value,
+                flattened.value.atom.arity
             ),
-        });
+        )?);
     }
     Ok(())
 }
 
 fn non_modal_relation_arities(program: &Program) -> BTreeMap<String, BTreeSet<usize>> {
+    non_modal_relation_arities_core(program, &mut None)
+        .expect("unbounded relation arity census has no owner refusal")
+}
+
+fn non_modal_relation_arities_core(
+    program: &Program,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<BTreeMap<String, BTreeSet<usize>>> {
     let mut arities = BTreeMap::new();
     for declaration in &program.predicates {
-        arities
-            .entry(declaration.name.clone())
-            .or_insert_with(BTreeSet::new)
-            .insert(declaration.arity());
+        record_signature_name_arity(&mut arities, &declaration.name, declaration.arity(), scope)?;
     }
     for rule in &program.rules {
-        record_predicate_signature(&mut arities, &rule.head);
-        record_non_modal_body_signatures(&mut arities, &rule.body);
+        record_predicate_signature_core(&mut arities, &rule.head, scope)?;
+        record_non_modal_body_signatures_core(&mut arities, &rule.body, scope)?;
     }
     for constraint in &program.constraints {
-        record_non_modal_body_signatures(&mut arities, &constraint.body);
+        record_non_modal_body_signatures_core(&mut arities, &constraint.body, scope)?;
     }
     for query in &program.queries {
-        record_predicate_signature(&mut arities, &query.atom);
+        record_predicate_signature_core(&mut arities, &query.atom, scope)?;
     }
     for fact in &program.prob_facts {
-        record_predicate_signature(&mut arities, &fact.atom);
+        record_predicate_signature_core(&mut arities, &fact.atom, scope)?;
     }
     for disjunction in &program.annotated_disjunctions {
         for choice in &disjunction.choices {
-            record_predicate_signature(&mut arities, &choice.atom);
+            record_predicate_signature_core(&mut arities, &choice.atom, scope)?;
         }
     }
     for evidence in &program.evidence {
-        record_predicate_signature(&mut arities, &evidence.atom);
+        record_predicate_signature_core(&mut arities, &evidence.atom, scope)?;
     }
     for query in &program.prob_queries {
-        record_predicate_signature(&mut arities, &query.atom);
+        record_predicate_signature_core(&mut arities, &query.atom, scope)?;
     }
     for declaration in &program.neural_predicates {
-        record_predicate_signature(&mut arities, &declaration.predicate);
+        record_predicate_signature_core(&mut arities, &declaration.predicate, scope)?;
     }
     for rule in &program.learnable_rules {
-        record_predicate_signature(&mut arities, &rule.head);
-        record_non_modal_body_signatures(&mut arities, &rule.body);
+        record_predicate_signature_core(&mut arities, &rule.head, scope)?;
+        record_non_modal_body_signatures_core(&mut arities, &rule.body, scope)?;
     }
-    arities
+    Ok(arities)
 }
 
 fn record_non_modal_body_signatures(
     signatures: &mut BTreeMap<String, BTreeSet<usize>>,
     body: &[BodyLiteral],
 ) {
+    record_non_modal_body_signatures_core(signatures, body, &mut None)
+        .expect("unbounded body relation census has no owner refusal")
+}
+
+fn record_non_modal_body_signatures_core(
+    signatures: &mut BTreeMap<String, BTreeSet<usize>>,
+    body: &[BodyLiteral],
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<()> {
     for literal in body {
         if let BodyLiteral::Positive(atom) | BodyLiteral::Negated(atom) = literal {
-            record_predicate_signature(signatures, atom);
+            record_predicate_signature_core(signatures, atom, scope)?;
         }
     }
+    Ok(())
 }
 
 /// Replace modals for validation without changing the authored ordinary literal order.
@@ -2407,10 +3719,28 @@ fn rewrite_modal_literals_for_source_validation(
     invariant: &InvariantRelations<'_>,
     determined: &EpistemicallyDeterminedPredicates,
 ) {
+    rewrite_modal_literals_for_source_validation_core(body, invariant, determined, &mut None)
+        .expect("unbounded modal validation rewrite has no owner refusal")
+}
+
+fn rewrite_modal_literals_for_source_validation_core(
+    body: &mut Vec<BodyLiteral>,
+    invariant: &InvariantRelations<'_>,
+    determined: &EpistemicallyDeterminedPredicates,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<()> {
+    let _non_binding_owner = reserve_scratch(
+        scope,
+        crate::compile::push_vector_allocation_bytes::<BodyLiteral>(body.len())?,
+    )?;
     let mut non_binding_modals = Vec::new();
-    body.retain_mut(|literal| {
+    acquire_vector::<BodyLiteral>(scope, body.len())?;
+    let original = std::mem::take(body);
+    *body = Vec::with_capacity(original.len());
+    for literal in original {
         let BodyLiteral::Epistemic(modal) = literal else {
-            return true;
+            body.push(literal);
+            continue;
         };
         if modal.atom.terms.iter().any(|term| {
             !matches!(
@@ -2426,25 +3756,24 @@ fn rewrite_modal_literals_for_source_validation(
             // Structured modal keys have a dedicated finite-key normalization and
             // diagnostic path. Ordinary list lowering cannot represent an unbounded
             // `cons` key and would preempt that precise epistemic diagnostic.
-            *literal = BodyLiteral::Comparison(Comparison {
+            body.push(BodyLiteral::Comparison(Comparison {
                 left: Term::Integer(1),
                 op: CompOp::Eq,
                 right: Term::Integer(1),
-            });
-            return true;
+            }));
+            continue;
         }
         if !modal.negated
             && (invariant.is_invariant(&modal.atom.predicate)
                 || determined.contains(&modal.atom.predicate))
         {
-            *literal = BodyLiteral::Positive(modal.atom.clone());
-            true
+            body.push(BodyLiteral::Positive(modal.atom));
         } else {
-            non_binding_modals.push(BodyLiteral::Negated(modal.atom.clone()));
-            false
+            non_binding_modals.push(BodyLiteral::Negated(modal.atom));
         }
-    });
+    }
     body.extend(non_binding_modals);
+    Ok(())
 }
 
 /// Variables with an ordinary finite source, matching the Lowerer's binding order:
@@ -2452,23 +3781,42 @@ fn rewrite_modal_literals_for_source_validation(
 /// once in source order. A reversed arithmetic dependency is therefore not accepted by a
 /// fixed-point approximation.
 fn non_epistemic_bound_variables(body: &[BodyLiteral]) -> BTreeSet<String> {
-    let mut bound = positive_body_bound_variables(body);
+    non_epistemic_bound_variables_core(body, &mut None)
+        .expect("unbounded variable binding has no owner refusal")
+}
+
+fn non_epistemic_bound_variables_core(
+    body: &[BodyLiteral],
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<BTreeSet<String>> {
+    let mut bound = match scope.as_deref_mut() {
+        Some(scope) => {
+            crate::lower::positive_body_bound_variables_with_allocation_owner(body, scope)?
+        }
+        None => positive_body_bound_variables(body),
+    };
 
     for literal in body {
         let BodyLiteral::IsExpr(binding) = literal else {
             continue;
         };
-        if binding
+        let mut all_bound = true;
+        binding
             .expr
-            .variables()
-            .iter()
-            .all(|name| bound.contains(*name))
-        {
+            .visit_variables(&mut |name| all_bound &= bound.contains(name));
+        if all_bound {
+            acquire(scope, binding.target.len() as u64)?;
+            if !bound.contains(&binding.target) {
+                acquire(
+                    scope,
+                    crate::compile::btree_insert_allocation_bytes::<String, ()>(bound.len())?,
+                )?;
+            }
             bound.insert(binding.target.clone());
         }
     }
 
-    bound
+    Ok(bound)
 }
 
 /// Enforce the modal binding contract before a reduction turns modal atoms into ordinary
@@ -2480,7 +3828,16 @@ fn validate_modal_variable_bindings(
     invariant: &InvariantRelations<'_>,
     determined: &EpistemicallyDeterminedPredicates,
 ) -> Result<()> {
-    let mut bound = non_epistemic_bound_variables(body);
+    validate_modal_variable_bindings_core(body, invariant, determined, &mut None)
+}
+
+fn validate_modal_variable_bindings_core(
+    body: &[BodyLiteral],
+    invariant: &InvariantRelations<'_>,
+    determined: &EpistemicallyDeterminedPredicates,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<()> {
+    let mut bound = non_epistemic_bound_variables_core(body, scope)?;
 
     // A rule body is a conjunction, so positive finite modal sources bind
     // independently of their textual order. Collect every such binder before
@@ -2494,14 +3851,33 @@ fn validate_modal_variable_bindings(
             && (invariant.is_invariant(&modal.atom.predicate)
                 || determined.contains(&modal.atom.predicate));
         if may_bind {
-            bound.extend(
-                modal
-                    .atom
-                    .variables()
-                    .into_iter()
-                    .filter(|name| *name != "_")
-                    .map(str::to_string),
-            );
+            let mut refusal = None;
+            modal.atom.visit_variables(&mut |name| {
+                if name == "_" || refusal.is_some() {
+                    return;
+                }
+                let acquired = (|| -> Result<()> {
+                    acquire(scope, name.len() as u64)?;
+                    if !bound.contains(name) {
+                        acquire(
+                            scope,
+                            crate::compile::btree_insert_allocation_bytes::<String, ()>(
+                                bound.len(),
+                            )?,
+                        )?;
+                    }
+                    Ok(())
+                })();
+                match acquired {
+                    Ok(()) => {
+                        bound.insert(name.to_owned());
+                    }
+                    Err(error) => refusal = Some(error),
+                }
+            });
+            if let Some(error) = refusal {
+                return Err(error);
+            }
         }
     }
 
@@ -2512,13 +3888,19 @@ fn validate_modal_variable_bindings(
         let may_bind = !modal.negated
             && (invariant.is_invariant(&modal.atom.predicate)
                 || determined.contains(&modal.atom.predicate));
-        for variable in modal.atom.variables() {
-            if variable == "_" {
-                continue;
+        let mut unsafe_variable = None;
+        modal.atom.visit_variables(&mut |variable| {
+            if unsafe_variable.is_none()
+                && variable != "_"
+                && !may_bind
+                && !bound.contains(variable)
+            {
+                unsafe_variable = Some(variable);
             }
-            if !may_bind && !bound.contains(variable) {
-                return Err(XlogError::UnsafeVariable(variable.to_string()));
-            }
+        });
+        if let Some(variable) = unsafe_variable {
+            acquire(scope, variable.len() as u64)?;
+            return Err(XlogError::UnsafeVariable(variable.to_owned()));
         }
     }
     Ok(())
@@ -2541,11 +3923,38 @@ fn validate_modal_variable_bindings(
 /// point. See [`reduce_epistemic_program_to_ordinary_for_stratified_schema`] for the
 /// schema-only relaxation used by the stratified driver.
 pub fn reduce_epistemic_program_to_ordinary(program: &Program) -> Result<Program> {
-    let prepared = prepare_root_authored_constraint_identity(program)?;
-    if let Some(reduced) = try_reduce_case_a_recursive_epistemic_program(&prepared)? {
+    reduce_epistemic_program_to_ordinary_core(program, &mut None)
+}
+
+/// Reduce through the original semantic guards with ownership of every retained program.
+pub fn reduce_epistemic_program_to_ordinary_with_allocation_owner(
+    program: &Program,
+    scope: &mut CompilationAllocationScope<'_>,
+) -> Result<Program> {
+    reduce_epistemic_program_to_ordinary_core(program, &mut Some(scope))
+}
+
+fn reduce_epistemic_program_to_ordinary_core(
+    program: &Program,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<Program> {
+    let prepared = ephemeral_compilation(scope, |scope| {
+        prepare_root_authored_constraint_identity_core(program, scope)
+    })?;
+    let recursive = ephemeral_compilation(scope, |scope| {
+        prepare_epistemic_program_core(&prepared.value, scope)
+    })?;
+    if let Some(reduced) =
+        try_reduce_prepared_recursive_epistemic_program_core(&recursive.value, scope)?
+    {
         return Ok(reduced);
     }
-    reduce_epistemic_program_to_ordinary_inner(&prepared, &BTreeSet::new(), &BTreeMap::new())
+    reduce_epistemic_program_to_ordinary_inner(
+        &prepared.value,
+        &BTreeSet::new(),
+        &BTreeMap::new(),
+        scope,
+    )
 }
 
 /// Schema-only reduction for the stratified epistemic driver.
@@ -2572,22 +3981,49 @@ pub fn reduce_epistemic_program_to_ordinary(program: &Program) -> Result<Program
 pub fn reduce_epistemic_program_to_ordinary_for_stratified_schema(
     program: &Program,
 ) -> Result<Program> {
-    let prepared = prepare_root_authored_constraint_identity(program)?;
-    let determined = EpistemicallyDeterminedPredicates::analyze(&prepared);
-    let path_specific_rules = stratified_schema_reduction_overrides(&prepared)?;
+    reduce_epistemic_program_to_ordinary_for_stratified_schema_core(program, &mut None)
+}
+
+/// Preserve schema-only determined-modal resolution under the same allocation owner.
+pub fn reduce_epistemic_program_to_ordinary_for_stratified_schema_with_allocation_owner(
+    program: &Program,
+    scope: &mut CompilationAllocationScope<'_>,
+) -> Result<Program> {
+    reduce_epistemic_program_to_ordinary_for_stratified_schema_core(program, &mut Some(scope))
+}
+
+fn reduce_epistemic_program_to_ordinary_for_stratified_schema_core(
+    program: &Program,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<Program> {
+    let prepared = ephemeral_compilation(scope, |scope| {
+        prepare_root_authored_constraint_identity_core(program, scope)
+    })?;
+    let determined = EpistemicallyDeterminedPredicates::analyze_with_scope(&prepared.value, scope)?;
+    let path_specific_rules = ephemeral_compilation(scope, |scope| {
+        stratified_schema_reduction_overrides_core(&prepared.value, scope)
+    })?;
     reduce_epistemic_program_to_ordinary_inner(
-        &prepared,
+        &prepared.value,
         &determined.determined,
-        &path_specific_rules,
+        &path_specific_rules.value,
+        scope,
     )
 }
 
 fn prepare_root_authored_constraint_identity(program: &Program) -> Result<Program> {
-    let mut prepared = program.clone();
+    prepare_root_authored_constraint_identity_core(program, &mut None)
+}
+
+fn prepare_root_authored_constraint_identity_core(
+    program: &Program,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<Program> {
+    let mut prepared = clone_program(program, scope)?;
     if prepared.authored_constraint_source_bound.is_some() {
-        prepared.validate_prepared_authored_constraint_identity()?;
+        validate_authored_constraint_identity_with_scope(&prepared, scope)?;
     } else {
-        prepared.prepare_authored_constraint_identity_at_root()?;
+        prepare_authored_constraint_identity_with_scope(&mut prepared, scope)?;
     }
     Ok(prepared)
 }
@@ -2602,9 +4038,16 @@ fn reduce_epistemic_program_to_ordinary_inner(
     program: &Program,
     schema_only_determined_resolve: &BTreeSet<String>,
     path_specific_rules: &BTreeMap<usize, crate::ast::Rule>,
+    scope: &mut AllocationScope<'_, '_>,
 ) -> Result<Program> {
+    let _path_indices_owner = reserve_scratch(
+        scope,
+        tree_allocation_bytes::<usize, ()>(path_specific_rules.len())?,
+    )?;
     let path_specific_rule_indices = path_specific_rules.keys().copied().collect::<BTreeSet<_>>();
-    validate_epistemic_relation_shapes(program, &path_specific_rule_indices)?;
+    drop(ephemeral_compilation(scope, |scope| {
+        validate_epistemic_relation_shapes_core(program, &path_specific_rule_indices, scope)
+    })?);
 
     // FAEEL FOUNDED-MODEL EXTENSION: a rule whose head is supported ONLY by circular
     // modal self-support (`possible p`/`know p` over its own head, with no independent
@@ -2626,15 +4069,27 @@ fn reduce_epistemic_program_to_ordinary_inner(
     // stripped that variable is genuinely unbound (`UnsafeVariable`) in EVERY mode
     // (G91 included), so it must fall through to the existing safety path rather than
     // be silently elided. Dropping it would mask a mode-independent safety failure.
-    let removed_rule_indices = faeel_unfounded_exact_tuple_self_support_rule_indices(program);
+    let removed_rule_indices = ephemeral_compilation(scope, |scope| {
+        faeel_unfounded_exact_tuple_self_support_rule_indices_core(program, scope)
+    })?;
+    let _removed_set_owner = reserve_scratch(
+        scope,
+        tree_allocation_bytes::<usize, ()>(removed_rule_indices.value.len())?,
+    )?;
     let removed_rule_index_set = removed_rule_indices
+        .value
         .iter()
         .copied()
         .collect::<BTreeSet<_>>();
+    let _active_indices_owner = reserve_scratch(
+        scope,
+        crate::compile::push_vector_allocation_bytes::<usize>(program.rules.len())?,
+    )?;
     let active_original_rule_indices = (0..program.rules.len())
         .filter(|index| !removed_rule_index_set.contains(index))
         .collect::<Vec<_>>();
-    let mut reduced = program_without_rule_indices(program, &removed_rule_indices);
+    let mut reduced =
+        program_without_rule_indices_core(program, &removed_rule_indices.value, scope)?;
 
     // AUGMENTING positive modals over INVARIANT relations are resolved into positive
     // ordinary join atoms (instead of being stripped) so the augmented head columns
@@ -2659,13 +4114,17 @@ fn reduce_epistemic_program_to_ordinary_inner(
     // never resolved — its augmenting variable stays unbound and the reduced program
     // fails closed). Non-augmenting modals keep the existing single- and joint-solver
     // strip-and-gate path.
-    let invariant = InvariantRelations::analyze(program);
+    let invariant = InvariantRelations::analyze_with_scope(program, scope)?;
 
     // Every rule whose internal head gains tuple-key columns must use a widened
     // declaration. The recursive epistemic path has its own non-augmenting reducer;
     // this single-pass reduction records the actual head transformation, including
     // columns that an ordinary atom already binds. Rule indices retain the exact
     // source signature because the head arity changes before reconciliation.
+    let _augmented_arities_owner = reserve_scratch(
+        scope,
+        tree_allocation_bytes::<usize, usize>(reduced.rules.len())?,
+    )?;
     let mut augmented_rule_original_arities = BTreeMap::new();
 
     for ((rule_index, rule), original_rule_index) in reduced
@@ -2675,6 +4134,7 @@ fn reduce_epistemic_program_to_ordinary_inner(
         .zip(active_original_rule_indices)
     {
         if let Some(path_specific_rule) = path_specific_rules.get(&original_rule_index) {
+            acquire(scope, path_specific_rule.owned_allocation_bytes()?)?;
             *rule = path_specific_rule.clone();
             continue;
         }
@@ -2686,8 +4146,10 @@ fn reduce_epistemic_program_to_ordinary_inner(
         // appends modal-local variables to the head, so both already-present head
         // variables like `Y` in `pair(X,Y) :- ..possible edge(X,Y)` AND augmented
         // variables like `Y` in `one_hop(X) :- ..know edge(X,Y)` are covered here.)
-        let modal_only_output_variables = modal_only_bound_output_variables(rule);
-        append_body_local_tuple_key_variables_to_head(rule);
+        let modal_only_output_variables = ephemeral_compilation(scope, |scope| {
+            modal_only_bound_output_variables_core(rule, scope)
+        })?;
+        append_body_local_tuple_key_variables_to_head_core(rule, scope)?;
         if rule.head.arity() > original_head_arity {
             augmented_rule_original_arities.insert(rule_index, original_head_arity);
         }
@@ -2714,10 +4176,11 @@ fn reduce_epistemic_program_to_ordinary_inner(
                 // resolves a modal over a still-derived (un-gated) relation.
                 if resolves_augmented_head_variable(
                     modal,
-                    &modal_only_output_variables,
+                    &modal_only_output_variables.value,
                     &invariant,
                     schema_only_determined_resolve,
                 ) {
+                    acquire(scope, modal.atom.owned_allocation_bytes()?)?;
                     *lit = BodyLiteral::Positive(modal.atom.clone());
                 }
             }
@@ -2725,6 +4188,7 @@ fn reduce_epistemic_program_to_ordinary_inner(
         rule.body
             .retain(|lit| !matches!(lit, BodyLiteral::Epistemic(_)));
         if !was_fact && had_epistemic_body && rule.body.is_empty() {
+            acquire_push(&rule.body, rule.body.capacity(), scope)?;
             rule.body.push(BodyLiteral::Comparison(Comparison {
                 left: Term::Integer(1),
                 op: CompOp::Eq,
@@ -2739,10 +4203,18 @@ fn reduce_epistemic_program_to_ordinary_inner(
     // the augmented rule output against the narrow declared (empty) stub and fail with
     // a schema mismatch. Infer each appended column's type from the positive body
     // atom that binds it; modal-only columns use the resolved invariant atom.
-    qualify_extensional_multi_arity_predicates(&mut reduced, program, &removed_rule_index_set);
+    qualify_extensional_multi_arity_predicates_core(
+        &mut reduced,
+        program,
+        &removed_rule_index_set,
+        scope,
+    )?;
 
-    let augmented_signatures =
-        reconcile_augmented_head_declarations(&mut reduced, &augmented_rule_original_arities)?;
+    let augmented_signatures = reconcile_augmented_head_declarations_core(
+        &mut reduced,
+        &augmented_rule_original_arities,
+        scope,
+    )?;
 
     // Drop reduced-program queries that reference an AUGMENTED head: the reduced
     // relation is now arity-bumped, so an original arity-N query over it would union
@@ -2753,10 +4225,28 @@ fn reduce_epistemic_program_to_ordinary_inner(
     // (`queried_predicates`) reads the ORIGINAL program's queries, so dropping the
     // redundant reduced query here is inert for display and only removes the crash.
     // Non-augmented epistemic heads keep their arity-matched reduced queries untouched.
-    if !augmented_signatures.is_empty() {
+    if !augmented_signatures.value.is_empty() {
+        let mut allocation_error = None;
         reduced.queries.retain(|query| {
-            !augmented_signatures.contains_key(&(query.atom.predicate.clone(), query.atom.arity()))
+            if allocation_error.is_some() {
+                return true;
+            }
+            let key_owner = match reserve_scratch(scope, query.atom.predicate.len() as u64) {
+                Ok(owner) => owner,
+                Err(error) => {
+                    allocation_error = Some(error);
+                    return true;
+                }
+            };
+            let key = (query.atom.predicate.clone(), query.atom.arity());
+            let keep = !augmented_signatures.value.contains_key(&key);
+            drop(key);
+            drop(key_owner);
+            keep
         });
+        if let Some(error) = allocation_error {
+            return Err(error);
+        }
     }
 
     // Constraints that contain epistemic literals are world-view integrity
@@ -2793,9 +4283,17 @@ fn reduce_epistemic_program_to_ordinary_inner(
 /// [`classify_recursive_epistemic_program`]; this function assumes that contract for
 /// every supported recursive class.
 pub fn reduce_case_a_epistemic_program_to_ordinary(program: &Program) -> Program {
-    let mut reduced = program.clone();
+    reduce_case_a_epistemic_program_to_ordinary_core(program, &mut None)
+        .expect("unbounded recursive reduction has no owner refusal")
+}
+
+fn reduce_case_a_epistemic_program_to_ordinary_core(
+    program: &Program,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<Program> {
+    let mut reduced = clone_program(program, scope)?;
     for rule in &mut reduced.rules {
-        resolve_recursive_epistemic_rule_modals(rule);
+        resolve_recursive_epistemic_rule_modals_core(rule, scope)?;
     }
     // World-view integrity constraints have no place in this ordinary recursive
     // program: the recursion already joins against the resolved relations. Drop any constraint that
@@ -2806,8 +4304,13 @@ pub fn reduce_case_a_epistemic_program_to_ordinary(program: &Program) -> Program
             .iter()
             .any(|lit| matches!(lit, BodyLiteral::Epistemic(_)))
     });
-    qualify_extensional_multi_arity_predicates(&mut reduced, program, &BTreeSet::new());
-    reduced
+    qualify_extensional_multi_arity_predicates_core(
+        &mut reduced,
+        program,
+        &BTreeSet::new(),
+        scope,
+    )?;
+    Ok(reduced)
 }
 
 /// Reduce the surviving acyclic portion of a FAEEL program after exact unfounded
@@ -2820,15 +4323,24 @@ pub fn reduce_case_a_epistemic_program_to_ordinary(program: &Program) -> Program
 /// surviving gate load-bearing. Modal integrity constraints are resolved as ordinary
 /// constraints because the surviving program has a single determined model.
 fn reduce_founded_epistemic_program_to_ordinary(program: &Program) -> Program {
-    let mut reduced = program.clone();
+    reduce_founded_epistemic_program_to_ordinary_core(program, &mut None)
+        .expect("unbounded founded reduction has no owner refusal")
+}
+
+fn reduce_founded_epistemic_program_to_ordinary_core(
+    program: &Program,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<Program> {
+    let mut reduced = clone_program(program, scope)?;
     for rule in &mut reduced.rules {
-        resolve_recursive_epistemic_rule_modals(rule);
+        resolve_recursive_epistemic_rule_modals_core(rule, scope)?;
     }
     for constraint in &mut reduced.constraints {
         for literal in &mut constraint.body {
             let BodyLiteral::Epistemic(modal) = literal else {
                 continue;
             };
+            acquire(scope, modal.atom.owned_allocation_bytes()?)?;
             *literal = if modal.negated {
                 BodyLiteral::Negated(modal.atom.clone())
             } else {
@@ -2836,13 +4348,27 @@ fn reduce_founded_epistemic_program_to_ordinary(program: &Program) -> Program {
             };
         }
     }
-    qualify_extensional_multi_arity_predicates(&mut reduced, program, &BTreeSet::new());
-    reduced
+    qualify_extensional_multi_arity_predicates_core(
+        &mut reduced,
+        program,
+        &BTreeSet::new(),
+        scope,
+    )?;
+    Ok(reduced)
 }
 
 fn resolve_recursive_epistemic_rule_modals(rule: &mut crate::ast::Rule) {
+    resolve_recursive_epistemic_rule_modals_core(rule, &mut None)
+        .expect("unbounded modal resolution has no owner refusal")
+}
+
+fn resolve_recursive_epistemic_rule_modals_core(
+    rule: &mut crate::ast::Rule,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<()> {
     for literal in &mut rule.body {
         if let BodyLiteral::Epistemic(modal) = literal {
+            acquire(scope, modal.atom.owned_allocation_bytes()?)?;
             *literal = if modal.negated {
                 BodyLiteral::Negated(modal.atom.clone())
             } else {
@@ -2850,6 +4376,7 @@ fn resolve_recursive_epistemic_rule_modals(rule: &mut crate::ast::Rule) {
             };
         }
     }
+    Ok(())
 }
 
 /// Output (head) variables of `rule` that are bound ONLY by epistemic literals, i.e.
@@ -2863,31 +4390,49 @@ fn resolve_recursive_epistemic_rule_modals(rule: &mut crate::ast::Rule) {
 /// it is resolved into a positive ordinary atom. Computed from the ORIGINAL rule,
 /// before the head is mutated by augmentation.
 fn modal_only_bound_output_variables(rule: &crate::ast::Rule) -> BTreeSet<String> {
-    let positively_bound = non_epistemic_bound_variables(&rule.body);
+    modal_only_bound_output_variables_core(rule, &mut None)
+        .expect("unbounded modal output binding has no owner refusal")
+}
+
+fn modal_only_bound_output_variables_core(
+    rule: &crate::ast::Rule,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<BTreeSet<String>> {
+    let positively_bound = ephemeral_compilation(scope, |scope| {
+        non_epistemic_bound_variables_core(&rule.body, scope)
+    })?;
 
     // Candidate output variables: every variable occurring in the user-visible head
     // plus every modal-local variable (which augmentation will append to the head).
     let mut modal_only = BTreeSet::new();
-    let mut consider = |name: &str| {
-        if name != "_" && !positively_bound.contains(name) {
+    let mut consider = |name: &str| -> Result<()> {
+        if name != "_" && !positively_bound.value.contains(name) && !modal_only.contains(name) {
+            acquire(scope, name.len() as u64)?;
+            if !modal_only.contains(name) {
+                acquire(
+                    scope,
+                    crate::compile::btree_insert_allocation_bytes::<String, ()>(modal_only.len())?,
+                )?;
+            }
             modal_only.insert(name.to_string());
         }
+        Ok(())
     };
     for term in &rule.head.terms {
         if let Term::Variable(name) = term {
-            consider(name);
+            consider(name)?;
         }
     }
     for lit in &rule.body {
         if let BodyLiteral::Epistemic(lit) = lit {
             for term in &lit.atom.terms {
                 if let Term::Variable(name) = term {
-                    consider(name);
+                    consider(name)?;
                 }
             }
         }
     }
-    modal_only
+    Ok(modal_only)
 }
 
 /// Whether `modal`'s atom carries at least one output variable that no positive
@@ -2918,56 +4463,119 @@ fn record_predicate_signature(
     signatures: &mut BTreeMap<String, BTreeSet<usize>>,
     atom: &crate::ast::Atom,
 ) {
-    signatures
-        .entry(atom.predicate.clone())
-        .or_default()
-        .insert(atom.arity());
+    record_predicate_signature_core(signatures, atom, &mut None)
+        .expect("unbounded signature census has no owner refusal")
+}
+
+fn record_signature_name_arity(
+    signatures: &mut BTreeMap<String, BTreeSet<usize>>,
+    name: &str,
+    arity: usize,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<()> {
+    if let Some(entries) = signatures.get_mut(name) {
+        if !entries.contains(&arity) {
+            acquire(
+                scope,
+                crate::compile::btree_insert_allocation_bytes::<usize, ()>(entries.len())?,
+            )?;
+            entries.insert(arity);
+        }
+        return Ok(());
+    }
+    acquire(
+        scope,
+        crate::compile::btree_insert_allocation_bytes::<String, BTreeSet<usize>>(signatures.len())?,
+    )?;
+    acquire(
+        scope,
+        crate::compile::btree_insert_allocation_bytes::<usize, ()>(0)?,
+    )?;
+    acquire(scope, name.len() as u64)?;
+    signatures.entry(name.to_owned()).or_default().insert(arity);
+    Ok(())
+}
+
+fn record_predicate_signature_core(
+    signatures: &mut BTreeMap<String, BTreeSet<usize>>,
+    atom: &Atom,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<()> {
+    record_signature_name_arity(signatures, &atom.predicate, atom.arity(), scope)
 }
 
 fn record_body_predicate_signatures(
     signatures: &mut BTreeMap<String, BTreeSet<usize>>,
     body: &[BodyLiteral],
 ) {
+    record_body_predicate_signatures_core(signatures, body, &mut None)
+        .expect("unbounded body census has no owner refusal")
+}
+
+fn record_body_predicate_signatures_core(
+    signatures: &mut BTreeMap<String, BTreeSet<usize>>,
+    body: &[BodyLiteral],
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<()> {
     for literal in body {
         match literal {
             BodyLiteral::Positive(atom) | BodyLiteral::Negated(atom) => {
-                record_predicate_signature(signatures, atom);
+                record_predicate_signature_core(signatures, atom, scope)?;
             }
             BodyLiteral::Epistemic(modal) => {
+                acquire_vector::<EirTerm>(scope, modal.atom.terms.len())?;
                 let eir_terms = modal
                     .atom
                     .terms
                     .iter()
-                    .map(convert_term)
-                    .collect::<Vec<_>>();
+                    .map(|term| match scope.as_deref_mut() {
+                        Some(scope) => crate::eir::convert_term_with_allocation_owner(term, scope),
+                        None => Ok(convert_term(term)),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 // Structured-key validation owns the typed error for unsupported
                 // shapes. Keep this identity census total for reducers that inspect
                 // the source before lowering; valid keys use the exact same
                 // production flattener as planning, while an invalid key retains its
                 // source arity until validation rejects it.
-                let arity = flatten_structured_key_terms(&modal.atom.predicate, &eir_terms)
-                    .map(|(arity, _, _)| arity)
-                    .unwrap_or_else(|_| modal.atom.arity());
-                signatures
-                    .entry(modal.atom.predicate.clone())
-                    .or_default()
-                    .insert(arity);
+                let arity = match flatten_structured_key_terms_core(
+                    &modal.atom.predicate,
+                    &eir_terms,
+                    scope,
+                ) {
+                    Ok((arity, _, _)) => arity,
+                    Err(XlogError::UnsupportedEpistemicConstruct { .. }) => modal.atom.arity(),
+                    Err(error) => return Err(error),
+                };
+                record_signature_name_arity(signatures, &modal.atom.predicate, arity, scope)?;
             }
             BodyLiteral::Comparison(_) | BodyLiteral::IsExpr(_) | BodyLiteral::Univ(_) => {}
         }
     }
+    Ok(())
 }
 
 fn collect_epistemic_relation_identities(
     program: &Program,
     removed_rules: &BTreeSet<usize>,
 ) -> (BTreeMap<String, BTreeSet<usize>>, BTreeSet<String>) {
+    collect_epistemic_relation_identities_core(program, removed_rules, &mut None)
+        .expect("unbounded relation census has no owner refusal")
+}
+
+fn collect_epistemic_relation_identities_core(
+    program: &Program,
+    removed_rules: &BTreeSet<usize>,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<(BTreeMap<String, BTreeSet<usize>>, BTreeSet<String>)> {
     let mut source_arities: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
     for declaration in &program.predicates {
-        source_arities
-            .entry(declaration.name.clone())
-            .or_default()
-            .insert(declaration.arity());
+        record_signature_name_arity(
+            &mut source_arities,
+            &declaration.name,
+            declaration.arity(),
+            scope,
+        )?;
     }
 
     let mut derived_predicates = BTreeSet::new();
@@ -2975,78 +4583,140 @@ fn collect_epistemic_relation_identities(
         if removed_rules.contains(&index) {
             continue;
         }
-        record_predicate_signature(&mut source_arities, &rule.head);
-        record_body_predicate_signatures(&mut source_arities, &rule.body);
+        record_predicate_signature_core(&mut source_arities, &rule.head, scope)?;
+        record_body_predicate_signatures_core(&mut source_arities, &rule.body, scope)?;
         if !rule.body.is_empty() {
+            acquire(scope, rule.head.predicate.len() as u64)?;
+            if !derived_predicates.contains(&rule.head.predicate) {
+                acquire(
+                    scope,
+                    crate::compile::btree_insert_allocation_bytes::<String, ()>(
+                        derived_predicates.len(),
+                    )?,
+                )?;
+            }
             derived_predicates.insert(rule.head.predicate.clone());
         }
     }
     for constraint in &program.constraints {
-        record_body_predicate_signatures(&mut source_arities, &constraint.body);
+        record_body_predicate_signatures_core(&mut source_arities, &constraint.body, scope)?;
     }
     for query in &program.queries {
-        record_predicate_signature(&mut source_arities, &query.atom);
+        record_predicate_signature_core(&mut source_arities, &query.atom, scope)?;
     }
     for fact in &program.prob_facts {
-        record_predicate_signature(&mut source_arities, &fact.atom);
+        record_predicate_signature_core(&mut source_arities, &fact.atom, scope)?;
     }
     for disjunction in &program.annotated_disjunctions {
         for choice in &disjunction.choices {
-            record_predicate_signature(&mut source_arities, &choice.atom);
+            record_predicate_signature_core(&mut source_arities, &choice.atom, scope)?;
         }
     }
     for evidence in &program.evidence {
-        record_predicate_signature(&mut source_arities, &evidence.atom);
+        record_predicate_signature_core(&mut source_arities, &evidence.atom, scope)?;
     }
     for query in &program.prob_queries {
-        record_predicate_signature(&mut source_arities, &query.atom);
+        record_predicate_signature_core(&mut source_arities, &query.atom, scope)?;
     }
     for declaration in &program.neural_predicates {
-        record_predicate_signature(&mut source_arities, &declaration.predicate);
+        record_predicate_signature_core(&mut source_arities, &declaration.predicate, scope)?;
     }
     for rule in &program.learnable_rules {
-        record_predicate_signature(&mut source_arities, &rule.head);
-        record_body_predicate_signatures(&mut source_arities, &rule.body);
+        record_predicate_signature_core(&mut source_arities, &rule.head, scope)?;
+        record_body_predicate_signatures_core(&mut source_arities, &rule.body, scope)?;
         if !rule.body.is_empty() {
+            acquire(scope, rule.head.predicate.len() as u64)?;
+            if !derived_predicates.contains(&rule.head.predicate) {
+                acquire(
+                    scope,
+                    crate::compile::btree_insert_allocation_bytes::<String, ()>(
+                        derived_predicates.len(),
+                    )?,
+                )?;
+            }
             derived_predicates.insert(rule.head.predicate.clone());
         }
     }
 
-    (source_arities, derived_predicates)
+    Ok((source_arities, derived_predicates))
 }
 
-fn all_multi_arity_predicates(program: &Program) -> BTreeSet<String> {
-    collect_epistemic_relation_identities(program, &BTreeSet::new())
-        .0
-        .into_iter()
-        .filter_map(|(predicate, arities)| (arities.len() > 1).then_some(predicate))
-        .collect()
+fn all_multi_arity_predicates_core(
+    program: &Program,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<BTreeSet<String>> {
+    let census = ephemeral_compilation(scope, |scope| {
+        collect_epistemic_relation_identities_core(program, &BTreeSet::new(), scope)
+    })?;
+    let identities = &census.value.0;
+    acquire(
+        scope,
+        tree_allocation_bytes::<String, ()>(identities.len())?,
+    )?;
+    let mut predicates = BTreeSet::new();
+    for (predicate, arities) in identities {
+        if arities.len() > 1 {
+            acquire(scope, predicate.len() as u64)?;
+            predicates.insert(predicate.clone());
+        }
+    }
+    Ok(predicates)
 }
 
 fn qualify_atom_for_extensional_multi_arity(
     atom: &mut crate::ast::Atom,
     predicates: &BTreeSet<String>,
 ) {
+    qualify_atom_for_extensional_multi_arity_core(atom, predicates, &mut None)
+        .expect("unbounded signature qualification has no owner refusal")
+}
+
+fn qualify_atom_for_extensional_multi_arity_core(
+    atom: &mut Atom,
+    predicates: &BTreeSet<String>,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<()> {
     if predicates.contains(&atom.predicate) {
+        if scope.is_some() {
+            acquire(
+                scope,
+                crate::compile::formatted_text_allocation_bytes(format_args!(
+                    "{}/{}",
+                    atom.predicate,
+                    atom.arity()
+                ))?,
+            )?;
+        }
         atom.predicate = format!("{}/{}", atom.predicate, atom.arity());
     }
+    Ok(())
 }
 
 fn qualify_body_for_extensional_multi_arity(
     body: &mut [BodyLiteral],
     predicates: &BTreeSet<String>,
 ) {
+    qualify_body_for_extensional_multi_arity_core(body, predicates, &mut None)
+        .expect("unbounded signature qualification has no owner refusal")
+}
+
+fn qualify_body_for_extensional_multi_arity_core(
+    body: &mut [BodyLiteral],
+    predicates: &BTreeSet<String>,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<()> {
     for literal in body {
         match literal {
             BodyLiteral::Positive(atom) | BodyLiteral::Negated(atom) => {
-                qualify_atom_for_extensional_multi_arity(atom, predicates);
+                qualify_atom_for_extensional_multi_arity_core(atom, predicates, scope)?;
             }
             BodyLiteral::Epistemic(modal) => {
-                qualify_atom_for_extensional_multi_arity(&mut modal.atom, predicates);
+                qualify_atom_for_extensional_multi_arity_core(&mut modal.atom, predicates, scope)?;
             }
             BodyLiteral::Comparison(_) | BodyLiteral::IsExpr(_) | BodyLiteral::Univ(_) => {}
         }
     }
+    Ok(())
 }
 
 /// Return extensional predicate names whose runtime identity must include arity.
@@ -3057,24 +4727,66 @@ fn qualify_body_for_extensional_multi_arity(
 /// or add a live signature. Reducers and fact upload must use this same set so a
 /// source fact and its compiled scan always receive the same runtime name.
 pub fn epistemic_extensional_multi_arity_predicates(program: &Program) -> BTreeSet<String> {
-    let removed_rules = faeel_unfounded_exact_tuple_self_support_rule_indices(program)
-        .into_iter()
+    epistemic_extensional_multi_arity_predicates_core(program, &mut None)
+        .expect("unbounded extensional census has no owner refusal")
+}
+
+/// Obtain the existing complete extensional signature census under its original owner.
+pub fn epistemic_extensional_multi_arity_predicates_with_allocation_owner(
+    program: &Program,
+    scope: &mut CompilationAllocationScope<'_>,
+) -> Result<BTreeSet<String>> {
+    epistemic_extensional_multi_arity_predicates_core(program, &mut Some(scope))
+}
+
+fn epistemic_extensional_multi_arity_predicates_core(
+    program: &Program,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<BTreeSet<String>> {
+    let removed_indices = ephemeral_compilation(scope, |scope| {
+        faeel_unfounded_exact_tuple_self_support_rule_indices_core(program, scope)
+    })?;
+    let _removed_owner = reserve_scratch(
+        scope,
+        tree_allocation_bytes::<usize, ()>(removed_indices.value.len())?,
+    )?;
+    let removed_rules = removed_indices
+        .value
+        .iter()
+        .copied()
         .collect::<BTreeSet<_>>();
-    extensional_multi_arity_predicates(program, &removed_rules)
+    extensional_multi_arity_predicates_core(program, &removed_rules, scope)
 }
 
 fn extensional_multi_arity_predicates(
     program: &Program,
     removed_rules: &BTreeSet<usize>,
 ) -> BTreeSet<String> {
-    let (source_arities, derived_predicates) =
-        collect_epistemic_relation_identities(program, removed_rules);
-    source_arities
-        .into_iter()
-        .filter_map(|(predicate, arities)| {
-            (arities.len() > 1 && !derived_predicates.contains(&predicate)).then_some(predicate)
-        })
-        .collect()
+    extensional_multi_arity_predicates_core(program, removed_rules, &mut None)
+        .expect("unbounded extensional census has no owner refusal")
+}
+
+fn extensional_multi_arity_predicates_core(
+    program: &Program,
+    removed_rules: &BTreeSet<usize>,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<BTreeSet<String>> {
+    let census = ephemeral_compilation(scope, |scope| {
+        collect_epistemic_relation_identities_core(program, removed_rules, scope)
+    })?;
+    let (source_arities, derived_predicates) = &census.value;
+    acquire(
+        scope,
+        tree_allocation_bytes::<String, ()>(source_arities.len())?,
+    )?;
+    let mut predicates = BTreeSet::new();
+    for (predicate, arities) in source_arities {
+        if arities.len() > 1 && !derived_predicates.contains(predicate) {
+            acquire(scope, predicate.len() as u64)?;
+            predicates.insert(predicate.clone());
+        }
+    }
+    Ok(predicates)
 }
 
 /// Give each extensional source signature the same arity-qualified runtime name
@@ -3088,8 +4800,20 @@ fn qualify_extensional_multi_arity_predicates(
     source: &Program,
     removed_rules: &BTreeSet<usize>,
 ) {
-    let predicates = extensional_multi_arity_predicates(source, removed_rules);
-    qualify_predicate_signatures(reduced, &predicates);
+    qualify_extensional_multi_arity_predicates_core(reduced, source, removed_rules, &mut None)
+        .expect("unbounded extensional qualification has no owner refusal")
+}
+
+fn qualify_extensional_multi_arity_predicates_core(
+    reduced: &mut Program,
+    source: &Program,
+    removed_rules: &BTreeSet<usize>,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<()> {
+    let predicates = ephemeral_compilation(scope, |scope| {
+        extensional_multi_arity_predicates_core(source, removed_rules, scope)
+    })?;
+    qualify_predicate_signatures_core(reduced, &predicates.value, scope)
 }
 
 /// Apply canonical name-and-arity identities to every AST surface naming one of
@@ -3097,46 +4821,70 @@ fn qualify_extensional_multi_arity_predicates(
 /// source validation calls it for every multi-arity name so each authored signature
 /// retains its own declarations and clauses while being checked.
 fn qualify_predicate_signatures(reduced: &mut Program, predicates: &BTreeSet<String>) {
+    qualify_predicate_signatures_core(reduced, predicates, &mut None)
+        .expect("unbounded signature qualification has no owner refusal")
+}
+
+fn qualify_predicate_signatures_core(
+    reduced: &mut Program,
+    predicates: &BTreeSet<String>,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<()> {
     if predicates.is_empty() {
-        return;
+        return Ok(());
     }
 
     for declaration in &mut reduced.predicates {
         if predicates.contains(&declaration.name) {
+            if scope.is_some() {
+                acquire(
+                    scope,
+                    crate::compile::formatted_text_allocation_bytes(format_args!(
+                        "{}/{}",
+                        declaration.name,
+                        declaration.arity()
+                    ))?,
+                )?;
+            }
             declaration.name = format!("{}/{}", declaration.name, declaration.arity());
         }
     }
     for rule in &mut reduced.rules {
-        qualify_atom_for_extensional_multi_arity(&mut rule.head, predicates);
-        qualify_body_for_extensional_multi_arity(&mut rule.body, predicates);
+        qualify_atom_for_extensional_multi_arity_core(&mut rule.head, predicates, scope)?;
+        qualify_body_for_extensional_multi_arity_core(&mut rule.body, predicates, scope)?;
     }
     for constraint in &mut reduced.constraints {
-        qualify_body_for_extensional_multi_arity(&mut constraint.body, predicates);
+        qualify_body_for_extensional_multi_arity_core(&mut constraint.body, predicates, scope)?;
     }
     for query in &mut reduced.queries {
-        qualify_atom_for_extensional_multi_arity(&mut query.atom, predicates);
+        qualify_atom_for_extensional_multi_arity_core(&mut query.atom, predicates, scope)?;
     }
     for fact in &mut reduced.prob_facts {
-        qualify_atom_for_extensional_multi_arity(&mut fact.atom, predicates);
+        qualify_atom_for_extensional_multi_arity_core(&mut fact.atom, predicates, scope)?;
     }
     for disjunction in &mut reduced.annotated_disjunctions {
         for choice in &mut disjunction.choices {
-            qualify_atom_for_extensional_multi_arity(&mut choice.atom, predicates);
+            qualify_atom_for_extensional_multi_arity_core(&mut choice.atom, predicates, scope)?;
         }
     }
     for evidence in &mut reduced.evidence {
-        qualify_atom_for_extensional_multi_arity(&mut evidence.atom, predicates);
+        qualify_atom_for_extensional_multi_arity_core(&mut evidence.atom, predicates, scope)?;
     }
     for query in &mut reduced.prob_queries {
-        qualify_atom_for_extensional_multi_arity(&mut query.atom, predicates);
+        qualify_atom_for_extensional_multi_arity_core(&mut query.atom, predicates, scope)?;
     }
     for declaration in &mut reduced.neural_predicates {
-        qualify_atom_for_extensional_multi_arity(&mut declaration.predicate, predicates);
+        qualify_atom_for_extensional_multi_arity_core(
+            &mut declaration.predicate,
+            predicates,
+            scope,
+        )?;
     }
     for rule in &mut reduced.learnable_rules {
-        qualify_atom_for_extensional_multi_arity(&mut rule.head, predicates);
-        qualify_body_for_extensional_multi_arity(&mut rule.body, predicates);
+        qualify_atom_for_extensional_multi_arity_core(&mut rule.head, predicates, scope)?;
+        qualify_body_for_extensional_multi_arity_core(&mut rule.body, predicates, scope)?;
     }
+    Ok(())
 }
 
 /// Validate the name-keyed runtime identity used for derived epistemic
@@ -3152,20 +4900,29 @@ fn validate_epistemic_derived_relation_identity(
     program: &Program,
     removed_rules: &BTreeSet<usize>,
 ) -> Result<BTreeMap<String, BTreeSet<usize>>> {
+    validate_epistemic_derived_relation_identity_core(program, removed_rules, &mut None)
+}
+
+fn validate_epistemic_derived_relation_identity_core(
+    program: &Program,
+    removed_rules: &BTreeSet<usize>,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<BTreeMap<String, BTreeSet<usize>>> {
     let (source_arities, derived_predicates) =
-        collect_epistemic_relation_identities(program, removed_rules);
+        collect_epistemic_relation_identities_core(program, removed_rules, scope)?;
     for predicate in derived_predicates {
         let arities = source_arities
             .get(&predicate)
             .expect("derived predicate has a source signature");
         if arities.len() > 1 {
-            return Err(XlogError::UnsupportedEpistemicConstruct {
-                construct: "epistemic derived predicate schema".to_string(),
-                context: format!(
+            return Err(unsupported_diagnostic(
+                scope,
+                "epistemic derived predicate schema",
+                format_args!(
                     "derived predicate `{predicate}` uses multiple source arities {arities:?}; \
                      epistemic derived relations require one source signature per predicate name"
                 ),
-            });
+            )?);
         }
     }
 
@@ -3184,9 +4941,32 @@ fn validate_epistemic_relation_shapes(
     program: &Program,
     non_augmenting_rule_indices: &BTreeSet<usize>,
 ) -> Result<()> {
-    let removed_rules = faeel_unfounded_exact_tuple_self_support_rule_indices(program)
-        .into_iter()
+    validate_epistemic_relation_shapes_core(program, non_augmenting_rule_indices, &mut None)
+}
+
+fn validate_epistemic_relation_shapes_core(
+    program: &Program,
+    non_augmenting_rule_indices: &BTreeSet<usize>,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<()> {
+    let removed_indices = ephemeral_compilation(scope, |scope| {
+        faeel_unfounded_exact_tuple_self_support_rule_indices_core(program, scope)
+    })?;
+    let _removed_owner = reserve_scratch(
+        scope,
+        tree_allocation_bytes::<usize, ()>(removed_indices.value.len())?,
+    )?;
+    let removed_rules = removed_indices
+        .value
+        .iter()
+        .copied()
         .collect::<BTreeSet<_>>();
+    let _active_owner = reserve_scratch(
+        scope,
+        crate::compile::push_vector_allocation_bytes::<(usize, &crate::ast::Rule)>(
+            program.rules.len(),
+        )?,
+    )?;
     let active_rules = program
         .rules
         .iter()
@@ -3196,18 +4976,36 @@ fn validate_epistemic_relation_shapes(
         })
         .collect::<Vec<_>>();
 
-    validate_epistemic_derived_relation_identity(program, &removed_rules)?;
+    drop(ephemeral_compilation(scope, |scope| {
+        validate_epistemic_derived_relation_identity_core(program, &removed_rules, scope)
+    })?);
 
+    let _arities_owner = reserve_scratch(
+        scope,
+        crate::compile::push_vector_allocation_bytes::<((String, usize), usize)>(
+            active_rules.len(),
+        )?,
+    )?;
+    let _targets_owner = reserve_scratch(
+        scope,
+        tree_allocation_bytes::<(String, usize), usize>(active_rules.len())?,
+    )?;
     let mut reduced_rule_arities = Vec::with_capacity(active_rules.len());
     let mut augmented_targets: BTreeMap<(String, usize), usize> = BTreeMap::new();
 
     for (_, rule) in &active_rules {
+        acquire(scope, rule.head.predicate.len() as u64)?;
         let original_signature = (rule.head.predicate.clone(), rule.head.arity());
-        let mut reduced_rule = (*rule).clone();
-        append_body_local_tuple_key_variables_to_head(&mut reduced_rule);
-        let reduced_arity = reduced_rule.head.arity();
+        let reduced_arity = ephemeral_compilation(scope, |scope| {
+            acquire(scope, rule.owned_allocation_bytes()?)?;
+            let mut reduced_rule = (*rule).clone();
+            append_body_local_tuple_key_variables_to_head_core(&mut reduced_rule, scope)?;
+            Ok(reduced_rule.head.arity())
+        })?;
+        let reduced_arity = reduced_arity.value;
 
         if reduced_arity > original_signature.1 {
+            acquire(scope, original_signature.0.len() as u64)?;
             augmented_targets
                 .entry(original_signature.clone())
                 .and_modify(|target| *target = (*target).max(reduced_arity))
@@ -3217,25 +5015,34 @@ fn validate_epistemic_relation_shapes(
     }
 
     for ((predicate, original_arity), target_arity) in augmented_targets {
+        let _arity_set_owner = reserve_scratch(
+            scope,
+            tree_allocation_bytes::<usize, ()>(reduced_rule_arities.len())?,
+        )?;
         let arities = reduced_rule_arities
             .iter()
             .filter(|((candidate, arity), _)| candidate == &predicate && *arity == original_arity)
             .map(|(_, arity)| *arity)
             .collect::<BTreeSet<_>>();
         if arities.len() != 1 || !arities.contains(&target_arity) {
-            return Err(XlogError::UnsupportedEpistemicConstruct {
-                construct: "epistemic augmented predicate schema".to_string(),
-                context: format!(
+            return Err(unsupported_diagnostic(
+                scope,
+                "epistemic augmented predicate schema",
+                format_args!(
                     "rules defining `{predicate}/{original_arity}` lower to incompatible \
                      internal arities {arities:?}; every clause for one predicate signature \
                      must bind the same augmented tuple shape"
                 ),
-            });
+            )?);
         }
 
         for query in program.queries.iter().filter(|query| {
             query.atom.predicate == predicate && query.atom.arity() == original_arity
         }) {
+            let _variables_owner = reserve_scratch(
+                scope,
+                tree_allocation_bytes::<&String, ()>(query.atom.terms.len())?,
+            )?;
             let mut variables = BTreeSet::new();
             let unconstrained = query.atom.terms.iter().all(|term| match term {
                 Term::Variable(name) => name != "_" && variables.insert(name.as_str()),
@@ -3251,26 +5058,35 @@ fn validate_epistemic_relation_shapes(
                 | Term::Aggregate(_) => false,
             });
             if !unconstrained {
-                return Err(XlogError::UnsupportedEpistemicConstruct {
-                    construct: "epistemic augmented head query".to_string(),
-                    context: format!(
+                return Err(unsupported_diagnostic(
+                    scope,
+                    "epistemic augmented head query",
+                    format_args!(
                         "query `{predicate}/{original_arity}` is not a tuple of distinct named \
                          variables; an augmented epistemic head can currently surface only \
                          queries whose arguments are distinct named variables"
                     ),
-                });
+                )?);
             }
         }
     }
 
-    let eir = build_eir(program)?;
+    let eir = ephemeral_compilation(scope, |scope| build_eir_with_scope(program, scope))?;
+    let _clauses_owner = reserve_scratch(
+        scope,
+        tree_allocation_bytes::<(String, usize), Vec<(usize, &crate::ast::Rule)>>(
+            active_rules.len(),
+        )?,
+    )?;
     let mut clauses_by_signature: BTreeMap<(String, usize), Vec<(usize, &crate::ast::Rule)>> =
         BTreeMap::new();
     for (rule_index, rule) in active_rules {
-        clauses_by_signature
+        acquire(scope, rule.head.predicate.len() as u64)?;
+        let clauses = clauses_by_signature
             .entry((rule.head.predicate.clone(), rule.head.arity()))
-            .or_default()
-            .push((rule_index, rule));
+            .or_default();
+        acquire_push(clauses, clauses.capacity(), scope)?;
+        clauses.push((rule_index, rule));
     }
     for ((predicate, arity), clauses) in clauses_by_signature {
         if clauses.len() > 1
@@ -3279,16 +5095,17 @@ fn validate_epistemic_relation_shapes(
                     .iter()
                     .any(|literal| matches!(literal, BodyLiteral::Epistemic(_)))
             })
-            && !epistemic_rule_union_gates_are_redundant(program, &eir, &clauses)
+            && !epistemic_rule_union_gates_are_redundant_core(program, &eir.value, &clauses, scope)?
         {
-            return Err(XlogError::UnsupportedEpistemicConstruct {
-                construct: "epistemic rule-union materialization".to_string(),
-                context: format!(
+            return Err(unsupported_diagnostic(
+                scope,
+                "epistemic rule-union materialization",
+                format_args!(
                     "predicate `{predicate}/{arity}` has multiple defining clauses and at least \
                      one epistemic clause; single-pass materialization cannot preserve \
                      per-clause modal provenance, so it cannot safely filter the clause union"
                 ),
-            });
+            )?);
         }
     }
 
@@ -3321,22 +5138,52 @@ fn epistemic_rule_union_gates_are_redundant(
     eir: &EirProgram,
     clauses: &[(usize, &crate::ast::Rule)],
 ) -> bool {
-    let invariant = InvariantRelations::analyze(program);
-    let mut normalized_conjunctions = clauses.iter().map(|(rule_index, _)| {
-        eir.rules
-            .get(*rule_index)
-            .and_then(|rule| normalized_rule_union_gates(rule, &invariant))
-    });
-    if let Some(Some(first)) = normalized_conjunctions.next() {
-        if !first.is_empty()
-            && normalized_conjunctions.all(|candidate| {
-                candidate.is_some_and(|candidate| rule_union_gate_sets_equal(&first, &candidate))
-            })
-        {
-            return true;
+    epistemic_rule_union_gates_are_redundant_core(program, eir, clauses, &mut None)
+        .expect("unbounded union-gate analysis has no owner refusal")
+}
+
+fn epistemic_rule_union_gates_are_redundant_core(
+    program: &Program,
+    eir: &EirProgram,
+    clauses: &[(usize, &crate::ast::Rule)],
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<bool> {
+    let invariant = InvariantRelations::analyze_with_scope(program, scope)?;
+    if let Some((rule_index, _)) = clauses.first() {
+        if let Some(rule) = eir.rules.get(*rule_index) {
+            let first = ephemeral_compilation(scope, |scope| {
+                normalized_rule_union_gates_core(rule, &invariant, scope)
+            })?;
+            if let Some(first_gates) = first.value.as_ref().filter(|gates| !gates.is_empty()) {
+                let mut equal = true;
+                for (rule_index, _) in clauses.iter().skip(1) {
+                    let Some(rule) = eir.rules.get(*rule_index) else {
+                        equal = false;
+                        break;
+                    };
+                    let candidate = ephemeral_compilation(scope, |scope| {
+                        normalized_rule_union_gates_core(rule, &invariant, scope)
+                    })?;
+                    if !candidate
+                        .value
+                        .as_ref()
+                        .is_some_and(|candidate| rule_union_gate_sets_equal(first_gates, candidate))
+                    {
+                        equal = false;
+                        break;
+                    }
+                }
+                if equal {
+                    return Ok(true);
+                }
+            }
         }
     }
 
+    let _clauses_owner = reserve_scratch(
+        scope,
+        crate::compile::push_vector_allocation_bytes::<&(usize, &crate::ast::Rule)>(clauses.len())?,
+    )?;
     let epistemic_clauses = clauses
         .iter()
         .filter(|(_, rule)| {
@@ -3346,64 +5193,75 @@ fn epistemic_rule_union_gates_are_redundant(
         })
         .collect::<Vec<_>>();
     if epistemic_clauses.is_empty() {
-        return true;
+        return Ok(true);
     }
 
     // Every modal filter is redundant when it is a positive ground atom with an
     // unconditional founded proof. This remains distributive even when several
     // sibling clauses use different ground modal atoms: every gate is true before
     // the clause outputs are unioned, so no per-clause provenance is needed later.
-    let every_gate_is_unconditionally_true = epistemic_clauses.iter().all(|(rule_index, _)| {
-        eir.rules.get(*rule_index).is_some_and(|eir_rule| {
-            let modal_literals = eir_rule
-                .body
-                .iter()
-                .filter_map(|literal| match literal {
-                    EirBodyLiteral::Epistemic(modal) => Some(modal),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            !modal_literals.is_empty()
-                && modal_literals.iter().all(|modal| {
-                    !modal.negated && has_unconditional_ground_founded_support(eir, &modal.atom)
-                })
-        })
-    });
+    let mut every_gate_is_unconditionally_true = true;
+    for (rule_index, _) in &epistemic_clauses {
+        let Some(eir_rule) = eir.rules.get(*rule_index) else {
+            every_gate_is_unconditionally_true = false;
+            break;
+        };
+        let mut has_modal = false;
+        for literal in &eir_rule.body {
+            let EirBodyLiteral::Epistemic(modal) = literal else {
+                continue;
+            };
+            has_modal = true;
+            if modal.negated
+                || !has_unconditional_ground_founded_support_core(eir, &modal.atom, scope)?
+            {
+                every_gate_is_unconditionally_true = false;
+                break;
+            }
+        }
+        if !has_modal {
+            every_gate_is_unconditionally_true = false;
+        }
+        if !every_gate_is_unconditionally_true {
+            break;
+        }
+    }
     if every_gate_is_unconditionally_true {
-        return true;
+        return Ok(true);
     }
 
     if epistemic_clauses.len() != 1 {
-        return false;
+        return Ok(false);
     }
 
     let (rule_index, _) = epistemic_clauses[0];
     let Some(eir_rule) = eir.rules.get(*rule_index) else {
-        return false;
+        return Ok(false);
     };
-    let modal_literals = eir_rule
-        .body
-        .iter()
-        .filter_map(|literal| match literal {
-            EirBodyLiteral::Epistemic(modal) => Some(modal),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-
-    !modal_literals.is_empty()
-        && modal_literals.iter().all(|modal| {
-            !modal.negated
-                && (has_unconditional_ground_founded_support(eir, &modal.atom)
-                    || (modal.atom == eir_rule.head
-                        && eir_head_is_bijective_variable_tuple(&eir_rule.head)
-                        && ((eir.mode == EirEpistemicMode::G91
-                            && modal.op == EirEpistemicOp::Possible)
-                            || has_tuple_level_independent_founded_support(
-                                eir,
-                                eir_rule,
-                                &modal.atom,
-                            ))))
-        })
+    let mut has_modal = false;
+    for literal in &eir_rule.body {
+        let EirBodyLiteral::Epistemic(modal) = literal else {
+            continue;
+        };
+        has_modal = true;
+        if modal.negated {
+            return Ok(false);
+        }
+        if has_unconditional_ground_founded_support_core(eir, &modal.atom, scope)? {
+            continue;
+        }
+        if modal.atom != eir_rule.head
+            || !eir_head_is_bijective_variable_tuple_core(&eir_rule.head, scope)?
+        {
+            return Ok(false);
+        }
+        if !(eir.mode == EirEpistemicMode::G91 && modal.op == EirEpistemicOp::Possible)
+            && !has_tuple_level_independent_founded_support_core(eir, eir_rule, &modal.atom, scope)?
+        {
+            return Ok(false);
+        }
+    }
+    Ok(has_modal)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3429,13 +5287,33 @@ fn normalized_rule_union_gates(
     rule: &xlog_ir::EirRule,
     invariant: &InvariantRelations<'_>,
 ) -> Option<Vec<RuleUnionGate>> {
-    let output_terms = augmented_eir_head_terms(rule);
+    normalized_rule_union_gates_core(rule, invariant, &mut None)
+        .expect("unbounded union-gate normalization has no owner refusal")
+}
+
+fn normalized_rule_union_gates_core(
+    rule: &xlog_ir::EirRule,
+    invariant: &InvariantRelations<'_>,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<Option<Vec<RuleUnionGate>>> {
+    let output_terms =
+        ephemeral_compilation(scope, |scope| augmented_eir_head_terms_core(rule, scope))?;
     let mut gates = Vec::new();
     for literal in &rule.body {
         let EirBodyLiteral::Epistemic(modal) = literal else {
             continue;
         };
-        let bound_columns = bound_output_columns_for_terms(&modal.atom.terms, &output_terms);
+        let _bound_owner = reserve_scratch(
+            scope,
+            crate::compile::push_vector_allocation_bytes::<Option<usize>>(modal.atom.terms.len())?,
+        )?;
+        let bound_columns = bound_output_columns_for_terms(&modal.atom.terms, &output_terms.value);
+        acquire_vector::<RuleUnionGateTerm>(scope, modal.atom.terms.len())?;
+        for term in &modal.atom.terms {
+            if !matches!(term, EirTerm::Variable(_)) {
+                acquire(scope, crate::eir::term_clone_allocation_bytes(term)?)?;
+            }
+        }
         let terms = modal
             .atom
             .terms
@@ -3456,7 +5334,11 @@ fn normalized_rule_union_gates(
                 ) => Some(RuleUnionGateTerm::Literal(term.clone())),
                 _ => None,
             })
-            .collect::<Option<Vec<_>>>()?;
+            .collect::<Option<Vec<_>>>();
+        let Some(terms) = terms else {
+            return Ok(None);
+        };
+        acquire(scope, modal.atom.predicate.len() as u64)?;
         let gate = RuleUnionGate {
             predicate: modal.atom.predicate.clone(),
             arity: modal.atom.arity,
@@ -3465,10 +5347,11 @@ fn normalized_rule_union_gates(
             negated: modal.negated,
         };
         if !gates.contains(&gate) {
+            acquire_push(&gates, gates.capacity(), scope)?;
             gates.push(gate);
         }
     }
-    Some(gates)
+    Ok(Some(gates))
 }
 
 fn rule_union_gate_sets_equal(left: &[RuleUnionGate], right: &[RuleUnionGate]) -> bool {
@@ -3476,11 +5359,23 @@ fn rule_union_gate_sets_equal(left: &[RuleUnionGate], right: &[RuleUnionGate]) -
 }
 
 fn eir_head_is_bijective_variable_tuple(head: &xlog_ir::EirAtom) -> bool {
+    eir_head_is_bijective_variable_tuple_core(head, &mut None)
+        .expect("unbounded tuple-key validation has no owner refusal")
+}
+
+fn eir_head_is_bijective_variable_tuple_core(
+    head: &xlog_ir::EirAtom,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<bool> {
+    let _variables_owner = reserve_scratch(
+        scope,
+        tree_allocation_bytes::<&String, ()>(head.terms.len())?,
+    )?;
     let mut variables = BTreeSet::new();
-    head.terms.iter().all(|term| match term {
+    Ok(head.terms.iter().all(|term| match term {
         EirTerm::Variable(name) => variables.insert(name),
         _ => false,
-    })
+    }))
 }
 
 /// Widen each predicate's declaration to the maximum arity of its (now possibly
@@ -3501,93 +5396,194 @@ fn reconcile_augmented_head_declarations(
     reduced: &mut Program,
     augmented_rule_original_arities: &BTreeMap<usize, usize>,
 ) -> Result<BTreeMap<(String, usize), usize>> {
+    reconcile_augmented_head_declarations_core(reduced, augmented_rule_original_arities, &mut None)
+        .map(|signatures| signatures.value)
+}
+
+fn reconcile_augmented_head_declarations_core(
+    reduced: &mut Program,
+    augmented_rule_original_arities: &BTreeMap<usize, usize>,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<RetainedEpistemicAllocation<BTreeMap<(String, usize), usize>>> {
     use crate::ast::{PredColumn, TypeRef};
 
-    // Per original head signature: the maximum augmented rule-head arity and, per
-    // column position, an inferred type from a positive body atom (the resolved modal
-    // or any binder).
-    let mut augmented_signatures: BTreeMap<(String, usize), usize> = BTreeMap::new();
-    let mut inferred_types: BTreeMap<(String, usize), Vec<Option<TypeRef>>> = BTreeMap::new();
+    let inference = ephemeral_compilation(scope, |scope| {
+        // Per original head signature: the maximum augmented rule-head arity and, per
+        // column position, an inferred type from a positive body atom (the resolved modal
+        // or any binder).
+        let mut augmented_signatures: BTreeMap<(String, usize), usize> = BTreeMap::new();
+        let mut inferred_types: BTreeMap<(String, usize), Vec<Option<TypeRef>>> = BTreeMap::new();
 
-    // Use the ordinary lowerer's fixed-point schema inference after extensional
-    // multi-arity names have been qualified. This is the same source of truth used
-    // by production compilation, so undeclared facts, transitive rule chains,
-    // declarations, domains, and arithmetic bindings all contribute their real
-    // scalar types instead of falling through to a guessed hidden-column type.
-    let mut lowerer = Lowerer::new();
-    lowerer.infer_schemas(reduced)?;
-    let schemas = lowerer.schemas().clone();
-
-    for (rule_index, rule) in reduced.rules.iter().enumerate() {
-        if rule.body.is_empty() {
-            continue;
-        }
-        // Only rules where the invariant-resolve genuinely fired are reconciled.
-        let Some(&original_arity) = augmented_rule_original_arities.get(&rule_index) else {
-            continue;
-        };
-        let arity = rule.head.terms.len();
-        if arity <= original_arity {
-            continue;
-        }
-        let signature = (rule.head.predicate.clone(), original_arity);
-        let entry = augmented_signatures.entry(signature.clone()).or_insert(0);
-        if arity > *entry {
-            *entry = arity;
-        }
-        let types = inferred_types
-            .entry(signature)
-            .or_insert_with(|| vec![None; arity]);
-        if types.len() < arity {
-            types.resize(arity, None);
-        }
-        let variable_types = lowerer.infer_rule_variable_types(rule, |atom, index| {
-            schemas
-                .get(&atom.predicate)
-                .and_then(|schema| schema.column_type(index))
+        // Use the ordinary lowerer's fixed-point schema inference after extensional
+        // multi-arity names have been qualified. This is the same source of truth used
+        // by production compilation, so undeclared facts, transitive rule chains,
+        // declarations, domains, and arithmetic bindings all contribute their real
+        // scalar types instead of falling through to a guessed hidden-column type.
+        let lowerer = ephemeral_compilation(scope, |scope| {
+            let mut lowerer = Lowerer::new();
+            match scope.as_deref_mut() {
+                Some(scope) => lowerer.infer_schemas_with_allocation_owner(reduced, scope)?,
+                None => lowerer.infer_schemas(reduced)?,
+            }
+            Ok(lowerer)
         })?;
+        let schemas = lowerer.value.schemas();
 
-        // Infer each head variable's type from every binding form understood by
-        // ordinary lowering, including body atoms and deterministic `is` results.
-        for (col, term) in rule.head.terms.iter().enumerate() {
-            if types[col].is_some() {
+        for (rule_index, rule) in reduced.rules.iter().enumerate() {
+            if rule.body.is_empty() {
                 continue;
             }
-            let Term::Variable(head_var) = term else {
+            // Only rules where the invariant-resolve genuinely fired are reconciled.
+            let Some(&original_arity) = augmented_rule_original_arities.get(&rule_index) else {
                 continue;
             };
-            if let Some((typ, _)) = variable_types.get(head_var) {
-                types[col] = Some(TypeRef::Scalar(*typ));
+            let arity = rule.head.terms.len();
+            if arity <= original_arity {
+                continue;
+            }
+            acquire(
+                scope,
+                (rule.head.predicate.len() as u64)
+                    .checked_mul(2)
+                    .ok_or_else(|| {
+                        allocation_extent_overflow("augmented signature allocation overflow")
+                    })?,
+            )?;
+            let signature = (rule.head.predicate.clone(), original_arity);
+            if !augmented_signatures.contains_key(&signature) {
+                acquire(
+                    scope,
+                    crate::compile::btree_insert_allocation_bytes::<(String, usize), usize>(
+                        augmented_signatures.len(),
+                    )?,
+                )?;
+            }
+            let entry = augmented_signatures.entry(signature.clone()).or_insert(0);
+            if arity > *entry {
+                *entry = arity;
+            }
+            if !inferred_types.contains_key(&signature) {
+                acquire(
+                    scope,
+                    crate::compile::btree_insert_allocation_bytes::<
+                        (String, usize),
+                        Vec<Option<TypeRef>>,
+                    >(inferred_types.len())?,
+                )?;
+                acquire_vector::<Option<TypeRef>>(scope, arity)?;
+            }
+            let types = inferred_types
+                .entry(signature)
+                .or_insert_with(|| vec![None; arity]);
+            if types.len() < arity {
+                if types.capacity() < arity {
+                    acquire_vector::<Option<TypeRef>>(scope, arity)?;
+                }
+                types.resize(arity, None);
+            }
+            let lookup = |atom: &Atom, index| {
+                schemas
+                    .get(&atom.predicate)
+                    .and_then(|schema| schema.column_type(index))
+            };
+            let variable_types = ephemeral_compilation(scope, |scope| {
+                Ok(match scope.as_deref_mut() {
+                    Some(scope) => lowerer
+                        .value
+                        .infer_rule_variable_types_with_allocation_owner(rule, lookup, scope)?,
+                    None => lowerer.value.infer_rule_variable_types(rule, lookup)?,
+                })
+            })?;
+
+            // Infer each head variable's type from every binding form understood by
+            // ordinary lowering, including body atoms and deterministic `is` results.
+            for (col, term) in rule.head.terms.iter().enumerate() {
+                if types[col].is_some() {
+                    continue;
+                }
+                let Term::Variable(head_var) = term else {
+                    continue;
+                };
+                if let Some((typ, _)) = variable_types.value.get(head_var) {
+                    types[col] = Some(TypeRef::Scalar(*typ));
+                }
             }
         }
-    }
 
+        Ok((augmented_signatures, inferred_types))
+    })?;
+    let (augmented_signatures, inferred_types) = &inference.value;
     for decl in &mut reduced.predicates {
+        let _signature_owner = reserve_scratch(scope, decl.name.len() as u64)?;
         let signature = (decl.name.clone(), decl.arity());
         let Some(&target_arity) = augmented_signatures.get(&signature) else {
             continue;
         };
+        acquire(scope, decl.owned_allocation_bytes()?)?;
         let mut columns = decl.schema_columns();
         if target_arity <= columns.len() {
             continue;
         }
         let inferred = inferred_types.get(&signature);
         for col in columns.len()..target_arity {
+            if let Some(typ) = inferred
+                .and_then(|types| types.get(col))
+                .and_then(Option::as_ref)
+            {
+                acquire(scope, typ.owned_allocation_bytes()?)?;
+            }
             let typ = inferred
                 .and_then(|types| types.get(col))
                 .and_then(|t| t.clone())
                 // Default appended columns to U32 (the modal relation key column type).
                 .unwrap_or(TypeRef::Scalar(xlog_core::ScalarType::U32));
+            acquire_push(&columns, columns.capacity(), scope)?;
             columns.push(PredColumn { name: None, typ });
+        }
+        acquire_vector::<TypeRef>(scope, columns.len())?;
+        for column in &columns {
+            acquire(scope, column.typ.owned_allocation_bytes()?)?;
         }
         decl.types = columns.iter().map(|column| column.typ.clone()).collect();
         decl.columns = columns;
     }
 
-    Ok(augmented_signatures)
+    let RetainedEpistemicAllocation {
+        value: (augmented_signatures, inferred_types),
+        _owner,
+    } = inference;
+    drop(inferred_types);
+    Ok(RetainedEpistemicAllocation {
+        value: augmented_signatures,
+        _owner,
+    })
 }
 
 fn append_body_local_tuple_key_variables_to_head(rule: &mut crate::ast::Rule) {
+    append_body_local_tuple_key_variables_to_head_core(rule, &mut None)
+        .expect("unbounded modal head augmentation has no owner refusal")
+}
+
+fn append_body_local_tuple_key_variables_to_head_core(
+    rule: &mut crate::ast::Rule,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<()> {
+    let count = rule
+        .body
+        .iter()
+        .filter_map(|literal| match literal {
+            BodyLiteral::Epistemic(modal) => Some(modal.atom.terms.len()),
+            _ => None,
+        })
+        .try_fold(0usize, |count, next| {
+            count
+                .checked_add(next)
+                .ok_or_else(|| allocation_extent_overflow("modal head variable count overflow"))
+        })?;
+    let _hidden_storage_owner = reserve_scratch(
+        scope,
+        crate::compile::push_vector_allocation_bytes::<String>(count)?,
+    )?;
     let mut hidden_variables = Vec::new();
     for lit in &rule.body {
         let BodyLiteral::Epistemic(lit) = lit else {
@@ -3606,57 +5602,97 @@ fn append_body_local_tuple_key_variables_to_head(rule: &mut crate::ast::Rule) {
                 .iter()
                 .any(|head_term| matches!(head_term, Term::Variable(name) if name == variable));
             if !already_in_head && !hidden_variables.iter().any(|name| name == variable) {
+                acquire(scope, variable.len() as u64)?;
                 hidden_variables.push(variable.clone());
             }
         }
     }
     for variable in hidden_variables {
+        acquire_push(&rule.head.terms, rule.head.terms.capacity(), scope)?;
         rule.head.terms.push(Term::Variable(variable));
     }
+    Ok(())
 }
 
 fn wcoj_status_for_reduction(
     positive_relational_atoms: &[xlog_ir::EirAtom],
     has_negated_relational_atom: bool,
 ) -> EpistemicWcojReductionStatus {
+    wcoj_status_for_reduction_core(
+        positive_relational_atoms,
+        has_negated_relational_atom,
+        &mut None,
+    )
+    .expect("unbounded join-shape classification has no owner refusal")
+}
+
+fn wcoj_status_for_reduction_core(
+    positive_relational_atoms: &[xlog_ir::EirAtom],
+    has_negated_relational_atom: bool,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<EpistemicWcojReductionStatus> {
     if !has_negated_relational_atom
-        && positive_relational_atoms_are_supported_wcoj_shape(positive_relational_atoms)
+        && positive_relational_atoms_are_supported_wcoj_shape_core(
+            positive_relational_atoms,
+            scope,
+        )?
     {
-        EpistemicWcojReductionStatus::RequiresPlannerEligibility
+        Ok(EpistemicWcojReductionStatus::RequiresPlannerEligibility)
     } else {
-        EpistemicWcojReductionStatus::NotWcojCandidate
+        Ok(EpistemicWcojReductionStatus::NotWcojCandidate)
     }
 }
 
 fn positive_relational_atoms_are_supported_wcoj_shape(atoms: &[xlog_ir::EirAtom]) -> bool {
-    let mut edges: BTreeSet<(String, String)> = BTreeSet::new();
-    let mut degrees: BTreeMap<String, usize> = BTreeMap::new();
+    positive_relational_atoms_are_supported_wcoj_shape_core(atoms, &mut None)
+        .expect("unbounded join-shape classification has no owner refusal")
+}
+
+fn positive_relational_atoms_are_supported_wcoj_shape_core(
+    atoms: &[xlog_ir::EirAtom],
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<bool> {
+    let _edges_owner = reserve_scratch(
+        scope,
+        tree_allocation_bytes::<(&str, &str), ()>(atoms.len())?,
+    )?;
+    let _degrees_owner = reserve_scratch(
+        scope,
+        tree_allocation_bytes::<&str, usize>(
+            atoms
+                .len()
+                .checked_mul(2)
+                .ok_or_else(|| allocation_extent_overflow("join variable count overflow"))?,
+        )?,
+    )?;
+    let mut edges: BTreeSet<(&str, &str)> = BTreeSet::new();
+    let mut degrees: BTreeMap<&str, usize> = BTreeMap::new();
     for atom in atoms {
         if atom.arity != 2 || atom.terms.len() != 2 {
-            return false;
+            return Ok(false);
         }
         let Some(left) = eir_variable_name(&atom.terms[0]) else {
-            return false;
+            return Ok(false);
         };
         let Some(right) = eir_variable_name(&atom.terms[1]) else {
-            return false;
+            return Ok(false);
         };
         if left == right {
-            return false;
+            return Ok(false);
         }
         let edge = if left < right {
-            (left.to_string(), right.to_string())
+            (left, right)
         } else {
-            (right.to_string(), left.to_string())
+            (right, left)
         };
-        if !edges.insert(edge.clone()) {
-            return false;
+        if !edges.insert(edge) {
+            return Ok(false);
         }
         *degrees.entry(edge.0).or_insert(0) += 1;
         *degrees.entry(edge.1).or_insert(0) += 1;
     }
 
-    match edges.len() {
+    Ok(match edges.len() {
         3 => degrees.len() == 3 && degrees.values().all(|degree| *degree == 2),
         4 => degrees.len() == 4 && degrees.values().all(|degree| *degree == 2),
         10 | 15 | 21 | 28 => {
@@ -3666,7 +5702,7 @@ fn positive_relational_atoms_are_supported_wcoj_shape(atoms: &[xlog_ir::EirAtom]
                 && degrees.values().all(|degree| *degree == variable_count - 1)
         }
         _ => false,
-    }
+    })
 }
 
 fn eir_variable_name(term: &EirTerm) -> Option<&str> {
@@ -4065,9 +6101,148 @@ pub fn run_generate_propagate_test_with_mode(
 
 /// Build a deterministic dependency graph for bounded epistemic splitting.
 pub fn build_epistemic_dependency_graph(program: &Program) -> Result<EpistemicDependencyGraph> {
+    build_epistemic_dependency_graph_core(program, &mut None)
+}
+
+fn dependency_component_scratch_bytes(program: &Program) -> Result<u64> {
+    let overflow = || allocation_extent_overflow("epistemic component storage overflow");
+    let mut bytes = crate::compile::push_vector_allocation_bytes::<usize>(program.rules.len())?;
+    bytes = bytes
+        .checked_add(crate::compile::push_vector_allocation_bytes::<
+            BTreeSet<String>,
+        >(program.rules.len())?)
+        .ok_or_else(overflow)?;
+    bytes = bytes
+        .checked_add(crate::compile::push_vector_allocation_bytes::<
+            BTreeSet<String>,
+        >(program.constraints.len())?)
+        .ok_or_else(overflow)?;
+    let mut modal_count = 0usize;
+    let mut atom_count = program.rules.len();
+    let mut merges = program
+        .rules
+        .len()
+        .checked_add(program.constraints.len())
+        .ok_or_else(overflow)?;
+    for rule in &program.rules {
+        bytes = bytes
+            .checked_add(rule.head.predicate.len() as u64)
+            .ok_or_else(overflow)?;
+        if !rule.body.is_empty() {
+            bytes = bytes
+                .checked_add(rule.head.predicate.len() as u64)
+                .ok_or_else(overflow)?;
+        }
+        let mut predicates = 1usize;
+        for literal in &rule.body {
+            if let Some(atom) = literal.atom() {
+                predicates = predicates.checked_add(1).ok_or_else(overflow)?;
+                atom_count = atom_count.checked_add(1).ok_or_else(overflow)?;
+                merges = merges.checked_add(1).ok_or_else(overflow)?;
+                bytes = bytes
+                    .checked_add(
+                        (atom.predicate.len() as u64)
+                            .checked_mul(2)
+                            .ok_or_else(overflow)?,
+                    )
+                    .ok_or_else(overflow)?;
+            }
+            if let BodyLiteral::Epistemic(modal) = literal {
+                modal_count = modal_count.checked_add(1).ok_or_else(overflow)?;
+                merges = merges.checked_add(1).ok_or_else(overflow)?;
+                bytes = bytes
+                    .checked_add(modal.atom.predicate.len() as u64)
+                    .and_then(|bytes| {
+                        bytes.checked_add(
+                            crate::compile::formatted_text_allocation_bytes(format_args!(
+                                "{}/{}",
+                                modal.atom.predicate,
+                                modal.atom.arity()
+                            ))
+                            .ok()?,
+                        )
+                    })
+                    .ok_or_else(overflow)?;
+            }
+        }
+        bytes = bytes
+            .checked_add(tree_allocation_bytes::<String, ()>(predicates)?)
+            .ok_or_else(overflow)?;
+    }
+    for constraint in &program.constraints {
+        let mut count = 0usize;
+        for literal in &constraint.body {
+            if let Some(atom) = literal.atom() {
+                count = count.checked_add(1).ok_or_else(overflow)?;
+                atom_count = atom_count.checked_add(1).ok_or_else(overflow)?;
+                bytes = bytes
+                    .checked_add(
+                        (atom.predicate.len() as u64)
+                            .checked_mul(2)
+                            .ok_or_else(overflow)?,
+                    )
+                    .ok_or_else(overflow)?;
+            }
+        }
+        bytes = bytes
+            .checked_add(tree_allocation_bytes::<String, ()>(count)?)
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    crate::compile::push_vector_allocation_bytes::<String>(count).ok()?,
+                )
+            })
+            .ok_or_else(overflow)?;
+    }
+    for addition in [
+        tree_allocation_bytes::<String, usize>(program.rules.len())?,
+        tree_allocation_bytes::<EpistemicAtomKey, usize>(modal_count)?,
+        crate::compile::push_vector_allocation_bytes::<(usize, EpistemicComponentMergeReason)>(
+            merges,
+        )?,
+        tree_allocation_bytes::<usize, (BTreeSet<String>, Vec<usize>)>(program.rules.len())?,
+        tree_allocation_bytes::<String, ()>(atom_count)?,
+        crate::compile::push_vector_allocation_bytes::<usize>(1)?
+            .checked_mul(program.rules.len() as u64)
+            .ok_or_else(overflow)?,
+        tree_allocation_bytes::<usize, BTreeSet<EpistemicComponentMergeReason>>(merges)?,
+        tree_allocation_bytes::<EpistemicComponentMergeReason, ()>(merges)?,
+    ] {
+        bytes = bytes.checked_add(addition).ok_or_else(overflow)?;
+    }
+    Ok(bytes)
+}
+
+fn acquire_component_reason(
+    reason: &EpistemicComponentMergeReason,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<()> {
+    match reason {
+        EpistemicComponentMergeReason::SharedHeadPredicate { predicate }
+        | EpistemicComponentMergeReason::DerivedPredicate { predicate }
+        | EpistemicComponentMergeReason::SharedModalPredicate { predicate } => {
+            acquire(scope, predicate.len() as u64)
+        }
+        EpistemicComponentMergeReason::Constraint { predicates } => {
+            acquire_vector::<String>(scope, predicates.len())?;
+            for predicate in predicates {
+                acquire(scope, predicate.len() as u64)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn build_epistemic_dependency_graph_core(
+    program: &Program,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<EpistemicDependencyGraph> {
     if program.rules.is_empty() {
         return Ok(EpistemicDependencyGraph { components: vec![] });
     }
+
+    // The original union-find, component tables and merge-log storage is
+    // temporary. Final component fields acquire separate receipts before packing.
+    let _scratch_owner = reserve_scratch(scope, dependency_component_scratch_bytes(program)?)?;
 
     let mut parents: Vec<usize> = (0..program.rules.len()).collect();
     let mut rule_predicates = Vec::with_capacity(program.rules.len());
@@ -4198,21 +6373,37 @@ pub fn build_epistemic_dependency_graph(program: &Program) -> Result<EpistemicDe
         reasons_by_root.entry(root).or_default().insert(reason);
     }
 
+    acquire_vector::<EpistemicDependencyComponent>(scope, grouped.len())?;
     let mut components: Vec<EpistemicDependencyComponent> = grouped
         .into_iter()
         .map(|(root, (predicates, mut rule_indices))| {
             rule_indices.sort_unstable();
-            let merge_reasons = reasons_by_root
+            let merge_reasons: Vec<EpistemicComponentMergeReason> = reasons_by_root
                 .remove(&root)
                 .map(|reasons| reasons.into_iter().collect())
                 .unwrap_or_default();
-            EpistemicDependencyComponent {
-                predicates: predicates.into_iter().collect(),
-                rule_indices,
-                merge_reasons,
+            acquire_vector::<String>(scope, predicates.len())?;
+            for predicate in &predicates {
+                acquire(scope, predicate.len() as u64)?;
             }
+            acquire_vector::<usize>(scope, rule_indices.len())?;
+            acquire_vector::<EpistemicComponentMergeReason>(scope, merge_reasons.len())?;
+            for reason in &merge_reasons {
+                acquire_component_reason(reason, scope)?;
+            }
+            Ok(EpistemicDependencyComponent {
+                predicates: predicates.iter().cloned().collect(),
+                rule_indices: rule_indices.clone(),
+                merge_reasons: merge_reasons.clone(),
+            })
         })
-        .collect();
+        .collect::<Result<_>>()?;
+    let _sort_owner = reserve_scratch(
+        scope,
+        crate::compile::push_vector_allocation_bytes::<EpistemicDependencyComponent>(
+            components.len(),
+        )?,
+    )?;
     components.sort_by(|a, b| a.predicates.cmp(&b.predicates));
     Ok(EpistemicDependencyGraph { components })
 }
@@ -4223,6 +6414,36 @@ fn constraint_predicate_set(constraint: &Constraint) -> BTreeSet<String> {
         .iter()
         .filter_map(|lit| lit.atom().map(|atom| atom.predicate.clone()))
         .collect()
+}
+
+fn constraint_predicate_set_with_scope(
+    constraint: &Constraint,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<RetainedEpistemicAllocation<BTreeSet<String>>> {
+    let count = constraint
+        .body
+        .iter()
+        .filter(|literal| literal.atom().is_some())
+        .count();
+    let mut bytes = tree_allocation_bytes::<String, ()>(count)?
+        .checked_add(crate::compile::push_vector_allocation_bytes::<String>(
+            count,
+        )?)
+        .ok_or_else(|| allocation_extent_overflow("constraint predicate storage overflow"))?;
+    for literal in &constraint.body {
+        if let Some(atom) = literal.atom() {
+            bytes = bytes
+                .checked_add(atom.predicate.len() as u64)
+                .ok_or_else(|| {
+                    allocation_extent_overflow("constraint predicate storage overflow")
+                })?;
+        }
+    }
+    let owner = reserve_scratch(scope, bytes)?;
+    Ok(RetainedEpistemicAllocation {
+        value: constraint_predicate_set(constraint),
+        _owner: owner,
+    })
 }
 
 fn find_component(parents: &mut [usize], idx: usize) -> usize {
@@ -4288,13 +6509,23 @@ pub struct EpistemicStratifiedPlan {
 /// already performs.
 struct EpistemicallyDeterminedPredicates {
     determined: BTreeSet<String>,
+    _allocation_owner: Option<std::sync::Arc<dyn Send + Sync>>,
 }
 
 impl EpistemicallyDeterminedPredicates {
     fn analyze(program: &Program) -> Self {
-        let invariant = InvariantRelations::analyze(program);
+        Self::analyze_with_scope(program, &mut None)
+            .expect("unbounded determined-predicate analysis has no owner refusal")
+    }
+
+    fn analyze_with_scope(program: &Program, scope: &mut AllocationScope<'_, '_>) -> Result<Self> {
+        let invariant = InvariantRelations::analyze_with_scope(program, scope)?;
 
         // Heads defined by at least one rule.
+        let _derived_owner = reserve_scratch(
+            scope,
+            tree_allocation_bytes::<&str, ()>(program.rules.len())?,
+        )?;
         let mut derived_heads: BTreeSet<&str> = BTreeSet::new();
         for rule in &program.rules {
             if !rule.body.is_empty() {
@@ -4317,6 +6548,13 @@ impl EpistemicallyDeterminedPredicates {
         // monotonicity keep every recursive predicate OUT of `determined`, so a
         // circular `know reach` in a recursive SCC is never determined
         // and stays fail-closed.
+        let mut bytes = tree_allocation_bytes::<String, ()>(derived_heads.len())?;
+        for head in &derived_heads {
+            bytes = bytes.checked_add(head.len() as u64).ok_or_else(|| {
+                allocation_extent_overflow("determined predicate allocation overflow")
+            })?;
+        }
+        let allocation_owner = reserve_scratch(scope, bytes)?;
         let mut determined: BTreeSet<String> = BTreeSet::new();
         let mut changed = true;
         while changed {
@@ -4333,7 +6571,10 @@ impl EpistemicallyDeterminedPredicates {
             }
         }
 
-        Self { determined }
+        Ok(Self {
+            determined,
+            _allocation_owner: allocation_owner,
+        })
     }
 
     /// Whether `head`'s every defining rule ranges only over invariant or
@@ -4409,9 +6650,26 @@ impl EpistemicallyDeterminedPredicates {
 pub fn try_plan_stratified_epistemic_program(
     program: &Program,
 ) -> Result<Option<EpistemicStratifiedPlan>> {
-    let prepared = prepare_root_authored_constraint_identity(program)?;
-    let program = &prepared;
-    let determined = EpistemicallyDeterminedPredicates::analyze(program);
+    try_plan_stratified_epistemic_program_core(program, &mut None)
+}
+
+/// Plan the original ordered modal strata under the same compilation owner.
+pub fn try_plan_stratified_epistemic_program_with_allocation_owner(
+    program: &Program,
+    scope: &mut CompilationAllocationScope<'_>,
+) -> Result<Option<EpistemicStratifiedPlan>> {
+    try_plan_stratified_epistemic_program_core(program, &mut Some(scope))
+}
+
+fn try_plan_stratified_epistemic_program_core(
+    program: &Program,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<Option<EpistemicStratifiedPlan>> {
+    let prepared = ephemeral_compilation(scope, |scope| {
+        prepare_root_authored_constraint_identity_core(program, scope)
+    })?;
+    let program = &prepared.value;
+    let determined = EpistemicallyDeterminedPredicates::analyze_with_scope(program, scope)?;
 
     // A stratification is needed only when some modal literal ranges over a
     // DETERMINED epistemic-derived head. (A modal over a base/EDB predicate is the
@@ -4431,21 +6689,38 @@ pub fn try_plan_stratified_epistemic_program(
     if !needs_stratification {
         return Ok(None);
     }
-    let removed_rules = faeel_unfounded_exact_tuple_self_support_rule_indices(program)
-        .into_iter()
+    let removed_indices = ephemeral_compilation(scope, |scope| {
+        faeel_unfounded_exact_tuple_self_support_rule_indices_core(program, scope)
+    })?;
+    let _removed_owner = reserve_scratch(
+        scope,
+        tree_allocation_bytes::<usize, ()>(removed_indices.value.len())?,
+    )?;
+    let removed_rules = removed_indices
+        .value
+        .iter()
+        .copied()
         .collect::<BTreeSet<_>>();
-    validate_epistemic_derived_relation_identity(program, &removed_rules)?;
+    drop(ephemeral_compilation(scope, |scope| {
+        validate_epistemic_derived_relation_identity_core(program, &removed_rules, scope)
+    })?);
 
     // Assign each epistemic-derived head a stratum level = longest modal-dependency
     // chain to a determined head it gates over. Heads not determined cannot be
     // stratified soundly here; if any modal ranges over a non-determined derived
     // epistemic head, hand back to the joint path's fail-closed diagnostic.
-    let stratum_level = assign_epistemic_strata(program, &determined)?;
-    let Some(stratum_level) = stratum_level else {
+    let stratum_level = ephemeral_compilation(scope, |scope| {
+        assign_epistemic_strata_core(program, &determined, scope)
+    })?;
+    let Some(stratum_level) = stratum_level.value.as_ref() else {
         return Ok(None);
     };
 
     // Group epistemic-bearing rules by their head's stratum level.
+    let _levels_owner = reserve_scratch(
+        scope,
+        tree_allocation_bytes::<usize, Vec<usize>>(program.rules.len())?,
+    )?;
     let mut levels: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for (idx, rule) in program.rules.iter().enumerate() {
         let has_epistemic = rule
@@ -4460,7 +6735,9 @@ pub fn try_plan_stratified_epistemic_program(
             // place it soundly; hand back.
             return Ok(None);
         };
-        levels.entry(*level).or_default().push(idx);
+        let rules = levels.entry(*level).or_default();
+        acquire_push(rules, rules.capacity(), scope)?;
+        rules.push(idx);
     }
 
     if levels.len() < 2 {
@@ -4469,17 +6746,31 @@ pub fn try_plan_stratified_epistemic_program(
         return Ok(None);
     }
 
+    acquire_vector::<EpistemicStratum>(scope, levels.len())?;
     let mut strata = Vec::with_capacity(levels.len());
     for (_level, rule_indices) in levels {
-        let head_predicates: Vec<String> = rule_indices
-            .iter()
-            .filter_map(|idx| program.rules.get(*idx))
-            .map(|rule| rule.head.predicate.clone())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        let stratum_program =
-            build_stratum_subprogram(program, &rule_indices, &head_predicates, &stratum_level)?;
+        acquire_vector::<String>(scope, rule_indices.len())?;
+        let _heads_owner = reserve_scratch(
+            scope,
+            tree_allocation_bytes::<String, ()>(rule_indices.len())?,
+        )?;
+        let mut heads = BTreeSet::new();
+        for index in &rule_indices {
+            if let Some(rule) = program.rules.get(*index) {
+                if !heads.contains(rule.head.predicate.as_str()) {
+                    acquire(scope, rule.head.predicate.len() as u64)?;
+                    heads.insert(rule.head.predicate.clone());
+                }
+            }
+        }
+        let head_predicates: Vec<String> = heads.into_iter().collect();
+        let stratum_program = build_stratum_subprogram_core(
+            program,
+            &rule_indices,
+            &head_predicates,
+            stratum_level,
+            scope,
+        )?;
         strata.push(EpistemicStratum {
             head_predicates,
             rule_indices,
@@ -4492,13 +6783,21 @@ pub fn try_plan_stratified_epistemic_program(
     // and never appends hidden head columns; non-recursive strata use the single-pass
     // materializer and therefore require its union/shape checks.
     for stratum in &strata {
-        if try_reduce_case_a_recursive_epistemic_program(&stratum.program)?.is_none() {
-            validate_epistemic_relation_shapes(&stratum.program, &BTreeSet::new())?;
+        let prepared = ephemeral_compilation(scope, |scope| {
+            prepare_epistemic_program_core(&stratum.program, scope)
+        })?;
+        let reduced = ephemeral_compilation(scope, |scope| {
+            try_reduce_prepared_recursive_epistemic_program_core(&prepared.value, scope)
+        })?;
+        if reduced.value.is_none() {
+            drop(ephemeral_compilation(scope, |scope| {
+                validate_epistemic_relation_shapes_core(&stratum.program, &BTreeSet::new(), scope)
+            })?);
         }
     }
 
-    let ordinary_post_program = build_post_stratification_ordinary_program(program);
-    ordinary_post_program.validate_prepared_authored_constraint_identity()?;
+    let ordinary_post_program = build_post_stratification_ordinary_program_core(program, scope)?;
+    validate_authored_constraint_identity_with_scope(&ordinary_post_program, scope)?;
 
     Ok(Some(EpistemicStratifiedPlan {
         strata,
@@ -4514,7 +6813,15 @@ pub fn try_plan_stratified_epistemic_program(
 /// authored ordinary constraints are evaluated. Queries stay attached so the
 /// high-level executor can surface relations derived only by this final stage.
 fn build_post_stratification_ordinary_program(program: &Program) -> Program {
-    let mut post = program.clone();
+    build_post_stratification_ordinary_program_core(program, &mut None)
+        .expect("unbounded ordinary epilogue has no owner refusal")
+}
+
+fn build_post_stratification_ordinary_program_core(
+    program: &Program,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<Program> {
+    let mut post = clone_program(program, scope)?;
     post.rules.retain(|rule| {
         rule.body
             .iter()
@@ -4526,7 +6833,7 @@ fn build_post_stratification_ordinary_program(program: &Program) -> Program {
             .iter()
             .all(|literal| !matches!(literal, BodyLiteral::Epistemic(_)))
     });
-    post
+    Ok(post)
 }
 
 /// Build the rule rewrites used only for plan-wide schema inference in a
@@ -4539,22 +6846,52 @@ fn build_post_stratification_ordinary_program(program: &Program) -> Program {
 fn stratified_schema_reduction_overrides(
     program: &Program,
 ) -> Result<BTreeMap<usize, crate::ast::Rule>> {
-    let Some(plan) = try_plan_stratified_epistemic_program(program)? else {
+    stratified_schema_reduction_overrides_core(program, &mut None)
+}
+
+fn stratified_schema_reduction_overrides_core(
+    program: &Program,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<BTreeMap<usize, crate::ast::Rule>> {
+    let plan = ephemeral_compilation(scope, |scope| {
+        try_plan_stratified_epistemic_program_core(program, scope)
+    })?;
+    let Some(plan) = plan.value.as_ref() else {
         return Ok(BTreeMap::new());
     };
 
     let mut overrides = BTreeMap::new();
-    for stratum in plan.strata {
-        if try_reduce_case_a_recursive_epistemic_program(&stratum.program)?.is_none() {
+    for stratum in &plan.strata {
+        let recursive = ephemeral_compilation(scope, |scope| {
+            let prepared = ephemeral_compilation(scope, |scope| {
+                prepare_epistemic_program_core(&stratum.program, scope)
+            })?;
+            try_reduce_prepared_recursive_epistemic_program_core(&prepared.value, scope)
+        })?;
+        if recursive.value.is_none() {
             continue;
         }
-        for rule_index in stratum.rule_indices {
-            let mut rule = program.rules.get(rule_index).cloned().ok_or_else(|| {
-                XlogError::Compilation(format!(
+        for &rule_index in &stratum.rule_indices {
+            let rule = match program.rules.get(rule_index) {
+                Some(rule) => rule,
+                None => {
+                    return Err(compilation_diagnostic(
+                        scope,
+                        format_args!(
                     "stratified epistemic rule index {rule_index} is outside the source program"
-                ))
-            })?;
-            resolve_recursive_epistemic_rule_modals(&mut rule);
+                ),
+                    )?)
+                }
+            };
+            acquire(scope, rule.owned_allocation_bytes()?)?;
+            let mut rule = rule.clone();
+            resolve_recursive_epistemic_rule_modals_core(&mut rule, scope)?;
+            acquire(
+                scope,
+                crate::compile::btree_insert_allocation_bytes::<usize, crate::ast::Rule>(
+                    overrides.len(),
+                )?,
+            )?;
             overrides.insert(rule_index, rule);
         }
     }
@@ -4572,6 +6909,18 @@ fn assign_epistemic_strata(
     program: &Program,
     determined: &EpistemicallyDeterminedPredicates,
 ) -> Result<Option<BTreeMap<String, usize>>> {
+    assign_epistemic_strata_core(program, determined, &mut None)
+}
+
+fn assign_epistemic_strata_core(
+    program: &Program,
+    determined: &EpistemicallyDeterminedPredicates,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<Option<BTreeMap<String, usize>>> {
+    let _heads_owner = reserve_scratch(
+        scope,
+        tree_allocation_bytes::<&str, ()>(program.rules.len())?,
+    )?;
     // Epistemic-derived heads.
     let mut epistemic_heads: BTreeSet<&str> = BTreeSet::new();
     for rule in &program.rules {
@@ -4607,22 +6956,59 @@ fn assign_epistemic_strata(
                         // stratifiable here. Hand back to the joint/recursive guard.
                         return Ok(None);
                     }
-                    modal_edges.entry(head).or_default().insert(target);
+                    if !modal_edges.contains_key(head) {
+                        acquire(
+                            scope,
+                            crate::compile::btree_insert_allocation_bytes::<&str, BTreeSet<&str>>(
+                                modal_edges.len(),
+                            )?,
+                        )?;
+                    }
+                    let targets = modal_edges.entry(head).or_default();
+                    if !targets.contains(target) {
+                        acquire(
+                            scope,
+                            crate::compile::btree_insert_allocation_bytes::<&str, ()>(
+                                targets.len(),
+                            )?,
+                        )?;
+                    }
+                    targets.insert(target);
                 } else if determined.contains(target) {
                     // Modal over an ORDINARY determined predicate: route edges to the
                     // epistemic determined heads in its transitive support so the
                     // modal's head sits above them.
-                    let support =
-                        epistemic_support_of_determined_ordinary(program, target, &epistemic_heads);
-                    if support.is_empty() {
+                    let support = epistemic_support_of_determined_ordinary_core(
+                        program,
+                        target,
+                        &epistemic_heads,
+                        scope,
+                    )?;
+                    if support.value.is_empty() {
                         // No epistemic head in the support means the target is fully
                         // invariant (pure-ordinary over EDB) — that is the ordinary
                         // single/joint path, not a stratification. Hand back.
                         return Ok(None);
                     }
+                    if !modal_edges.contains_key(head) {
+                        acquire(
+                            scope,
+                            crate::compile::btree_insert_allocation_bytes::<&str, BTreeSet<&str>>(
+                                modal_edges.len(),
+                            )?,
+                        )?;
+                    }
                     let entry = modal_edges.entry(head).or_default();
-                    for support_head in support {
-                        entry.insert(support_head);
+                    for support_head in &support.value {
+                        if !entry.contains(support_head) {
+                            acquire(
+                                scope,
+                                crate::compile::btree_insert_allocation_bytes::<&str, ()>(
+                                    entry.len(),
+                                )?,
+                            )?;
+                        }
+                        entry.insert(*support_head);
                     }
                 }
             }
@@ -4637,31 +7023,44 @@ fn assign_epistemic_strata(
         modal_edges: &BTreeMap<&'a str, BTreeSet<&'a str>>,
         level: &mut BTreeMap<String, usize>,
         active: &mut BTreeSet<&'a str>,
+        scope: &mut AllocationScope<'_, '_>,
     ) -> Result<usize> {
         if let Some(l) = level.get(head) {
             return Ok(*l);
         }
+        if !active.contains(head) {
+            acquire(
+                scope,
+                crate::compile::btree_insert_allocation_bytes::<&str, ()>(active.len())?,
+            )?;
+        }
         if !active.insert(head) {
             // A cycle through modal edges should have been excluded upstream; be
             // defensive and refuse to stratify.
-            return Err(recursive_epistemic_rejection(
+            return Err(recursive_epistemic_rejection_core(
                 "stratified epistemic planning encountered a modal dependency cycle",
-            ));
+                scope,
+            )?);
         }
         let mut l = 0;
         if let Some(targets) = modal_edges.get(head) {
             for target in targets {
-                let tl = visit(target, modal_edges, level, active)?;
+                let tl = visit(target, modal_edges, level, active, scope)?;
                 l = l.max(tl + 1);
             }
         }
         active.remove(head);
+        acquire(scope, head.len() as u64)?;
+        acquire(
+            scope,
+            crate::compile::btree_insert_allocation_bytes::<String, usize>(level.len())?,
+        )?;
         level.insert(head.to_string(), l);
         Ok(l)
     }
 
     for head in &epistemic_heads {
-        visit(head, &modal_edges, &mut level, &mut BTreeSet::new())?;
+        visit(head, &modal_edges, &mut level, &mut BTreeSet::new(), scope)?;
     }
 
     Ok(Some(level))
@@ -4679,6 +7078,34 @@ fn epistemic_support_of_determined_ordinary<'a>(
     predicate: &'a str,
     epistemic_heads: &BTreeSet<&'a str>,
 ) -> BTreeSet<&'a str> {
+    epistemic_support_of_determined_ordinary_core(program, predicate, epistemic_heads, &mut None)
+        .expect("unbounded support traversal has no owner refusal")
+        .value
+}
+
+fn epistemic_support_of_determined_ordinary_core<'a>(
+    program: &'a Program,
+    predicate: &'a str,
+    epistemic_heads: &BTreeSet<&'a str>,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<RetainedEpistemicAllocation<BTreeSet<&'a str>>> {
+    let mut count = 1usize;
+    for rule in &program.rules {
+        for literal in &rule.body {
+            if matches!(literal, BodyLiteral::Positive(_) | BodyLiteral::Negated(_)) {
+                count = count.checked_add(1).ok_or_else(|| {
+                    allocation_extent_overflow("support traversal storage overflow")
+                })?;
+            }
+        }
+    }
+    let bytes = tree_allocation_bytes::<&str, ()>(count)?
+        .checked_add(tree_allocation_bytes::<&str, ()>(epistemic_heads.len())?)
+        .and_then(|bytes| {
+            bytes.checked_add(crate::compile::push_vector_allocation_bytes::<&str>(count).ok()?)
+        })
+        .ok_or_else(|| allocation_extent_overflow("support traversal storage overflow"))?;
+    let owner = reserve_scratch(scope, bytes)?;
     let mut support: BTreeSet<&'a str> = BTreeSet::new();
     let mut seen: BTreeSet<&'a str> = BTreeSet::new();
     let mut stack: Vec<&'a str> = vec![predicate];
@@ -4715,7 +7142,10 @@ fn epistemic_support_of_determined_ordinary<'a>(
             support.insert(current);
         }
     }
-    support
+    Ok(RetainedEpistemicAllocation {
+        value: support,
+        _owner: owner,
+    })
 }
 
 /// Build a self-contained sub-program for one stratum.
@@ -4733,6 +7163,34 @@ fn build_stratum_subprogram(
     head_predicates: &[String],
     stratum_level: &BTreeMap<String, usize>,
 ) -> Result<Program> {
+    build_stratum_subprogram_core(
+        program,
+        rule_indices,
+        head_predicates,
+        stratum_level,
+        &mut None,
+    )
+}
+
+fn build_stratum_subprogram_core(
+    program: &Program,
+    rule_indices: &[usize],
+    head_predicates: &[String],
+    stratum_level: &BTreeMap<String, usize>,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<Program> {
+    let _level_heads_owner = reserve_scratch(
+        scope,
+        tree_allocation_bytes::<&str, ()>(stratum_level.len())?,
+    )?;
+    let _all_heads_owner = reserve_scratch(
+        scope,
+        tree_allocation_bytes::<&str, ()>(program.rules.len())?,
+    )?;
+    let _indices_owner = reserve_scratch(
+        scope,
+        tree_allocation_bytes::<usize, ()>(rule_indices.len())?,
+    )?;
     let this_level = head_predicates
         .iter()
         .filter_map(|h| stratum_level.get(h))
@@ -4763,81 +7221,92 @@ fn build_stratum_subprogram(
 
     let own_rule_indices: BTreeSet<usize> = rule_indices.iter().copied().collect();
 
-    let mut stratum = program.clone();
-    stratum.rules = program
-        .rules
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, rule)| {
-            if own_rule_indices.contains(&idx) {
-                return Some(rule.clone());
-            }
-            // Drop any rule that (re)defines a lower-stratum epistemic head.
-            if lower_epistemic_heads.contains(rule.head.predicate.as_str()) {
-                return None;
-            }
-            // Keep facts and ordinary supporting rules (EDB + non-epistemic
-            // derivations the stratum's bodies may reference).
-            let has_epistemic = rule
-                .body
-                .iter()
-                .any(|lit| matches!(lit, BodyLiteral::Epistemic(_)));
-            if has_epistemic && !own_rule_indices.contains(&idx) {
-                // Another stratum's epistemic rule: exclude.
-                return None;
-            }
-            // An ORDINARY supporting rule whose transitive epistemic support includes a
-            // head NOT yet materialized (gated) at this level must NOT run here — it
-            // would compute over the UNGATED candidate extension of that head and leak
-            // the wrong tuples into the store (which the higher stratum then gates
-            // against). Defer it to the lowest stratum where ALL its epistemic support
-            // is already a materialized gated base relation. E.g. `r :- a` (a an
-            // epistemic-determined head) is dropped from `a`'s own stratum (level 0) and
-            // kept only in the strictly-higher stratum where `a` is materialized base,
-            // so `r` is computed once from the gated `a`. Pure-ordinary rules over EDB
-            // (empty epistemic support) are never deferred.
-            let support = epistemic_support_of_determined_ordinary(
-                program,
-                rule.head.predicate.as_str(),
-                &all_epistemic_heads,
-            );
-            if support
-                .iter()
-                .any(|h| stratum_level.get(*h).copied().unwrap_or(0) >= this_level)
-            {
-                return None;
-            }
-            Some(rule.clone())
-        })
-        .collect();
+    let mut stratum = clone_program(program, scope)?;
+    acquire_vector::<crate::ast::Rule>(scope, program.rules.len())?;
+    let mut rules = Vec::with_capacity(program.rules.len());
+    for (idx, rule) in program.rules.iter().enumerate() {
+        if own_rule_indices.contains(&idx) {
+            acquire(scope, rule.owned_allocation_bytes()?)?;
+            rules.push(rule.clone());
+            continue;
+        }
+        // Drop any rule that (re)defines a lower-stratum epistemic head.
+        if lower_epistemic_heads.contains(rule.head.predicate.as_str()) {
+            continue;
+        }
+        // Keep facts and ordinary supporting rules (EDB + non-epistemic
+        // derivations the stratum's bodies may reference).
+        let has_epistemic = rule
+            .body
+            .iter()
+            .any(|lit| matches!(lit, BodyLiteral::Epistemic(_)));
+        if has_epistemic && !own_rule_indices.contains(&idx) {
+            // Another stratum's epistemic rule: exclude.
+            continue;
+        }
+        // An ORDINARY supporting rule whose transitive epistemic support includes a
+        // head NOT yet materialized (gated) at this level must NOT run here — it
+        // would compute over the UNGATED candidate extension of that head and leak
+        // the wrong tuples into the store (which the higher stratum then gates
+        // against). Defer it to the lowest stratum where ALL its epistemic support
+        // is already a materialized gated base relation. E.g. `r :- a` (a an
+        // epistemic-determined head) is dropped from `a`'s own stratum (level 0) and
+        // kept only in the strictly-higher stratum where `a` is materialized base,
+        // so `r` is computed once from the gated `a`. Pure-ordinary rules over EDB
+        // (empty epistemic support) are never deferred.
+        let support = epistemic_support_of_determined_ordinary_core(
+            program,
+            rule.head.predicate.as_str(),
+            &all_epistemic_heads,
+            scope,
+        )?;
+        if support
+            .value
+            .iter()
+            .any(|h| stratum_level.get(*h).copied().unwrap_or(0) >= this_level)
+        {
+            continue;
+        }
+        acquire(scope, rule.owned_allocation_bytes()?)?;
+        rules.push(rule.clone());
+    }
+    stratum.rules = rules;
 
     // Authored queries are compiled exactly once by the post-stratification stage.
     // Keeping compiler-local `__xlog_query_N` relations in modal strata would reuse
     // the same local names across strata and can collide when query projections have
     // different schemas.
+    let _head_set_owner = reserve_scratch(
+        scope,
+        tree_allocation_bytes::<&str, ()>(head_predicates.len())?,
+    )?;
     let head_set: BTreeSet<&str> = head_predicates.iter().map(String::as_str).collect();
     stratum.queries.clear();
 
     // Ordinary constraints are global postconditions and belong only to the single
     // post-stratification ordinary stage. Modal constraints retain predicate-local
     // ownership because they participate in candidate/world-view semantics here.
-    stratum.constraints = program
-        .constraints
-        .iter()
-        .filter(|constraint| {
-            let is_ordinary = constraint
-                .body
-                .iter()
-                .all(|literal| !matches!(literal, BodyLiteral::Epistemic(_)));
-            if is_ordinary {
-                return false;
-            }
-            constraint_predicate_set(constraint)
-                .iter()
-                .all(|p| head_set.contains(p.as_str()) || !is_program_head(program, p))
-        })
-        .cloned()
-        .collect();
+    acquire_vector::<Constraint>(scope, program.constraints.len())?;
+    let mut constraints = Vec::with_capacity(program.constraints.len());
+    for constraint in &program.constraints {
+        let is_ordinary = constraint
+            .body
+            .iter()
+            .all(|literal| !matches!(literal, BodyLiteral::Epistemic(_)));
+        if is_ordinary {
+            continue;
+        }
+        let predicates = constraint_predicate_set_with_scope(constraint, scope)?;
+        if predicates
+            .value
+            .iter()
+            .all(|p| head_set.contains(p.as_str()) || !is_program_head(program, p))
+        {
+            acquire(scope, constraint.owned_allocation_bytes()?)?;
+            constraints.push(constraint.clone());
+        }
+    }
+    stratum.constraints = constraints;
 
     Ok(stratum)
 }
@@ -4857,6 +7326,13 @@ fn is_program_head(program: &Program, predicate: &str) -> bool {
 /// in isolation. This is the entry point for the safe-split / joint-solving and
 /// stratified-execution routing decisions in the GPU driver.
 pub fn split_epistemic_program(program: &Program) -> Result<EpistemicSplitPlan> {
+    split_epistemic_program_core(program, &mut None)
+}
+
+fn split_epistemic_program_core(
+    program: &Program,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<EpistemicSplitPlan> {
     // rules that couple more than one distinct epistemic body predicate
     // are NOT rejected here. The dependency graph already unions every such rule
     // into a single component (each epistemic predicate occurrence routes through
@@ -4871,7 +7347,7 @@ pub fn split_epistemic_program(program: &Program) -> Result<EpistemicSplitPlan> 
     // own typed source-contextualized diagnostics, so no blanket coupling
     // rejection is needed at the split boundary.
     Ok(EpistemicSplitPlan {
-        components: build_epistemic_dependency_graph(program)?.components,
+        components: build_epistemic_dependency_graph_core(program, scope)?.components,
     })
 }
 
@@ -4892,16 +7368,36 @@ pub fn compile_epistemic_gpu_split_execution_with_stats_snapshot(
     program: &Program,
     stats_snapshot: Option<&StatsSnapshot>,
 ) -> Result<EpistemicSplitExecutablePlan> {
-    let mut prepared = program.clone();
-    if prepared.authored_constraint_source_bound.is_some() {
-        prepared.validate_prepared_authored_constraint_identity()?;
-    } else {
-        prepared.prepare_authored_constraint_identity_at_root()?;
-    }
-    let program = &prepared;
-    validate_epistemic_relation_shapes(program, &BTreeSet::new())?;
-    reject_epistemic_constraints(program)?;
-    let split_plan = split_epistemic_program(program)?;
+    compile_epistemic_gpu_split_execution_core(program, stats_snapshot, &mut None)
+}
+
+/// Compile the existing split components with the original owner and compiler.
+pub fn compile_epistemic_gpu_split_execution_with_allocation_owner(
+    program: &Program,
+    scope: &mut CompilationAllocationScope<'_>,
+) -> Result<EpistemicSplitExecutablePlan> {
+    compile_epistemic_gpu_split_execution_core(program, None, &mut Some(scope))
+}
+
+fn compile_epistemic_gpu_split_execution_core(
+    program: &Program,
+    stats_snapshot: Option<&StatsSnapshot>,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<EpistemicSplitExecutablePlan> {
+    let prepared = ephemeral_compilation(scope, |scope| {
+        prepare_root_authored_constraint_identity_core(program, scope)
+    })?;
+    let program = &prepared.value;
+    drop(ephemeral_compilation(scope, |scope| {
+        validate_epistemic_relation_shapes_core(program, &BTreeSet::new(), scope)
+    })?);
+    reject_epistemic_constraints_for_boundary_core(
+        program,
+        "epistemic GPU constraint",
+        "GPU lowering",
+        scope,
+    )?;
+    let split_plan = split_epistemic_program_core(program, scope)?;
     let mut components = Vec::new();
 
     for component in &split_plan.components {
@@ -4917,14 +7413,30 @@ pub fn compile_epistemic_gpu_split_execution_with_stats_snapshot(
         // the heads' world-view acceptance is genuinely interdependent and the
         // independent split would be unsound). A single epistemic head is always
         // the existing single-output joint path.
-        let coupling = classify_cross_component_modal_coupling(program, component)?;
+        let coupling = ephemeral_compilation(scope, |scope| {
+            classify_cross_component_modal_coupling_core(program, component, scope)
+        })?
+        .value;
 
-        let component_program = split_component_program(program, component)?;
+        let component_program = ephemeral_compilation(scope, |scope| {
+            split_component_program_core(program, component, scope)
+        })?;
         let executable = compile_epistemic_gpu_execution_inner(
-            &component_program,
+            &component_program.value,
             stats_snapshot,
             coupling.allows_multiple_output_heads(),
+            scope,
         )?;
+        acquire_push(&components, components.capacity(), scope)?;
+        acquire_vector::<String>(scope, component.predicates.len())?;
+        for predicate in &component.predicates {
+            acquire(scope, predicate.len() as u64)?;
+        }
+        acquire_vector::<usize>(scope, component.rule_indices.len())?;
+        acquire_vector::<EpistemicComponentMergeReason>(scope, component.merge_reasons.len())?;
+        for reason in &component.merge_reasons {
+            acquire_component_reason(reason, scope)?;
+        }
         components.push(EpistemicSplitExecutableComponent {
             component: component.clone(),
             executable,
@@ -4932,10 +7444,11 @@ pub fn compile_epistemic_gpu_split_execution_with_stats_snapshot(
     }
 
     if components.is_empty() {
-        return Err(XlogError::UnsupportedEpistemicConstruct {
-            construct: "epistemic GPU split execution".to_string(),
-            context: "requires at least one epistemic split component".to_string(),
-        });
+        return Err(unsupported_diagnostic(
+            scope,
+            "epistemic GPU split execution",
+            format_args!("{}", "requires at least one epistemic split component"),
+        )?);
     }
 
     Ok(EpistemicSplitExecutablePlan {
@@ -4963,7 +7476,7 @@ fn component_has_epistemic_rule(
 ///
 /// Each such head is a final epistemic output relation the joint single-pass GPU
 /// path would have to materialize. The single-output-buffer contract
-/// ([`require_single_epistemic_output_relation`]) admits exactly one, so a count
+/// ([`require_single_epistemic_output_relation_core`]) admits exactly one, so a count
 /// above one means the component is genuinely *coupled* across what local
 /// analysis would otherwise split — its epistemic outputs cannot be solved
 /// independently AND cannot be jointly materialized into one buffer.
@@ -4971,6 +7484,19 @@ fn component_epistemic_output_heads(
     program: &Program,
     component: &EpistemicDependencyComponent,
 ) -> Vec<String> {
+    component_epistemic_output_heads_core(program, component, &mut None)
+        .expect("unbounded component heads have no owner refusal")
+}
+
+fn component_epistemic_output_heads_core(
+    program: &Program,
+    component: &EpistemicDependencyComponent,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<Vec<String>> {
+    let _tree_owner = reserve_scratch(
+        scope,
+        tree_allocation_bytes::<String, ()>(component.rule_indices.len())?,
+    )?;
     let mut heads: BTreeSet<String> = BTreeSet::new();
     for idx in &component.rule_indices {
         let Some(rule) = program.rules.get(*idx) else {
@@ -4981,10 +7507,12 @@ fn component_epistemic_output_heads(
             .iter()
             .any(|lit| matches!(lit, BodyLiteral::Epistemic(_)));
         if has_epistemic_body {
+            acquire(scope, rule.head.predicate.len() as u64)?;
             heads.insert(rule.head.predicate.clone());
         }
     }
-    heads.into_iter().collect()
+    acquire_vector::<String>(scope, heads.len())?;
+    Ok(heads.into_iter().collect())
 }
 
 /// Render a coalesced component's merge reasons into a stable, human-readable list
@@ -4994,29 +7522,50 @@ fn component_epistemic_output_heads(
 /// `Constraint`) are exactly *why* the dependency graph could not split the
 /// component's epistemic outputs, so naming them tells the caller which structural
 /// coupling forced the fail-closed.
-fn format_component_merge_reasons(component: &EpistemicDependencyComponent) -> String {
-    if component.merge_reasons.is_empty() {
-        return "no recorded coalesce reason".to_string();
+
+struct ComponentMergeReasons<'a>(&'a EpistemicDependencyComponent);
+
+impl std::fmt::Display for ComponentMergeReasons<'_> {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.merge_reasons.is_empty() {
+            return output.write_str("no recorded coalesce reason");
+        }
+        for (index, reason) in self.0.merge_reasons.iter().enumerate() {
+            if index != 0 {
+                output.write_str(", ")?;
+            }
+            match reason {
+                EpistemicComponentMergeReason::SharedHeadPredicate { predicate } => {
+                    write!(output, "SharedHeadPredicate({predicate})")?
+                }
+                EpistemicComponentMergeReason::DerivedPredicate { predicate } => {
+                    write!(output, "DerivedPredicate({predicate})")?
+                }
+                EpistemicComponentMergeReason::SharedModalPredicate { predicate } => {
+                    write!(output, "SharedModalPredicate({predicate})")?
+                }
+                EpistemicComponentMergeReason::Constraint { predicates } => {
+                    output.write_str("Constraint(")?;
+                    for (index, predicate) in predicates.iter().enumerate() {
+                        if index != 0 {
+                            output.write_str(", ")?;
+                        }
+                        output.write_str(predicate)?;
+                    }
+                    output.write_str(")")?;
+                }
+            }
+        }
+        Ok(())
     }
-    component
-        .merge_reasons
-        .iter()
-        .map(|reason| match reason {
-            EpistemicComponentMergeReason::SharedHeadPredicate { predicate } => {
-                format!("SharedHeadPredicate({predicate})")
-            }
-            EpistemicComponentMergeReason::DerivedPredicate { predicate } => {
-                format!("DerivedPredicate({predicate})")
-            }
-            EpistemicComponentMergeReason::SharedModalPredicate { predicate } => {
-                format!("SharedModalPredicate({predicate})")
-            }
-            EpistemicComponentMergeReason::Constraint { predicates } => {
-                format!("Constraint({})", predicates.join(", "))
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
+}
+
+struct ModalPredicateList<'a>(&'a BTreeSet<String>);
+
+impl std::fmt::Debug for ModalPredicateList<'_> {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        output.debug_list().entries(self.0.iter()).finish()
+    }
 }
 
 /// Classification of a coalesced epistemic component's cross-component coupling.
@@ -5114,7 +7663,15 @@ fn classify_cross_component_modal_coupling(
     program: &Program,
     component: &EpistemicDependencyComponent,
 ) -> Result<CrossComponentCoupling> {
-    let epistemic_heads = component_epistemic_output_heads(program, component);
+    classify_cross_component_modal_coupling_core(program, component, &mut None)
+}
+
+fn classify_cross_component_modal_coupling_core(
+    program: &Program,
+    component: &EpistemicDependencyComponent,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<CrossComponentCoupling> {
+    let epistemic_heads = component_epistemic_output_heads_core(program, component, scope)?;
     if epistemic_heads.len() <= 1 {
         return Ok(CrossComponentCoupling::JointSolvable);
     }
@@ -5130,6 +7687,16 @@ fn classify_cross_component_modal_coupling(
     // ordinary rule dependency relation within the component (least fixpoint). A
     // modal over any tainted predicate fails closed. A modal over a purely
     // base/invariant or epistemic-INDEPENDENT predicate is joint-solvable.
+    let _tainted_owner = reserve_scratch(
+        scope,
+        tree_allocation_bytes::<&str, ()>(
+            component
+                .rule_indices
+                .len()
+                .checked_add(epistemic_heads.len())
+                .ok_or_else(|| allocation_extent_overflow("component taint allocation overflow"))?,
+        )?,
+    )?;
     let tainted = epistemic_tainted_predicates(program, component, &epistemic_heads);
 
     let mut nested_modal_predicates: BTreeSet<String> = BTreeSet::new();
@@ -5140,6 +7707,20 @@ fn classify_cross_component_modal_coupling(
         for lit in &rule.body {
             if let BodyLiteral::Epistemic(modal) = lit {
                 if tainted.contains(modal.atom.predicate.as_str()) {
+                    acquire(
+                        scope,
+                        crate::compile::btree_insert_allocation_bytes::<String, ()>(
+                            nested_modal_predicates.len(),
+                        )?,
+                    )?;
+                    acquire(
+                        scope,
+                        crate::compile::formatted_text_allocation_bytes(format_args!(
+                            "{}/{}",
+                            modal.atom.predicate,
+                            modal.atom.arity()
+                        ))?,
+                    )?;
                     nested_modal_predicates.insert(format!(
                         "{}/{}",
                         modal.atom.predicate,
@@ -5158,9 +7739,10 @@ fn classify_cross_component_modal_coupling(
         return Ok(CrossComponentCoupling::JointSolvable);
     }
 
-    Err(XlogError::UnsupportedEpistemicConstruct {
-        construct: "cross-component epistemic coupling".to_string(),
-        context: format!(
+    Err(unsupported_diagnostic(
+        scope,
+        "cross-component epistemic coupling",
+        format_args!(
             "epistemic output heads {:?} are coupled into a single dependency \
              component (reasons: {}) through nested modal literals over \
              epistemic-derived predicates {:?}; the modal truth of an \
@@ -5169,17 +7751,37 @@ fn classify_cross_component_modal_coupling(
              nested modality and an independent split would be unsound, so this \
              fails closed",
             epistemic_heads,
-            format_component_merge_reasons(component),
-            nested_modal_predicates.into_iter().collect::<Vec<_>>(),
+            ComponentMergeReasons(component),
+            ModalPredicateList(&nested_modal_predicates),
         ),
-    })
+    )?)
 }
 
 fn split_component_program(
     program: &Program,
     component: &EpistemicDependencyComponent,
 ) -> Result<Program> {
-    let mut component_program = program.clone();
+    split_component_program_core(program, component, &mut None)
+}
+
+fn split_component_program_core(
+    program: &Program,
+    component: &EpistemicDependencyComponent,
+    scope: &mut AllocationScope<'_, '_>,
+) -> Result<Program> {
+    let _predicate_owner = reserve_scratch(
+        scope,
+        tree_allocation_bytes::<&str, ()>(component.predicates.len())?,
+    )?;
+    let _index_owner = reserve_scratch(
+        scope,
+        tree_allocation_bytes::<usize, ()>(component.rule_indices.len())?,
+    )?;
+    let _head_owner = reserve_scratch(
+        scope,
+        tree_allocation_bytes::<&str, ()>(program.rules.len())?,
+    )?;
+    let mut component_program = clone_program(program, scope)?;
     let component_predicates: BTreeSet<&str> =
         component.predicates.iter().map(String::as_str).collect();
     let component_rule_indices: BTreeSet<usize> = component.rule_indices.iter().copied().collect();
@@ -5188,32 +7790,36 @@ fn split_component_program(
         .iter()
         .map(|rule| rule.head.predicate.as_str())
         .collect();
-    component_program.rules = program
-        .rules
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, rule)| {
-            (component_rule_indices.contains(&idx)
-                || (rule.body.is_empty()
-                    && component_predicates.contains(rule.head.predicate.as_str())))
-            .then_some(rule.clone())
-        })
-        .collect();
-    component_program.constraints = program
-        .constraints
-        .iter()
-        .filter(|constraint| {
-            let predicates = constraint_predicate_set(constraint);
-            let has_component_owned_predicate = predicates
+    acquire_vector::<crate::ast::Rule>(scope, program.rules.len())?;
+    let mut rules = Vec::new();
+    for (idx, rule) in program.rules.iter().enumerate() {
+        if component_rule_indices.contains(&idx)
+            || (rule.body.is_empty() && component_predicates.contains(rule.head.predicate.as_str()))
+        {
+            acquire(scope, rule.owned_allocation_bytes()?)?;
+            rules.push(rule.clone());
+        }
+    }
+    component_program.rules = rules;
+    acquire_vector::<Constraint>(scope, program.constraints.len())?;
+    let mut constraints = Vec::new();
+    for constraint in &program.constraints {
+        let predicates = constraint_predicate_set_with_scope(constraint, scope)?;
+        let has_component_owned_predicate = predicates
+            .value
+            .iter()
+            .any(|predicate| head_predicates.contains(predicate.as_str()));
+        if !has_component_owned_predicate
+            || predicates
+                .value
                 .iter()
-                .any(|predicate| head_predicates.contains(predicate.as_str()));
-            !has_component_owned_predicate
-                || predicates
-                    .iter()
-                    .all(|predicate| component_predicates.contains(predicate.as_str()))
-        })
-        .cloned()
-        .collect();
+                .all(|predicate| component_predicates.contains(predicate.as_str()))
+        {
+            acquire(scope, constraint.owned_allocation_bytes()?)?;
+            constraints.push(constraint.clone());
+        }
+    }
+    component_program.constraints = constraints;
     Ok(component_program)
 }
 

@@ -591,7 +591,7 @@ impl PrivateReplayChildCustody {
             self.session
                 .borrow(py)
                 .owner()?
-                .share_cold_native_work(&work.inner)
+                .share_cold_native_work(&work.custody(py)?.inner)
                 .map_err(xlog_err)?
         } else {
             let phase = self.phase(py)?;
@@ -992,6 +992,96 @@ impl PrivateReplayChildCustody {
         Ok(())
     }
 
+    pub(in crate::semantic_transition) fn original_source_target(
+        &self,
+        py: Python<'_>,
+        prepared: &prepared_import::PySemanticPreparedTaskImport,
+    ) -> PyResult<(Py<PySemanticTransitionSession>, SemanticPreparedStep)> {
+        self.require_preparation(py)?;
+        let state = self.state()?;
+        if state.released
+            || state.import_returned
+            || state
+                .prepared_import
+                .as_ref()
+                .is_none_or(|original| !std::ptr::eq(&*original.borrow(py), prepared))
+        {
+            return Err(invalid(
+                "SOURCE structural target changed its original prepared import",
+            ));
+        }
+        drop(state);
+        let instruction = self
+            .instruction
+            .upgrade()
+            .ok_or_else(|| invalid("SOURCE target lost its original instruction"))?;
+        let original = instruction.preparation()?;
+        let phase = self
+            .phase
+            .lock()
+            .map_err(|_| invalid("original replay phase custody is poisoned"))?
+            .as_ref()
+            .map(|phase| phase.clone_ref(py));
+        let step = if let Some(phase) = phase {
+            let phase = phase.borrow(py);
+            let retained = phase.private_group()?;
+            let group = retained
+                .as_ref()
+                .ok_or_else(|| invalid("SOURCE target lost its original private group"))?;
+            if group.ordinal != self.group_ordinal
+                || group.native_retired
+                || !group
+                    .replay_children
+                    .iter()
+                    .any(|child| std::ptr::eq(self, child.as_ref()))
+            {
+                return Err(invalid(
+                    "SOURCE target changed its original private group membership",
+                ));
+            }
+            group
+                .native_steps
+                .get(self.step_index)
+                .cloned()
+                .ok_or_else(|| invalid("SOURCE target lost its original Update"))?
+        } else {
+            let session = self.session.borrow(py);
+            let retained = session
+                .prepared_segment
+                .lock()
+                .map_err(|_| invalid("prepared segment mutex is poisoned"))?;
+            let retained = retained
+                .as_ref()
+                .ok_or_else(|| invalid("SOURCE target lost its original prepared segment"))?;
+            if original
+                .scope
+                .as_ref()
+                .is_none_or(|scope| !Arc::ptr_eq(scope, &retained.scope))
+                || retained.task_use.as_ptr() != self.task.as_ptr()
+            {
+                return Err(invalid("SOURCE target changed its original prepared scope"));
+            }
+            let step = retained
+                .steps
+                .get(self.step_index)
+                .ok_or_else(|| invalid("SOURCE target lost its original Update"))?
+                .borrow(py)
+                .inner
+                .clone();
+            step
+        };
+        if original
+            .native_steps
+            .get(self.step_index)
+            .is_none_or(|target| !target.same_handle(&step))
+        {
+            return Err(invalid(
+                "SOURCE target changed its original native instruction member",
+            ));
+        }
+        Ok((self.session.clone_ref(py), step))
+    }
+
     pub(in crate::semantic_transition) fn detach_preparation_work(
         &self,
         py: Python<'_>,
@@ -1150,6 +1240,19 @@ impl PrivateReplayChildCustody {
         py: Python<'_>,
         prepared: &prepared_import::PySemanticPreparedTaskImport,
     ) -> PyResult<()> {
+        self.cancelled_prepared_import_proof(py, prepared)
+            .map(|_| ())
+    }
+
+    pub(in crate::semantic_transition) fn cancelled_prepared_import_proof(
+        &self,
+        py: Python<'_>,
+        prepared: &prepared_import::PySemanticPreparedTaskImport,
+    ) -> PyResult<(
+        Py<PySemanticTransitionSession>,
+        SemanticPreparedStep,
+        xlog_cuda::SemanticPreparedSegmentNonSubmission,
+    )> {
         let state = self.state()?;
         if self.failed.load(Ordering::Acquire)
             || !state.retirement_entered
@@ -1165,10 +1268,21 @@ impl PrivateReplayChildCustody {
         }
         self.require_known_prepared_cancellation(py, &state)?;
         drop(state);
-        self.require_cancelled_target_final_use(py)
+        self.cancelled_target_final_use_proof(py)
     }
 
     fn require_cancelled_target_final_use(&self, py: Python<'_>) -> PyResult<()> {
+        self.cancelled_target_final_use_proof(py).map(|_| ())
+    }
+
+    fn cancelled_target_final_use_proof(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<(
+        Py<PySemanticTransitionSession>,
+        SemanticPreparedStep,
+        xlog_cuda::SemanticPreparedSegmentNonSubmission,
+    )> {
         let session = self.session.borrow(py);
         if !session.retiring.load(Ordering::Acquire) {
             return Err(invalid(
@@ -1243,10 +1357,11 @@ impl PrivateReplayChildCustody {
                 .ok_or_else(|| {
                     invalid("cancelled replay lost its original instruction non-submission proof")
                 })?;
-            return session
+            session
                 .owner()?
                 .require_cancelled_prepared_step_final_use(&target, &proof)
-                .map_err(xlog_err);
+                .map_err(xlog_err)?;
+            return Ok((self.session.clone_ref(py), target, proof));
         }
         let phase = phase.expect("original private replay phase");
         let phase = phase.borrow(py);
@@ -1280,11 +1395,11 @@ impl PrivateReplayChildCustody {
             .native_steps
             .get(self.step_index)
             .ok_or_else(|| invalid("cancelled replay lost its original target Update"))?;
-        let result = session
+        session
             .owner()?
             .require_cancelled_prepared_step_final_use(target, proof)
-            .map_err(xlog_err);
-        result
+            .map_err(xlog_err)?;
+        Ok((self.session.clone_ref(py), target.clone(), proof.clone()))
     }
 
     pub(in crate::semantic_transition) fn finish_retained_source(
@@ -1552,12 +1667,13 @@ impl PySemanticLearningPhaseTransition {
             return Ok(());
         }
         work.check(py)?;
-        let reader = work.reader.borrow(py);
+        let work_custody = work.custody(py)?;
+        let reader = work_custody.reader.borrow(py);
         let source = reader.session.borrow(py);
         for child in children {
             let custody = source
                 .owner()?
-                .share_cold_native_work(&work.inner)
+                .share_cold_native_work(&work.custody(py)?.inner)
                 .map_err(xlog_err)?;
             child.attach_retirement_work(py, custody)?;
         }
@@ -2041,6 +2157,15 @@ impl PySemanticLearningPhaseTransition {
         drain_export_owners();
         // Unknown retirement retains the original Python custody slot. Remove
         // it only after all native storage and consumer joins are known closed.
+        let instruction = session
+            .prepared_segment
+            .lock()
+            .map_err(|_| invalid("cancelled Python segment custody is poisoned"))?
+            .as_ref()
+            .and_then(|segment| segment.instruction.as_ref().map(Arc::clone));
+        if let Some(instruction) = instruction {
+            instruction.release_retired_initialization_roster(true)?;
+        }
         let python_segment = session
             .prepared_segment
             .lock()
@@ -2592,7 +2717,7 @@ impl PySemanticLearningPhaseTransition {
             self.source
                 .borrow(py)
                 .owner()?
-                .require_closed_cold_model_work(&work.inner)
+                .require_closed_cold_model_work(&work.custody(py)?.inner)
                 .map_err(xlog_err)?;
         }
         // Structural allocation retained the same roster; recording follows
@@ -2829,7 +2954,7 @@ impl PySemanticLearningPhaseTransition {
             .owner()?
             .finish_cold_model_work(
                 &*self.parent.borrow(py).lease()?,
-                &work.borrow(py).inner,
+                &work.borrow(py).custody(py)?.inner,
                 &streams,
                 xlog_cuda::SemanticColdModelWorkDisposition::Complete,
             )
@@ -2870,9 +2995,8 @@ impl PySemanticLearningPhaseTransition {
             .source
             .borrow(py)
             .owner()?
-            .prepare_cold_model_work(
+            .prepare_cold_model_work_deferred(
                 &*self.parent.borrow(py).lease()?,
-                self.preparation_inputs.cold_model_work_capacity,
                 ordinal,
                 self.records()?.confirmed_admission()?,
                 match role {
@@ -2896,13 +3020,13 @@ impl PySemanticLearningPhaseTransition {
             .map_err(xlog_err)?;
         let work = Py::new(
             py,
-            PySemanticColdModelWork {
-                parent: parent.clone_ref(py),
-                reader: self.parent.clone_ref(py),
+            PySemanticColdModelWork::new(
+                Some(parent.clone_ref(py)),
+                self.parent.clone_ref(py),
                 inner,
-                region: None,
-                active: AtomicBool::new(true),
-            },
+                None,
+                true,
+            ),
         )?;
         {
             let mut retained = self.private_group()?;
@@ -3000,7 +3124,7 @@ impl PySemanticLearningPhaseTransition {
                         &instruction.inner,
                         &*instruction.parent.borrow(py).lease()?,
                         &source,
-                        &work.borrow(py).inner,
+                        &work.borrow(py).custody(py)?.inner,
                         cancellation.as_ref(),
                     )
                     .map_err(xlog_err)?;
@@ -3087,7 +3211,7 @@ impl PySemanticLearningPhaseTransition {
         self.source
             .borrow(py)
             .owner()?
-            .require_closed_cold_model_work(&work.inner)
+            .require_closed_cold_model_work(&work.custody(py)?.inner)
             .map_err(xlog_err)?;
         if group.preparation_custody.is_some() {
             return Err(invalid(
@@ -3453,7 +3577,7 @@ impl PySemanticLearningPhaseTransition {
                     &instruction.inner,
                     &*instruction.parent.borrow(py).lease()?,
                     &source,
-                    &work.borrow(py).inner,
+                    &work.borrow(py).custody(py)?.inner,
                 )
                 .map_err(xlog_err)?
         };
@@ -3493,7 +3617,8 @@ impl PySemanticLearningPhaseTransition {
         py: Python<'_>,
         work: &PySemanticColdModelWork,
     ) -> PyResult<()> {
-        let parent = work.parent.borrow(py);
+        let work_custody = work.custody(py)?;
+        let parent = work_custody.parent()?.borrow(py);
         self.require_private_group_owner(
             py,
             &parent.session.borrow(py),
@@ -3882,9 +4007,8 @@ impl PySemanticLearningPhaseTransition {
                 .source
                 .borrow(py)
                 .owner()?
-                .prepare_cold_model_work(
+                .prepare_cold_model_work_deferred(
                     &*self.parent.borrow(py).lease()?,
-                    self.preparation_inputs.cold_model_work_capacity,
                     ordinal,
                     self.records()?.confirmed_admission()?,
                     xlog_cuda::SemanticColdModelWorkPurpose::PrivateExecution,
@@ -3898,13 +4022,13 @@ impl PySemanticLearningPhaseTransition {
                 .map_err(xlog_err)?;
             let work = Py::new(
                 py,
-                PySemanticColdModelWork {
-                    parent: child.parent.clone_ref(py),
-                    reader: self.parent.clone_ref(py),
+                PySemanticColdModelWork::new(
+                    Some(child.parent.clone_ref(py)),
+                    self.parent.clone_ref(py),
                     inner,
-                    region: None,
-                    active: AtomicBool::new(false),
-                },
+                    None,
+                    false,
+                ),
             )?;
             {
                 let mut retained = self.private_group()?;

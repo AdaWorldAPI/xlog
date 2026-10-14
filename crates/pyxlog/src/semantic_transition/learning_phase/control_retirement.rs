@@ -6,7 +6,7 @@ use xlog_cuda::{SemanticColdModelWork, SemanticColdModelWorkResult, SemanticCold
 
 pub(super) struct ControlRetirement {
     owners: Option<EvaluationOwners>,
-    checkpoint: Py<PyBytes>,
+    checkpoint: Py<material_bytes::PySemanticMaterialBytes>,
     checkpoint_sha256: [u8; 32],
     parent_identity: Py<PyTuple>,
     entries: Py<PyTuple>,
@@ -100,7 +100,7 @@ impl PySemanticLearningPhaseTransition {
             ));
         }
         let checkpoint_sha256: [u8; 32] =
-            Sha256::digest(current.checkpoint.bind(py).as_bytes()).into();
+            Sha256::digest(current.checkpoint.borrow(py).as_bytes()).into();
         if checkpoint_sha256 != current.checkpoint_sha256 {
             return Err(invalid(
                 "control retirement changed its original complete checkpoint",
@@ -142,7 +142,8 @@ impl PySemanticLearningPhaseTransition {
                 budget[2].unsigned()?,
             ];
             let parent_identity = owners.parent.borrow(py).identity(py)?;
-            let checkpoint_sha256: [u8; 32] = Sha256::digest(checkpoint.bind(py).as_bytes()).into();
+            let checkpoint_sha256: [u8; 32] =
+                Sha256::digest(checkpoint.borrow(py).as_bytes()).into();
             *self.control_retirement()? = Some(ControlRetirement {
                 owners: Some(owners),
                 checkpoint,
@@ -224,9 +225,8 @@ impl PySemanticLearningPhaseTransition {
                 .source
                 .borrow(py)
                 .owner()?
-                .prepare_cold_model_work(
+                .prepare_cold_model_work_deferred(
                     &*self.parent.borrow(py).lease()?,
-                    self.preparation_inputs.cold_model_work_capacity,
                     ordinal,
                     self.records()?.confirmed_admission()?,
                     xlog_cuda::SemanticColdModelWorkPurpose::ControlRetirement,
@@ -238,13 +238,13 @@ impl PySemanticLearningPhaseTransition {
                 .work = Some(work.clone());
             let callback_work = Py::new(
                 py,
-                PySemanticColdModelWork {
-                    parent: parent.clone_ref(py),
-                    reader: self.parent.clone_ref(py),
-                    inner: work.clone(),
-                    region: None,
-                    active: AtomicBool::new(false),
-                },
+                PySemanticColdModelWork::new(
+                    Some(parent.clone_ref(py)),
+                    self.parent.clone_ref(py),
+                    work.clone(),
+                    None,
+                    false,
+                ),
             )?;
             self.control_retirement()?
                 .as_mut()
@@ -453,7 +453,7 @@ impl PySemanticLearningPhaseTransition {
                 .expect("original retirement registrar")
                 .clone_ref(py)
         };
-        let parent = work.borrow(py).parent.clone_ref(py);
+        let parent = work.borrow(py).custody(py)?.parent()?.clone_ref(py);
         let task = parent.borrow(py).task_use.clone_ref(py);
         if !completed {
             if self
@@ -519,7 +519,7 @@ impl PySemanticLearningPhaseTransition {
         self.source
             .borrow(py)
             .owner()?
-            .require_closed_cold_model_work(&work.borrow(py).inner)
+            .require_closed_cold_model_work(&work.borrow(py).custody(py)?.inner)
             .map_err(xlog_err)?;
         let session = parent.borrow(py).session.clone_ref(py);
         let (released, entered, custody) = {

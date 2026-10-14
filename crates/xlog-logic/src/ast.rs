@@ -2,6 +2,32 @@
 
 use xlog_core::{Result, ScalarType, XlogError};
 
+type AuthoredIdentityAllocationOwner<'a> =
+    Option<&'a mut dyn FnMut(u64) -> Result<std::sync::Arc<dyn Send + Sync>>>;
+
+fn authored_identity_error(
+    context: std::fmt::Arguments<'_>,
+    reserve: &mut AuthoredIdentityAllocationOwner<'_>,
+) -> Result<XlogError> {
+    let owners = match reserve.as_deref_mut() {
+        Some(reserve) => {
+            let allocations = reserve(xlog_core::error::formatted_text_allocation_bytes(context)?)?;
+            let metadata = reserve(
+                u64::try_from(xlog_core::error::OwnedDiagnostic::allocation_bytes()).map_err(
+                    |_| XlogError::allocation_extent_overflow("authored identity diagnostic"),
+                )?,
+            )?;
+            Some((allocations, metadata))
+        }
+        None => None,
+    };
+    let error = XlogError::Compilation(format!("{context}"));
+    Ok(match owners {
+        Some((allocations, metadata)) => error.with_diagnostic_owner(allocations, metadata),
+        None => error,
+    })
+}
+
 /// A term in an atom
 #[derive(Debug, Clone, PartialEq)]
 pub enum Term {
@@ -99,22 +125,37 @@ impl Term {
 
     /// Return all named variables referenced by this term.
     pub fn variables(&self) -> Vec<&str> {
+        let mut variables = Vec::new();
+        self.visit_variables(&mut |name| variables.push(name));
+        variables
+    }
+
+    /// Visit the original variable references in source order without an owned
+    /// collection. Compilation uses this same traversal before allocating it.
+    pub fn visit_variables<'a>(&'a self, visitor: &mut dyn FnMut(&'a str)) {
         match self {
-            Term::Variable(name) => vec![name.as_str()],
-            Term::List(items) => items.iter().flat_map(Term::variables).collect(),
-            Term::Cons { head, tail } => {
-                let mut vars = head.variables();
-                vars.extend(tail.variables());
-                vars
+            Term::Variable(name) => visitor(name),
+            Term::List(items) => {
+                for item in items {
+                    item.visit_variables(visitor);
+                }
             }
-            Term::Compound { args, .. } => args.iter().flat_map(Term::variables).collect(),
+            Term::Cons { head, tail } => {
+                head.visit_variables(visitor);
+                tail.visit_variables(visitor);
+            }
+            Term::Compound { args, .. } => {
+                for argument in args {
+                    argument.visit_variables(visitor);
+                }
+            }
             Term::Anonymous
             | Term::Integer(_)
             | Term::Float(_)
             | Term::String(_)
             | Term::Symbol(_)
             | Term::PredRef(_)
-            | Term::Aggregate(_) => vec![],
+            | Term::Aggregate(_) => {}
         }
     }
 }
@@ -236,9 +277,16 @@ pub enum ArithExpr {
 impl ArithExpr {
     /// Get all variable names used in this expression
     pub fn variables(&self) -> Vec<&str> {
+        let mut variables = Vec::new();
+        self.visit_variables(&mut |name| variables.push(name));
+        variables
+    }
+
+    /// Visit original expression variables in order without allocating.
+    pub fn visit_variables<'a>(&'a self, visitor: &mut dyn FnMut(&'a str)) {
         match self {
-            ArithExpr::Variable(name) => vec![name.as_str()],
-            ArithExpr::Integer(_) | ArithExpr::Float(_) => vec![],
+            ArithExpr::Variable(name) => visitor(name),
+            ArithExpr::Integer(_) | ArithExpr::Float(_) => {}
             ArithExpr::Add(l, r)
             | ArithExpr::Sub(l, r)
             | ArithExpr::Mul(l, r)
@@ -247,12 +295,15 @@ impl ArithExpr {
             | ArithExpr::Min(l, r)
             | ArithExpr::Max(l, r)
             | ArithExpr::Pow(l, r) => {
-                let mut vars = l.variables();
-                vars.extend(r.variables());
-                vars
+                l.visit_variables(visitor);
+                r.visit_variables(visitor);
             }
-            ArithExpr::Abs(e) | ArithExpr::Cast(e, _) => e.variables(),
-            ArithExpr::FuncCall { args, .. } => args.iter().flat_map(|a| a.variables()).collect(),
+            ArithExpr::Abs(e) | ArithExpr::Cast(e, _) => e.visit_variables(visitor),
+            ArithExpr::FuncCall { args, .. } => {
+                for argument in args {
+                    argument.visit_variables(visitor);
+                }
+            }
             ArithExpr::Conditional {
                 cond_left,
                 cond_right,
@@ -260,11 +311,10 @@ impl ArithExpr {
                 else_expr,
                 ..
             } => {
-                let mut vars = cond_left.variables();
-                vars.extend(cond_right.variables());
-                vars.extend(then_expr.variables());
-                vars.extend(else_expr.variables());
-                vars
+                cond_left.visit_variables(visitor);
+                cond_right.visit_variables(visitor);
+                then_expr.visit_variables(visitor);
+                else_expr.visit_variables(visitor);
             }
         }
     }
@@ -296,7 +346,16 @@ impl Atom {
 
     /// Collect all named variables in this atom.
     pub fn variables(&self) -> Vec<&str> {
-        self.terms.iter().flat_map(Term::variables).collect()
+        let mut variables = Vec::new();
+        self.visit_variables(&mut |name| variables.push(name));
+        variables
+    }
+
+    /// Visit original atom variables in order without allocating.
+    pub fn visit_variables<'a>(&'a self, visitor: &mut dyn FnMut(&'a str)) {
+        for term in &self.terms {
+            term.visit_variables(visitor);
+        }
     }
 }
 
@@ -396,24 +455,27 @@ impl BodyLiteral {
 
     /// Collect all named variables referenced by this literal.
     pub fn variables(&self) -> Vec<&str> {
+        let mut variables = Vec::new();
+        self.visit_variables(&mut |name| variables.push(name));
+        variables
+    }
+
+    /// Visit original literal variables in order without allocating.
+    pub fn visit_variables<'a>(&'a self, visitor: &mut dyn FnMut(&'a str)) {
         match self {
-            BodyLiteral::Positive(a) | BodyLiteral::Negated(a) => a.variables(),
-            BodyLiteral::Epistemic(lit) => lit.atom.variables(),
+            BodyLiteral::Positive(a) | BodyLiteral::Negated(a) => a.visit_variables(visitor),
+            BodyLiteral::Epistemic(lit) => lit.atom.visit_variables(visitor),
             BodyLiteral::Comparison(c) => {
-                let mut vars = vec![];
-                vars.extend(c.left.variables());
-                vars.extend(c.right.variables());
-                vars
+                c.left.visit_variables(visitor);
+                c.right.visit_variables(visitor);
             }
             BodyLiteral::IsExpr(is_expr) => {
-                let mut vars = is_expr.expr.variables();
-                vars.push(is_expr.target.as_str());
-                vars
+                is_expr.expr.visit_variables(visitor);
+                visitor(&is_expr.target);
             }
             BodyLiteral::Univ(univ) => {
-                let mut vars = univ.term.variables();
-                vars.extend(univ.parts.variables());
-                vars
+                univ.term.visit_variables(visitor);
+                univ.parts.visit_variables(visitor);
             }
         }
     }
@@ -500,6 +562,25 @@ impl Rule {
     }
 }
 
+impl Constraint {
+    /// Checked original constraint-body clone geometry.
+    pub fn owned_allocation_bytes(&self) -> Result<u64> {
+        let mut size = AstAllocationSize::new(0);
+        size.body(&self.body)?;
+        u64::try_from(size.0).map_err(|_| AstAllocationSize::overflow())
+    }
+}
+
+impl PredDecl {
+    /// Checked original declaration clone geometry, preserving both authored
+    /// type and named-column rosters.
+    pub fn owned_allocation_bytes(&self) -> Result<u64> {
+        let mut size = AstAllocationSize::new(0);
+        size.predicate(self)?;
+        u64::try_from(size.0).map_err(|_| AstAllocationSize::overflow())
+    }
+}
+
 /// A constraint (:- body)
 #[derive(Debug, Clone, PartialEq)]
 pub struct Constraint {
@@ -512,11 +593,28 @@ pub struct Constraint {
 impl Constraint {
     /// Return the authored identity required by prepared compilation paths.
     pub fn require_authored_index(&self) -> Result<usize> {
-        self.authored_index.ok_or_else(|| {
-            XlogError::Compilation(
-                "prepared constraint compilation requires authored identities".to_string(),
-            )
-        })
+        self.require_authored_index_core(&mut None)
+    }
+
+    /// Require the same original identity with diagnostic allocation custody.
+    pub fn require_authored_index_with_allocation_owner(
+        &self,
+        reserve: &mut dyn FnMut(u64) -> Result<std::sync::Arc<dyn Send + Sync>>,
+    ) -> Result<usize> {
+        self.require_authored_index_core(&mut Some(reserve))
+    }
+
+    fn require_authored_index_core(
+        &self,
+        reserve: &mut AuthoredIdentityAllocationOwner<'_>,
+    ) -> Result<usize> {
+        match self.authored_index {
+            Some(index) => Ok(index),
+            None => Err(authored_identity_error(
+                format_args!("prepared constraint compilation requires authored identities"),
+                reserve,
+            )?),
+        }
     }
 }
 
@@ -958,7 +1056,414 @@ pub(crate) struct ProgramMergeReport {
     pub rules: Vec<usize>,
 }
 
+// Borrowed shape accounting for the same owned AST types. Inline enum/record
+// fields are already included by their outer carrier; only heap children are
+// added here. A Vec/String clone allocates its logical extent, not the source
+// allocation's unused capacity.
+pub(crate) trait AstHeapUnitSink {
+    fn heap_unit(&mut self, bytes: usize) -> Result<()>;
+}
+
+pub(crate) struct AstAllocationSize<'a>(usize, Option<&'a mut dyn AstHeapUnitSink>);
+
+impl<'a> AstAllocationSize<'a> {
+    fn new(inline_bytes: usize) -> Self {
+        Self(inline_bytes, None)
+    }
+
+    pub(crate) fn with_sink(sink: &'a mut dyn AstHeapUnitSink) -> Self {
+        Self(0, Some(sink))
+    }
+
+    pub(crate) fn overflow() -> XlogError {
+        XlogError::allocation_extent_overflow("AST")
+    }
+
+    fn add(&mut self, bytes: usize) -> Result<()> {
+        self.0 = self.0.checked_add(bytes).ok_or_else(Self::overflow)?;
+        Ok(())
+    }
+
+    fn heap(&mut self, bytes: usize) -> Result<()> {
+        self.add(bytes)?;
+        if bytes != 0 {
+            if let Some(sink) = self.1.as_deref_mut() {
+                sink.heap_unit(bytes)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn boxes<T>(&mut self, count: usize) -> Result<()> {
+        for _ in 0..count {
+            self.heap(std::mem::size_of::<T>())?;
+        }
+        Ok(())
+    }
+
+    fn vector<T>(&mut self, items: &[T]) -> Result<()> {
+        self.heap(
+            items
+                .len()
+                .checked_mul(std::mem::size_of::<T>())
+                .ok_or_else(Self::overflow)?,
+        )
+    }
+
+    pub(crate) fn text(&mut self, text: &str) -> Result<()> {
+        self.heap(text.len())
+    }
+
+    fn strings(&mut self, items: &[String]) -> Result<()> {
+        self.vector(items)?;
+        for item in items {
+            self.text(item)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn type_ref(&mut self, typ: &TypeRef) -> Result<()> {
+        match typ {
+            TypeRef::Domain(name) => self.text(name),
+            TypeRef::List(inner) => {
+                self.boxes::<TypeRef>(1)?;
+                self.type_ref(inner)
+            }
+            TypeRef::Scalar(_) | TypeRef::Term | TypeRef::Compound | TypeRef::PredRef => Ok(()),
+        }
+    }
+
+    pub(crate) fn term(&mut self, term: &Term) -> Result<()> {
+        match term {
+            Term::Variable(name) | Term::String(name) | Term::PredRef(name) => self.text(name),
+            Term::List(items) => {
+                self.vector(items)?;
+                for item in items {
+                    self.term(item)?;
+                }
+                Ok(())
+            }
+            Term::Cons { head, tail } => {
+                self.boxes::<Term>(2)?;
+                self.term(head)?;
+                self.term(tail)
+            }
+            Term::Compound { functor, args } => {
+                self.text(functor)?;
+                self.vector(args)?;
+                for arg in args {
+                    self.term(arg)?;
+                }
+                Ok(())
+            }
+            Term::Aggregate(aggregate) => self.text(&aggregate.variable),
+            Term::Anonymous | Term::Integer(_) | Term::Float(_) | Term::Symbol(_) => Ok(()),
+        }
+    }
+
+    pub(crate) fn atom(&mut self, atom: &Atom) -> Result<()> {
+        self.text(&atom.predicate)?;
+        self.vector(&atom.terms)?;
+        for term in &atom.terms {
+            self.term(term)?;
+        }
+        Ok(())
+    }
+
+    fn expression(&mut self, expression: &ArithExpr) -> Result<()> {
+        match expression {
+            ArithExpr::Variable(name) => self.text(name),
+            ArithExpr::Integer(_) | ArithExpr::Float(_) => Ok(()),
+            ArithExpr::Add(left, right)
+            | ArithExpr::Sub(left, right)
+            | ArithExpr::Mul(left, right)
+            | ArithExpr::Div(left, right)
+            | ArithExpr::Mod(left, right)
+            | ArithExpr::Min(left, right)
+            | ArithExpr::Max(left, right)
+            | ArithExpr::Pow(left, right) => {
+                self.boxes::<ArithExpr>(2)?;
+                self.expression(left)?;
+                self.expression(right)
+            }
+            ArithExpr::Abs(inner) | ArithExpr::Cast(inner, _) => {
+                self.boxes::<ArithExpr>(1)?;
+                self.expression(inner)
+            }
+            ArithExpr::FuncCall { name, args } => {
+                self.text(name)?;
+                self.vector(args)?;
+                for arg in args {
+                    self.expression(arg)?;
+                }
+                Ok(())
+            }
+            ArithExpr::Conditional {
+                cond_left,
+                cond_right,
+                then_expr,
+                else_expr,
+                ..
+            } => {
+                self.boxes::<ArithExpr>(4)?;
+                self.expression(cond_left)?;
+                self.expression(cond_right)?;
+                self.expression(then_expr)?;
+                self.expression(else_expr)
+            }
+        }
+    }
+
+    pub(crate) fn body(&mut self, body: &[BodyLiteral]) -> Result<()> {
+        self.vector(body)?;
+        for literal in body {
+            self.body_literal(literal)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn body_literal(&mut self, literal: &BodyLiteral) -> Result<()> {
+        match literal {
+            BodyLiteral::Positive(atom) | BodyLiteral::Negated(atom) => self.atom(atom),
+            BodyLiteral::Epistemic(literal) => self.atom(&literal.atom),
+            BodyLiteral::Comparison(comparison) => {
+                self.term(&comparison.left)?;
+                self.term(&comparison.right)
+            }
+            BodyLiteral::IsExpr(expression) => {
+                self.text(&expression.target)?;
+                self.expression(&expression.expr)
+            }
+            BodyLiteral::Univ(univ) => {
+                self.term(&univ.term)?;
+                self.term(&univ.parts)
+            }
+        }
+    }
+
+    fn function_body(&mut self, body: &FuncBody) -> Result<()> {
+        match body {
+            FuncBody::Arithmetic(expression) => self.expression(expression),
+            FuncBody::Conditional(condition) => {
+                self.expression(&condition.cond_left)?;
+                self.expression(&condition.cond_right)?;
+                self.boxes::<FuncBody>(2)?;
+                self.function_body(&condition.then_branch)?;
+                self.function_body(&condition.else_branch)
+            }
+            FuncBody::Predicate { result, body } => {
+                self.text(result)?;
+                self.body(body)
+            }
+        }
+    }
+
+    pub(crate) fn import(&mut self, import: &UseDecl) -> Result<()> {
+        self.strings(&import.module_path)?;
+        if let Some(imports) = &import.imports {
+            self.strings(imports)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn function(&mut self, function: &FuncDef) -> Result<()> {
+        self.text(&function.name)?;
+        self.vector(&function.params)?;
+        for parameter in &function.params {
+            self.text(&parameter.name)?;
+        }
+        self.function_body(&function.body)
+    }
+
+    fn predicate(&mut self, predicate: &PredDecl) -> Result<()> {
+        self.text(&predicate.name)?;
+        self.vector(&predicate.types)?;
+        for typ in &predicate.types {
+            self.type_ref(typ)?;
+        }
+        self.vector(&predicate.columns)?;
+        for column in &predicate.columns {
+            if let Some(name) = &column.name {
+                self.text(name)?;
+            }
+            self.type_ref(&column.typ)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn rule(&mut self, rule: &Rule) -> Result<()> {
+        self.atom(&rule.head)?;
+        self.body(&rule.body)
+    }
+
+    pub(crate) fn neural_metadata(&mut self, neural: &NeuralPredDecl) -> Result<()> {
+        self.text(&neural.network)?;
+        self.strings(&neural.inputs)?;
+        self.text(&neural.output)?;
+        if let Some(labels) = &neural.labels {
+            self.vector(labels)?;
+            for label in labels {
+                if let NeuralLabel::Symbol(text) = label {
+                    self.text(text)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Term {
+    /// Owned term geometry for a reservation before the original clone.
+    pub fn owned_allocation_bytes(&self) -> Result<u64> {
+        let mut size = AstAllocationSize::new(std::mem::size_of::<Self>());
+        size.term(self)?;
+        u64::try_from(size.0).map_err(|_| AstAllocationSize::overflow())
+    }
+}
+
+impl Atom {
+    /// Owned atom geometry for a reservation before the original clone.
+    pub fn owned_allocation_bytes(&self) -> Result<u64> {
+        let mut size = AstAllocationSize::new(std::mem::size_of::<Self>());
+        size.atom(self)?;
+        u64::try_from(size.0).map_err(|_| AstAllocationSize::overflow())
+    }
+}
+
+impl ArithExpr {
+    /// Owned expression geometry for a reservation before the original clone.
+    pub fn owned_allocation_bytes(&self) -> Result<u64> {
+        let mut size = AstAllocationSize::new(std::mem::size_of::<Self>());
+        size.expression(self)?;
+        u64::try_from(size.0).map_err(|_| AstAllocationSize::overflow())
+    }
+}
+
+impl TypeRef {
+    /// Owned type geometry for a reservation before the original clone.
+    pub fn owned_allocation_bytes(&self) -> Result<u64> {
+        let mut size = AstAllocationSize::new(std::mem::size_of::<Self>());
+        size.type_ref(self)?;
+        u64::try_from(size.0).map_err(|_| AstAllocationSize::overflow())
+    }
+}
+
+impl BodyLiteral {
+    /// Owned literal geometry for a reservation before the original clone.
+    pub fn owned_allocation_bytes(&self) -> Result<u64> {
+        let mut size = AstAllocationSize::new(0);
+        size.body(std::slice::from_ref(self))?;
+        u64::try_from(size.0).map_err(|_| AstAllocationSize::overflow())
+    }
+}
+
+impl FuncBody {
+    /// Owned function-body geometry for an original expansion task.
+    pub fn owned_allocation_bytes(&self) -> Result<u64> {
+        let mut size = AstAllocationSize::new(std::mem::size_of::<Self>());
+        size.function_body(self)?;
+        u64::try_from(size.0).map_err(|_| AstAllocationSize::overflow())
+    }
+}
+
+impl FuncDef {
+    /// Original function clone geometry, including parameter names and body.
+    pub fn owned_allocation_bytes(&self) -> Result<u64> {
+        let mut size = AstAllocationSize::new(std::mem::size_of::<Self>());
+        size.function(self)?;
+        u64::try_from(size.0).map_err(|_| AstAllocationSize::overflow())
+    }
+}
+
+impl Rule {
+    /// Original rule clone geometry for stage-owned compilation.
+    pub fn owned_allocation_bytes(&self) -> Result<u64> {
+        let mut size = AstAllocationSize::new(std::mem::size_of::<Self>());
+        size.rule(self)?;
+        u64::try_from(size.0).map_err(|_| AstAllocationSize::overflow())
+    }
+}
+
 impl Program {
+    /// Acquire each physical clone allocation under the original authority,
+    /// then perform the original clone once. The inline Program header is not
+    /// a heap allocation, and caller-owned receipts are not replaced here.
+    pub(crate) fn clone_with_allocation_custody(
+        &self,
+        scope: &mut xlog_core::CompilationAllocationScope<'_>,
+    ) -> Result<crate::program_custody::RetainedProgram> {
+        let custody = crate::program_custody::ProgramAllocationCustody::for_clone(self, scope)?;
+        Ok(crate::program_custody::RetainedProgram {
+            value: self.clone(),
+            custody,
+        })
+    }
+
+    /// Actual owned geometry of this AST, for reservation before an original
+    /// clone. This does not validate, normalize, or admit the program.
+    pub fn owned_allocation_bytes(&self) -> Result<u64> {
+        let mut size = AstAllocationSize::new(std::mem::size_of::<Self>());
+        size.vector(&self.imports)?;
+        for import in &self.imports {
+            size.import(import)?;
+        }
+        size.vector(&self.functions)?;
+        for function in &self.functions {
+            size.function(function)?;
+        }
+        size.vector(&self.domains)?;
+        for domain in &self.domains {
+            size.text(&domain.name)?;
+        }
+        size.vector(&self.predicates)?;
+        for predicate in &self.predicates {
+            size.predicate(predicate)?;
+        }
+        size.vector(&self.rules)?;
+        for rule in &self.rules {
+            size.rule(rule)?;
+        }
+        size.vector(&self.constraints)?;
+        for constraint in &self.constraints {
+            size.body(&constraint.body)?;
+        }
+        size.vector(&self.queries)?;
+        for query in &self.queries {
+            size.atom(&query.atom)?;
+        }
+        size.vector(&self.prob_facts)?;
+        for fact in &self.prob_facts {
+            size.atom(&fact.atom)?;
+        }
+        size.vector(&self.annotated_disjunctions)?;
+        for disjunction in &self.annotated_disjunctions {
+            size.vector(&disjunction.choices)?;
+            for fact in &disjunction.choices {
+                size.atom(&fact.atom)?;
+            }
+        }
+        size.vector(&self.evidence)?;
+        for evidence in &self.evidence {
+            size.atom(&evidence.atom)?;
+        }
+        size.vector(&self.prob_queries)?;
+        for query in &self.prob_queries {
+            size.atom(&query.atom)?;
+        }
+        size.vector(&self.neural_predicates)?;
+        for neural in &self.neural_predicates {
+            size.neural_metadata(neural)?;
+            size.atom(&neural.predicate)?;
+        }
+        size.vector(&self.learnable_rules)?;
+        for rule in &self.learnable_rules {
+            size.text(&rule.mask_name)?;
+            size.atom(&rule.head)?;
+            size.body(&rule.body)?;
+        }
+        u64::try_from(size.0).map_err(|_| AstAllocationSize::overflow())
+    }
+
     /// Create an empty program.
     pub fn new() -> Self {
         Self::default()
@@ -969,11 +1474,20 @@ impl Program {
         &mut self,
         authored_source_constraint_count: usize,
     ) -> Result<()> {
+        self.prepare_authored_constraint_identity_core(authored_source_constraint_count, &mut None)
+    }
+
+    fn prepare_authored_constraint_identity_core(
+        &mut self,
+        authored_source_constraint_count: usize,
+        reserve: &mut AuthoredIdentityAllocationOwner<'_>,
+    ) -> Result<()> {
         if let Some(existing_bound) = self.authored_constraint_source_bound {
             if existing_bound != authored_source_constraint_count {
-                return Err(XlogError::Compilation(format!(
-                    "authored constraint source bound {existing_bound} does not match requested bound {authored_source_constraint_count}"
-                )));
+                return Err(authored_identity_error(
+                    format_args!("authored constraint source bound {existing_bound} does not match requested bound {authored_source_constraint_count}"),
+                    reserve,
+                )?);
             }
         }
 
@@ -985,11 +1499,14 @@ impl Program {
 
         if assigned == 0 {
             if self.constraints.len() != authored_source_constraint_count {
-                return Err(XlogError::Compilation(format!(
-                    "unassigned constraint count {} does not match authored source bound {}",
-                    self.constraints.len(),
-                    authored_source_constraint_count
-                )));
+                return Err(authored_identity_error(
+                    format_args!(
+                        "unassigned constraint count {} does not match authored source bound {}",
+                        self.constraints.len(),
+                        authored_source_constraint_count
+                    ),
+                    reserve,
+                )?);
             }
             for (authored_index, constraint) in self.constraints.iter_mut().enumerate() {
                 constraint.authored_index = Some(authored_index);
@@ -999,25 +1516,34 @@ impl Program {
         }
 
         if assigned != self.constraints.len() {
-            return Err(XlogError::Compilation(
-                "mixed assigned and unassigned authored constraint identities".to_string(),
-            ));
+            return Err(authored_identity_error(
+                format_args!("mixed assigned and unassigned authored constraint identities"),
+                reserve,
+            )?);
         }
 
+        let _seen_receipt = match reserve.as_deref_mut() {
+            Some(reserve) if !self.constraints.is_empty() => Some(reserve(
+                crate::compile::hash_allocation_bytes::<usize, ()>(self.constraints.len())?,
+            )?),
+            _ => None,
+        };
         let mut seen = std::collections::HashSet::with_capacity(self.constraints.len());
         for constraint in &self.constraints {
             let authored_index = constraint
                 .authored_index
                 .expect("all constraint identities were checked as assigned");
             if authored_index >= authored_source_constraint_count {
-                return Err(XlogError::Compilation(format!(
-                    "authored constraint index {authored_index} is outside source bound {authored_source_constraint_count}"
-                )));
+                return Err(authored_identity_error(
+                    format_args!("authored constraint index {authored_index} is outside source bound {authored_source_constraint_count}"),
+                    reserve,
+                )?);
             }
             if !seen.insert(authored_index) {
-                return Err(XlogError::Compilation(format!(
-                    "duplicate authored constraint index {authored_index}"
-                )));
+                return Err(authored_identity_error(
+                    format_args!("duplicate authored constraint index {authored_index}"),
+                    reserve,
+                )?);
             }
         }
         self.authored_constraint_source_bound = Some(authored_source_constraint_count);
@@ -1030,42 +1556,78 @@ impl Program {
         self.prepare_authored_constraint_identity(authored_source_constraint_count)
     }
 
+    /// Prepare the same root identities with original temporary allocation custody.
+    pub fn prepare_authored_constraint_identity_at_root_with_allocation_owner(
+        &mut self,
+        reserve: &mut dyn FnMut(u64) -> Result<std::sync::Arc<dyn Send + Sync>>,
+    ) -> Result<()> {
+        let authored_source_constraint_count = self.constraints.len();
+        self.prepare_authored_constraint_identity_core(
+            authored_source_constraint_count,
+            &mut Some(reserve),
+        )
+    }
+
     /// Validate identities on a program already prepared at the outer boundary.
     pub fn validate_prepared_authored_constraint_identity(&self) -> Result<()> {
+        self.validate_prepared_authored_constraint_identity_core(&mut None)
+    }
+
+    /// Validate the same original identities with temporary allocation custody.
+    pub fn validate_prepared_authored_constraint_identity_with_allocation_owner(
+        &self,
+        reserve: &mut dyn FnMut(u64) -> Result<std::sync::Arc<dyn Send + Sync>>,
+    ) -> Result<()> {
+        self.validate_prepared_authored_constraint_identity_core(&mut Some(reserve))
+    }
+
+    fn validate_prepared_authored_constraint_identity_core(
+        &self,
+        reserve: &mut AuthoredIdentityAllocationOwner<'_>,
+    ) -> Result<()> {
         if self.constraints.is_empty() && self.authored_constraint_source_bound.is_none() {
             return Ok(());
         }
-        let authored_source_constraint_count =
-            self.authored_constraint_source_bound.ok_or_else(|| {
-                XlogError::Compilation(
-                "prepared constraint compilation requires authored identities and a source bound"
-                    .to_string(),
-            )
-            })?;
+        let authored_source_constraint_count = match self.authored_constraint_source_bound {
+            Some(count) => count,
+            None => return Err(authored_identity_error(
+                format_args!("prepared constraint compilation requires authored identities and a source bound"),
+                reserve,
+            )?),
+        };
         if self
             .constraints
             .iter()
             .any(|constraint| constraint.authored_index.is_none())
         {
-            return Err(XlogError::Compilation(
-                "prepared constraint compilation requires authored identities".to_string(),
-            ));
+            return Err(authored_identity_error(
+                format_args!("prepared constraint compilation requires authored identities"),
+                reserve,
+            )?);
         }
 
+        let _seen_receipt = match reserve.as_deref_mut() {
+            Some(reserve) if !self.constraints.is_empty() => Some(reserve(
+                crate::compile::hash_allocation_bytes::<usize, ()>(self.constraints.len())?,
+            )?),
+            _ => None,
+        };
         let mut seen = std::collections::HashSet::with_capacity(self.constraints.len());
         for constraint in &self.constraints {
             let authored_index = constraint
                 .authored_index
                 .expect("all prepared constraint identities were checked as assigned");
             if authored_index >= authored_source_constraint_count {
-                return Err(XlogError::Compilation(format!(
-                    "authored constraint index {authored_index} is outside source bound {authored_source_constraint_count}"
-                )));
+                return Err(authored_identity_error(
+                    format_args!("authored constraint index {authored_index} is outside source bound {authored_source_constraint_count}"),
+                    reserve,
+                )?);
             }
             if !seen.insert(authored_index) {
-                return Err(XlogError::Compilation(format!(
-                    "duplicate authored constraint index {authored_index}"
-                )));
+                return Err(authored_identity_error(
+                    format_args!("duplicate authored constraint index {authored_index}"),
+                    reserve,
+                )?);
             }
         }
         Ok(())

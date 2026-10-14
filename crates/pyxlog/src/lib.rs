@@ -82,9 +82,20 @@ pub(crate) fn dlpack_capsule_from_tensor(
     py: Python<'_>,
     tensor: DlpackManagedTensor,
 ) -> PyResult<Py<PyAny>> {
-    let raw = tensor.into_raw();
-    let ptr = raw as *mut c_void;
-    // SAFETY: capsule validity was checked immediately before this call; pointer lifetime is managed by the capsule
+    dlpack_capsule_from_retained_tensor(py, &mut Some(tensor))
+}
+
+/// Keep the original managed tensor if Python capsule allocation is refused.
+pub(crate) fn dlpack_capsule_from_retained_tensor(
+    py: Python<'_>,
+    original: &mut Option<DlpackManagedTensor>,
+) -> PyResult<Py<PyAny>> {
+    let tensor = original
+        .as_ref()
+        .ok_or_else(|| PyRuntimeError::new_err("Original DLPack tensor was already transferred"))?;
+    let ptr = tensor.as_ptr() as *mut c_void;
+    // SAFETY: the retained original owns this pointer until capsule creation
+    // succeeds. Failure leaves that same owner available to its caller.
     let capsule = unsafe {
         pyo3::ffi::PyCapsule_New(
             ptr,
@@ -93,12 +104,13 @@ pub(crate) fn dlpack_capsule_from_tensor(
         )
     };
     if capsule.is_null() {
-        // SAFETY: the pointer is a valid owned Python object pointer returned by the C API
-        unsafe {
-            drop(DlpackManagedTensor::from_raw(raw));
-        }
-        return Err(PyRuntimeError::new_err("Failed to create DLPack capsule"));
+        return Err(PyErr::fetch(py));
     }
+    // The new capsule now exclusively owns this same original managed tensor.
+    let _raw = original
+        .take()
+        .expect("retained original tensor")
+        .into_raw();
     // SAFETY: capsule is a non-null owned pointer returned by PyCapsule_New; PyO3 takes ownership
     let obj: Py<PyAny> = unsafe { Bound::from_owned_ptr(py, capsule) }.unbind();
     Ok(obj)
@@ -1240,6 +1252,7 @@ pub struct CompiledIlpProgram {
 #[pymodule]
 #[pyo3(name = "_native")]
 fn pyxlog(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    types::initialize_owned_diagnostic_types(_py, m)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<Program>()?;
     m.add_class::<CompiledProgram>()?;
@@ -1266,11 +1279,26 @@ fn pyxlog(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<semantic_transition::PySemanticInitialPrefillContentWitness>()?;
     m.add_class::<semantic_transition::PySemanticInitialPrefillReceipt>()?;
     m.add_class::<semantic_transition::PySemanticPublishedParent>()?;
+    m.add_class::<semantic_transition::material_bytes::PySemanticMaterialBytes>()?;
+    m.add_class::<semantic_transition::material_bytes::PySemanticMaterialWriter>()?;
+    m.add_class::<semantic_transition::publication_material::PySemanticPublicationMaterialProjection>()?;
+    m.add_class::<semantic_transition::material_owner::PySemanticMaterialSource>()?;
+    m.add_class::<semantic_transition::material_owner::PySemanticMaterialReadWorkspace>()?;
+    m.add_function(wrap_pyfunction!(
+        semantic_transition::material_owner::prepare_material_source,
+        m
+    )?)?;
+    m.add_class::<semantic_transition::resident_model_memory::PySemanticPreparedResidentModelMemory>()?;
+    #[cfg(feature = "semantic-policy")]
+    m.add_class::<semantic_transition::resident_model_memory::PySemanticResidentModelRead>()?;
+    #[cfg(feature = "semantic-policy")]
+    m.add_class::<semantic_transition::resident_model_memory::PySemanticPreparedResidentModelRestoration>()?;
     m.add_class::<semantic_transition::PySemanticTransitionRestoredCheckpoint>()?;
     m.add_class::<semantic_transition::learning_phase::PySemanticLearningPhaseRecipe>()?;
     m.add_class::<semantic_transition::learning_phase::PySemanticLearningPhaseTransition>()?;
     m.add_class::<semantic_transition::PyNativeTensorAllocation>()?;
     m.add_class::<semantic_transition::PySemanticPreparedStep>()?;
+    m.add_class::<semantic_transition::model_work_port::PySemanticModelWorkBufferPort>()?;
     #[cfg(feature = "semantic-policy")]
     {
         m.add_class::<semantic_transition::learning_phase::PySemanticPrivateExecutionContinuation>(
@@ -1278,6 +1306,12 @@ fn pyxlog(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<semantic_transition::actor_refresh::PySemanticPreparedActorRefresh>()?;
         m.add_class::<semantic_transition::PySemanticSegmentInstructionAdmission>()?;
         m.add_class::<semantic_transition::prepared_import::PySemanticPreparedTaskImport>()?;
+        m.add_class::<semantic_transition::prepared_import::PySemanticPreparedSourceContent>()?;
+        m.add_class::<semantic_transition::source_content_geometry::PySemanticPreparedSourceContentGeometry>()?;
+        m.add_class::<semantic_transition::source_content_geometry::PySemanticSourceGeometryAllocation>()?;
+        m.add_class::<semantic_transition::source_content_geometry::PySemanticModelInputGenerationPort>()?;
+        m.add_class::<semantic_transition::source_content_occurrences::PySemanticSourceContentFamily>()?;
+        m.add_class::<semantic_transition::source_content_occurrences::PySemanticSourceContentOccurrence>()?;
         m.add(
             "SemanticTransitionCheckpointCancelled",
             m.py().get_type::<semantic_transition::cancelled_checkpoint::SemanticTransitionCheckpointCancelled>(),
@@ -1318,6 +1352,7 @@ fn pyxlog(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<semantic_transition::model_evaluation::PySemanticModelEvaluation>()?;
         m.add_class::<semantic_transition::PySemanticCompletedExecutionObservation>()?;
         m.add_class::<semantic_transition::model_evaluation::PySemanticCompletedModelEvaluation>()?;
+        m.add_class::<semantic_transition::model_evaluation::PySemanticCancelledModelEvaluation>()?;
     }
     #[cfg(feature = "semantic-policy")]
     m.add_class::<semantic_transition::PySemanticCompletedModelCarrier>()?;

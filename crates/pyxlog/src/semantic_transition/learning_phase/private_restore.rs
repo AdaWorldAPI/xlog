@@ -259,7 +259,7 @@ impl PySemanticLearningPhaseTransition {
         self.require_trajectory_entry(py)?;
         let retained = self.trajectory_start()?;
         let operation = retained.as_ref().expect("retained original trajectory");
-        if checkpoint != self.source_checkpoint
+        if checkpoint != self.source_checkpoint.as_bytes()
             || transition.is_some()
             || !operation.decoded_verified
             || !operation.started
@@ -304,7 +304,7 @@ impl PySemanticLearningPhaseTransition {
         if self.intermediate_restore_pending()? {
             return self.intermediate_factory_work(py, parent);
         }
-        self.require_private_restore_admission(py, &self.source_checkpoint, None)?;
+        self.require_private_restore_admission(py, self.source_checkpoint.as_bytes(), None)?;
         {
             let retained = self.private_restore()?;
             if retained
@@ -326,17 +326,17 @@ impl PySemanticLearningPhaseTransition {
         }
         let work = Py::new(
             py,
-            PySemanticColdModelWork {
-                parent: parent.clone_ref(py),
-                reader: self.parent.clone_ref(py),
-                inner: operation
+            PySemanticColdModelWork::new(
+                Some(parent.clone_ref(py)),
+                self.parent.clone_ref(py),
+                operation
                     .work
                     .as_ref()
                     .expect("retained original work")
                     .clone(),
-                region: None,
-                active: AtomicBool::new(false),
-            },
+                None,
+                false,
+            ),
         )?;
         operation.callback_work = Some(work.clone_ref(py));
         Ok(work)
@@ -383,6 +383,14 @@ impl PySemanticLearningPhaseTransition {
             )
         };
         original.borrow(py).check(py)?;
+        self.private_branch_feedback_projection(py, branch)
+    }
+
+    pub(super) fn private_branch_feedback_projection(
+        &self,
+        py: Python<'_>,
+        branch: &'static str,
+    ) -> PyResult<Py<PyTuple>> {
         let materials = feedback_materials(
             self.preparation_inputs
                 .feedback_interventions
@@ -444,9 +452,8 @@ impl PySemanticLearningPhaseTransition {
                 .source
                 .borrow(py)
                 .owner()?
-                .prepare_cold_model_work(
+                .prepare_cold_model_work_deferred(
                     &*self.parent.borrow(py).lease()?,
-                    self.preparation_inputs.cold_model_work_capacity,
                     ordinal,
                     self.records()?.confirmed_admission()?,
                     xlog_cuda::SemanticColdModelWorkPurpose::PrivateRestore,
@@ -468,7 +475,7 @@ impl PySemanticLearningPhaseTransition {
                 check_learning_grant(&task, &self.grant_reference, &latest)?;
                 self.require_trajectory_entry(py)?;
                 self.preparation_inputs.require_program(py, &self.scientific_owner)?;
-                let checkpoint = PyBytes::new(py, &self.source_checkpoint);
+                let checkpoint = self.source_checkpoint_handoff.bind(py);
                 let domain = task.checkpoint.training_domain.python_value(py)?;
                 let checkpoint_limit = self.preparation_inputs.max_checkpoint_bytes.as_ref()
                     .map(|value| value.python_value(py)).transpose()?;
@@ -488,7 +495,7 @@ impl PySemanticLearningPhaseTransition {
                     self.preparation_inputs.resolve_checkpoint.as_ref().map(|callback| callback.bind(py)),
                     checkpoint_limit.as_ref().map(|value| value.bind(py)),
                     total_limit.as_ref().map(|value| value.bind(py)), Some(self.refresh_snapshot.bind(py)),
-                    Some(&task.checkpoint.proposal_expense), Some(&task.checkpoint.checkpoint_sources), Some(pending),
+                    Some(&task.checkpoint.proposal_expense), Some(&task.checkpoint.checkpoint_sources), Some(&task.checkpoint.material_sources), Some(pending), None, None,
                 );
                 let mut retained = self.trajectory_start()?;
                 let operation = retained.as_mut().expect("retained original trajectory");
@@ -681,7 +688,7 @@ impl PySemanticLearningPhaseTransition {
             )?;
             arguments.set_item(
                 "source_checkpoint",
-                PyBytes::new(py, &self.source_checkpoint),
+                self.source_checkpoint_handoff.clone_ref(py),
             )?;
             arguments.set_item("resource_usage", (work, peak, report.model_calls))?;
             self.preparation_inputs

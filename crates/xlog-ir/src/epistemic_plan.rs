@@ -1,11 +1,79 @@
 //! GPU-native epistemic execution planning contracts.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use xlog_core::RelId;
 
 use crate::eir::{EirEpistemicLiteral, EirEpistemicMode, EirEpistemicOp, EirTerm};
 use crate::plan::ExecutionPlan;
+
+type PlanAllocationOwner<'a> =
+    Option<&'a mut dyn FnMut(u64) -> xlog_core::Result<Arc<dyn Send + Sync>>>;
+
+fn plan_extent_overflow() -> xlog_core::XlogError {
+    xlog_core::XlogError::AllocationRefused {
+        operation: "epistemic plan metadata",
+        reason: xlog_core::error::AllocationRefusal::ExtentOverflow,
+    }
+}
+
+fn vector_allocation_bytes<T>(count: usize) -> xlog_core::Result<u64> {
+    count
+        .checked_mul(std::mem::size_of::<T>())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(plan_extent_overflow)
+}
+
+fn reserve_vector<T>(
+    count: usize,
+    reserve: &mut PlanAllocationOwner<'_>,
+) -> xlog_core::Result<Option<Arc<dyn Send + Sync>>> {
+    match reserve.as_deref_mut() {
+        Some(reserve) if count != 0 => Ok(Some(reserve(vector_allocation_bytes::<T>(count)?)?)),
+        _ => Ok(None),
+    }
+}
+
+fn unsupported_plan(
+    construct: &'static str,
+    context: std::fmt::Arguments<'_>,
+    reserve: &mut PlanAllocationOwner<'_>,
+) -> xlog_core::Result<xlog_core::XlogError> {
+    let owners = match reserve.as_deref_mut() {
+        Some(reserve) => {
+            let bytes = xlog_core::error::formatted_text_allocation_bytes(context)?
+                .checked_add(u64::try_from(construct.len()).map_err(|_| plan_extent_overflow())?)
+                .ok_or_else(plan_extent_overflow)?;
+            let allocations = reserve(bytes)?;
+            let metadata = reserve(
+                u64::try_from(xlog_core::error::OwnedDiagnostic::allocation_bytes())
+                    .map_err(|_| plan_extent_overflow())?,
+            )?;
+            Some((allocations, metadata))
+        }
+        None => None,
+    };
+    let error = xlog_core::XlogError::UnsupportedEpistemicConstruct {
+        construct: construct.to_string(),
+        context: format!("{context}"),
+    };
+    Ok(match owners {
+        Some((allocations, metadata)) => error.with_diagnostic_owner(allocations, metadata),
+        None => error,
+    })
+}
+
+fn plan_metadata_allocation_bytes() -> xlog_core::Result<u64> {
+    // The real planner supplies its already-owned bindings. This constructor
+    // allocates only the original fixed phase and buffer vectors.
+    vector_allocation_bytes::<EpistemicGpuHotPathPhase>(4)?
+        .checked_add(vector_allocation_bytes::<EpistemicGpuHotPathPhase>(8)?)
+        .and_then(|bytes| {
+            bytes.checked_add(vector_allocation_bytes::<EpistemicGpuBufferKind>(4).ok()?)
+        })
+        .ok_or_else(plan_extent_overflow)
+}
 
 /// Generate-Propagate-Test hot-path phase that must execute on GPU.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,10 +260,40 @@ pub struct EpistemicSolverServiceContract {
     pub required_statuses: Vec<EpistemicSolverStatusKind>,
 }
 
+enum SolverContractInput {
+    Prepared(EpistemicSolverServiceContract),
+    Inferred(Vec<EpistemicSolverAssumptionBinding>),
+}
+
 impl EpistemicSolverServiceContract {
     /// Build the v0.9 production solver contract for the provided assumptions.
     pub fn production_default(assumption_bindings: Vec<EpistemicSolverAssumptionBinding>) -> Self {
-        Self {
+        Self::production_default_core(assumption_bindings, &mut None)
+            .expect("ordinary solver metadata has no allocation callback")
+    }
+
+    /// Build the same contract after acquiring its original metadata storage.
+    /// The callback retains the returned receipt in the enclosing plan owner.
+    pub fn production_default_with_allocation_owner(
+        assumption_bindings: Vec<EpistemicSolverAssumptionBinding>,
+        reserve: &mut dyn FnMut(u64) -> xlog_core::Result<Arc<dyn Send + Sync>>,
+    ) -> xlog_core::Result<Self> {
+        Self::production_default_core(assumption_bindings, &mut Some(reserve))
+    }
+
+    fn production_default_core(
+        assumption_bindings: Vec<EpistemicSolverAssumptionBinding>,
+        reserve: &mut PlanAllocationOwner<'_>,
+    ) -> xlog_core::Result<Self> {
+        let _metadata_receipt = match reserve.as_deref_mut() {
+            Some(reserve) => Some(reserve(
+                vector_allocation_bytes::<EpistemicSolverCapability>(5)?
+                    .checked_add(vector_allocation_bytes::<EpistemicSolverStatusKind>(4)?)
+                    .ok_or_else(plan_extent_overflow)?,
+            )?),
+            None => None,
+        };
+        Ok(Self {
             assumption_bindings,
             required_capabilities: vec![
                 EpistemicSolverCapability::IncrementalSat,
@@ -210,25 +308,38 @@ impl EpistemicSolverServiceContract {
                 EpistemicSolverStatusKind::Unknown,
                 EpistemicSolverStatusKind::Timeout,
             ],
-        }
+        })
     }
 
     /// Count distinct required solver capabilities.
     pub fn distinct_required_capability_count(&self) -> usize {
         self.required_capabilities
             .iter()
-            .copied()
-            .collect::<BTreeSet<_>>()
-            .len()
+            .fold(0u8, |seen, capability| {
+                seen | match capability {
+                    EpistemicSolverCapability::IncrementalSat => 1,
+                    EpistemicSolverCapability::AssumptionLifecycle => 2,
+                    EpistemicSolverCapability::LearnedClauseTransfer => 4,
+                    EpistemicSolverCapability::WeightedMaxSat => 8,
+                    EpistemicSolverCapability::PortfolioSatMaxSat => 16,
+                }
+            })
+            .count_ones() as usize
     }
 
     /// Count distinct solver statuses that must cross the semantic boundary.
     pub fn distinct_required_status_count(&self) -> usize {
         self.required_statuses
             .iter()
-            .copied()
-            .collect::<BTreeSet<_>>()
-            .len()
+            .fold(0u8, |seen, status| {
+                seen | match status {
+                    EpistemicSolverStatusKind::Sat => 1,
+                    EpistemicSolverStatusKind::Unsat => 2,
+                    EpistemicSolverStatusKind::Unknown => 4,
+                    EpistemicSolverStatusKind::Timeout => 8,
+                }
+            })
+            .count_ones() as usize
     }
 }
 
@@ -269,38 +380,85 @@ impl EpistemicGpuPlan {
         epistemic_literals: Vec<EirEpistemicLiteral>,
         reductions: Vec<EpistemicReductionPlan>,
     ) -> Self {
-        let tuple_membership_bindings = epistemic_literals
-            .iter()
-            .enumerate()
-            .map(|(literal_index, literal)| EpistemicTupleMembershipBinding {
-                literal_index,
-                reduction_index: literal_index.min(reductions.len().saturating_sub(1)),
-                predicate: literal.atom.predicate.clone(),
-                arity: literal.atom.arity,
-                key_columns: (0..literal.atom.arity).collect(),
-                key_terms: literal.atom.terms.clone(),
-                bound_output_columns: vec![None; literal.atom.arity],
-                op: literal.op,
-                negated: literal.negated,
-            })
-            .collect();
-        let solver_assumption_bindings = epistemic_literals
-            .iter()
-            .enumerate()
-            .map(
-                |(literal_index, literal)| EpistemicSolverAssumptionBinding {
-                    literal_index,
-                    reduction_index: literal_index.min(reductions.len().saturating_sub(1)),
-                    predicate: literal.atom.predicate.clone(),
-                    arity: literal.atom.arity,
-                    terms: literal.atom.terms.clone(),
-                    op: literal.op,
-                    negated: literal.negated,
-                },
-            )
-            .collect();
+        Self::new_core(mode, epistemic_literals, reductions, None, &mut None)
+            .expect("ordinary epistemic metadata has no allocation callback")
+    }
 
-        Self {
+    /// Move the planner's original bindings into the same plan constructor.
+    /// Their storage is already owned by the caller; only the actual phase and
+    /// buffer metadata is acquired here, without constructing replaced defaults.
+    pub fn new_with_prepared_bindings_and_allocation_owner(
+        mode: EirEpistemicMode,
+        epistemic_literals: Vec<EirEpistemicLiteral>,
+        reductions: Vec<EpistemicReductionPlan>,
+        tuple_membership_bindings: Vec<EpistemicTupleMembershipBinding>,
+        solver_contract: EpistemicSolverServiceContract,
+        reserve: &mut dyn FnMut(u64) -> xlog_core::Result<Arc<dyn Send + Sync>>,
+    ) -> xlog_core::Result<Self> {
+        Self::new_core(
+            mode,
+            epistemic_literals,
+            reductions,
+            Some((tuple_membership_bindings, solver_contract)),
+            &mut Some(reserve),
+        )
+    }
+
+    fn new_core(
+        mode: EirEpistemicMode,
+        epistemic_literals: Vec<EirEpistemicLiteral>,
+        reductions: Vec<EpistemicReductionPlan>,
+        prepared_bindings: Option<(
+            Vec<EpistemicTupleMembershipBinding>,
+            EpistemicSolverServiceContract,
+        )>,
+        reserve: &mut PlanAllocationOwner<'_>,
+    ) -> xlog_core::Result<Self> {
+        let _metadata_receipt = match reserve.as_deref_mut() {
+            Some(reserve) => Some(reserve(plan_metadata_allocation_bytes()?)?),
+            None => None,
+        };
+        let (tuple_membership_bindings, solver_contract) = match prepared_bindings {
+            Some((bindings, contract)) => (bindings, SolverContractInput::Prepared(contract)),
+            None => {
+                let tuple_membership_bindings = epistemic_literals
+                    .iter()
+                    .enumerate()
+                    .map(|(literal_index, literal)| EpistemicTupleMembershipBinding {
+                        literal_index,
+                        reduction_index: literal_index.min(reductions.len().saturating_sub(1)),
+                        predicate: literal.atom.predicate.clone(),
+                        arity: literal.atom.arity,
+                        key_columns: (0..literal.atom.arity).collect(),
+                        key_terms: literal.atom.terms.clone(),
+                        bound_output_columns: vec![None; literal.atom.arity],
+                        op: literal.op,
+                        negated: literal.negated,
+                    })
+                    .collect();
+                let solver_assumption_bindings = epistemic_literals
+                    .iter()
+                    .enumerate()
+                    .map(
+                        |(literal_index, literal)| EpistemicSolverAssumptionBinding {
+                            literal_index,
+                            reduction_index: literal_index.min(reductions.len().saturating_sub(1)),
+                            predicate: literal.atom.predicate.clone(),
+                            arity: literal.atom.arity,
+                            terms: literal.atom.terms.clone(),
+                            op: literal.op,
+                            negated: literal.negated,
+                        },
+                    )
+                    .collect();
+                (
+                    tuple_membership_bindings,
+                    SolverContractInput::Inferred(solver_assumption_bindings),
+                )
+            }
+        };
+
+        Ok(Self {
             mode,
             execution_backend: EpistemicExecutionBackend::Gpu,
             fallback_policy: EpistemicFallbackPolicy::RejectUnsupported,
@@ -331,10 +489,13 @@ impl EpistemicGpuPlan {
             tuple_membership_bindings,
             constraints: Vec::new(),
             final_output_columns: None,
-            solver_contract: EpistemicSolverServiceContract::production_default(
-                solver_assumption_bindings,
-            ),
-        }
+            solver_contract: match solver_contract {
+                SolverContractInput::Prepared(contract) => contract,
+                SolverContractInput::Inferred(bindings) => {
+                    EpistemicSolverServiceContract::production_default_core(bindings, reserve)?
+                }
+            },
+        })
     }
 
     /// Replace inferred tuple-membership bindings with planner-derived bindings.
@@ -360,39 +521,58 @@ impl EpistemicGpuPlan {
 
     /// Validate that every world-view constraint references in-range epistemic literals.
     pub fn validate_constraints(&self) -> xlog_core::Result<()> {
+        self.validate_constraints_core(&mut None)
+    }
+
+    /// Validate the same constraints with original temporary allocation custody.
+    pub fn validate_constraints_with_allocation_owner(
+        &self,
+        reserve: &mut dyn FnMut(u64) -> xlog_core::Result<Arc<dyn Send + Sync>>,
+    ) -> xlog_core::Result<()> {
+        self.validate_constraints_core(&mut Some(reserve))
+    }
+
+    fn validate_constraints_core(
+        &self,
+        reserve: &mut PlanAllocationOwner<'_>,
+    ) -> xlog_core::Result<()> {
         for constraint in &self.constraints {
             if constraint.literal_indices.is_empty() {
-                return Err(xlog_core::XlogError::UnsupportedEpistemicConstruct {
-                    construct: "epistemic GPU world-view constraint".to_string(),
-                    context: format!(
+                return Err(unsupported_plan(
+                    "epistemic GPU world-view constraint",
+                    format_args!(
                         "constraint[{}] has no epistemic body literals; epistemic integrity \
                          constraints must constrain accepted world views through at least one \
                          know/possible literal",
                         constraint.constraint_index
                     ),
-                });
+                    reserve,
+                )?);
             }
+            let _seen_receipt = reserve_vector::<bool>(self.epistemic_literals.len(), reserve)?;
             let mut seen = vec![false; self.epistemic_literals.len()];
             for &literal_index in &constraint.literal_indices {
                 if literal_index >= self.epistemic_literals.len() {
-                    return Err(xlog_core::XlogError::UnsupportedEpistemicConstruct {
-                        construct: "epistemic GPU world-view constraint".to_string(),
-                        context: format!(
+                    return Err(unsupported_plan(
+                        "epistemic GPU world-view constraint",
+                        format_args!(
                             "constraint[{}] references literal_index {} exceeding literal count {}",
                             constraint.constraint_index,
                             literal_index,
                             self.epistemic_literals.len()
                         ),
-                    });
+                        reserve,
+                    )?);
                 }
                 if seen[literal_index] {
-                    return Err(xlog_core::XlogError::UnsupportedEpistemicConstruct {
-                        construct: "epistemic GPU world-view constraint".to_string(),
-                        context: format!(
+                    return Err(unsupported_plan(
+                        "epistemic GPU world-view constraint",
+                        format_args!(
                             "constraint[{}] references literal_index {} more than once",
                             constraint.constraint_index, literal_index
                         ),
-                    });
+                        reserve,
+                    )?);
                 }
                 seen[literal_index] = true;
             }
@@ -408,40 +588,59 @@ impl EpistemicGpuPlan {
 
     /// Validate that solver obligations match the epistemic semantic boundary.
     pub fn validate_solver_contract(&self) -> xlog_core::Result<()> {
+        self.validate_solver_contract_core(&mut None)
+    }
+
+    /// Validate the same solver obligations with original temporary custody.
+    pub fn validate_solver_contract_with_allocation_owner(
+        &self,
+        reserve: &mut dyn FnMut(u64) -> xlog_core::Result<Arc<dyn Send + Sync>>,
+    ) -> xlog_core::Result<()> {
+        self.validate_solver_contract_core(&mut Some(reserve))
+    }
+
+    fn validate_solver_contract_core(
+        &self,
+        reserve: &mut PlanAllocationOwner<'_>,
+    ) -> xlog_core::Result<()> {
         let contract = &self.solver_contract;
         if contract.assumption_bindings.len() != self.epistemic_literals.len() {
-            return Err(xlog_core::XlogError::UnsupportedEpistemicConstruct {
-                construct: "epistemic solver service contract".to_string(),
-                context: format!(
+            return Err(unsupported_plan(
+                "epistemic solver service contract",
+                format_args!(
                     "expected {} solver assumption bindings for epistemic literals, found {}",
                     self.epistemic_literals.len(),
                     contract.assumption_bindings.len()
                 ),
-            });
+                reserve,
+            )?);
         }
 
         let distinct_capability_count = contract.distinct_required_capability_count();
         if distinct_capability_count != contract.required_capabilities.len() {
-            return Err(xlog_core::XlogError::UnsupportedEpistemicConstruct {
-                construct: "epistemic solver service contract".to_string(),
-                context: format!(
+            return Err(unsupported_plan(
+                "epistemic solver service contract",
+                format_args!(
                     "solver capability requirements must be distinct, got {} entries but {} distinct",
                     contract.required_capabilities.len(),
                     distinct_capability_count
+
                 ),
-            });
+                reserve,
+            )?);
         }
 
         let distinct_status_count = contract.distinct_required_status_count();
         if distinct_status_count != contract.required_statuses.len() {
-            return Err(xlog_core::XlogError::UnsupportedEpistemicConstruct {
-                construct: "epistemic solver service contract".to_string(),
-                context: format!(
+            return Err(unsupported_plan(
+                "epistemic solver service contract",
+                format_args!(
                     "solver status requirements must be distinct, got {} entries but {} distinct",
                     contract.required_statuses.len(),
                     distinct_status_count
                 ),
-            });
+                reserve,
+            )?);
         }
 
         for required in [
@@ -452,10 +651,11 @@ impl EpistemicGpuPlan {
             EpistemicSolverCapability::PortfolioSatMaxSat,
         ] {
             if !contract.required_capabilities.contains(&required) {
-                return Err(xlog_core::XlogError::UnsupportedEpistemicConstruct {
-                    construct: "epistemic solver service contract".to_string(),
-                    context: format!("missing required solver capability {required:?}"),
-                });
+                return Err(unsupported_plan(
+                    "epistemic solver service contract",
+                    format_args!("missing required solver capability {required:?}"),
+                    reserve,
+                )?);
             }
         }
 
@@ -466,71 +666,82 @@ impl EpistemicGpuPlan {
             EpistemicSolverStatusKind::Timeout,
         ] {
             if !contract.required_statuses.contains(&required) {
-                return Err(xlog_core::XlogError::UnsupportedEpistemicConstruct {
-                    construct: "epistemic solver service contract".to_string(),
-                    context: format!("missing required solver status {required:?}"),
-                });
+                return Err(unsupported_plan(
+                    "epistemic solver service contract",
+                    format_args!("missing required solver status {required:?}"),
+                    reserve,
+                )?);
             }
         }
 
+        let _seen_receipt = reserve_vector::<bool>(self.epistemic_literals.len(), reserve)?;
         let mut seen_literals = vec![false; self.epistemic_literals.len()];
         for binding in &contract.assumption_bindings {
             if binding.literal_index >= self.epistemic_literals.len() {
-                return Err(xlog_core::XlogError::UnsupportedEpistemicConstruct {
-                    construct: "epistemic solver service contract".to_string(),
-                    context: format!(
+                return Err(unsupported_plan(
+                    "epistemic solver service contract",
+                    format_args!(
                         "literal_index {} exceeds literal count {}",
                         binding.literal_index,
                         self.epistemic_literals.len()
                     ),
-                });
+                    reserve,
+                )?);
             }
             if seen_literals[binding.literal_index] {
-                return Err(xlog_core::XlogError::UnsupportedEpistemicConstruct {
-                    construct: "epistemic solver service contract".to_string(),
-                    context: format!(
+                return Err(unsupported_plan(
+                    "epistemic solver service contract",
+                    format_args!(
                         "duplicate solver assumption for literal_index {}",
                         binding.literal_index
                     ),
-                });
+                    reserve,
+                )?);
             }
             seen_literals[binding.literal_index] = true;
 
             if binding.reduction_index >= self.reductions.len() {
-                return Err(xlog_core::XlogError::UnsupportedEpistemicConstruct {
-                    construct: "epistemic solver service contract".to_string(),
-                    context: format!(
+                return Err(unsupported_plan(
+                    "epistemic solver service contract",
+                    format_args!(
                         "reduction_index {} exceeds reduction count {}",
                         binding.reduction_index,
                         self.reductions.len()
                     ),
-                });
+                    reserve,
+                )?);
             }
 
             let literal = &self.epistemic_literals[binding.literal_index];
-            let tuple_binding =
-                self.tuple_membership_bindings
-                    .iter()
-                    .find(|tuple_binding| tuple_binding.literal_index == binding.literal_index)
-                    .ok_or_else(|| {
-                        xlog_core::XlogError::UnsupportedEpistemicConstruct {
-                            construct: "epistemic solver service contract".to_string(),
-                            context: format!(
-                                "solver assumption for literal_index {} has no matching tuple-membership binding",
-                                binding.literal_index
-                            ),
-                        }
-                    })?;
+            let tuple_binding = match self
+                .tuple_membership_bindings
+                .iter()
+                .find(|tuple_binding| tuple_binding.literal_index == binding.literal_index)
+            {
+                Some(tuple_binding) => tuple_binding,
+                None => {
+                    return Err(unsupported_plan(
+                        "epistemic solver service contract",
+                        format_args!(
+                            "solver assumption for literal_index {} has no matching tuple-membership binding",
+                            binding.literal_index
+                        ),
+                        reserve,
+                    )?);
+                }
+            };
             if binding.reduction_index != tuple_binding.reduction_index {
-                return Err(xlog_core::XlogError::UnsupportedEpistemicConstruct {
-                    construct: "epistemic solver service contract".to_string(),
-                    context: format!(
+                return Err(unsupported_plan(
+                    "epistemic solver service contract",
+                    format_args!(
                         "solver assumption for literal_index {} uses reduction_index {}, but tuple membership uses {}",
                         binding.literal_index,
                         binding.reduction_index,
                         tuple_binding.reduction_index
+
                     ),
-                });
+                    reserve,
+                )?);
             }
             if binding.predicate != literal.atom.predicate
                 || binding.arity != literal.atom.arity
@@ -538,13 +749,14 @@ impl EpistemicGpuPlan {
                 || binding.op != literal.op
                 || binding.negated != literal.negated
             {
-                return Err(xlog_core::XlogError::UnsupportedEpistemicConstruct {
-                    construct: "epistemic solver service contract".to_string(),
-                    context: format!(
+                return Err(unsupported_plan(
+                    "epistemic solver service contract",
+                    format_args!(
                         "solver assumption for literal_index {} does not match epistemic literal",
                         binding.literal_index
                     ),
-                });
+                    reserve,
+                )?);
             }
         }
 
@@ -553,50 +765,70 @@ impl EpistemicGpuPlan {
 
     /// Validate that every epistemic literal has a matching tuple-membership binding.
     pub fn validate_tuple_membership_bindings(&self) -> xlog_core::Result<()> {
+        self.validate_tuple_membership_bindings_core(&mut None)
+    }
+
+    /// Validate the same tuple bindings with original temporary custody.
+    pub fn validate_tuple_membership_bindings_with_allocation_owner(
+        &self,
+        reserve: &mut dyn FnMut(u64) -> xlog_core::Result<Arc<dyn Send + Sync>>,
+    ) -> xlog_core::Result<()> {
+        self.validate_tuple_membership_bindings_core(&mut Some(reserve))
+    }
+
+    fn validate_tuple_membership_bindings_core(
+        &self,
+        reserve: &mut PlanAllocationOwner<'_>,
+    ) -> xlog_core::Result<()> {
         if self.tuple_membership_bindings.len() != self.epistemic_literals.len() {
-            return Err(xlog_core::XlogError::UnsupportedEpistemicConstruct {
-                construct: "epistemic GPU tuple membership binding".to_string(),
-                context: format!(
+            return Err(unsupported_plan(
+                "epistemic GPU tuple membership binding",
+                format_args!(
                     "expected {} bindings for epistemic literals, found {}",
                     self.epistemic_literals.len(),
                     self.tuple_membership_bindings.len()
                 ),
-            });
+                reserve,
+            )?);
         }
 
+        let _seen_receipt = reserve_vector::<bool>(self.epistemic_literals.len(), reserve)?;
         let mut seen_literals = vec![false; self.epistemic_literals.len()];
 
         for binding in &self.tuple_membership_bindings {
             if binding.literal_index >= self.epistemic_literals.len() {
-                return Err(xlog_core::XlogError::UnsupportedEpistemicConstruct {
-                    construct: "epistemic GPU tuple membership binding".to_string(),
-                    context: format!(
+                return Err(unsupported_plan(
+                    "epistemic GPU tuple membership binding",
+                    format_args!(
                         "literal_index {} exceeds literal count {}",
                         binding.literal_index,
                         self.epistemic_literals.len()
                     ),
-                });
+                    reserve,
+                )?);
             }
             if seen_literals[binding.literal_index] {
-                return Err(xlog_core::XlogError::UnsupportedEpistemicConstruct {
-                    construct: "epistemic GPU tuple membership binding".to_string(),
-                    context: format!(
+                return Err(unsupported_plan(
+                    "epistemic GPU tuple membership binding",
+                    format_args!(
                         "duplicate literal_index {} in tuple-membership bindings",
                         binding.literal_index
                     ),
-                });
+                    reserve,
+                )?);
             }
             seen_literals[binding.literal_index] = true;
 
             if binding.reduction_index >= self.reductions.len() {
-                return Err(xlog_core::XlogError::UnsupportedEpistemicConstruct {
-                    construct: "epistemic GPU tuple membership binding".to_string(),
-                    context: format!(
+                return Err(unsupported_plan(
+                    "epistemic GPU tuple membership binding",
+                    format_args!(
                         "reduction_index {} exceeds reduction count {}",
                         binding.reduction_index,
                         self.reductions.len()
                     ),
-                });
+                    reserve,
+                )?);
             }
 
             let literal = &self.epistemic_literals[binding.literal_index];
@@ -605,59 +837,64 @@ impl EpistemicGpuPlan {
                 || binding.op != literal.op
                 || binding.negated != literal.negated
             {
-                return Err(xlog_core::XlogError::UnsupportedEpistemicConstruct {
-                    construct: "epistemic GPU tuple membership binding".to_string(),
-                    context: format!(
+                return Err(unsupported_plan(
+                    "epistemic GPU tuple membership binding",
+                    format_args!(
                         "binding for literal_index {} does not match epistemic literal",
                         binding.literal_index
                     ),
-                });
+                    reserve,
+                )?);
             }
 
             if binding.key_columns.len() != binding.arity {
-                return Err(xlog_core::XlogError::UnsupportedEpistemicConstruct {
-                    construct: "epistemic GPU tuple membership binding".to_string(),
-                    context: format!(
+                return Err(unsupported_plan(
+                    "epistemic GPU tuple membership binding",
+                    format_args!(
                         "binding for literal_index {} has {} key columns for arity {}",
                         binding.literal_index,
                         binding.key_columns.len(),
                         binding.arity
                     ),
-                });
+                    reserve,
+                )?);
             }
 
             if binding.key_terms.len() != binding.arity {
-                return Err(xlog_core::XlogError::UnsupportedEpistemicConstruct {
-                    construct: "epistemic GPU tuple membership binding".to_string(),
-                    context: format!(
+                return Err(unsupported_plan(
+                    "epistemic GPU tuple membership binding",
+                    format_args!(
                         "binding for literal_index {} has {} key terms for arity {}",
                         binding.literal_index,
                         binding.key_terms.len(),
                         binding.arity
                     ),
-                });
+                    reserve,
+                )?);
             }
 
             if binding.key_terms != literal.atom.terms {
-                return Err(xlog_core::XlogError::UnsupportedEpistemicConstruct {
-                    construct: "epistemic GPU tuple membership binding".to_string(),
-                    context: format!(
+                return Err(unsupported_plan(
+                    "epistemic GPU tuple membership binding",
+                    format_args!(
                         "key terms for literal_index {} do not match epistemic literal",
                         binding.literal_index
                     ),
-                });
+                    reserve,
+                )?);
             }
 
             if binding.bound_output_columns.len() != binding.arity {
-                return Err(xlog_core::XlogError::UnsupportedEpistemicConstruct {
-                    construct: "epistemic GPU tuple membership binding".to_string(),
-                    context: format!(
+                return Err(unsupported_plan(
+                    "epistemic GPU tuple membership binding",
+                    format_args!(
                         "binding for literal_index {} has {} bound output columns for arity {}",
                         binding.literal_index,
                         binding.bound_output_columns.len(),
                         binding.arity
                     ),
-                });
+                    reserve,
+                )?);
             }
 
             for (term, bound_col) in binding
@@ -668,48 +905,53 @@ impl EpistemicGpuPlan {
                 match (term, bound_col) {
                     (EirTerm::Variable(_), Some(_)) => {}
                     (EirTerm::Variable(variable), None) => {
-                        return Err(xlog_core::XlogError::UnsupportedEpistemicConstruct {
-                            construct: "epistemic GPU tuple membership binding".to_string(),
-                            context: format!(
+                        return Err(unsupported_plan(
+                            "epistemic GPU tuple membership binding",
+                            format_args!(
                                 "variable tuple key {variable} for literal_index {} is missing a \
                                  reduced output column",
                                 binding.literal_index
                             ),
-                        });
+                            reserve,
+                        )?);
                     }
                     (_, None) => {}
                     (_, Some(bound_col)) => {
-                        return Err(xlog_core::XlogError::UnsupportedEpistemicConstruct {
-                            construct: "epistemic GPU tuple membership binding".to_string(),
-                            context: format!(
+                        return Err(unsupported_plan(
+                            "epistemic GPU tuple membership binding",
+                            format_args!(
                                 "ground tuple key for literal_index {} unexpectedly binds \
                                  reduced output column {}",
                                 binding.literal_index, bound_col
                             ),
-                        });
+                            reserve,
+                        )?);
                     }
                 }
             }
 
+            let _key_receipt = reserve_vector::<bool>(binding.arity, reserve)?;
             let mut seen_key_columns = vec![false; binding.arity];
             for &key_col in &binding.key_columns {
                 if key_col >= binding.arity {
-                    return Err(xlog_core::XlogError::UnsupportedEpistemicConstruct {
-                        construct: "epistemic GPU tuple membership binding".to_string(),
-                        context: format!(
+                    return Err(unsupported_plan(
+                        "epistemic GPU tuple membership binding",
+                        format_args!(
                             "key column {} exceeds arity {} for literal_index {}",
                             key_col, binding.arity, binding.literal_index
                         ),
-                    });
+                        reserve,
+                    )?);
                 }
                 if seen_key_columns[key_col] {
-                    return Err(xlog_core::XlogError::UnsupportedEpistemicConstruct {
-                        construct: "epistemic GPU tuple membership binding".to_string(),
-                        context: format!(
+                    return Err(unsupported_plan(
+                        "epistemic GPU tuple membership binding",
+                        format_args!(
                             "duplicate key column {} for literal_index {}",
                             key_col, binding.literal_index
                         ),
-                    });
+                        reserve,
+                    )?);
                 }
                 seen_key_columns[key_col] = true;
             }

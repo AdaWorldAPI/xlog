@@ -6,14 +6,14 @@ const SUCCESSOR_CUSTODY_ROLES: [u64; 9] = [14, 27, 28, 30, 31, 32, 33, 39, 48];
 
 /// Canonical replay roots belonging to one original completed Proposal.
 #[cfg(feature = "semantic-policy")]
-pub struct SemanticCompletedReplayMaterials {
+pub struct SemanticCompletedReplayMaterials<B = Vec<u8>> {
     pub predecessor: SemanticPublishedIdentity,
     pub successor: SemanticPublishedIdentity,
-    pub parent: Vec<u8>,
-    pub provenance: Vec<u8>,
-    pub evidence: Vec<u8>,
+    pub parent: B,
+    pub provenance: B,
+    pub evidence: B,
     /// Canonical absent-prefill section for a late predecessor checkpoint.
-    pub checkpoint_initial_prefill: Vec<u8>,
+    pub checkpoint_initial_prefill: B,
 }
 
 #[repr(C)]
@@ -520,10 +520,13 @@ impl RetainedSnapshot {
     fn read(
         &self,
         session: &mut SemanticTransitionSession,
+        reservation: Option<&Arc<SemanticReplayMaterialReservation>>,
     ) -> Result<RetainedPublication, SemanticTransitionError> {
-        let actual = session.publication_read(self.actual.clone())?;
-        let bank = session.publication_read(self.bank.clone())?[0];
-        let directory = session.publication_read(self.directory.clone())?;
+        let actual =
+            session.publication_read_with_owner(self.actual.clone(), reservation.cloned())?;
+        let bank = session.publication_read_with_owner(self.bank.clone(), reservation.cloned())?[0];
+        let directory =
+            session.publication_read_with_owner(self.directory.clone(), reservation.cloned())?;
         if actual[2] != 1
             || actual[1] != bank.header.publication_word
             || bank.header.range_count as usize != directory.len()
@@ -575,10 +578,11 @@ impl RetainedSnapshot {
             let bytes = if capacity == 0 {
                 Vec::new()
             } else {
-                session.publication_read(
+                session.publication_read_with_owner(
                     backing
                         .try_slice(0..capacity)
                         .ok_or(SemanticTransitionError::ObservationMismatch)?,
+                    reservation.cloned(),
                 )?
             };
             if row.model != 0 {
@@ -671,6 +675,16 @@ impl SemanticTransitionSession {
         step: &SemanticPreparedStep,
         header: &PublicationHeader,
     ) -> Result<SemanticRootMaterial, SemanticTransitionError> {
+        self.prepared_parent_root_material_with_owner(step, header, None)
+    }
+
+    #[cfg(feature = "semantic-policy")]
+    fn prepared_parent_root_material_with_owner(
+        &mut self,
+        step: &SemanticPreparedStep,
+        header: &PublicationHeader,
+        reservation: Option<Arc<SemanticReplayMaterialReservation>>,
+    ) -> Result<SemanticRootMaterial, SemanticTransitionError> {
         let original = self.checked_prepared_step(step, false)?;
         let prepared = original.prepared.as_ref().expect("checked original owner");
         if !prepared.observed
@@ -696,15 +710,15 @@ impl SemanticTransitionSession {
             .as_ref()
             .ok_or(SemanticTransitionError::ObservationMismatch)?
             .view();
-        let actual = self.publication_read(actual)?;
+        let actual = self.publication_read_with_owner(actual, reservation.clone())?;
         if actual[2] != 1
             || actual[1] != header.publication_word
-            || self.publication_read(bank)?[0].header != *header
+            || self.publication_read_with_owner(bank, reservation.clone())?[0].header != *header
         {
             self.poisoned = true;
             return Err(SemanticTransitionError::ObservationMismatch);
         }
-        let arena = self.publication_read(arena)?;
+        let arena = self.publication_read_with_owner(arena, reservation)?;
         self.graph
             .export_retained_transition_root(
                 &arena,
@@ -764,11 +778,216 @@ impl SemanticTransitionSession {
     }
 
     #[cfg(feature = "semantic-policy")]
+    fn completed_replay_observation_allocation_bound(
+        &self,
+        step: &SemanticPreparedStep,
+    ) -> Result<u64, SemanticTransitionError> {
+        let original = self.checked_prepared_step(step, false)?;
+        let inputs = original
+            .inputs
+            .as_ref()
+            .ok_or(SemanticTransitionError::ObservationMismatch)?;
+        let custody = original
+            .prepared
+            .as_ref()
+            .and_then(|prepared| prepared.replay_custody.as_ref())
+            .ok_or(SemanticTransitionError::ObservationMismatch)?;
+        let parent = &custody.parent;
+        let successor = &custody.successor;
+        let mut requested = self.publication_material_observation_allocation_bound(
+            &inputs.storage,
+            parent.directory.len(),
+            inputs.storage.bank_templates[0].iter().map(|range| {
+                if matches!(range.role, 18..=25) {
+                    return Ok((range.role, range.length_bytes));
+                }
+                let row = parent
+                    .plan
+                    .iter()
+                    .find(|row| {
+                        row.model == 0 && (row.role, row.index) == (range.role, range.index)
+                    })
+                    .ok_or(SemanticTransitionError::ObservationMismatch)?;
+                Ok((range.role, row.bytes[0].max(row.bytes[1])))
+            }),
+            false,
+            &custody.learning_phases,
+        )?;
+        let mut add = |count: u64, width: usize| -> Result<(), SemanticTransitionError> {
+            let width =
+                u64::try_from(width).map_err(|_| SemanticTransitionError::GenerationExhausted)?;
+            requested = requested
+                .checked_add(
+                    count
+                        .checked_mul(width)
+                        .ok_or(SemanticTransitionError::GenerationExhausted)?,
+                )
+                .ok_or(SemanticTransitionError::GenerationExhausted)?;
+            Ok(())
+        };
+        // Retained view/plan copies are made before reading either original snapshot.
+        for snapshot in [parent, successor] {
+            add(1, size_of::<RetainedSnapshot>())?;
+            add(snapshot.plan.len() as u64, size_of::<ReplayCopyRow>())?;
+            add(
+                snapshot.backings.len() as u64,
+                size_of::<DeviceMemoryView<u8>>(),
+            )?;
+            let ranges = snapshot.plan.iter().filter(|row| row.model == 0).count();
+            let models = snapshot.plan.len() - ranges;
+            for (count, width) in [
+                (ranges, size_of::<PublicationMaterialRange>()),
+                (models, size_of::<Vec<u8>>()),
+            ] {
+                if count != 0 {
+                    let capacity = count
+                        .checked_mul(2)
+                        .ok_or(SemanticTransitionError::GenerationExhausted)?
+                        .max(4);
+                    add(capacity as u64, width)?;
+                }
+            }
+        }
+        // The successor exports only its original evidence ranges, never another
+        // full model. Read staging/result, range extraction and proof copies use
+        // the same five non-model byte visits as the canonical observation bound.
+        add(2, size_of::<PublicationBank>() + 3 * size_of::<u64>())?;
+        add(
+            successor.directory.len() as u64,
+            2 * size_of::<PublicationRange>(),
+        )?;
+        for row in &successor.plan {
+            add(row.bytes[0].max(row.bytes[1]), 5)?;
+        }
+        add(
+            inputs.model_slots.len() as u64,
+            size_of::<(u64, Arc<ModelGenerationOwner>)>(),
+        )?;
+        add(
+            4,
+            size_of::<SemanticReplayLoadedMaterial>()
+                + size_of::<PublicationMaterialBytesOwner>()
+                + 2 * size_of::<usize>(),
+        )?;
+        Ok(requested)
+    }
+
+    #[cfg(feature = "semantic-policy")]
     pub fn prepared_completed_replay_materials(
         &mut self,
         step: &SemanticPreparedStep,
         consumer_streams: &[u64],
     ) -> Result<Option<SemanticCompletedReplayMaterials>, SemanticTransitionError> {
+        self.completed_replay_materials(
+            step,
+            consumer_streams,
+            None,
+            |material, _| material.encode(),
+            |bytes, _| Ok(bytes),
+        )
+    }
+
+    /// Pure original predecessor capacity; no snapshot read or fresh owner.
+    #[cfg(feature = "semantic-policy")]
+    pub fn prepared_completed_replay_material_capacity(
+        &self,
+        step: &SemanticPreparedStep,
+    ) -> Result<(usize, usize), SemanticTransitionError> {
+        let original = self.checked_prepared_step(step, false)?;
+        let inputs = original
+            .inputs
+            .as_ref()
+            .ok_or(SemanticTransitionError::ObservationMismatch)?;
+        let custody = original
+            .prepared
+            .as_ref()
+            .and_then(|prepared| prepared.replay_custody.as_ref())
+            .ok_or(SemanticTransitionError::ObservationMismatch)?;
+        self.publication_material_encoded_capacity(
+            &inputs.storage,
+            inputs.storage.bank_templates[0].iter().map(|range| {
+                if matches!(range.role, 18..=25) {
+                    return Ok((range.role, range.length_bytes));
+                }
+                let row = custody
+                    .parent
+                    .plan
+                    .iter()
+                    .find(|row| {
+                        row.model == 0 && (row.role, row.index) == (range.role, range.index)
+                    })
+                    .ok_or(SemanticTransitionError::ObservationMismatch)?;
+                Ok((range.role, row.bytes[0].max(row.bytes[1])))
+            }),
+            &custody.learning_phases,
+        )
+        .map(|native| (native, CheckpointInitialPrefill::MAGIC.len() + 8 + 1))
+    }
+
+    /// Original completed predecessor bytes with live shared-pool custody.
+    #[cfg(feature = "semantic-policy")]
+    pub fn prepared_completed_replay_loaded_materials(
+        &mut self,
+        step: &SemanticPreparedStep,
+        consumer_streams: &[u64],
+    ) -> Result<
+        Option<SemanticCompletedReplayMaterials<SemanticReplayLoadedMaterial>>,
+        SemanticTransitionError,
+    > {
+        let budget = self
+            .replay_material_budget
+            .as_ref()
+            .ok_or_else(|| {
+                publication_input_error("completed checkpoint requires its original byte pool")
+            })?
+            .clone();
+        self.completed_replay_materials(
+            step,
+            consumer_streams,
+            Some(&budget),
+            |material, reservation| {
+                material
+                    .encode_loaded(reservation.ok_or(SemanticTransitionError::ObservationMismatch)?)
+            },
+            |bytes, reservation| {
+                let reservation =
+                    reservation.ok_or(SemanticTransitionError::ObservationMismatch)?;
+                if u64::try_from(bytes.capacity())
+                    .ok()
+                    .is_none_or(|capacity| capacity > reservation.charged_bytes)
+                {
+                    return Err(SemanticTransitionError::ObservationMismatch);
+                }
+                Ok(SemanticReplayLoadedMaterial {
+                    bytes: PublicationMaterialBytes::readback(bytes, Some(Arc::clone(reservation))),
+                    decoded: None,
+                })
+            },
+        )
+    }
+
+    #[cfg(feature = "semantic-policy")]
+    fn completed_replay_materials<B: AsRef<[u8]>>(
+        &mut self,
+        step: &SemanticPreparedStep,
+        consumer_streams: &[u64],
+        budget: Option<&SemanticReplayMaterialBudget>,
+        encode_material: impl Fn(
+            &OwnedPublicationMaterial,
+            Option<&Arc<SemanticReplayMaterialReservation>>,
+        ) -> Result<B, SemanticTransitionError>,
+        retain_bytes: impl Fn(
+            Vec<u8>,
+            Option<&Arc<SemanticReplayMaterialReservation>>,
+        ) -> Result<B, SemanticTransitionError>,
+    ) -> Result<Option<SemanticCompletedReplayMaterials<B>>, SemanticTransitionError> {
+        let reservation = budget
+            .map(|budget| {
+                self.completed_replay_observation_allocation_bound(step)
+                    .and_then(|bytes| budget.reserve_auxiliary(bytes))
+                    .map(Arc::new)
+            })
+            .transpose()?;
         if self.completed_prepared_transition_kind(step)? != SemanticTransitionKind::Proposal {
             return Err(publication_input_error(
                 "completed replay export requires an original Proposal",
@@ -832,13 +1051,26 @@ impl SemanticTransitionSession {
             let RetainedPublication {
                 bank,
                 directory,
-                mut ranges,
+                ranges,
                 models: model_allocations,
-            } = parent.read(self)?;
+            } = parent.read(self, reservation.as_ref())?;
+            let model_allocations: Vec<PublicationMaterialBytes> = model_allocations
+                .into_iter()
+                .map(|bytes| PublicationMaterialBytes::readback(bytes, reservation.clone()))
+                .collect();
+            let mut ranges: Vec<OwnedPublicationMaterialRange> = ranges
+                .into_iter()
+                .map(|item| OwnedPublicationMaterialRange {
+                    range: item.range,
+                    capacity: item.capacity,
+                    bytes: PublicationMaterialBytes::readback(item.bytes, reservation.clone()),
+                })
+                .collect();
             if bank.header != header {
                 return Err(SemanticTransitionError::ObservationMismatch);
             }
-            let graph = self.prepared_parent_root_material(step, &header)?;
+            let graph =
+                self.prepared_parent_root_material_with_owner(step, &header, reservation.clone())?;
             for range in &directory {
                 if matches!(range.role, 18..=25) {
                     let (allocation, offset) =
@@ -851,16 +1083,13 @@ impl SemanticTransitionSession {
                     let end = offset
                         .checked_add(used)
                         .ok_or(SemanticTransitionError::ObservationMismatch)?;
-                    ranges.push(PublicationMaterialRange {
+                    ranges.push(OwnedPublicationMaterialRange {
                         range: *range,
                         capacity: allocation
                             .len()
                             .checked_sub(offset)
                             .ok_or(SemanticTransitionError::ObservationMismatch)?,
-                        bytes: allocation
-                            .get(offset..end)
-                            .ok_or(SemanticTransitionError::ObservationMismatch)?
-                            .to_vec(),
+                        bytes: allocation.slice_bytes(offset..end)?,
                     });
                 }
             }
@@ -889,7 +1118,7 @@ impl SemanticTransitionSession {
             contract.terminal_tokens = 0;
             contract.role_counts = 0;
             contract.semantic_owner = 0;
-            let material = PublicationMaterial {
+            let material = OwnedPublicationMaterial {
                 bank,
                 contract,
                 role_counts,
@@ -905,7 +1134,7 @@ impl SemanticTransitionSession {
                 bank: next,
                 ranges: next_ranges,
                 ..
-            } = successor.read(self)?;
+            } = successor.read(self, reservation.as_ref())?;
             if next.header != result.header {
                 return Err(SemanticTransitionError::ObservationMismatch);
             }
@@ -936,7 +1165,7 @@ impl SemanticTransitionSession {
                     .iter()
                     .find(|item| (item.range.role, item.range.index) == (38, 0))
                     .ok_or(SemanticTransitionError::ObservationMismatch)?
-                    .clone(),
+                    .to_owned_range(),
                 decision: range(39)?.clone(),
             };
             provenance.validate(&material)?;
@@ -966,17 +1195,20 @@ impl SemanticTransitionSession {
             Ok(Some(SemanticCompletedReplayMaterials {
                 predecessor: identity(header),
                 successor: identity(next.header),
-                parent: material.encode()?,
-                provenance: provenance.encode()?,
-                evidence: evidence.encode()?,
-                checkpoint_initial_prefill: CheckpointInitialPrefill::encode_section(None)?,
+                parent: encode_material(&material, reservation.as_ref())?,
+                provenance: retain_bytes(provenance.encode()?, reservation.as_ref())?,
+                evidence: retain_bytes(evidence.encode()?, reservation.as_ref())?,
+                checkpoint_initial_prefill: retain_bytes(
+                    CheckpointInitialPrefill::encode_section(None)?,
+                    reservation.as_ref(),
+                )?,
             }))
         })();
         if observation.is_err() {
             self.poisoned = true;
         }
         if let Ok(Some(material)) = &observation {
-            let digest = Identity256::from_bytes(Sha256::digest(&material.parent).into());
+            let digest = Identity256::from_bytes(Sha256::digest(material.parent.as_ref()).into());
             let custody = self
                 .steps
                 .get_mut(&step.token)

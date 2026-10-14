@@ -10,6 +10,7 @@ use xlog_core::{resolve_bool, symbol, RelId, Result, ScalarType, Schema, XlogErr
 use xlog_cuda::{CudaBuffer, CudaColumn, CudaKernelProvider};
 use xlog_ir::{EpistemicExecutablePlan, ExecutionPlan};
 use xlog_logic::ast::{PredColumn, PredDecl, TypeRef};
+use xlog_logic::compile::CompilationAllocationScope;
 use xlog_logic::epistemic::{
     compile_epistemic_gpu_execution, compile_epistemic_gpu_split_execution,
     epistemic_extensional_multi_arity_predicates, prepare_epistemic_program,
@@ -487,11 +488,57 @@ struct ResidentEvaluationOwner {
 }
 
 struct LogicProgramIdentity {
-    resident_certification:
-        OnceLock<std::result::Result<Arc<ResidentGraphCertifiedPlan>, Arc<str>>>,
+    resident_certification: OnceLock<
+        std::result::Result<Arc<ResidentGraphCertifiedPlan>, ResidentCertificationFailure>,
+    >,
     resident_evaluation_owner: Mutex<Option<ResidentEvaluationOwner>>,
     #[cfg(test)]
     resident_certification_initializations: AtomicU64,
+}
+
+enum ResidentCertificationFailure {
+    Ordinary(Arc<str>),
+    Owned {
+        _original: XlogError,
+        reported: Arc<xlog_core::error::OwnedDiagnostic>,
+    },
+}
+
+impl ResidentCertificationFailure {
+    fn report(&self) -> XlogError {
+        match self {
+            Self::Ordinary(message) => {
+                XlogError::Execution(format!("resident route certification failed: {message}"))
+            }
+            Self::Owned { reported, .. } => XlogError::OwnedDiagnostic(Arc::clone(reported)),
+        }
+    }
+
+    fn report_with_allocation_owner(
+        &self,
+        scope: &mut CompilationAllocationScope<'_>,
+    ) -> XlogError {
+        match self {
+            Self::Owned { reported, .. } => XlogError::OwnedDiagnostic(Arc::clone(reported)),
+            Self::Ordinary(message) => {
+                let mut owned = scope.child_scope();
+                if let Err(error) = owned.prepare_owner() {
+                    return error;
+                }
+                let result = xlog_core::error::formatted_text_allocation_bytes(format_args!(
+                    "resident route certification failed: {message}"
+                ))
+                .and_then(|bytes| owned.acquire(bytes));
+                let error = match result {
+                    Ok(_) => XlogError::Execution(format!(
+                        "resident route certification failed: {message}"
+                    )),
+                    Err(error) => error,
+                };
+                owned.into_failure(error)
+            }
+        }
+    }
 }
 
 impl LogicProgramIdentity {
@@ -541,13 +588,14 @@ impl LogicProgramIdentity {
             #[cfg(test)]
             self.resident_certification_initializations
                 .fetch_add(1, Ordering::Relaxed);
-            initialize()
-                .map(Arc::new)
-                .map_err(|error| Arc::<str>::from(error.to_string()))
+            initialize().map(Arc::new).map_err(|error| {
+                ResidentCertificationFailure::Ordinary(Arc::<str>::from(error.to_string()))
+            })
         });
-        cached.as_ref().map(Arc::clone).map_err(|message| {
-            XlogError::Execution(format!("resident route certification failed: {message}"))
-        })
+        cached
+            .as_ref()
+            .map(Arc::clone)
+            .map_err(ResidentCertificationFailure::report)
     }
 
     fn get_or_init_resident_certification_with_outcome(
@@ -561,16 +609,72 @@ impl LogicProgramIdentity {
             #[cfg(test)]
             self.resident_certification_initializations
                 .fetch_add(1, Ordering::Relaxed);
-            initialize()
-                .map(Arc::new)
-                .map_err(|error| Arc::<str>::from(error.to_string()))
+            initialize().map(Arc::new).map_err(|error| {
+                ResidentCertificationFailure::Ordinary(Arc::<str>::from(error.to_string()))
+            })
         });
         cached
             .as_ref()
             .map(|certified| (Arc::clone(certified), cache_was_warm, initialized_here))
-            .map_err(|message| {
-                XlogError::Execution(format!("resident route certification failed: {message}"))
-            })
+            .map_err(ResidentCertificationFailure::report)
+    }
+
+    fn get_or_init_resident_certification_with_allocation_owner(
+        &self,
+        initialize: impl FnOnce(
+            &mut CompilationAllocationScope<'_>,
+        ) -> Result<ResidentGraphCertifiedPlan>,
+        scope: &mut CompilationAllocationScope<'_>,
+    ) -> Result<Arc<ResidentGraphCertifiedPlan>> {
+        if let Some(cached) = self.resident_certification.get() {
+            return cached
+                .as_ref()
+                .map(Arc::clone)
+                .map_err(|failure| failure.report_with_allocation_owner(scope));
+        }
+        let mut owned = scope.child_scope();
+        owned.prepare_owner()?;
+        let mut attempt = Some(owned);
+        let cached = self.resident_certification.get_or_init(|| {
+            let mut owned = attempt.take().expect("original certificate attempt");
+            match initialize(&mut owned) {
+                Ok(certificate) => Ok(Arc::new(certificate)),
+                Err(original) => {
+                    let reported = match original.unowned() {
+                        XlogError::AllocationRefused { operation, reason } => {
+                            XlogError::AllocationRefused {
+                                operation,
+                                reason: *reason,
+                            }
+                        }
+                        _ => {
+                            let result = xlog_core::error::formatted_text_allocation_bytes(
+                                format_args!("resident route certification failed: {original}"),
+                            )
+                            .and_then(|bytes| owned.acquire(bytes));
+                            match result {
+                                Ok(_) => XlogError::Execution(format!(
+                                    "resident route certification failed: {original}"
+                                )),
+                                Err(error) => error,
+                            }
+                        }
+                    };
+                    let XlogError::OwnedDiagnostic(reported) = owned.into_failure(reported) else {
+                        unreachable!("prepared certificate failure owns its diagnostic")
+                    };
+                    Err(ResidentCertificationFailure::Owned {
+                        _original: original,
+                        reported,
+                    })
+                }
+            }
+        });
+        drop(attempt);
+        cached
+            .as_ref()
+            .map(Arc::clone)
+            .map_err(|failure| failure.report_with_allocation_owner(scope))
     }
 
     #[cfg(test)]
@@ -1104,6 +1208,10 @@ pub struct SemanticLogicTaskProgram {
     query_ordinals: Vec<usize>,
     program: LogicProgram,
     editable: Option<Arc<xlog_cuda::SemanticProgramAdmission>>,
+    // The actual input owner retires after the source, selector, and program.
+    allocation_owner: Option<Arc<dyn Send + Sync>>,
+    compiler_allocations: Option<Arc<dyn Send + Sync>>,
+    endpoint_allocations: Option<Arc<dyn Send + Sync>>,
 }
 
 impl std::fmt::Debug for SemanticLogicTaskProgram {
@@ -1121,33 +1229,126 @@ impl SemanticLogicTaskProgram {
     /// This performs no GPU execution; the native semantic owner calls `observe`
     /// during cold binding, including when restoring a retained task.
     pub fn compile(source: String, query_ordinals: Vec<usize>) -> Result<Self> {
+        Self::compile_owned(source, query_ordinals, &mut None)
+    }
+
+    /// Compile the same complete canonical source using its original host
+    /// allocation owner. This performs no model construction or GPU execution.
+    pub fn compile_with_allocation_owner(
+        source: String,
+        query_ordinals: Vec<usize>,
+        reserve: &mut dyn FnMut(u64) -> Result<Arc<dyn Send + Sync>>,
+    ) -> Result<Self> {
+        Self::compile_owned(source, query_ordinals, &mut Some(reserve))
+    }
+
+    fn compile_owned(
+        source: String,
+        query_ordinals: Vec<usize>,
+        reserve: &mut Option<&mut dyn FnMut(u64) -> Result<Arc<dyn Send + Sync>>>,
+    ) -> Result<Self> {
+        let mut scope = reserve.as_deref_mut().map(|reserve| {
+            xlog_logic::compile::CompilationAllocationScope::new(
+                reserve as &mut dyn FnMut(u64) -> Result<Arc<dyn Send + Sync>>,
+            )
+        });
+        if let Some(scope) = scope.as_mut() {
+            scope.prepare_owner()?;
+        }
+        let result = Self::compile_owned_core(source, query_ordinals, &mut scope.as_mut());
+        match (result, scope) {
+            (Ok(mut program), Some(scope)) => {
+                program.endpoint_allocations = Some(scope.into_owner()?);
+                Ok(program)
+            }
+            (Err(error), Some(scope)) => Err(scope.into_failure(error)),
+            (result, None) => result,
+        }
+    }
+
+    fn compile_owned_core(
+        source: String,
+        query_ordinals: Vec<usize>,
+        scope: &mut Option<&mut xlog_logic::compile::CompilationAllocationScope<'_>>,
+    ) -> Result<Self> {
         if query_ordinals.is_empty() || query_ordinals.len() > u32::MAX as usize {
-            return Err(XlogError::Compilation(
-                "semantic task requires a finite nonempty query roster".into(),
+            return Err(semantic_task_compilation_error(
+                scope,
+                format_args!("semantic task requires a finite nonempty query roster"),
             ));
         }
-        let program = LogicProgram::compile(&source)?;
-        if !program.source_program.imports.is_empty() {
-            return Err(XlogError::Compilation(
-                "semantic task source must contain its complete program without imports".into(),
+        let (program, compiler_allocations) = match scope.as_deref_mut() {
+            Some(scope) => {
+                let (program, owner) =
+                    LogicProgram::compile_source_with_allocation_owner(&source, &mut |bytes| {
+                        scope.reserve_allocation(bytes)
+                    })?;
+                (program, Some(owner))
+            }
+            None => (LogicProgram::compile(&source)?, None),
+        };
+        let program = TemporaryCompilation {
+            value: program,
+            _owner: compiler_allocations,
+        };
+        if !program.value.source_program.imports.is_empty() {
+            return Err(semantic_task_compilation_error(
+                scope,
+                format_args!(
+                    "semantic task source must contain its complete program without imports"
+                ),
             ));
         }
         for &ordinal in &query_ordinals {
-            let query = program.source_program.queries.get(ordinal).ok_or_else(|| {
-                XlogError::Compilation(format!("semantic task query ordinal {ordinal} is absent"))
-            })?;
+            let query = program
+                .value
+                .source_program
+                .queries
+                .get(ordinal)
+                .ok_or_else(|| {
+                    semantic_task_compilation_error(
+                        scope,
+                        format_args!("semantic task query ordinal {ordinal} is absent"),
+                    )
+                })?;
+            let _validation_owner = match scope.as_deref_mut() {
+                Some(scope) => Some(
+                    scope.reserve_allocation(semantic_query_validation_allocation_bytes(query)?)?,
+                ),
+                None => None,
+            };
             if !query_output_vars(query).is_empty() {
-                return Err(XlogError::Compilation(format!(
-                    "semantic task query ordinal {ordinal} must have a zero-arity result",
-                )));
+                return Err(semantic_task_compilation_error(
+                    scope,
+                    format_args!(
+                        "semantic task query ordinal {ordinal} must have a zero-arity result",
+                    ),
+                ));
             }
         }
         Ok(Self {
             source,
             query_ordinals,
-            program,
+            program: program.value,
             editable: None,
+            allocation_owner: None,
+            compiler_allocations: program._owner,
+            endpoint_allocations: None,
         })
+    }
+
+    /// Retain the original task-input allocation owner through this program's
+    /// actual lifetime. Repeated attachment must name the same original owner.
+    pub fn retain_allocation_owner(mut self, owner: Arc<dyn Send + Sync>) -> Self {
+        if let Some(original) = &self.allocation_owner {
+            assert!(
+                Arc::ptr_eq(original, &owner),
+                "semantic task input allocation owner is already attached"
+            );
+        } else {
+            self.allocation_owner = Some(owner);
+        }
+        self
     }
 
     /// Bind the independently admitted editable source to the observer without
@@ -1161,6 +1362,56 @@ impl SemanticLogicTaskProgram {
     }
 }
 
+fn semantic_task_compilation_error(
+    scope: &mut Option<&mut xlog_logic::compile::CompilationAllocationScope<'_>>,
+    arguments: std::fmt::Arguments<'_>,
+) -> XlogError {
+    if let Some(scope) = scope.as_deref_mut() {
+        let bytes = match xlog_core::error::formatted_text_allocation_bytes(arguments) {
+            Ok(bytes) => bytes,
+            Err(error) => return error,
+        };
+        if let Err(error) = scope.acquire(bytes) {
+            return error;
+        }
+    }
+    XlogError::Compilation(std::fmt::format(arguments))
+}
+
+fn semantic_query_validation_allocation_bytes(query: &Query) -> Result<u64> {
+    let mut variables = 0usize;
+    let mut text = 0u64;
+    let mut overflow = false;
+    query.atom.visit_variables(&mut |name| {
+        if let Some(count) = variables.checked_add(1) {
+            variables = count;
+        } else {
+            overflow = true;
+        }
+        if let Some(bytes) = text.checked_add(name.len() as u64) {
+            text = bytes;
+        } else {
+            overflow = true;
+        }
+    });
+    if overflow {
+        return Err(XlogError::allocation_extent_overflow("semantic query"));
+    }
+    // Original per-term variable lists, deduplication table and owned result
+    // strings are acquired before the unchanged zero-arity validation runs.
+    xlog_logic::compile::push_vector_allocation_bytes::<&str>(variables)?
+        .checked_add(xlog_logic::compile::hash_allocation_bytes::<&str, ()>(
+            variables,
+        )?)
+        .and_then(|n| {
+            n.checked_add(
+                xlog_logic::compile::push_vector_allocation_bytes::<String>(variables).ok()?,
+            )
+        })
+        .and_then(|n| n.checked_add(text))
+        .ok_or_else(|| XlogError::allocation_extent_overflow("semantic query"))
+}
+
 /// Lower an admitted editable source to the exact positive binary program bank
 /// consumed by the resident semantic evaluator. The independent observer is
 /// deliberately absent: it may supply expected truth, never candidate syntax.
@@ -1170,6 +1421,155 @@ pub fn compile_positive_binary_task(
     statements: &[&str],
     query_records: &[u32],
 ) -> Result<xlog_cuda::SemanticProgramAdmission> {
+    compile_positive_binary_task_owned(initial_theory, input_facts, statements, query_records, None)
+        .map(|(program, _)| program)
+}
+
+/// Original positive task compiler with a retained owner for the resulting
+/// native program. Transient parser/compiler/certificate leases retire only
+/// after their real ASTs and plans; global symbol leases stay in that registry.
+pub struct PositiveBinaryTaskAllocations {
+    _result: Arc<dyn Send + Sync>,
+}
+
+/// Reserve actual source and typed compiler geometry through the caller's
+/// original capacity owner, then use the same validators and full compiler.
+pub fn compile_positive_binary_task_with_allocation_owner(
+    initial_theory: &str,
+    input_facts: &str,
+    statements: &[&str],
+    query_records: &[u32],
+    reserve: &mut dyn FnMut(u64) -> Result<Arc<dyn Send + Sync>>,
+) -> Result<(
+    xlog_cuda::SemanticProgramAdmission,
+    PositiveBinaryTaskAllocations,
+)> {
+    let (program, owner) = compile_positive_binary_task_owned(
+        initial_theory,
+        input_facts,
+        statements,
+        query_records,
+        Some(reserve),
+    )?;
+    Ok((
+        program,
+        PositiveBinaryTaskAllocations {
+            _result: owner.expect("original compiler allocation owner"),
+        },
+    ))
+}
+
+fn reserve_positive_host(
+    reserve: &mut Option<&mut dyn FnMut(u64) -> Result<Arc<dyn Send + Sync>>>,
+    bytes: u64,
+) -> Result<Option<Arc<dyn Send + Sync>>> {
+    reserve
+        .as_deref_mut()
+        .map(|reserve| reserve(bytes))
+        .transpose()
+}
+
+struct OwnedPositiveSource {
+    program: Program,
+    _owner: Option<Arc<dyn Send + Sync>>,
+}
+
+fn parse_positive_source(
+    source: &str,
+    reserve: &mut Option<&mut dyn FnMut(u64) -> Result<Arc<dyn Send + Sync>>>,
+) -> Result<OwnedPositiveSource> {
+    let owner = match reserve.as_deref_mut() {
+        Some(reserve) => Some(reserve(
+            xlog_logic::parser::parse_program_allocation_bound(source)?,
+        )?),
+        None => None,
+    };
+    let program = match reserve.as_deref_mut() {
+        Some(reserve) => {
+            xlog_logic::parser::parse_program_with_symbol_allocation_owner(source, &mut |bytes| {
+                reserve(u64::try_from(bytes).map_err(|_| {
+                    XlogError::Compilation("symbol allocation extent overflow".into())
+                })?)
+            })?
+        }
+        None => xlog_logic::parse_program(source)?,
+    };
+    Ok(OwnedPositiveSource {
+        program,
+        _owner: owner,
+    })
+}
+
+fn positive_source_extent(
+    initial_theory: &str,
+    input_facts: &str,
+    statements: &[&str],
+) -> Result<u64> {
+    let overflow = || XlogError::Compilation("editable source allocation extent overflow".into());
+    let mut bytes = initial_theory
+        .len()
+        .checked_add(input_facts.len())
+        .and_then(|n| n.checked_add(2))
+        .ok_or_else(overflow)?;
+    for statement in statements {
+        bytes = bytes
+            .checked_add(statement.len())
+            .and_then(|n| n.checked_add(5))
+            .ok_or_else(overflow)?;
+    }
+    u64::try_from(bytes).map_err(|_| overflow())
+}
+
+fn positive_debug_extent(value: impl std::fmt::Debug) -> Result<usize> {
+    struct Counter(usize);
+    impl std::fmt::Write for Counter {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            self.0 = self.0.checked_add(text.len()).ok_or(std::fmt::Error)?;
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    std::fmt::write(&mut counter, format_args!("{value:#?}"))
+        .map_err(|_| XlogError::Compilation("resident certificate text extent overflow".into()))?;
+    Ok(counter.0)
+}
+
+fn positive_schema_extent(schema: &Schema) -> Result<usize> {
+    let overflow = || XlogError::Compilation("resident schema allocation extent overflow".into());
+    let mut bytes = std::mem::size_of::<Schema>();
+    for (name, _) in &schema.columns {
+        bytes = bytes
+            .checked_add(std::mem::size_of::<(String, ScalarType)>())
+            .and_then(|n| n.checked_add(name.len()))
+            .ok_or_else(overflow)?;
+    }
+    for label in schema.sort_labels() {
+        bytes = bytes
+            .checked_add(std::mem::size_of::<String>())
+            .and_then(|n| n.checked_add(label.len()))
+            .ok_or_else(overflow)?;
+    }
+    bytes
+        .checked_add(
+            schema
+                .key_columns
+                .len()
+                .checked_mul(std::mem::size_of::<usize>())
+                .ok_or_else(overflow)?,
+        )
+        .ok_or_else(overflow)
+}
+
+fn compile_positive_binary_task_owned(
+    initial_theory: &str,
+    input_facts: &str,
+    statements: &[&str],
+    query_records: &[u32],
+    mut reserve: Option<&mut dyn FnMut(u64) -> Result<Arc<dyn Send + Sync>>>,
+) -> Result<(
+    xlog_cuda::SemanticProgramAdmission,
+    Option<Arc<dyn Send + Sync>>,
+)> {
     use xlog_cuda::{SemanticProgramAdmission, SemanticProgramFact};
 
     if statements.is_empty()
@@ -1185,8 +1585,10 @@ pub fn compile_positive_binary_task(
         ));
     }
 
-    let theory = xlog_logic::parse_program(initial_theory)?;
-    let facts = xlog_logic::parse_program(input_facts)?;
+    let theory_owner = parse_positive_source(initial_theory, &mut reserve)?;
+    let theory = &theory_owner.program;
+    let facts_owner = parse_positive_source(input_facts, &mut reserve)?;
+    let facts = &facts_owner.program;
     if !positive_binary_source_only(&theory)
         || !positive_binary_source_only(&facts)
         || !facts.predicates.is_empty()
@@ -1196,16 +1598,45 @@ pub fn compile_positive_binary_task(
             "editable semantic source requires declarations, positive binary rules and separate ground facts only".into(),
         ));
     }
-    // The production compiler remains the authority for XLOG syntax and type
-    // semantics. The resident lowering below only handles its admitted subset.
+    // The ordered source and selector storage are reserved before collection.
+    let selector_bytes = query_records
+        .len()
+        .checked_mul(std::mem::size_of::<&str>())
+        .ok_or_else(|| {
+            XlogError::Compilation("editable selector allocation extent overflow".into())
+        })?;
+    let _selector_owner = reserve_positive_host(&mut reserve, selector_bytes as u64)?;
     let selected_statements = query_records
         .iter()
         .map(|record| statements[*record as usize])
         .collect::<Vec<_>>();
+    let selected_source_bytes =
+        positive_source_extent(initial_theory, input_facts, &selected_statements)?;
+    let _executable_owner = reserve_positive_host(&mut reserve, selected_source_bytes)?;
     let executable_source =
         positive_binary_task_source(initial_theory, input_facts, &selected_statements);
-    LogicProgram::compile(&executable_source)?;
-
+    // One B-tree node per original declaration is an upper envelope even at
+    // minimum occupancy; all eleven key/value slots and twelve edges are real
+    // canonical B-tree node geometry, not a source-name tariff.
+    let predicate_bytes = theory
+        .predicates
+        .iter()
+        .try_fold(0usize, |total, declaration| {
+            total
+                .checked_add(declaration.name.len())
+                .and_then(|n| {
+                    n.checked_add(
+                        2 * std::mem::size_of::<usize>()
+                            + 2 * std::mem::size_of::<u16>()
+                            + 11 * std::mem::size_of::<(String, u32)>()
+                            + 12 * std::mem::size_of::<usize>(),
+                    )
+                })
+                .ok_or_else(|| {
+                    XlogError::Compilation("editable predicate allocation extent overflow".into())
+                })
+        })?;
+    let _predicate_owner = reserve_positive_host(&mut reserve, predicate_bytes as u64)?;
     let mut predicate_indices = BTreeMap::new();
     for (index, declaration) in theory.predicates.iter().enumerate() {
         if declaration.types.len() != 2
@@ -1228,8 +1659,93 @@ pub fn compile_positive_binary_task(
         ));
     }
 
-    let mut initial_facts = Vec::new();
-    let mut initial_rules = Vec::new();
+    let fact_count = theory
+        .rules
+        .iter()
+        .chain(&facts.rules)
+        .filter(|rule| rule.is_fact())
+        .count();
+    let rule_count = theory
+        .rules
+        .len()
+        .checked_add(facts.rules.len())
+        .and_then(|n| n.checked_sub(fact_count))
+        .ok_or_else(|| {
+            XlogError::Compilation("editable program allocation extent overflow".into())
+        })?;
+    let result_bytes = [
+        (fact_count, std::mem::size_of::<SemanticProgramFact>()),
+        (
+            rule_count,
+            std::mem::size_of::<xlog_cuda::SemanticProgramRule>(),
+        ),
+        (
+            statements.len(),
+            std::mem::size_of::<(u32, SemanticProgramFact)>(),
+        ),
+        (
+            query_records.len(),
+            std::mem::size_of::<SemanticProgramFact>() + std::mem::size_of::<u32>(),
+        ),
+    ]
+    .into_iter()
+    .try_fold(
+        std::mem::size_of::<SemanticProgramAdmission>() + 2 * std::mem::size_of::<usize>(),
+        |total, (count, width)| {
+            count
+                .checked_mul(width)
+                .and_then(|n| total.checked_add(n))
+                .ok_or_else(|| {
+                    XlogError::Compilation("editable program allocation extent overflow".into())
+                })
+        },
+    )?;
+    let result_owner = reserve_positive_host(&mut reserve, result_bytes as u64)?;
+    let mut lowering_bytes = 0usize;
+    for rule in &theory.rules {
+        let mut bytes = 0usize;
+        for literal in &rule.body {
+            if let BodyLiteral::Positive(atom) = literal {
+                for term in &atom.terms {
+                    if let Term::Variable(name) = term {
+                        bytes = bytes
+                            .checked_add(name.len())
+                            .and_then(|n| {
+                                n.checked_add(
+                                    2 * std::mem::size_of::<usize>()
+                                        + 2 * std::mem::size_of::<u16>()
+                                        + 11 * std::mem::size_of::<(String, u32)>()
+                                        + 12 * std::mem::size_of::<usize>(),
+                                )
+                            })
+                            .ok_or_else(|| {
+                                XlogError::Compilation(
+                                    "binary rule lowering allocation extent overflow".into(),
+                                )
+                            })?;
+                    }
+                }
+            }
+        }
+        bytes = bytes
+            .checked_add(
+                rule.body
+                    .len()
+                    .checked_mul(std::mem::size_of::<(u32, u32, u32)>())
+                    .ok_or_else(|| {
+                        XlogError::Compilation(
+                            "binary rule lowering allocation extent overflow".into(),
+                        )
+                    })?,
+            )
+            .ok_or_else(|| {
+                XlogError::Compilation("binary rule lowering allocation extent overflow".into())
+            })?;
+        lowering_bytes = lowering_bytes.max(bytes);
+    }
+    let _lowering_owner = reserve_positive_host(&mut reserve, lowering_bytes as u64)?;
+    let mut initial_facts = Vec::with_capacity(fact_count);
+    let mut initial_rules = Vec::with_capacity(rule_count);
     for rule in theory.rules.iter().chain(&facts.rules) {
         if rule.is_fact() {
             initial_facts.push(lower_binary_fact(&rule.head, &predicate_indices)?);
@@ -1237,8 +1753,11 @@ pub fn compile_positive_binary_task(
             initial_rules.push(lower_positive_binary_rule(rule, &predicate_indices)?);
         }
     }
+    let statement_source_bytes = positive_source_extent(initial_theory, input_facts, statements)?;
+    let _statement_source_owner = reserve_positive_host(&mut reserve, statement_source_bytes)?;
     let statement_source = positive_binary_task_source(initial_theory, input_facts, statements);
-    let mut parsed_statements = xlog_logic::parse_program(&statement_source)?;
+    let mut statements_owner = parse_positive_source(&statement_source, &mut reserve)?;
+    let parsed_statements = &mut statements_owner.program;
     let parsed_queries = std::mem::take(&mut parsed_statements.queries);
     if parsed_queries.len() != statements.len()
         || !positive_binary_source_only(&parsed_statements)
@@ -1249,25 +1768,45 @@ pub fn compile_positive_binary_task(
             "each admitted Statement must contain exactly one ground query".into(),
         ));
     }
-    let observation_facts: Vec<(u32, SemanticProgramFact)> = parsed_queries
-        .iter()
-        .enumerate()
-        .map(|(record, query)| {
-            lower_binary_fact(&query.atom, &predicate_indices).map(|fact| (record as u32, fact))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut observation_facts = Vec::with_capacity(parsed_queries.len());
+    for (record, query) in parsed_queries.iter().enumerate() {
+        observation_facts.push((
+            record as u32,
+            lower_binary_fact(&query.atom, &predicate_indices)?,
+        ));
+    }
+    // Validate the same native subset before entering the general compiler so
+    // its finite typed storage envelope is derived from authentic scalar ASTs.
+    // The production compiler remains the syntax/type authority and its full
+    // normalization, lowering, optimization and finalization still run once.
+    let compiler_input = parse_positive_source(&executable_source, &mut reserve)?;
+    let _compiler_owner = match reserve.as_deref_mut() {
+        Some(reserve) => Some(reserve(
+            xlog_logic::compile::positive_binary_compiler_allocation_bound(
+                &compiler_input.program,
+            )?,
+        )?),
+        None => None,
+    };
+    let (compiled, certificate_owner) =
+        LogicProgram::compile_program_owned(compiler_input.program, &mut reserve)?;
+    drop(compiled);
+    drop(certificate_owner);
     let queries = query_records
         .iter()
         .map(|record| observation_facts[*record as usize].1)
         .collect();
-    Ok(SemanticProgramAdmission {
-        predicate_count: theory.predicates.len() as u32,
-        initial_facts,
-        initial_rules,
-        observation_facts,
-        queries,
-        query_records: query_records.to_vec(),
-    })
+    Ok((
+        SemanticProgramAdmission {
+            predicate_count: theory.predicates.len() as u32,
+            initial_facts,
+            initial_rules,
+            observation_facts,
+            queries,
+            query_records: query_records.to_vec(),
+        },
+        result_owner,
+    ))
 }
 
 /// The original admitted initial theory and facts with their ordered ground
@@ -1277,7 +1816,9 @@ pub fn positive_binary_task_source(
     input_facts: &str,
     statements: &[&str],
 ) -> String {
-    let mut source = String::new();
+    let extent = positive_source_extent(initial_theory, input_facts, statements)
+        .expect("original source extent fits host address space");
+    let mut source = String::with_capacity(extent as usize);
     source.push_str(initial_theory);
     source.push('\n');
     source.push_str(input_facts);
@@ -1629,40 +2170,116 @@ impl LogicProgram {
     ///
     /// This method does not resolve imports; import-aware callers merge them
     /// first. The program enters the canonical execution normalizer once here.
-    pub fn compile_program(mut program: Program) -> Result<Self> {
-        if program.authored_constraint_source_bound.is_some() {
-            program.validate_prepared_authored_constraint_identity()?;
-        } else {
-            program.prepare_authored_constraint_identity_at_root()?;
-        }
-        let source_program = program.clone();
-        let normalized = normalize_program_for_execution(program)?;
-        Self::compile_normalized_program(normalized, source_program)
+    pub fn compile_program(program: Program) -> Result<Self> {
+        Self::compile_program_owned(program, &mut None).map(|(program, _)| program)
     }
 
-    fn compile_normalized_program(normalized: Program, source_program: Program) -> Result<Self> {
+    fn compile_source_with_allocation_owner(
+        source: &str,
+        reserve: &mut dyn FnMut(u64) -> Result<Arc<dyn Send + Sync>>,
+    ) -> Result<(Self, Arc<dyn Send + Sync>)> {
+        let mut scope = CompilationAllocationScope::new(reserve);
+        scope.prepare_owner()?;
+        let compiled = (|| {
+            scope.acquire(xlog_logic::parser::parse_program_allocation_bound(source)?)?;
+            let program = xlog_logic::parser::parse_program_with_symbol_allocation_owner(
+                source,
+                &mut |bytes| {
+                    scope.reserve_allocation(u64::try_from(bytes).map_err(|_| {
+                        compilation_allocation_overflow("source symbol allocation extent overflow")
+                    })?)
+                },
+            )?;
+            Self::compile_program_core(program, &mut Some(&mut scope))
+        })();
+        let compiled = match compiled {
+            Ok(compiled) => compiled,
+            Err(error) => return Err(scope.into_failure(error)),
+        };
+        Ok((compiled, scope.into_owner()?))
+    }
+
+    fn compile_program_owned(
+        program: Program,
+        reserve: &mut Option<&mut dyn FnMut(u64) -> Result<Arc<dyn Send + Sync>>>,
+    ) -> Result<(Self, Option<Arc<dyn Send + Sync>>)> {
+        match reserve.as_deref_mut() {
+            Some(reserve) => {
+                let mut scope = CompilationAllocationScope::new(reserve);
+                scope.prepare_owner()?;
+                let program = match Self::compile_program_core(program, &mut Some(&mut scope)) {
+                    Ok(program) => program,
+                    Err(error) => return Err(scope.into_failure(error)),
+                };
+                Ok((program, Some(scope.into_owner()?)))
+            }
+            None => Ok((Self::compile_program_core(program, &mut None)?, None)),
+        }
+    }
+
+    fn compile_program_core(
+        mut program: Program,
+        scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+    ) -> Result<Self> {
+        if program.authored_constraint_source_bound.is_some() {
+            validate_authored_constraint_identity_with_scope(&program, scope)?;
+        } else {
+            prepare_authored_constraint_identity_with_scope(&mut program, scope)?;
+        }
+        acquire_compilation(scope, program.owned_allocation_bytes()?)?;
+        let source_program = program.clone();
+        let normalized = normalize_program_for_execution_core(program, scope)?;
+        Self::compile_normalized_program(normalized, source_program, scope)
+    }
+
+    fn compile_normalized_program(
+        normalized: Program,
+        source_program: Program,
+        scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+    ) -> Result<Self> {
         for query_index in 0..normalized.queries.len() {
-            let generated_head = format!("__xlog_query_{query_index}");
+            let generated_head = compile_temporary(scope, |scope| {
+                acquire_compilation_text(scope, format_args!("__xlog_query_{query_index}"))?;
+                Ok(format!("__xlog_query_{query_index}"))
+            })?;
             let authored_collision = source_program
                 .predicates
                 .iter()
-                .any(|declaration| declaration.name == generated_head)
+                .any(|declaration| declaration.name == generated_head.value)
                 || source_program
                     .rules
                     .iter()
-                    .any(|rule| rule.head.predicate == generated_head);
+                    .any(|rule| rule.head.predicate == generated_head.value);
             if authored_collision {
-                return Err(XlogError::Compilation(format!(
-                    "authored relation {generated_head} collides with generated query head"
-                )));
+                return Err(compilation_diagnostic(
+                    scope,
+                    format_args!(
+                        "authored relation {} collides with generated query head",
+                        generated_head.value
+                    ),
+                )?);
             }
         }
         // Function, meta-term, list, and shared-variable normalization preserve
         // constraint count and source order. Keep the authored snapshot only
         // while that one-to-one invariant remains observable.
-        let authored_constraints = (source_program.constraints.len()
-            == normalized.constraints.len())
-        .then(|| source_program.constraints.clone());
+        let authored_constraints =
+            if source_program.constraints.len() == normalized.constraints.len() {
+                acquire_compilation_vector::<Constraint>(scope, source_program.constraints.len())?;
+                for constraint in &source_program.constraints {
+                    acquire_compilation_vector::<BodyLiteral>(scope, constraint.body.len())?;
+                    for literal in &constraint.body {
+                        acquire_compilation(scope, literal.owned_allocation_bytes()?)?;
+                    }
+                }
+                Some(source_program.constraints.clone())
+            } else {
+                None
+            };
+        acquire_compilation(
+            scope,
+            (std::mem::size_of::<LogicProgramIdentity>() + 2 * std::mem::size_of::<usize>()) as u64,
+        )?;
         let reusable_state_identity = Arc::new(LogicProgramIdentity::new());
         let compiled = if program_has_epistemic_literals(&normalized) {
             Self::compile_epistemic_program(
@@ -1670,15 +2287,17 @@ impl LogicProgram {
                 source_program,
                 authored_constraints,
                 reusable_state_identity,
+                scope,
             )?
         } else {
             let mut compiler = Compiler::new();
-            let plan = match qualify_same_name_multi_arity_program(&normalized) {
-                Some(qualified) => compiler.compile_prepared_program(&qualified)?,
-                None => compiler.compile_prepared_program(&normalized)?,
+            let plan = match qualify_same_name_multi_arity_program_core(&normalized, scope)? {
+                Some(qualified) => compile_prepared_with_scope(&mut compiler, &qualified, scope)?,
+                None => compile_prepared_with_scope(&mut compiler, &normalized, scope)?,
             };
-            let mut schemas = compiler.schemas().clone();
-            augment_same_name_multi_arity_schemas(&normalized, &mut schemas)?;
+            let mut schemas = clone_compilation_schemas(compiler.schemas(), scope)?;
+            augment_same_name_multi_arity_schemas_core(&normalized, &mut schemas, scope)?;
+            acquire_compilation(scope, std::mem::size_of::<ExecutionPlan>() as u64)?;
             Self {
                 reusable_state_identity,
                 source_program,
@@ -1686,12 +2305,31 @@ impl LogicProgram {
                 authored_constraints,
                 plan: LogicExecutionPlan::Ordinary(Box::new(plan)),
                 schemas,
-                rel_ids: compiler.rel_ids().clone(),
+                rel_ids: clone_compilation_rel_ids(compiler.rel_ids(), scope)?,
                 fact_arity_qualifications: OnceLock::new(),
                 epistemic_provenance: None,
             }
         };
-        Ok(compiled.finalize_compilation())
+        match scope.as_deref_mut() {
+            Some(scope) => compiled.finalize_compilation_with_allocation_owner(scope),
+            None => Ok(compiled.finalize_compilation()),
+        }
+    }
+
+    fn finalize_compilation_with_allocation_owner(
+        self,
+        scope: &mut CompilationAllocationScope<'_>,
+    ) -> Result<Self> {
+        if !self.program.queries.is_empty() {
+            if let LogicExecutionPlan::Ordinary(plan) = &self.plan {
+                self.reusable_state_identity
+                    .get_or_init_resident_certification_with_allocation_owner(
+                        |scope| self.inspect_resident_plan_with_allocation_owner(plan, scope),
+                        scope,
+                    )?;
+            }
+        }
+        Ok(self)
     }
 
     fn finalize_compilation(self) -> Self {
@@ -1748,24 +2386,52 @@ impl LogicProgram {
         source_program: Program,
         authored_constraints: Option<Vec<Constraint>>,
         reusable_state_identity: Arc<LogicProgramIdentity>,
+        scope: &mut Option<&mut CompilationAllocationScope<'_>>,
     ) -> Result<Self> {
         // Capture epistemic provenance up front: the source-EIR modal literals are
         // retained even when a Case-A recursive reduction lowers the program to an
         // Ordinary executable plan, so the epistemic plan dump can still emit a stable id
         // for a recursive epistemic fixpoint.
-        let provenance_literals = collect_eir_epistemic_literals(&normalized);
-        let prepared = prepare_epistemic_program(&normalized)?;
-        let active_program = prepared.active_program();
+        let provenance_literals = collect_eir_epistemic_literals_core(&normalized, scope)?;
+        let prepared = compile_temporary(scope, |scope| {
+            Ok(match scope.as_deref_mut() {
+                Some(scope) => {
+                    xlog_logic::epistemic::prepare_epistemic_program_with_allocation_owner(
+                        &normalized,
+                        scope,
+                    )?
+                }
+                None => prepare_epistemic_program(&normalized)?,
+            })
+        })?;
+        let active_program = prepared.value.active_program();
 
         // Positive Gelfond-1991 `possible` cycles require tuple-level dynamic
         // compatibility. Predicate SCC membership alone cannot prove that the same
         // concrete tuple survives every edge's ordinary body filters. Route the
         // complete active program through a descending GPU fixpoint before any
         // stratified or ordinary least-fixpoint reduction can erase those gates.
-        if let Some(reduction) = try_prepare_g91_compatibility_reduction(&prepared)? {
-            let plan = compile_g91_compatibility_gpu_plan(&reduction)?;
-            let schemas = g91_plan_combined_schemas(&plan);
-            let rel_ids = g91_plan_combined_rel_ids(&plan);
+        let compatibility_checkpoint = scope
+            .as_deref()
+            .map(CompilationAllocationScope::receipt_checkpoint);
+        let compatibility = compile_temporary(scope, |scope| {
+            Ok(match scope.as_deref_mut() {
+            Some(scope) => xlog_logic::epistemic::try_prepare_g91_compatibility_reduction_with_allocation_owner(&prepared.value, scope)?,
+            None => try_prepare_g91_compatibility_reduction(&prepared.value)?,
+        })
+        })?;
+        if let Some(reduction) = compatibility.value.as_ref() {
+            let plan = compile_g91_compatibility_gpu_plan_core(reduction, scope)?;
+            let schemas = g91_plan_combined_schemas_core(&plan, scope)?;
+            let rel_ids = g91_plan_combined_rel_ids_core(&plan, scope)?;
+            acquire_compilation(
+                scope,
+                reduction.refinement_program().owned_allocation_bytes()?,
+            )?;
+            acquire_compilation(
+                scope,
+                std::mem::size_of::<EpistemicG91CompatibilityGpuPlan>() as u64,
+            )?;
             return Ok(Self {
                 reusable_state_identity,
                 source_program,
@@ -1783,6 +2449,11 @@ impl LogicProgram {
             });
         }
 
+        drop(compatibility);
+        if let (Some(scope), Some(checkpoint)) = (scope.as_deref_mut(), compatibility_checkpoint) {
+            scope.retire_since(checkpoint)?;
+        }
+
         // Stratified epistemic execution FIRST: a modal literal ranges over an
         // epistemically-DETERMINED derived head (`b :- know a` where `a :- know p`,
         // `p` invariant — possibly with the higher stratum RECURSING over the
@@ -1796,7 +2467,21 @@ impl LogicProgram {
         // determined derived head) returns `None` here and falls through to
         // the joint path UNCHANGED; plain Case-A recursion over an EDB modal
         // (`know edge`) also returns `None` and falls through to Case-A below.
-        if let Some(stratified) = try_plan_stratified_epistemic_program(active_program)? {
+        let stratified_checkpoint = scope
+            .as_deref()
+            .map(CompilationAllocationScope::receipt_checkpoint);
+        let stratified = compile_temporary(scope, |scope| {
+            Ok(match scope.as_deref_mut() {
+            Some(scope) => {
+                xlog_logic::epistemic::try_plan_stratified_epistemic_program_with_allocation_owner(
+                    active_program,
+                    scope,
+                )?
+            }
+            None => try_plan_stratified_epistemic_program(active_program)?,
+        })
+        })?;
+        if let Some(stratified) = stratified.value.as_ref() {
             // SCHEMA-ONLY reduction: resolve augmenting positive modals over INVARIANT
             // *or* epistemically-DETERMINED targets into positive ordinary atoms, so an
             // augmented head whose extra output column is bound by a modal over a
@@ -1807,30 +2492,40 @@ impl LogicProgram {
             // the determined head is already a materialized base relation (strict
             // invariant resolve), so no modal is ever resolved over an un-gated
             // candidate at runtime.
-            let reduced =
-                reduce_epistemic_program_to_ordinary_for_stratified_schema(active_program)?;
-            let mut schema_compiler = Compiler::new();
-            schema_compiler.compile_prepared_program(&reduced)?;
-            let mut schemas = schema_compiler.schemas().clone();
-            augment_same_name_multi_arity_schemas(active_program, &mut schemas)?;
+            let reduced = compile_temporary(scope, |scope| {
+                Ok(match scope.as_deref_mut() {
+                Some(scope) => xlog_logic::epistemic::reduce_epistemic_program_to_ordinary_for_stratified_schema_with_allocation_owner(active_program, scope)?,
+                None => reduce_epistemic_program_to_ordinary_for_stratified_schema(active_program)?,
+            })
+            })?;
+            let schema_compiler = compile_temporary(scope, |scope| {
+                let mut compiler = Compiler::new();
+                compile_prepared_with_scope(&mut compiler, &reduced.value, scope)?;
+                Ok(compiler)
+            })?;
+            let mut schemas = clone_compilation_schemas(schema_compiler.value.schemas(), scope)?;
+            drop(schema_compiler);
+            drop(reduced);
+            augment_same_name_multi_arity_schemas_core(active_program, &mut schemas, scope)?;
 
+            acquire_compilation_vector::<StratumExecutable>(scope, stratified.strata.len())?;
             let mut strata = Vec::with_capacity(stratified.strata.len());
             for stratum in &stratified.strata {
                 strata.push(StratumExecutable {
-                    plan: Self::compile_stratum_plan(&stratum.program)?,
+                    plan: Self::compile_stratum_plan_core(&stratum.program, scope)?,
                 });
             }
-            let ordinary_post = compile_gpu_ordinary_pass(&stratified.ordinary_post_program)?;
+            let ordinary_post =
+                compile_gpu_ordinary_pass_core(&stratified.ordinary_post_program, scope)?;
             for (name, schema) in &ordinary_post.schemas {
-                schemas
-                    .entry(name.clone())
-                    .or_insert_with(|| schema.clone());
+                insert_compilation_schema(&mut schemas, name, schema, scope)?;
             }
+            acquire_compilation(scope, std::mem::size_of::<StratifiedExecutable>() as u64)?;
             let plan = LogicExecutionPlan::EpistemicStratified(Box::new(StratifiedExecutable {
                 strata,
                 ordinary_post,
             }));
-            let rel_ids = epistemic_relation_ids(&plan)?;
+            let rel_ids = epistemic_relation_ids_core(&plan, scope)?;
             return Ok(Self {
                 reusable_state_identity,
                 source_program,
@@ -1848,18 +2543,32 @@ impl LogicProgram {
             });
         }
 
+        drop(stratified);
+        if let (Some(scope), Some(checkpoint)) = (scope.as_deref_mut(), stratified_checkpoint) {
+            scope.retire_since(checkpoint)?;
+        }
+
         // Case A/B: reduce admissible recursive epistemic programs to ordinary
         // recursion. Stratified reduced programs route through the existing ordinary
         // semi-naive engine; non-monotone reduced SCCs route through the GPU-native
         // WFS alternating-fixpoint plan below. Recursive shapes outside the admissible
         // fragment still fail closed in `try_reduce_case_a_recursive_epistemic_program`.
-        if let Some(recursive_reduced) = try_reduce_prepared_recursive_epistemic_program(&prepared)?
-        {
-            let strat = xlog_logic::stratify::analyze_stratification(&recursive_reduced);
-            if !strat.non_monotone_sccs.is_empty() {
-                let wfs_plan = compile_epistemic_wfs_gpu_plan(&recursive_reduced)?;
-                let schemas = wfs_plan_combined_schemas(&wfs_plan);
-                let rel_ids = wfs_plan_combined_rel_ids(&wfs_plan);
+        let recursive_checkpoint = scope
+            .as_deref()
+            .map(CompilationAllocationScope::receipt_checkpoint);
+        let recursive_reduced = match scope.as_deref_mut() {
+            Some(scope) => xlog_logic::epistemic::try_reduce_prepared_recursive_epistemic_program_with_allocation_owner(&prepared.value, scope)?,
+            None => try_reduce_prepared_recursive_epistemic_program(&prepared.value)?,
+        };
+        if let Some(recursive_reduced) = recursive_reduced {
+            let strat = compile_temporary(scope, |scope| {
+                analyze_stratification_with_scope(&recursive_reduced, scope)
+            })?;
+            if !strat.value.non_monotone_sccs.is_empty() {
+                let wfs_plan = compile_epistemic_wfs_gpu_plan_core(&recursive_reduced, scope)?;
+                let schemas = wfs_plan_combined_schemas_core(&wfs_plan, scope)?;
+                let rel_ids = wfs_plan_combined_rel_ids_core(&wfs_plan, scope)?;
+                acquire_compilation(scope, std::mem::size_of::<EpistemicWfsGpuPlan>() as u64)?;
                 return Ok(Self {
                     reusable_state_identity,
                     source_program,
@@ -1877,15 +2586,16 @@ impl LogicProgram {
                 });
             }
             let mut compiler = Compiler::new();
-            let plan = compiler.compile_prepared_program(&recursive_reduced)?;
+            let plan = compile_prepared_with_scope(&mut compiler, &recursive_reduced, scope)?;
+            acquire_compilation(scope, std::mem::size_of::<ExecutionPlan>() as u64)?;
             return Ok(Self {
                 reusable_state_identity,
                 source_program,
                 program: recursive_reduced,
                 authored_constraints,
                 plan: LogicExecutionPlan::Ordinary(Box::new(plan)),
-                schemas: compiler.schemas().clone(),
-                rel_ids: compiler.rel_ids().clone(),
+                schemas: clone_compilation_schemas(compiler.schemas(), scope)?,
+                rel_ids: clone_compilation_rel_ids(compiler.rel_ids(), scope)?,
                 fact_arity_qualifications: OnceLock::new(),
                 epistemic_provenance: Some(EpistemicProvenance {
                     reduction: "ordinary_recursive_modal_reduction",
@@ -1895,30 +2605,60 @@ impl LogicProgram {
             });
         }
 
-        let reduced = reduce_epistemic_program_to_ordinary(active_program)?;
-        let mut schema_compiler = Compiler::new();
-        schema_compiler.compile_prepared_program(&reduced)?;
-        let mut schemas = schema_compiler.schemas().clone();
-        augment_same_name_multi_arity_schemas(active_program, &mut schemas)?;
+        if let (Some(scope), Some(checkpoint)) = (scope.as_deref_mut(), recursive_checkpoint) {
+            scope.retire_since(checkpoint)?;
+        }
+        let reduced = compile_temporary(scope, |scope| {
+            reduce_epistemic_with_scope(active_program, scope)
+        })?;
+        let schema_compiler = compile_temporary(scope, |scope| {
+            let mut compiler = Compiler::new();
+            compile_prepared_with_scope(&mut compiler, &reduced.value, scope)?;
+            Ok(compiler)
+        })?;
+        let mut schemas = clone_compilation_schemas(schema_compiler.value.schemas(), scope)?;
+        drop(schema_compiler);
+        drop(reduced);
+        augment_same_name_multi_arity_schemas_core(active_program, &mut schemas, scope)?;
 
-        let plan = if epistemic_output_head_predicate_count(active_program) > 1 {
-            LogicExecutionPlan::EpistemicSplit(Box::new(compile_epistemic_gpu_split_execution(
+        let single_checkpoint = scope
+            .as_deref()
+            .map(CompilationAllocationScope::receipt_checkpoint);
+        let plan = if epistemic_output_head_predicate_count_core(active_program, scope)? > 1 {
+            acquire_compilation(
+                scope,
+                std::mem::size_of::<EpistemicSplitExecutablePlan>() as u64,
+            )?;
+            LogicExecutionPlan::EpistemicSplit(Box::new(compile_epistemic_split_with_scope(
                 active_program,
+                scope,
             )?))
         } else {
-            match compile_epistemic_gpu_execution(active_program) {
+            acquire_compilation(scope, std::mem::size_of::<EpistemicExecutablePlan>() as u64)?;
+            match compile_epistemic_single_with_scope(active_program, scope) {
                 Ok(executable) => LogicExecutionPlan::EpistemicSingle(Box::new(executable)),
-                Err(XlogError::UnsupportedEpistemicConstruct { construct, .. })
-                    if construct == "epistemic GPU final output relation" =>
+                Err(error)
+                    if matches!(error.unowned(), XlogError::UnsupportedEpistemicConstruct { construct, .. }
+                        if construct == "epistemic GPU final output relation") =>
                 {
+                    drop(error);
+                    if let (Some(scope), Some(checkpoint)) =
+                        (scope.as_deref_mut(), single_checkpoint)
+                    {
+                        scope.retire_since(checkpoint)?;
+                    }
+                    acquire_compilation(
+                        scope,
+                        std::mem::size_of::<EpistemicSplitExecutablePlan>() as u64,
+                    )?;
                     LogicExecutionPlan::EpistemicSplit(Box::new(
-                        compile_epistemic_gpu_split_execution(active_program)?,
+                        compile_epistemic_split_with_scope(active_program, scope)?,
                     ))
                 }
                 Err(err) => return Err(err),
             }
         };
-        let rel_ids = epistemic_relation_ids(&plan)?;
+        let rel_ids = epistemic_relation_ids_core(&plan, scope)?;
         Ok(Self {
             reusable_state_identity,
             source_program,
@@ -1945,24 +2685,60 @@ impl LogicProgram {
     /// higher stratum (`reach :- reach, know a`, `a` materialized base) routes
     /// through the ordinary semi-naive engine.
     fn compile_stratum_plan(stratum_program: &Program) -> Result<StratumPlanKind> {
-        if let Some(case_a_reduced) =
-            try_reduce_case_a_recursive_epistemic_program(stratum_program)?
-        {
+        Self::compile_stratum_plan_core(stratum_program, &mut None)
+    }
+
+    fn compile_stratum_plan_core(
+        stratum_program: &Program,
+        scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+    ) -> Result<StratumPlanKind> {
+        let recursive_checkpoint = scope
+            .as_deref()
+            .map(CompilationAllocationScope::receipt_checkpoint);
+        let case_a_reduced = compile_temporary(scope, |scope| {
+            Ok(match scope.as_deref_mut() {
+                Some(scope) => {
+                    let prepared = compile_temporary(&mut Some(&mut *scope), |scope| {
+                        Ok(match scope.as_deref_mut() {
+                        Some(scope) =>
+                    xlog_logic::epistemic::prepare_epistemic_program_with_allocation_owner(
+                        stratum_program,
+                        scope,
+                    )?,
+                        None => prepare_epistemic_program(stratum_program)?,
+                    })
+                    })?;
+                    xlog_logic::epistemic::try_reduce_prepared_recursive_epistemic_program_with_allocation_owner(&prepared.value, scope)?
+                }
+                None => try_reduce_case_a_recursive_epistemic_program(stratum_program)?,
+            })
+        })?;
+        if let Some(case_a_reduced) = case_a_reduced.value.as_ref() {
             let mut compiler = Compiler::new();
-            let plan = compiler.compile_prepared_program(&case_a_reduced)?;
-            let head_predicates = epistemic_stratum_output_heads(stratum_program);
+            let plan = compile_prepared_with_scope(&mut compiler, case_a_reduced, scope)?;
+            acquire_compilation(scope, std::mem::size_of::<ExecutionPlan>() as u64)?;
+            let head_predicates = epistemic_stratum_output_heads_core(stratum_program, scope)?;
             return Ok(StratumPlanKind::Ordinary {
                 plan: Box::new(plan),
                 head_predicates,
             });
         }
-        if epistemic_output_head_predicate_count(stratum_program) > 1 {
+        drop(case_a_reduced);
+        if let (Some(scope), Some(checkpoint)) = (scope.as_deref_mut(), recursive_checkpoint) {
+            scope.retire_since(checkpoint)?;
+        }
+        if epistemic_output_head_predicate_count_core(stratum_program, scope)? > 1 {
+            acquire_compilation(
+                scope,
+                std::mem::size_of::<EpistemicSplitExecutablePlan>() as u64,
+            )?;
             Ok(StratumPlanKind::Split(Box::new(
-                compile_epistemic_gpu_split_execution(stratum_program)?,
+                compile_epistemic_split_with_scope(stratum_program, scope)?,
             )))
         } else {
+            acquire_compilation(scope, std::mem::size_of::<EpistemicExecutablePlan>() as u64)?;
             Ok(StratumPlanKind::Single(Box::new(
-                compile_epistemic_gpu_execution(stratum_program)?,
+                compile_epistemic_single_with_scope(stratum_program, scope)?,
             )))
         }
     }
@@ -3736,90 +4512,241 @@ impl LogicProgram {
         ResidentGraphCertifiedPlan::inspect(Arc::new(resident_plan), &catalog)
     }
 
+    fn inspect_resident_plan_with_allocation_owner(
+        &self,
+        plan: &ExecutionPlan,
+        scope: &mut CompilationAllocationScope<'_>,
+    ) -> Result<ResidentGraphCertifiedPlan> {
+        let mut owned = scope.child_scope();
+        owned.prepare_owner()?;
+        let result = (|| {
+            owned.acquire(
+                (std::mem::size_of::<ResidentGraphCertifiedPlan>()
+                    + 2 * std::mem::size_of::<usize>()) as u64,
+            )?;
+            owned.acquire(
+                (std::mem::size_of::<ExecutionPlan>() + 2 * std::mem::size_of::<usize>()) as u64,
+            )?;
+            let resident_plan =
+                self.resident_dependency_closed_plan_core(plan, &mut Some(&mut owned))?;
+            let catalog =
+                ResidentGraphSchemaCatalog::from_named_schema_references_with_allocation_owner(
+                    self.rel_ids.iter().filter_map(|(name, relation)| {
+                        self.schemas
+                            .get(name)
+                            .map(|schema| (name.as_str(), *relation, schema))
+                    }),
+                    &mut owned,
+                )?;
+            Ok((Arc::new(resident_plan), catalog))
+        })();
+        let (resident_plan, catalog) = match result {
+            Ok(value) => value,
+            Err(error) => return Err(owned.into_failure(error)),
+        };
+        let owner = owned.into_owner()?;
+        ResidentGraphCertifiedPlan::inspect_with_allocation_owner(
+            resident_plan,
+            &catalog,
+            scope,
+            owner,
+        )
+    }
+
     fn resident_dependency_closed_plan(&self, plan: &ExecutionPlan) -> ExecutionPlan {
-        self.try_resident_dependency_closed_plan(plan)
-            .unwrap_or_else(|| plan.clone())
+        self.resident_dependency_closed_plan_core(plan, &mut None)
+            .expect("ordinary dependency closure has no allocation callback")
+    }
+
+    fn resident_dependency_closed_plan_core(
+        &self,
+        plan: &ExecutionPlan,
+        scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+    ) -> Result<ExecutionPlan> {
+        match self.try_resident_dependency_closed_plan_core(plan, scope)? {
+            Some(plan) => Ok(plan),
+            None => {
+                if scope.is_some() {
+                    acquire_compilation(scope, plan.owned_allocation_bytes()?)?;
+                }
+                Ok(plan.clone())
+            }
+        }
     }
 
     fn try_resident_dependency_closed_plan(&self, plan: &ExecutionPlan) -> Option<ExecutionPlan> {
-        if self.program.queries.is_empty()
-            || plan.generated_query_rules.len() != self.program.queries.len()
-        {
-            return None;
-        }
+        self.try_resident_dependency_closed_plan_core(plan, &mut None)
+            .expect("ordinary dependency closure has no allocation callback")
+    }
 
-        let mut roots =
-            Vec::with_capacity(plan.generated_query_rules.len() + self.program.constraints.len());
-        let mut root_heads = std::collections::HashSet::with_capacity(roots.capacity());
-        let mut seen_queries = vec![false; self.program.queries.len()];
-        for query in &plan.generated_query_rules {
-            let expected_head = format!("__xlog_query_{}", query.query_index);
-            let rule = plan
-                .rules_by_scc
-                .get(query.scc_index)?
-                .get(query.rule_index)?;
-            let seen = seen_queries.get_mut(query.query_index)?;
-            if *seen || rule.head != expected_head {
-                return None;
-            }
-            let occurrences = plan
-                .rules_by_scc
-                .iter()
-                .flatten()
-                .filter(|candidate| candidate.head == expected_head)
-                .count();
-            if occurrences != 1 {
-                return None;
-            }
-            *seen = true;
-            roots.push(query.scc_index);
-            if !root_heads.insert(expected_head) {
-                return None;
-            }
-        }
-        if seen_queries.iter().any(|seen| !seen) {
-            return None;
-        }
-
-        for constraint_index in 0..self.program.constraints.len() {
-            let expected_head = format!("__xlog_constraint_{constraint_index}");
-            let positions = plan
-                .rules_by_scc
-                .iter()
-                .enumerate()
-                .flat_map(|(scc_index, rules)| {
-                    rules
-                        .iter()
-                        .filter(|rule| rule.head == expected_head)
-                        .map(move |_| scc_index)
-                })
-                .collect::<Vec<_>>();
-            let [scc_index] = positions.as_slice() else {
-                return None;
-            };
-            roots.push(*scc_index);
-            if !root_heads.insert(expected_head) {
-                return None;
-            }
-        }
-
-        let mut defining_sccs = HashMap::new();
-        for (scc_index, rules) in plan.rules_by_scc.iter().enumerate() {
-            for rule in rules {
-                let Some(relation) = self.rel_ids.get(&rule.head).copied() else {
-                    if root_heads.contains(&rule.head) {
-                        continue;
+    fn try_resident_dependency_closed_plan_core(
+        &self,
+        plan: &ExecutionPlan,
+        scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+    ) -> Result<Option<ExecutionPlan>> {
+        let scratch = compile_temporary(scope, |scratch_scope| {
+            let mut failure = None;
+            macro_rules! allocation {
+                ($result:expr) => {
+                    if let Err(error) = $result {
+                        failure = Some(error);
+                        return None;
                     }
-                    return None;
                 };
-                match defining_sccs.insert(relation, scc_index) {
-                    Some(previous) if previous != scc_index => return None,
-                    _ => {}
-                }
             }
-        }
+            macro_rules! allocation_value {
+                ($result:expr) => {
+                    match $result {
+                        Ok(value) => value,
+                        Err(error) => {
+                            failure = Some(error);
+                            return None;
+                        }
+                    }
+                };
+            }
+            let value = (|| -> Option<_> {
+                if self.program.queries.is_empty()
+                    || plan.generated_query_rules.len() != self.program.queries.len()
+                {
+                    return None;
+                }
 
-        plan.dependency_closed_subplan(&roots, &defining_sccs)
+                let count = allocation_value!(plan
+                    .generated_query_rules
+                    .len()
+                    .checked_add(self.program.constraints.len())
+                    .ok_or_else(|| compilation_allocation_overflow("resident dependency roots")));
+                allocation!(acquire_compilation_vector::<usize>(scratch_scope, count));
+                let mut roots = Vec::with_capacity(count);
+                allocation!(acquire_compilation(
+                    scratch_scope,
+                    allocation_value!(xlog_core::hash_allocation_bytes::<String, ()>(
+                        roots.capacity()
+                    ))
+                ));
+                let mut root_heads = std::collections::HashSet::with_capacity(roots.capacity());
+                allocation!(acquire_compilation_vector::<bool>(
+                    scratch_scope,
+                    self.program.queries.len()
+                ));
+                let mut seen_queries = vec![false; self.program.queries.len()];
+                for query in &plan.generated_query_rules {
+                    allocation!(acquire_compilation_text(
+                        scratch_scope,
+                        format_args!("__xlog_query_{}", query.query_index)
+                    ));
+                    let expected_head = format!("__xlog_query_{}", query.query_index);
+                    let rule = plan
+                        .rules_by_scc
+                        .get(query.scc_index)?
+                        .get(query.rule_index)?;
+                    let seen = seen_queries.get_mut(query.query_index)?;
+                    if *seen || rule.head != expected_head {
+                        return None;
+                    }
+                    let occurrences = plan
+                        .rules_by_scc
+                        .iter()
+                        .flatten()
+                        .filter(|candidate| candidate.head == expected_head)
+                        .count();
+                    if occurrences != 1 {
+                        return None;
+                    }
+                    *seen = true;
+                    roots.push(query.scc_index);
+                    if !root_heads.insert(expected_head) {
+                        return None;
+                    }
+                }
+                if seen_queries.iter().any(|seen| !seen) {
+                    return None;
+                }
+
+                for constraint_index in 0..self.program.constraints.len() {
+                    allocation!(acquire_compilation_text(
+                        scratch_scope,
+                        format_args!("__xlog_constraint_{constraint_index}")
+                    ));
+                    let expected_head = format!("__xlog_constraint_{constraint_index}");
+                    let positions = allocation_value!(compile_temporary(scratch_scope, |scope| {
+                        let count = plan
+                            .rules_by_scc
+                            .iter()
+                            .flatten()
+                            .filter(|rule| rule.head == expected_head)
+                            .count();
+                        acquire_compilation_vector::<usize>(scope, count)?;
+                        Ok(plan
+                            .rules_by_scc
+                            .iter()
+                            .enumerate()
+                            .flat_map(|(scc_index, rules)| {
+                                rules
+                                    .iter()
+                                    .filter(|rule| rule.head == expected_head)
+                                    .map(move |_| scc_index)
+                            })
+                            .collect::<Vec<_>>())
+                    }));
+                    let [scc_index] = positions.value.as_slice() else {
+                        return None;
+                    };
+                    roots.push(*scc_index);
+                    if !root_heads.insert(expected_head) {
+                        return None;
+                    }
+                }
+
+                let mut defining_sccs = HashMap::new();
+                for (scc_index, rules) in plan.rules_by_scc.iter().enumerate() {
+                    for rule in rules {
+                        let Some(relation) = self.rel_ids.get(&rule.head).copied() else {
+                            if root_heads.contains(&rule.head) {
+                                continue;
+                            }
+                            return None;
+                        };
+                        if !defining_sccs.contains_key(&relation)
+                            && defining_sccs.len() == defining_sccs.capacity()
+                        {
+                            let count = allocation_value!(defining_sccs
+                                .len()
+                                .checked_add(1)
+                                .ok_or_else(|| compilation_allocation_overflow(
+                                    "resident defining relations"
+                                )));
+                            allocation!(acquire_compilation(
+                                scratch_scope,
+                                allocation_value!(
+                                    xlog_core::hash_allocation_bytes::<RelId, usize>(count)
+                                )
+                            ));
+                        }
+                        match defining_sccs.insert(relation, scc_index) {
+                            Some(previous) if previous != scc_index => return None,
+                            _ => {}
+                        }
+                    }
+                }
+
+                Some((roots, defining_sccs, root_heads, seen_queries))
+            })();
+            match failure {
+                Some(error) => Err(error),
+                None => Ok(value),
+            }
+        })?;
+        let Some((roots, defining_sccs, _, _)) = scratch.value.as_ref() else {
+            return Ok(None);
+        };
+        match scope.as_deref_mut() {
+            Some(scope) => {
+                plan.dependency_closed_subplan_with_allocation_owner(roots, defining_sccs, scope)
+            }
+            None => Ok(plan.dependency_closed_subplan(roots, defining_sccs)),
+        }
     }
 
     #[cfg(test)]
@@ -5008,17 +5935,266 @@ const DEFAULT_EPISTEMIC_MAX_MODELS_PER_REDUCTION: usize = 1024;
 /// expands user-defined functions with the entry program's recursion limit, normalizes
 /// meta and list builtins, and desugars shared-variable epistemic constraints.
 pub fn normalize_program_for_execution(mut program: Program) -> Result<Program> {
+    normalize_program_for_execution_core(program, &mut None)
+}
+
+fn acquire_compilation(
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+    bytes: u64,
+) -> Result<()> {
+    if let Some(scope) = scope.as_deref_mut() {
+        scope.acquire(bytes)?;
+    }
+    Ok(())
+}
+
+fn compilation_allocation_overflow(operation: &'static str) -> XlogError {
+    XlogError::AllocationRefused {
+        operation,
+        reason: xlog_core::error::AllocationRefusal::ExtentOverflow,
+    }
+}
+
+fn unsupported_compilation_diagnostic(
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+    construct: &str,
+    context: std::fmt::Arguments<'_>,
+) -> Result<XlogError> {
+    if scope.is_some() {
+        acquire_compilation(scope, construct.len() as u64)?;
+        acquire_compilation_text(scope, context)?;
+    }
+    Ok(XlogError::UnsupportedEpistemicConstruct {
+        construct: construct.to_owned(),
+        context: format!("{context}"),
+    })
+}
+
+fn compilation_diagnostic(
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+    context: std::fmt::Arguments<'_>,
+) -> Result<XlogError> {
+    acquire_compilation_text(scope, context)?;
+    Ok(XlogError::Compilation(format!("{context}")))
+}
+
+fn validate_authored_constraint_identity_with_scope(
+    program: &Program,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<()> {
+    match scope.as_deref_mut() {
+        Some(scope) => program
+            .validate_prepared_authored_constraint_identity_with_allocation_owner(&mut |bytes| {
+                scope.reserve_allocation(bytes)
+            }),
+        None => program.validate_prepared_authored_constraint_identity(),
+    }
+}
+
+fn prepare_authored_constraint_identity_with_scope(
+    program: &mut Program,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<()> {
+    match scope.as_deref_mut() {
+        Some(scope) => program.prepare_authored_constraint_identity_at_root_with_allocation_owner(
+            &mut |bytes| scope.reserve_allocation(bytes),
+        ),
+        None => program.prepare_authored_constraint_identity_at_root(),
+    }
+}
+
+struct TemporaryCompilation<T> {
+    value: T,
+    _owner: Option<Arc<dyn Send + Sync>>,
+}
+
+fn compile_temporary<T>(
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+    build: impl FnOnce(&mut Option<&mut CompilationAllocationScope<'_>>) -> Result<T>,
+) -> Result<TemporaryCompilation<T>> {
+    match scope.as_deref_mut() {
+        Some(scope) => {
+            let mut child = scope.child_scope();
+            child.prepare_owner()?;
+            let value = match build(&mut Some(&mut child)) {
+                Ok(value) => value,
+                Err(error) => return Err(child.into_failure(error)),
+            };
+            let owner = child.into_owner()?;
+            Ok(TemporaryCompilation {
+                value,
+                _owner: Some(owner),
+            })
+        }
+        None => Ok(TemporaryCompilation {
+            value: build(&mut None)?,
+            _owner: None,
+        }),
+    }
+}
+
+fn acquire_compilation_vector<T>(
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+    count: usize,
+) -> Result<()> {
+    if scope.is_some() {
+        acquire_compilation(
+            scope,
+            xlog_logic::compile::push_vector_allocation_bytes::<T>(count)?,
+        )?;
+    }
+    Ok(())
+}
+
+fn acquire_compilation_text(
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+    arguments: std::fmt::Arguments<'_>,
+) -> Result<()> {
+    if scope.is_some() {
+        acquire_compilation(
+            scope,
+            xlog_logic::compile::formatted_text_allocation_bytes(arguments)?,
+        )?;
+    }
+    Ok(())
+}
+
+fn clone_compilation_schemas(
+    schemas: &HashMap<String, Schema>,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<HashMap<String, Schema>> {
+    if scope.is_some() {
+        acquire_compilation(
+            scope,
+            xlog_logic::compile::hash_allocation_bytes::<String, Schema>(schemas.capacity())?,
+        )?;
+        for (name, schema) in schemas {
+            acquire_compilation(scope, name.len() as u64)?;
+            acquire_compilation(scope, schema.owned_allocation_bytes()?)?;
+        }
+    }
+    Ok(schemas.clone())
+}
+
+fn clone_compilation_rel_ids(
+    rel_ids: &HashMap<String, RelId>,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<HashMap<String, RelId>> {
+    if scope.is_some() {
+        acquire_compilation(
+            scope,
+            xlog_logic::compile::hash_allocation_bytes::<String, RelId>(rel_ids.capacity())?,
+        )?;
+        for name in rel_ids.keys() {
+            acquire_compilation(scope, name.len() as u64)?;
+        }
+    }
+    Ok(rel_ids.clone())
+}
+
+fn compile_prepared_with_scope(
+    compiler: &mut Compiler,
+    program: &Program,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<ExecutionPlan> {
+    match scope.as_deref_mut() {
+        Some(scope) => compiler.compile_prepared_program_with_allocation_owner(program, scope),
+        None => compiler.compile_prepared_program(program),
+    }
+}
+
+fn analyze_stratification_with_scope(
+    program: &Program,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<xlog_logic::stratify::StratificationResult> {
+    match scope.as_deref_mut() {
+        Some(scope) => {
+            xlog_logic::stratify::analyze_stratification_with_allocation_owner(program, scope)
+        }
+        None => Ok(xlog_logic::stratify::analyze_stratification(program)),
+    }
+}
+
+fn reduce_epistemic_with_scope(
+    program: &Program,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<Program> {
+    match scope.as_deref_mut() {
+        Some(scope) => {
+            xlog_logic::epistemic::reduce_epistemic_program_to_ordinary_with_allocation_owner(
+                program, scope,
+            )
+        }
+        None => reduce_epistemic_program_to_ordinary(program),
+    }
+}
+
+fn compile_epistemic_single_with_scope(
+    program: &Program,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<EpistemicExecutablePlan> {
+    match scope.as_deref_mut() {
+        Some(scope) => {
+            xlog_logic::epistemic::compile_epistemic_gpu_execution_with_allocation_owner(
+                program, scope,
+            )
+        }
+        None => compile_epistemic_gpu_execution(program),
+    }
+}
+
+fn compile_epistemic_split_with_scope(
+    program: &Program,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<EpistemicSplitExecutablePlan> {
+    match scope.as_deref_mut() {
+        Some(scope) => {
+            xlog_logic::epistemic::compile_epistemic_gpu_split_execution_with_allocation_owner(
+                program, scope,
+            )
+        }
+        None => compile_epistemic_gpu_split_execution(program),
+    }
+}
+
+fn normalize_program_for_execution_core(
+    mut program: Program,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<Program> {
     if program.authored_constraint_source_bound.is_some() {
-        program.validate_prepared_authored_constraint_identity()?;
+        validate_authored_constraint_identity_with_scope(&program, scope)?;
     } else {
-        program.prepare_authored_constraint_identity_at_root()?;
+        prepare_authored_constraint_identity_with_scope(&mut program, scope)?;
     }
     let max_recursion = program.directives.max_recursion_depth_or_default();
-    let expanded = xlog_logic::expand_program_functions_owned(program, max_recursion)
-        .map_err(|e| XlogError::Compilation(e.to_string()))?;
-    let normalized = xlog_logic::normalize_meta_builtins_owned(expanded)?;
-    let listed = xlog_logic::normalize_list_builtins_owned(normalized)?;
-    Ok(desugar_shared_variable_epistemic_constraints(listed))
+    let expanded = match match scope.as_deref_mut() {
+        Some(scope) => xlog_logic::expand::expand_program_functions_owned_with_allocation_owner(
+            program,
+            max_recursion,
+            scope,
+        ),
+        None => xlog_logic::expand_program_functions_owned(program, max_recursion),
+    } {
+        Ok(expanded) => expanded,
+        Err(error) => return Err(compilation_diagnostic(scope, format_args!("{error}"))?),
+    };
+    let normalized = match scope.as_deref_mut() {
+        Some(scope) => {
+            xlog_logic::meta_normalize::normalize_meta_builtins_owned_with_allocation_owner(
+                expanded, scope,
+            )?
+        }
+        None => xlog_logic::normalize_meta_builtins_owned(expanded)?,
+    };
+    let listed = match scope.as_deref_mut() {
+        Some(scope) => {
+            xlog_logic::list_normalize::normalize_list_builtins_owned_with_allocation_owner(
+                normalized, scope,
+            )?
+        }
+        None => xlog_logic::normalize_list_builtins_owned(normalized)?,
+    };
+    desugar_shared_variable_epistemic_constraints_core(listed, scope)
 }
 
 enum WfsNegationTransform<'a> {
@@ -5032,19 +6208,49 @@ enum WfsNegationTransform<'a> {
 fn compile_g91_compatibility_gpu_plan(
     reduction: &G91CompatibilityReduction,
 ) -> Result<EpistemicG91CompatibilityGpuPlan> {
-    let upper_bound = compile_gpu_evaluation_pass(reduction.upper_bound_program())?;
-    let upper_schemas = gpu_evaluation_pass_schemas(&upper_bound);
-    let mut refinement_program = reduction.refinement_program().clone();
-    add_inferred_g91_snapshot_declarations(
-        &mut refinement_program,
-        reduction.snapshot_relations(),
-        &upper_schemas,
-    )?;
+    compile_g91_compatibility_gpu_plan_core(reduction, &mut None)
+}
+
+fn compile_g91_compatibility_gpu_plan_core(
+    reduction: &G91CompatibilityReduction,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<EpistemicG91CompatibilityGpuPlan> {
+    let upper_bound = compile_gpu_evaluation_pass_core(reduction.upper_bound_program(), scope)?;
+    let upper_schemas = compile_temporary(scope, |scope| {
+        gpu_evaluation_pass_schemas_core(&upper_bound, scope)
+    })?;
+    let refinement_program = compile_temporary(scope, |scope| {
+        acquire_compilation(
+            scope,
+            reduction.refinement_program().owned_allocation_bytes()?,
+        )?;
+        let mut program = reduction.refinement_program().clone();
+        add_inferred_g91_snapshot_declarations_core(
+            &mut program,
+            reduction.snapshot_relations(),
+            &upper_schemas.value,
+            scope,
+        )?;
+        Ok(program)
+    })?;
     let max_iterations = (refinement_program
+        .value
         .directives
         .max_recursion_depth_or_default() as usize)
         .max(1);
-    let refinement = compile_gpu_evaluation_pass(&refinement_program)?;
+    let refinement = compile_gpu_evaluation_pass_core(&refinement_program.value, scope)?;
+    for (index, (source, snapshot)) in reduction.snapshot_relations().iter().enumerate() {
+        acquire_compilation(
+            scope,
+            xlog_logic::compile::btree_insert_allocation_bytes::<String, String>(index)?,
+        )?;
+        acquire_compilation(scope, source.len() as u64)?;
+        acquire_compilation(scope, snapshot.len() as u64)?;
+    }
+    acquire_compilation_vector::<String>(scope, reduction.convergence_predicates().len())?;
+    for predicate in reduction.convergence_predicates() {
+        acquire_compilation(scope, predicate.len() as u64)?;
+    }
     Ok(EpistemicG91CompatibilityGpuPlan {
         upper_bound,
         refinement,
@@ -5055,14 +6261,25 @@ fn compile_g91_compatibility_gpu_plan(
 }
 
 fn compile_gpu_evaluation_pass(program: &Program) -> Result<GpuEvaluationPass> {
-    let stratification = xlog_logic::stratify::analyze_stratification(program);
-    if stratification.non_monotone_sccs.is_empty() {
+    compile_gpu_evaluation_pass_core(program, &mut None)
+}
+
+fn compile_gpu_evaluation_pass_core(
+    program: &Program,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<GpuEvaluationPass> {
+    let stratification = compile_temporary(scope, |scope| {
+        analyze_stratification_with_scope(program, scope)
+    })?;
+    if stratification.value.non_monotone_sccs.is_empty() {
+        acquire_compilation(scope, std::mem::size_of::<GpuOrdinaryPass>() as u64)?;
         Ok(GpuEvaluationPass::Ordinary(Box::new(
-            compile_gpu_ordinary_pass(program)?,
+            compile_gpu_ordinary_pass_core(program, scope)?,
         )))
     } else {
+        acquire_compilation(scope, std::mem::size_of::<EpistemicWfsGpuPlan>() as u64)?;
         Ok(GpuEvaluationPass::Wfs(Box::new(
-            compile_epistemic_wfs_gpu_plan(program)?,
+            compile_epistemic_wfs_gpu_plan_core(program, scope)?,
         )))
     }
 }
@@ -5072,26 +6289,48 @@ fn add_inferred_g91_snapshot_declarations(
     snapshots: &BTreeMap<String, String>,
     upper_schemas: &HashMap<String, Schema>,
 ) -> Result<()> {
-    let existing = refinement
-        .predicates
-        .iter()
-        .map(|declaration| declaration.name.clone())
-        .collect::<BTreeSet<_>>();
+    add_inferred_g91_snapshot_declarations_core(refinement, snapshots, upper_schemas, &mut None)
+}
+
+fn add_inferred_g91_snapshot_declarations_core(
+    refinement: &mut Program,
+    snapshots: &BTreeMap<String, String>,
+    upper_schemas: &HashMap<String, Schema>,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<()> {
+    let existing = compile_temporary(scope, |scope| {
+        acquire_compilation_tree::<String, ()>(scope, refinement.predicates.len())?;
+        for declaration in &refinement.predicates {
+            acquire_compilation(scope, declaration.name.len() as u64)?;
+        }
+        Ok(refinement
+            .predicates
+            .iter()
+            .map(|declaration| declaration.name.clone())
+            .collect::<BTreeSet<_>>())
+    })?;
     let mut inferred = Vec::new();
     for (source, snapshot) in snapshots {
-        if existing.contains(snapshot) {
+        if existing.value.contains(snapshot) {
             continue;
         }
-        let schema =
-            upper_schemas
-                .get(source)
-                .ok_or_else(|| XlogError::UnsupportedEpistemicConstruct {
-                    construct: "Gelfond-1991 compatibility snapshot schema".to_string(),
-                    context: format!(
+        let schema = match upper_schemas.get(source) {
+            Some(schema) => schema,
+            None => {
+                return Err(unsupported_compilation_diagnostic(
+                    scope,
+                    "Gelfond-1991 compatibility snapshot schema",
+                    format_args!(
                         "upper-bound compilation produced no schema for compatibility relation \
                      `{source}`"
                     ),
-                })?;
+                )?)
+            }
+        };
+        acquire_compilation_vector::<PredColumn>(scope, schema.columns.len())?;
+        for (name, _) in &schema.columns {
+            acquire_compilation(scope, name.len() as u64)?;
+        }
         let columns = schema
             .columns
             .iter()
@@ -5100,6 +6339,16 @@ fn add_inferred_g91_snapshot_declarations(
                 typ: TypeRef::Scalar(*scalar_type),
             })
             .collect::<Vec<_>>();
+        acquire_compilation_vector::<TypeRef>(scope, columns.len())?;
+        acquire_compilation(scope, snapshot.len() as u64)?;
+        if inferred.len() == inferred.capacity() {
+            acquire_compilation_vector::<PredDecl>(
+                scope,
+                inferred.len().checked_add(1).ok_or_else(|| {
+                    compilation_allocation_overflow("snapshot declaration count overflow")
+                })?,
+            )?;
+        }
         inferred.push(PredDecl {
             name: snapshot.clone(),
             types: columns.iter().map(|column| column.typ.clone()).collect(),
@@ -5107,42 +6356,75 @@ fn add_inferred_g91_snapshot_declarations(
             is_private: false,
         });
     }
+    if refinement
+        .predicates
+        .capacity()
+        .saturating_sub(refinement.predicates.len())
+        < inferred.len()
+    {
+        acquire_compilation_vector::<PredDecl>(
+            scope,
+            refinement
+                .predicates
+                .len()
+                .checked_add(inferred.len())
+                .ok_or_else(|| {
+                    compilation_allocation_overflow("snapshot declaration count overflow")
+                })?,
+        )?;
+    }
     refinement.predicates.extend(inferred);
     Ok(())
 }
 
 fn compile_epistemic_wfs_gpu_plan(program: &Program) -> Result<EpistemicWfsGpuPlan> {
-    let negated = wfs_negated_predicates(program);
-    let upper_fixed_names = wfs_fixed_names(program, &negated, "__wfs_upper");
-    let lower_fixed_names = wfs_fixed_names(program, &negated, "__wfs_lower");
-    let source_schemas = infer_wfs_source_schemas(program)?;
+    compile_epistemic_wfs_gpu_plan_core(program, &mut None)
+}
 
-    let mut overapprox_program = wfs_transform_program(program, WfsNegationTransform::Drop)?;
+fn compile_epistemic_wfs_gpu_plan_core(
+    program: &Program,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<EpistemicWfsGpuPlan> {
+    let negated = compile_temporary(scope, |scope| wfs_negated_predicates_core(program, scope))?;
+    let upper_fixed_names = wfs_fixed_names_core(program, &negated.value, "__wfs_upper", scope)?;
+    let lower_fixed_names = wfs_fixed_names_core(program, &negated.value, "__wfs_lower", scope)?;
+    let source_schemas =
+        compile_temporary(scope, |scope| infer_wfs_source_schemas_core(program, scope))?;
+
+    let mut overapprox_program = compile_temporary(scope, |scope| {
+        wfs_transform_program_core(program, WfsNegationTransform::Drop, scope)
+    })?;
     // Constraints do not influence the alternating fixpoint. Evaluate them only in
     // the lower pass, where positive atoms read the true extension and negated atoms
     // read the frozen upper extension.
-    overapprox_program.constraints.clear();
-    let lower_program = wfs_transform_program(
-        program,
-        WfsNegationTransform::Rename {
-            names: &upper_fixed_names,
-            source_schemas: &source_schemas,
-        },
-    )?;
-    let mut upper_program = wfs_transform_program(
-        program,
-        WfsNegationTransform::Rename {
-            names: &lower_fixed_names,
-            source_schemas: &source_schemas,
-        },
-    )?;
-    upper_program.constraints.clear();
+    overapprox_program.value.constraints.clear();
+    let lower_program = compile_temporary(scope, |scope| {
+        wfs_transform_program_core(
+            program,
+            WfsNegationTransform::Rename {
+                names: &upper_fixed_names,
+                source_schemas: &source_schemas.value,
+            },
+            scope,
+        )
+    })?;
+    let mut upper_program = compile_temporary(scope, |scope| {
+        wfs_transform_program_core(
+            program,
+            WfsNegationTransform::Rename {
+                names: &lower_fixed_names,
+                source_schemas: &source_schemas.value,
+            },
+            scope,
+        )
+    })?;
+    upper_program.value.constraints.clear();
 
     Ok(EpistemicWfsGpuPlan {
-        overapprox: compile_gpu_ordinary_pass(&overapprox_program)?,
-        lower: compile_gpu_ordinary_pass(&lower_program)?,
-        upper: compile_gpu_ordinary_pass(&upper_program)?,
-        intensional_predicates: wfs_intensional_predicates(program),
+        overapprox: compile_gpu_ordinary_pass_core(&overapprox_program.value, scope)?,
+        lower: compile_gpu_ordinary_pass_core(&lower_program.value, scope)?,
+        upper: compile_gpu_ordinary_pass_core(&upper_program.value, scope)?,
+        intensional_predicates: wfs_intensional_predicates_core(program, scope)?,
         upper_fixed_names,
         lower_fixed_names,
         max_iterations: (program.directives.max_recursion_depth_or_default() as usize).max(1),
@@ -5150,43 +6432,75 @@ fn compile_epistemic_wfs_gpu_plan(program: &Program) -> Result<EpistemicWfsGpuPl
 }
 
 fn infer_wfs_source_schemas(program: &Program) -> Result<HashMap<String, Schema>> {
+    infer_wfs_source_schemas_core(program, &mut None)
+}
+
+fn infer_wfs_source_schemas_core(
+    program: &Program,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<HashMap<String, Schema>> {
     // Ordinary compilation cannot plan a cycle through negation, but its schema
     // inference treats positive and negated atoms identically. Make a monotone copy
     // that retains every atom, compile it through the authoritative compiler path,
     // and use the resulting schemas for the private fixed relations.
-    let mut inference_program = program.clone();
-    for rule in &mut inference_program.rules {
-        for literal in &mut rule.body {
-            if let BodyLiteral::Negated(atom) = literal {
-                *literal = BodyLiteral::Positive(atom.clone());
+    let inference_program = compile_temporary(scope, |scope| {
+        acquire_compilation(scope, program.owned_allocation_bytes()?)?;
+        let mut inference_program = program.clone();
+        for rule in &mut inference_program.rules {
+            for literal in &mut rule.body {
+                if let BodyLiteral::Negated(atom) = literal {
+                    acquire_compilation(scope, atom.owned_allocation_bytes()?)?;
+                    *literal = BodyLiteral::Positive(atom.clone());
+                }
             }
         }
-    }
-
-    let mut compiler = Compiler::new();
-    compiler.compile_prepared_program(&inference_program)?;
-    Ok(compiler.schemas().clone())
+        Ok(inference_program)
+    })?;
+    let compiler = compile_temporary(scope, |scope| {
+        let mut compiler = Compiler::new();
+        compile_prepared_with_scope(&mut compiler, &inference_program.value, scope)?;
+        Ok(compiler)
+    })?;
+    clone_compilation_schemas(compiler.value.schemas(), scope)
 }
 
 fn compile_gpu_ordinary_pass(program: &Program) -> Result<GpuOrdinaryPass> {
+    compile_gpu_ordinary_pass_core(program, &mut None)
+}
+
+fn compile_gpu_ordinary_pass_core(
+    program: &Program,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<GpuOrdinaryPass> {
     let mut compiler = Compiler::new();
-    let plan = compiler.compile_prepared_program(program)?;
+    let plan = compile_prepared_with_scope(&mut compiler, program, scope)?;
     Ok(GpuOrdinaryPass {
         plan,
-        schemas: compiler.schemas().clone(),
-        rel_ids: compiler.rel_ids().clone(),
+        schemas: clone_compilation_schemas(compiler.schemas(), scope)?,
+        rel_ids: clone_compilation_rel_ids(compiler.rel_ids(), scope)?,
     })
 }
 
 fn wfs_transform_program(program: &Program, negation: WfsNegationTransform<'_>) -> Result<Program> {
+    wfs_transform_program_core(program, negation, &mut None)
+}
+
+fn wfs_transform_program_core(
+    program: &Program,
+    negation: WfsNegationTransform<'_>,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<Program> {
+    acquire_compilation(scope, program.owned_allocation_bytes()?)?;
     let mut out = program.clone();
+    acquire_compilation_vector::<Rule>(scope, program.rules.len())?;
     out.rules = program
         .rules
         .iter()
         .map(|rule| {
+            acquire_compilation(scope, rule.owned_allocation_bytes()?)?;
             let mut rule = rule.clone();
             let was_fact = rule.body.is_empty();
-            let mut body = transform_wfs_body(&rule.body, &negation)?;
+            let mut body = transform_wfs_body_core(&rule.body, &negation, scope)?;
             if !was_fact && body.is_empty() {
                 // Dropping every negated literal computes the WFS upper
                 // over-approximation. Keep the transformed clause executable as a
@@ -5202,12 +6516,17 @@ fn wfs_transform_program(program: &Program, negation: WfsNegationTransform<'_>) 
             Ok(rule)
         })
         .collect::<Result<Vec<_>>>()?;
+    acquire_compilation_vector::<Constraint>(scope, program.constraints.len())?;
     out.constraints = program
         .constraints
         .iter()
         .map(|constraint| {
+            acquire_compilation_vector::<BodyLiteral>(scope, constraint.body.len())?;
+            for literal in &constraint.body {
+                acquire_compilation(scope, literal.owned_allocation_bytes()?)?;
+            }
             let mut constraint = constraint.clone();
-            constraint.body = transform_wfs_body(&constraint.body, &negation)?;
+            constraint.body = transform_wfs_body_core(&constraint.body, &negation, scope)?;
             Ok(constraint)
         })
         .collect::<Result<Vec<_>>>()?;
@@ -5216,7 +6535,7 @@ fn wfs_transform_program(program: &Program, negation: WfsNegationTransform<'_>) 
         source_schemas,
     } = negation
     {
-        add_wfs_fixed_predicates(&mut out, names, source_schemas)?;
+        add_wfs_fixed_predicates_core(&mut out, names, source_schemas, scope)?;
     }
     Ok(out)
 }
@@ -5225,12 +6544,25 @@ fn transform_wfs_body(
     body: &[BodyLiteral],
     negation: &WfsNegationTransform<'_>,
 ) -> Result<Vec<BodyLiteral>> {
+    transform_wfs_body_core(body, negation, &mut None)
+}
+
+fn transform_wfs_body_core(
+    body: &[BodyLiteral],
+    negation: &WfsNegationTransform<'_>,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<Vec<BodyLiteral>> {
+    acquire_compilation_vector::<BodyLiteral>(scope, body.len().max(1))?;
     let mut transformed = Vec::with_capacity(body.len());
     for literal in body {
         match (literal, negation) {
             (BodyLiteral::Negated(_), WfsNegationTransform::Drop) => {}
             (BodyLiteral::Negated(atom), WfsNegationTransform::Rename { names, .. }) => {
+                acquire_compilation(scope, atom.owned_allocation_bytes()?)?;
                 let mut atom = atom.clone();
+                if let Some(name) = names.get(&atom.predicate) {
+                    acquire_compilation(scope, name.len() as u64)?;
+                }
                 atom.predicate = names.get(&atom.predicate).cloned().ok_or_else(|| {
                     XlogError::Execution(format!(
                         "missing WFS fixed relation name for {}",
@@ -5238,11 +6570,15 @@ fn transform_wfs_body(
                     ))
                 })?;
                 if atom.terms.is_empty() {
+                    acquire_compilation_vector::<Term>(scope, 1)?;
                     atom.terms.push(Term::Integer(1));
                 }
                 transformed.push(BodyLiteral::Negated(atom));
             }
-            _ => transformed.push(literal.clone()),
+            _ => {
+                acquire_compilation(scope, literal.owned_allocation_bytes()?)?;
+                transformed.push(literal.clone());
+            }
         }
     }
     Ok(transformed)
@@ -5253,27 +6589,42 @@ fn add_wfs_fixed_predicates(
     names: &HashMap<String, String>,
     source_schemas: &HashMap<String, Schema>,
 ) -> Result<()> {
-    let existing: BTreeSet<String> = program
-        .predicates
-        .iter()
-        .map(|decl| decl.name.clone())
-        .collect();
+    add_wfs_fixed_predicates_core(program, names, source_schemas, &mut None)
+}
+
+fn add_wfs_fixed_predicates_core(
+    program: &mut Program,
+    names: &HashMap<String, String>,
+    source_schemas: &HashMap<String, Schema>,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<()> {
+    let existing = compile_temporary(scope, |scope| {
+        acquire_compilation_tree::<String, ()>(scope, program.predicates.len())?;
+        for declaration in &program.predicates {
+            acquire_compilation(scope, declaration.name.len() as u64)?;
+        }
+        Ok(program
+            .predicates
+            .iter()
+            .map(|decl| decl.name.clone())
+            .collect::<BTreeSet<String>>())
+    })?;
     for (source, fixed) in names {
-        if existing.contains(fixed) {
-            return Err(XlogError::UnsupportedEpistemicConstruct {
-                construct: "GPU WFS fixed relation name".to_string(),
-                context: format!(
-                    "internal fixed relation {fixed} collides with a declared predicate"
-                ),
-            });
+        if existing.value.contains(fixed) {
+            return Err(unsupported_compilation_diagnostic(
+                scope,
+                "GPU WFS fixed relation name",
+                format_args!("internal fixed relation {fixed} collides with a declared predicate"),
+            )?);
         }
         let Some(schema) = source_schemas.get(source) else {
-            return Err(XlogError::UnsupportedEpistemicConstruct {
-                construct: "GPU WFS fixed relation schema".to_string(),
-                context: format!(
+            return Err(unsupported_compilation_diagnostic(
+                scope,
+                "GPU WFS fixed relation schema",
+                format_args!(
                     "ordinary schema inference produced no schema for negated predicate {source}"
                 ),
-            });
+            )?);
         };
 
         let is_private = program
@@ -5281,6 +6632,13 @@ fn add_wfs_fixed_predicates(
             .iter()
             .find(|declaration| declaration.name == *source)
             .is_some_and(|declaration| declaration.is_private);
+        acquire_compilation_vector::<PredColumn>(scope, schema.arity().max(1))?;
+        if schema.arity() == 0 {
+            acquire_compilation(scope, "present".len() as u64)?;
+        }
+        for (name, _) in &schema.columns {
+            acquire_compilation(scope, name.len() as u64)?;
+        }
         let columns = if schema.arity() == 0 {
             vec![PredColumn {
                 name: Some("present".to_string()),
@@ -5296,6 +6654,16 @@ fn add_wfs_fixed_predicates(
                 })
                 .collect::<Vec<_>>()
         };
+        acquire_compilation_vector::<TypeRef>(scope, columns.len())?;
+        acquire_compilation(scope, fixed.len() as u64)?;
+        if program.predicates.len() == program.predicates.capacity() {
+            acquire_compilation_vector::<PredDecl>(
+                scope,
+                program.predicates.len().checked_add(1).ok_or_else(|| {
+                    compilation_allocation_overflow("fixed declaration count overflow")
+                })?,
+            )?;
+        }
         program.predicates.push(PredDecl {
             name: fixed.clone(),
             types: columns.iter().map(|column| column.typ.clone()).collect(),
@@ -5307,7 +6675,16 @@ fn add_wfs_fixed_predicates(
 }
 
 fn wfs_negated_predicates(program: &Program) -> BTreeSet<String> {
-    program
+    wfs_negated_predicates_core(program, &mut None)
+        .expect("unbounded negated predicate census has no owner refusal")
+}
+
+fn wfs_negated_predicates_core(
+    program: &Program,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<BTreeSet<String>> {
+    let mut predicates = BTreeSet::new();
+    for literal in program
         .rules
         .iter()
         .map(|rule| &rule.body)
@@ -5318,20 +6695,43 @@ fn wfs_negated_predicates(program: &Program) -> BTreeSet<String> {
                 .map(|constraint| &constraint.body),
         )
         .flatten()
-        .filter_map(|lit| match lit {
-            BodyLiteral::Negated(atom) => Some(atom.predicate.clone()),
-            _ => None,
-        })
-        .collect()
+    {
+        if let BodyLiteral::Negated(atom) = literal {
+            if !predicates.contains(atom.predicate.as_str()) {
+                acquire_compilation(
+                    scope,
+                    xlog_logic::compile::btree_insert_allocation_bytes::<String, ()>(
+                        predicates.len(),
+                    )?,
+                )?;
+                acquire_compilation(scope, atom.predicate.len() as u64)?;
+                predicates.insert(atom.predicate.clone());
+            }
+        }
+    }
+    Ok(predicates)
 }
 
 fn wfs_intensional_predicates(program: &Program) -> Vec<String> {
-    program
-        .proper_rules()
-        .map(|rule| rule.head.predicate.clone())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
+    wfs_intensional_predicates_core(program, &mut None)
+        .expect("unbounded intensional census has no owner refusal")
+}
+
+fn wfs_intensional_predicates_core(
+    program: &Program,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<Vec<String>> {
+    let _tree_owner =
+        reserve_compilation_tree::<String, ()>(scope, program.proper_rules().count())?;
+    let mut predicates = BTreeSet::new();
+    for rule in program.proper_rules() {
+        if !predicates.contains(rule.head.predicate.as_str()) {
+            acquire_compilation(scope, rule.head.predicate.len() as u64)?;
+            predicates.insert(rule.head.predicate.clone());
+        }
+    }
+    acquire_compilation_vector::<String>(scope, predicates.len())?;
+    Ok(predicates.into_iter().collect())
 }
 
 fn wfs_fixed_names(
@@ -5339,6 +6739,37 @@ fn wfs_fixed_names(
     predicates: &BTreeSet<String>,
     prefix: &str,
 ) -> HashMap<String, String> {
+    wfs_fixed_names_core(program, predicates, prefix, &mut None)
+        .expect("unbounded fixed predicate names have no owner refusal")
+}
+
+fn wfs_fixed_names_core(
+    program: &Program,
+    predicates: &BTreeSet<String>,
+    prefix: &str,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<HashMap<String, String>> {
+    let reserved_count = program
+        .predicates
+        .len()
+        .checked_add(predicates.len())
+        .ok_or_else(|| compilation_allocation_overflow("fixed-name census count overflow"))?;
+    let _tree_owner = reserve_compilation_tree::<String, ()>(scope, reserved_count)?;
+    let _receipt_storage = match scope.as_deref_mut() {
+        Some(scope) => Some(scope.reserve_allocation(
+            xlog_logic::compile::push_vector_allocation_bytes::<Arc<dyn Send + Sync>>(
+                reserved_count,
+            )?,
+        )?),
+        None => None,
+    };
+    let mut reserved_string_owners =
+        Vec::with_capacity(if scope.is_some() { reserved_count } else { 0 });
+    for declaration in &program.predicates {
+        if let Some(scope) = scope.as_deref_mut() {
+            reserved_string_owners.push(scope.reserve_allocation(declaration.name.len() as u64)?);
+        }
+    }
     let mut reserved: BTreeSet<String> = program
         .predicates
         .iter()
@@ -5346,85 +6777,224 @@ fn wfs_fixed_names(
         .collect();
     let mut names = HashMap::new();
     for pred in predicates {
-        let mut candidate = format!("{prefix}_{pred}");
-        if reserved.contains(&candidate) {
+        let mut candidate = compile_temporary(scope, |scope| {
+            acquire_compilation_text(scope, format_args!("{prefix}_{pred}"))?;
+            Ok(format!("{prefix}_{pred}"))
+        })?;
+        if reserved.contains(&candidate.value) {
             let mut suffix = 0usize;
             loop {
-                let suffixed = format!("{prefix}_{suffix}_{pred}");
-                if !reserved.contains(&suffixed) {
+                let suffixed = compile_temporary(scope, |scope| {
+                    acquire_compilation_text(scope, format_args!("{prefix}_{suffix}_{pred}"))?;
+                    Ok(format!("{prefix}_{suffix}_{pred}"))
+                })?;
+                if !reserved.contains(&suffixed.value) {
                     candidate = suffixed;
                     break;
                 }
                 suffix += 1;
             }
         }
-        reserved.insert(candidate.clone());
-        names.insert(pred.clone(), candidate);
+        if let Some(scope) = scope.as_deref_mut() {
+            reserved_string_owners.push(scope.reserve_allocation(candidate.value.len() as u64)?);
+            if let Some(owner) = candidate._owner.as_ref() {
+                scope.retain(Arc::clone(owner))?;
+            }
+        }
+        reserved.insert(candidate.value.clone());
+        if names.len() == names.capacity() {
+            acquire_compilation(
+                scope,
+                xlog_logic::compile::hash_allocation_bytes::<String, String>(
+                    names.len().checked_add(1).ok_or_else(|| {
+                        compilation_allocation_overflow("fixed-name output count overflow")
+                    })?,
+                )?,
+            )?;
+        }
+        acquire_compilation(scope, pred.len() as u64)?;
+        names.insert(pred.clone(), candidate.value);
     }
-    names
+    Ok(names)
 }
 
 fn wfs_plan_combined_schemas(plan: &EpistemicWfsGpuPlan) -> HashMap<String, Schema> {
+    wfs_plan_combined_schemas_core(plan, &mut None)
+        .expect("unbounded schema collection has no owner refusal")
+}
+
+fn insert_compilation_schema(
+    schemas: &mut HashMap<String, Schema>,
+    name: &str,
+    schema: &Schema,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<()> {
+    if schemas.contains_key(name) {
+        return Ok(());
+    }
+    if scope.is_some() && schemas.len() == schemas.capacity() {
+        acquire_compilation(
+            scope,
+            xlog_logic::compile::hash_allocation_bytes::<String, Schema>(
+                schemas.len().checked_add(1).ok_or_else(|| {
+                    compilation_allocation_overflow("compiler schema count overflow")
+                })?,
+            )?,
+        )?;
+    }
+    acquire_compilation(scope, name.len() as u64)?;
+    acquire_compilation(scope, schema.owned_allocation_bytes()?)?;
+    schemas.insert(name.to_owned(), schema.clone());
+    Ok(())
+}
+
+fn insert_compilation_rel_id(
+    rel_ids: &mut HashMap<String, RelId>,
+    name: &str,
+    rel_id: RelId,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<()> {
+    if scope.is_some() && !rel_ids.contains_key(name) && rel_ids.len() == rel_ids.capacity() {
+        acquire_compilation(
+            scope,
+            xlog_logic::compile::hash_allocation_bytes::<String, RelId>(
+                rel_ids.len().checked_add(1).ok_or_else(|| {
+                    compilation_allocation_overflow("compiler relation count overflow")
+                })?,
+            )?,
+        )?;
+    }
+    acquire_compilation(scope, name.len() as u64)?;
+    rel_ids.insert(name.to_owned(), rel_id);
+    Ok(())
+}
+
+fn wfs_plan_combined_schemas_core(
+    plan: &EpistemicWfsGpuPlan,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<HashMap<String, Schema>> {
     let mut schemas = HashMap::new();
     for ordinary in [&plan.overapprox, &plan.lower, &plan.upper] {
         for (name, schema) in &ordinary.schemas {
-            schemas
-                .entry(name.clone())
-                .or_insert_with(|| schema.clone());
+            insert_compilation_schema(&mut schemas, name, schema, scope)?;
         }
     }
-    schemas
+    Ok(schemas)
 }
 
 fn g91_plan_combined_schemas(plan: &EpistemicG91CompatibilityGpuPlan) -> HashMap<String, Schema> {
+    g91_plan_combined_schemas_core(plan, &mut None)
+        .expect("unbounded schema collection has no owner refusal")
+}
+
+fn g91_plan_combined_schemas_core(
+    plan: &EpistemicG91CompatibilityGpuPlan,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<HashMap<String, Schema>> {
     let mut schemas = HashMap::new();
     for pass in [&plan.upper_bound, &plan.refinement] {
-        for (name, schema) in gpu_evaluation_pass_schemas(pass) {
-            schemas.entry(name).or_insert(schema);
+        let pass_schemas =
+            compile_temporary(scope, |scope| gpu_evaluation_pass_schemas_core(pass, scope))?;
+        for (name, schema) in &pass_schemas.value {
+            insert_compilation_schema(&mut schemas, &name, &schema, scope)?;
         }
     }
-    schemas
+    Ok(schemas)
 }
 
 fn gpu_evaluation_pass_schemas(pass: &GpuEvaluationPass) -> HashMap<String, Schema> {
+    gpu_evaluation_pass_schemas_core(pass, &mut None)
+        .expect("unbounded schema collection has no owner refusal")
+}
+
+fn gpu_evaluation_pass_schemas_core(
+    pass: &GpuEvaluationPass,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<HashMap<String, Schema>> {
     match pass {
-        GpuEvaluationPass::Ordinary(ordinary) => ordinary.schemas.clone(),
-        GpuEvaluationPass::Wfs(wfs) => wfs_plan_combined_schemas(wfs),
+        GpuEvaluationPass::Ordinary(ordinary) => {
+            clone_compilation_schemas(&ordinary.schemas, scope)
+        }
+        GpuEvaluationPass::Wfs(wfs) => wfs_plan_combined_schemas_core(wfs, scope),
     }
 }
 
 fn g91_plan_combined_rel_ids(plan: &EpistemicG91CompatibilityGpuPlan) -> HashMap<String, RelId> {
+    g91_plan_combined_rel_ids_core(plan, &mut None)
+        .expect("unbounded relation collection has no owner refusal")
+}
+
+fn g91_plan_combined_rel_ids_core(
+    plan: &EpistemicG91CompatibilityGpuPlan,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<HashMap<String, RelId>> {
     let mut rel_ids = HashMap::new();
     for pass in [&plan.upper_bound, &plan.refinement] {
-        for (name, rel_id) in gpu_evaluation_pass_rel_ids(pass) {
-            rel_ids.insert(name, rel_id);
+        let pass_rel_ids =
+            compile_temporary(scope, |scope| gpu_evaluation_pass_rel_ids_core(pass, scope))?;
+        for (name, rel_id) in &pass_rel_ids.value {
+            insert_compilation_rel_id(&mut rel_ids, name, *rel_id, scope)?;
         }
     }
-    rel_ids
+    Ok(rel_ids)
 }
 
 fn gpu_evaluation_pass_rel_ids(pass: &GpuEvaluationPass) -> HashMap<String, RelId> {
+    gpu_evaluation_pass_rel_ids_core(pass, &mut None)
+        .expect("unbounded relation collection has no owner refusal")
+}
+
+fn gpu_evaluation_pass_rel_ids_core(
+    pass: &GpuEvaluationPass,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<HashMap<String, RelId>> {
     match pass {
-        GpuEvaluationPass::Ordinary(ordinary) => ordinary.rel_ids.clone(),
-        GpuEvaluationPass::Wfs(wfs) => wfs_plan_combined_rel_ids(wfs),
+        GpuEvaluationPass::Ordinary(ordinary) => {
+            clone_compilation_rel_ids(&ordinary.rel_ids, scope)
+        }
+        GpuEvaluationPass::Wfs(wfs) => wfs_plan_combined_rel_ids_core(wfs, scope),
     }
 }
 
 fn wfs_plan_combined_rel_ids(plan: &EpistemicWfsGpuPlan) -> HashMap<String, RelId> {
+    wfs_plan_combined_rel_ids_core(plan, &mut None)
+        .expect("unbounded relation collection has no owner refusal")
+}
+
+fn wfs_plan_combined_rel_ids_core(
+    plan: &EpistemicWfsGpuPlan,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<HashMap<String, RelId>> {
     let mut rel_ids = HashMap::new();
     for ordinary in [&plan.overapprox, &plan.lower, &plan.upper] {
         for (name, rel_id) in &ordinary.rel_ids {
-            rel_ids.insert(name.clone(), *rel_id);
+            insert_compilation_rel_id(&mut rel_ids, name, *rel_id, scope)?;
         }
     }
-    rel_ids
+    Ok(rel_ids)
 }
 
 fn schema_from_pred_decl(
     decl: &xlog_logic::ast::PredDecl,
     domains: &HashMap<String, ScalarType>,
 ) -> Result<Schema> {
+    schema_from_pred_decl_core(decl, domains, &mut None)
+}
+
+fn schema_from_pred_decl_core(
+    decl: &PredDecl,
+    domains: &HashMap<String, ScalarType>,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<Schema> {
+    acquire_compilation(scope, decl.owned_allocation_bytes()?)?;
     let columns = decl.schema_columns();
+    acquire_compilation_vector::<(String, ScalarType)>(scope, columns.len())?;
+    for (index, column) in columns.iter().enumerate() {
+        match &column.name {
+            Some(name) => acquire_compilation(scope, name.len() as u64)?,
+            None => acquire_compilation_text(scope, format_args!("c{index}"))?,
+        }
+    }
     let resolved = columns
         .iter()
         .enumerate()
@@ -5457,12 +7027,24 @@ fn resolve_pred_column_type(
 }
 
 fn schema_from_terms(terms: &[Term]) -> Schema {
+    schema_from_terms_core(terms, &mut None)
+        .expect("unbounded schema construction has no owner refusal")
+}
+
+fn schema_from_terms_core(
+    terms: &[Term],
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<Schema> {
+    acquire_compilation_vector::<(String, ScalarType)>(scope, terms.len())?;
+    for index in 0..terms.len() {
+        acquire_compilation_text(scope, format_args!("c{index}"))?;
+    }
     let columns = terms
         .iter()
         .enumerate()
         .map(|(idx, term)| (format!("c{idx}"), term.inferred_scalar_type()))
         .collect();
-    Schema::new(columns)
+    Ok(Schema::new(columns))
 }
 
 /// Desugar a shared-variable epistemic constraint — a constraint with at least one
@@ -5493,11 +7075,63 @@ fn schema_from_terms(terms: &[Term]) -> Schema {
 /// variable-keyed modal, distinct-variable multi-literal, and ground constraints have no
 /// repeated variable and are likewise untouched.
 fn desugar_shared_variable_epistemic_constraints(mut program: Program) -> Program {
+    desugar_shared_variable_epistemic_constraints_core(program, &mut None)
+        .expect("unbounded constraint desugaring has no owner refusal")
+}
+
+fn reserve_compilation_tree<K, V>(
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+    count: usize,
+) -> Result<Option<Arc<dyn Send + Sync>>> {
+    match scope.as_deref_mut() {
+        Some(scope) => {
+            let bytes = (0..count).try_fold(0u64, |bytes, length| {
+                bytes
+                    .checked_add(xlog_logic::compile::btree_insert_allocation_bytes::<K, V>(
+                        length,
+                    )?)
+                    .ok_or_else(|| {
+                        compilation_allocation_overflow("compiler tree allocation extent overflow")
+                    })
+            })?;
+            Ok(Some(scope.reserve_allocation(bytes)?))
+        }
+        None => Ok(None),
+    }
+}
+
+fn acquire_compilation_tree<K, V>(
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+    count: usize,
+) -> Result<()> {
+    if let Some(owner) = reserve_compilation_tree::<K, V>(scope, count)? {
+        scope
+            .as_deref_mut()
+            .expect("tree receipt has its original scope")
+            .retain(owner)?;
+    }
+    Ok(())
+}
+
+fn desugar_shared_variable_epistemic_constraints_core(
+    mut program: Program,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<Program> {
     // A predicate defined by any rule carrying an epistemic body literal is "modal-derived":
     // for it `know p`/`possible p` is NOT equal to the ordinary `p`, so ordinary-izing it
     // would be UNSOUND. Restrict the desugaring to base/EDB or purely-ordinary-derived
     // targets (where `know p == possible p == p`), the case for base tuple-key targets.
-    let modal_derived: BTreeSet<String> = program
+    let modal_count = program
+        .rules
+        .iter()
+        .filter(|rule| {
+            rule.body
+                .iter()
+                .any(|literal| matches!(literal, BodyLiteral::Epistemic(_)))
+        })
+        .count();
+    let _modal_owner = reserve_compilation_tree::<&str, ()>(scope, modal_count)?;
+    let modal_derived: BTreeSet<&str> = program
         .rules
         .iter()
         .filter(|rule| {
@@ -5505,7 +7139,7 @@ fn desugar_shared_variable_epistemic_constraints(mut program: Program) -> Progra
                 .iter()
                 .any(|lit| matches!(lit, BodyLiteral::Epistemic(_)))
         })
-        .map(|rule| rule.head.predicate.clone())
+        .map(|rule| rule.head.predicate.as_str())
         .collect();
     let mut extraction_rules: Vec<Rule> = Vec::new();
     let mut counter = 0usize;
@@ -5514,25 +7148,47 @@ fn desugar_shared_variable_epistemic_constraints(mut program: Program) -> Progra
             .body
             .iter()
             .any(|lit| matches!(lit, BodyLiteral::Epistemic(_)));
-        if !has_epistemic || !constraint_has_shared_variable(&constraint.body) {
+        if !has_epistemic || !constraint_has_shared_variable_core(&constraint.body, scope)? {
             continue;
         }
         // Sound only when EVERY modal target is non-modal-derived (know == possible == ord).
         let has_modal_derived_target = constraint.body.iter().any(|lit| {
-            matches!(lit, BodyLiteral::Epistemic(e) if modal_derived.contains(&e.atom.predicate))
+            matches!(lit, BodyLiteral::Epistemic(e) if modal_derived.contains(e.atom.predicate.as_str()))
         });
         if has_modal_derived_target {
             continue;
         }
-        let distinct = distinct_body_variables(&constraint.body);
+        let distinct = distinct_body_variables_core(&constraint.body, scope)?;
+        acquire_compilation_text(scope, format_args!("__epi_join_{counter}"))?;
         let helper = format!("__epi_join_{counter}");
         counter += 1;
+        acquire_compilation_vector::<Term>(scope, distinct.len())?;
+        for variable in &distinct {
+            acquire_compilation(scope, variable.len() as u64)?;
+        }
         let helper_terms: Vec<Term> = distinct.iter().map(|v| Term::Variable(v.clone())).collect();
+        acquire_compilation_vector::<BodyLiteral>(scope, constraint.body.len())?;
+        for literal in &constraint.body {
+            acquire_compilation(scope, literal.owned_allocation_bytes()?)?;
+        }
         let helper_body: Vec<BodyLiteral> = constraint
             .body
             .iter()
             .map(ordinaryize_modal_literal)
             .collect();
+        if extraction_rules.len() == extraction_rules.capacity() {
+            acquire_compilation_vector::<Rule>(
+                scope,
+                extraction_rules.len().checked_add(1).ok_or_else(|| {
+                    compilation_allocation_overflow("constraint extraction rule count overflow")
+                })?,
+            )?;
+        }
+        acquire_compilation(scope, helper.len() as u64)?;
+        acquire_compilation_vector::<Term>(scope, helper_terms.len())?;
+        for term in &helper_terms {
+            acquire_compilation(scope, term.owned_allocation_bytes()?)?;
+        }
         extraction_rules.push(Rule {
             head: Atom {
                 predicate: helper.clone(),
@@ -5541,6 +7197,7 @@ fn desugar_shared_variable_epistemic_constraints(mut program: Program) -> Progra
             body: helper_body,
         });
         // Replace the whole constraint with a single-occurrence modal over the join helper.
+        acquire_compilation_vector::<BodyLiteral>(scope, 1)?;
         constraint.body = vec![BodyLiteral::Epistemic(EpistemicLiteral {
             op: EpistemicOp::Know,
             negated: false,
@@ -5550,8 +7207,19 @@ fn desugar_shared_variable_epistemic_constraints(mut program: Program) -> Progra
             },
         })];
     }
+    drop(modal_derived);
+    if program.rules.capacity().saturating_sub(program.rules.len()) < extraction_rules.len() {
+        acquire_compilation_vector::<Rule>(
+            scope,
+            program
+                .rules
+                .len()
+                .checked_add(extraction_rules.len())
+                .ok_or_else(|| compilation_allocation_overflow("normalized rule count overflow"))?,
+        )?;
+    }
     program.rules.extend(extraction_rules);
-    program
+    Ok(program)
 }
 
 /// Replace a modal literal with its ordinary counterpart (`know/possible r` -> `r`,
@@ -5569,85 +7237,186 @@ fn ordinaryize_modal_literal(lit: &BodyLiteral) -> BodyLiteral {
 /// True if some variable occurs in more than one atom term position across the constraint
 /// body — the signature of a join / diagonal / negated-difference the core compiler rejects.
 fn constraint_has_shared_variable(body: &[BodyLiteral]) -> bool {
-    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    constraint_has_shared_variable_core(body, &mut None)
+        .expect("unbounded variable census has no owner refusal")
+}
+
+fn constraint_has_shared_variable_core(
+    body: &[BodyLiteral],
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<bool> {
+    let count = body
+        .iter()
+        .filter_map(BodyLiteral::atom)
+        .try_fold(0usize, |count, atom| {
+            count.checked_add(atom.terms.len()).ok_or_else(|| {
+                compilation_allocation_overflow("constraint variable count overflow")
+            })
+        })?;
+    let _counts_owner = reserve_compilation_tree::<&str, usize>(scope, count)?;
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
     for lit in body {
         if let Some(atom) = lit.atom() {
             for term in &atom.terms {
                 if let Term::Variable(name) = term {
-                    *counts.entry(name.clone()).or_insert(0) += 1;
+                    *counts.entry(name.as_str()).or_insert(0) += 1;
                 }
             }
         }
     }
-    counts.values().any(|&count| count > 1)
+    Ok(counts.values().any(|&count| count > 1))
 }
 
 /// Ordered DISTINCT variable names appearing in atom positions across the constraint body
 /// (first-appearance order), used as the extracted helper relation's columns.
 fn distinct_body_variables(body: &[BodyLiteral]) -> Vec<String> {
+    distinct_body_variables_core(body, &mut None)
+        .expect("unbounded variable collection has no owner refusal")
+}
+
+fn distinct_body_variables_core(
+    body: &[BodyLiteral],
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<Vec<String>> {
+    let count = body
+        .iter()
+        .filter_map(BodyLiteral::atom)
+        .try_fold(0usize, |count, atom| {
+            count.checked_add(atom.terms.len()).ok_or_else(|| {
+                compilation_allocation_overflow("constraint variable count overflow")
+            })
+        })?;
+    let _seen_owner = reserve_compilation_tree::<&str, ()>(scope, count)?;
     let mut seen = BTreeSet::new();
     let mut order = Vec::new();
     for lit in body {
         if let Some(atom) = lit.atom() {
             for term in &atom.terms {
                 if let Term::Variable(name) = term {
-                    if seen.insert(name.clone()) {
+                    if seen.insert(name.as_str()) {
+                        acquire_compilation(scope, name.len() as u64)?;
+                        if order.len() == order.capacity() {
+                            acquire_compilation_vector::<String>(
+                                scope,
+                                order.len().checked_add(1).ok_or_else(|| {
+                                    compilation_allocation_overflow(
+                                        "constraint variable count overflow",
+                                    )
+                                })?,
+                            )?;
+                        }
                         order.push(name.clone());
                     }
                 }
             }
         }
     }
-    order
+    Ok(order)
 }
 
 fn augment_same_name_multi_arity_schemas(
     program: &Program,
     schemas: &mut HashMap<String, Schema>,
 ) -> Result<()> {
-    let predicates = if program_has_epistemic_literals(program) {
-        epistemic_extensional_multi_arity_predicates(program)
-    } else {
-        predicate_arities(program)
-            .into_iter()
-            .filter_map(|(predicate, arities)| (arities.len() > 1).then_some(predicate))
-            .collect()
-    };
-    let domains: HashMap<String, ScalarType> = program
-        .domains
-        .iter()
-        .map(|domain| (domain.name.clone(), domain.typ))
-        .collect();
+    augment_same_name_multi_arity_schemas_core(program, schemas, &mut None)
+}
+
+fn augment_same_name_multi_arity_schemas_core(
+    program: &Program,
+    schemas: &mut HashMap<String, Schema>,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<()> {
+    let predicates = compile_temporary(scope, |scope| {
+        Ok(if program_has_epistemic_literals(program) {
+            match scope.as_deref_mut() {
+            Some(scope) => xlog_logic::epistemic::epistemic_extensional_multi_arity_predicates_with_allocation_owner(program, scope)?,
+            None => epistemic_extensional_multi_arity_predicates(program),
+        }
+        } else {
+            let arities = predicate_arities_core(program, scope)?;
+            acquire_compilation_tree::<String, ()>(scope, arities.len())?;
+            arities
+                .into_iter()
+                .filter_map(|(predicate, arities)| (arities.len() > 1).then_some(predicate))
+                .collect()
+        })
+    })?;
+    let domains = compile_temporary(scope, |scope| {
+        acquire_compilation(
+            scope,
+            xlog_logic::compile::hash_allocation_bytes::<String, ScalarType>(
+                program.domains.len(),
+            )?,
+        )?;
+        for domain in &program.domains {
+            acquire_compilation(scope, domain.name.len() as u64)?;
+        }
+        Ok(program
+            .domains
+            .iter()
+            .map(|domain| (domain.name.clone(), domain.typ))
+            .collect::<HashMap<String, ScalarType>>())
+    })?;
 
     for decl in &program.predicates {
-        if !predicates.contains(&decl.name) {
+        if !predicates.value.contains(&decl.name) {
             continue;
         }
+        acquire_compilation_text(scope, format_args!("{}/{}", decl.name, decl.arity()))?;
         let key = arity_qualified_name(&decl.name, decl.arity());
-        schemas.insert(key, schema_from_pred_decl(decl, &domains)?);
+        let schema = schema_from_pred_decl_core(decl, &domains.value, scope)?;
+        if scope.is_some() && !schemas.contains_key(&key) && schemas.len() == schemas.capacity() {
+            acquire_compilation(
+                scope,
+                xlog_logic::compile::hash_allocation_bytes::<String, Schema>(
+                    schemas
+                        .len()
+                        .checked_add(1)
+                        .ok_or_else(|| compilation_allocation_overflow("schema count overflow"))?,
+                )?,
+            )?;
+        }
+        schemas.insert(key, schema);
     }
 
     for fact in program.facts() {
         let pred = fact.head.predicate.as_str();
         let arity = fact.head.terms.len();
-        if !predicates.contains(pred) {
+        if !predicates.value.contains(pred) {
             continue;
         }
+        acquire_compilation_text(scope, format_args!("{pred}/{arity}"))?;
         let key = arity_qualified_name(pred, arity);
-        schemas
-            .entry(key)
-            .or_insert_with(|| schema_from_terms(&fact.head.terms));
+        if !schemas.contains_key(&key) {
+            let schema = schema_from_terms_core(&fact.head.terms, scope)?;
+            if scope.is_some() && schemas.len() == schemas.capacity() {
+                acquire_compilation(
+                    scope,
+                    xlog_logic::compile::hash_allocation_bytes::<String, Schema>(
+                        schemas.len().checked_add(1).ok_or_else(|| {
+                            compilation_allocation_overflow("schema count overflow")
+                        })?,
+                    )?,
+                )?;
+            }
+            schemas.insert(key, schema);
+        }
     }
 
     for rule in &program.rules {
-        augment_atom_schema_if_needed(&rule.head, &predicates, schemas);
+        augment_atom_schema_if_needed_core(&rule.head, &predicates.value, schemas, scope)?;
         for literal in &rule.body {
             match literal {
                 BodyLiteral::Positive(atom) | BodyLiteral::Negated(atom) => {
-                    augment_atom_schema_if_needed(atom, &predicates, schemas);
+                    augment_atom_schema_if_needed_core(atom, &predicates.value, schemas, scope)?;
                 }
                 BodyLiteral::Epistemic(epistemic) => {
-                    augment_atom_schema_if_needed(&epistemic.atom, &predicates, schemas);
+                    augment_atom_schema_if_needed_core(
+                        &epistemic.atom,
+                        &predicates.value,
+                        schemas,
+                        scope,
+                    )?;
                 }
                 BodyLiteral::Comparison(_) | BodyLiteral::IsExpr(_) | BodyLiteral::Univ(_) => {}
             }
@@ -5655,7 +7424,7 @@ fn augment_same_name_multi_arity_schemas(
     }
 
     for query in &program.queries {
-        augment_atom_schema_if_needed(&query.atom, &predicates, schemas);
+        augment_atom_schema_if_needed_core(&query.atom, &predicates.value, schemas, scope)?;
     }
 
     Ok(())
@@ -5664,51 +7433,92 @@ fn augment_same_name_multi_arity_schemas(
 /// Arity-qualify same-name multi-arity predicates; `None` when the program has
 /// no such overloads (the caller then compiles `program` itself, unchanged).
 fn qualify_same_name_multi_arity_program(program: &Program) -> Option<Program> {
-    let overloaded = predicate_arities(program)
-        .into_iter()
-        .filter_map(|(predicate, arities)| (arities.len() > 1).then_some(predicate))
-        .collect::<BTreeSet<_>>();
-    if overloaded.is_empty() {
-        return None;
+    qualify_same_name_multi_arity_program_core(program, &mut None)
+        .expect("unbounded arity qualification has no owner refusal")
+}
+
+fn qualify_same_name_multi_arity_program_core(
+    program: &Program,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<Option<Program>> {
+    let overloaded = compile_temporary(scope, |scope| {
+        let arities = predicate_arities_core(program, scope)?;
+        acquire_compilation_tree::<String, ()>(scope, arities.len())?;
+        Ok(arities
+            .into_iter()
+            .filter_map(|(predicate, arities)| (arities.len() > 1).then_some(predicate))
+            .collect::<BTreeSet<_>>())
+    })?;
+    if overloaded.value.is_empty() {
+        return Ok(None);
     }
 
+    acquire_compilation(scope, program.owned_allocation_bytes()?)?;
     let mut qualified = program.clone();
     for declaration in &mut qualified.predicates {
-        if overloaded.contains(&declaration.name) {
+        if overloaded.value.contains(&declaration.name) {
+            acquire_compilation_text(
+                scope,
+                format_args!("{}/{}", declaration.name, declaration.arity()),
+            )?;
             declaration.name = arity_qualified_name(&declaration.name, declaration.arity());
         }
     }
     for rule in &mut qualified.rules {
-        qualify_atom_arity(&mut rule.head, &overloaded);
-        qualify_body_literal_arities(&mut rule.body, &overloaded);
+        qualify_atom_arity_core(&mut rule.head, &overloaded.value, scope)?;
+        qualify_body_literal_arities_core(&mut rule.body, &overloaded.value, scope)?;
     }
     for constraint in &mut qualified.constraints {
-        qualify_body_literal_arities(&mut constraint.body, &overloaded);
+        qualify_body_literal_arities_core(&mut constraint.body, &overloaded.value, scope)?;
     }
     for query in &mut qualified.queries {
-        qualify_atom_arity(&mut query.atom, &overloaded);
+        qualify_atom_arity_core(&mut query.atom, &overloaded.value, scope)?;
     }
-    Some(qualified)
+    Ok(Some(qualified))
 }
 
 fn qualify_body_literal_arities(literals: &mut [BodyLiteral], overloaded: &BTreeSet<String>) {
+    qualify_body_literal_arities_core(literals, overloaded, &mut None)
+        .expect("unbounded arity qualification has no owner refusal")
+}
+
+fn qualify_body_literal_arities_core(
+    literals: &mut [BodyLiteral],
+    overloaded: &BTreeSet<String>,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<()> {
     for literal in literals {
         match literal {
             BodyLiteral::Positive(atom) | BodyLiteral::Negated(atom) => {
-                qualify_atom_arity(atom, overloaded);
+                qualify_atom_arity_core(atom, overloaded, scope)?;
             }
             BodyLiteral::Epistemic(epistemic) => {
-                qualify_atom_arity(&mut epistemic.atom, overloaded);
+                qualify_atom_arity_core(&mut epistemic.atom, overloaded, scope)?;
             }
             BodyLiteral::Comparison(_) | BodyLiteral::IsExpr(_) | BodyLiteral::Univ(_) => {}
         }
     }
+    Ok(())
 }
 
 fn qualify_atom_arity(atom: &mut Atom, overloaded: &BTreeSet<String>) {
+    qualify_atom_arity_core(atom, overloaded, &mut None)
+        .expect("unbounded arity qualification has no owner refusal")
+}
+
+fn qualify_atom_arity_core(
+    atom: &mut Atom,
+    overloaded: &BTreeSet<String>,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<()> {
     if overloaded.contains(&atom.predicate) {
+        acquire_compilation_text(
+            scope,
+            format_args!("{}/{}", atom.predicate, atom.terms.len()),
+        )?;
         atom.predicate = arity_qualified_name(&atom.predicate, atom.terms.len());
     }
+    Ok(())
 }
 
 fn augment_atom_schema_if_needed(
@@ -5716,59 +7526,115 @@ fn augment_atom_schema_if_needed(
     predicates: &BTreeSet<String>,
     schemas: &mut HashMap<String, Schema>,
 ) {
+    augment_atom_schema_if_needed_core(atom, predicates, schemas, &mut None)
+        .expect("unbounded schema augmentation has no owner refusal")
+}
+
+fn augment_atom_schema_if_needed_core(
+    atom: &Atom,
+    predicates: &BTreeSet<String>,
+    schemas: &mut HashMap<String, Schema>,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<()> {
     if !predicates.contains(&atom.predicate) {
-        return;
+        return Ok(());
     }
+    acquire_compilation_text(
+        scope,
+        format_args!("{}/{}", atom.predicate, atom.terms.len()),
+    )?;
     let key = arity_qualified_name(&atom.predicate, atom.terms.len());
-    schemas
-        .entry(key)
-        .or_insert_with(|| schema_from_terms(&atom.terms));
+    if !schemas.contains_key(&key) {
+        let schema = schema_from_terms_core(&atom.terms, scope)?;
+        if scope.is_some() && schemas.len() == schemas.capacity() {
+            acquire_compilation(
+                scope,
+                xlog_logic::compile::hash_allocation_bytes::<String, Schema>(
+                    schemas
+                        .len()
+                        .checked_add(1)
+                        .ok_or_else(|| compilation_allocation_overflow("schema count overflow"))?,
+                )?,
+            )?;
+        }
+        schemas.insert(key, schema);
+    }
+    Ok(())
 }
 
 fn predicate_arities(program: &Program) -> HashMap<String, BTreeSet<usize>> {
+    predicate_arities_core(program, &mut None).expect("unbounded arity census has no owner refusal")
+}
+
+fn predicate_arities_core(
+    program: &Program,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<HashMap<String, BTreeSet<usize>>> {
     let mut arities = HashMap::new();
     for decl in &program.predicates {
-        add_predicate_arity(&mut arities, &decl.name, decl.arity());
+        add_predicate_arity_core(&mut arities, &decl.name, decl.arity(), scope)?;
     }
     for rule in &program.rules {
-        add_predicate_arity(&mut arities, &rule.head.predicate, rule.head.terms.len());
+        add_predicate_arity_core(
+            &mut arities,
+            &rule.head.predicate,
+            rule.head.terms.len(),
+            scope,
+        )?;
         for literal in &rule.body {
             match literal {
                 BodyLiteral::Positive(atom) | BodyLiteral::Negated(atom) => {
-                    add_predicate_arity(&mut arities, &atom.predicate, atom.terms.len());
+                    add_predicate_arity_core(
+                        &mut arities,
+                        &atom.predicate,
+                        atom.terms.len(),
+                        scope,
+                    )?;
                 }
                 BodyLiteral::Epistemic(epistemic) => {
-                    add_predicate_arity(
+                    add_predicate_arity_core(
                         &mut arities,
                         &epistemic.atom.predicate,
                         epistemic.atom.terms.len(),
-                    );
+                        scope,
+                    )?;
                 }
                 BodyLiteral::Comparison(_) | BodyLiteral::IsExpr(_) | BodyLiteral::Univ(_) => {}
             }
         }
     }
     for query in &program.queries {
-        add_predicate_arity(&mut arities, &query.atom.predicate, query.atom.terms.len());
+        add_predicate_arity_core(
+            &mut arities,
+            &query.atom.predicate,
+            query.atom.terms.len(),
+            scope,
+        )?;
     }
     for constraint in &program.constraints {
         for literal in &constraint.body {
             match literal {
                 BodyLiteral::Positive(atom) | BodyLiteral::Negated(atom) => {
-                    add_predicate_arity(&mut arities, &atom.predicate, atom.terms.len());
+                    add_predicate_arity_core(
+                        &mut arities,
+                        &atom.predicate,
+                        atom.terms.len(),
+                        scope,
+                    )?;
                 }
                 BodyLiteral::Epistemic(epistemic) => {
-                    add_predicate_arity(
+                    add_predicate_arity_core(
                         &mut arities,
                         &epistemic.atom.predicate,
                         epistemic.atom.terms.len(),
-                    );
+                        scope,
+                    )?;
                 }
                 BodyLiteral::Comparison(_) | BodyLiteral::IsExpr(_) | BodyLiteral::Univ(_) => {}
             }
         }
     }
-    arities
+    Ok(arities)
 }
 
 fn add_predicate_arity(
@@ -5776,10 +7642,41 @@ fn add_predicate_arity(
     predicate: &str,
     arity: usize,
 ) {
+    add_predicate_arity_core(arities, predicate, arity, &mut None)
+        .expect("unbounded arity census has no owner refusal")
+}
+
+fn add_predicate_arity_core(
+    arities: &mut HashMap<String, BTreeSet<usize>>,
+    predicate: &str,
+    arity: usize,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<()> {
+    if scope.is_some() && !arities.contains_key(predicate) && arities.len() == arities.capacity() {
+        acquire_compilation(
+            scope,
+            xlog_logic::compile::hash_allocation_bytes::<String, BTreeSet<usize>>(
+                arities.len().checked_add(1).ok_or_else(|| {
+                    compilation_allocation_overflow("arity census count overflow")
+                })?,
+            )?,
+        )?;
+    }
+    let set = arities.get(predicate);
+    if scope.is_some() && set.is_none_or(|arities| !arities.contains(&arity)) {
+        acquire_compilation(
+            scope,
+            xlog_logic::compile::btree_insert_allocation_bytes::<usize, ()>(
+                set.map_or(0, BTreeSet::len),
+            )?,
+        )?;
+    }
+    acquire_compilation(scope, predicate.len() as u64)?;
     arities
         .entry(predicate.to_string())
         .or_default()
         .insert(arity);
+    Ok(())
 }
 
 fn arity_qualified_name(predicate: &str, arity: usize) -> String {
@@ -5800,7 +7697,16 @@ fn program_has_epistemic_literals(program: &Program) -> bool {
 }
 
 fn epistemic_output_head_predicate_count(program: &Program) -> usize {
-    program
+    epistemic_output_head_predicate_count_core(program, &mut None)
+        .expect("unbounded output-head census has no owner refusal")
+}
+
+fn epistemic_output_head_predicate_count_core(
+    program: &Program,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<usize> {
+    let _heads_owner = reserve_compilation_tree::<&str, ()>(scope, program.rules.len())?;
+    Ok(program
         .rules
         .iter()
         .filter(|rule| {
@@ -5810,14 +7716,33 @@ fn epistemic_output_head_predicate_count(program: &Program) -> usize {
         })
         .map(|rule| rule.head.predicate.as_str())
         .collect::<BTreeSet<_>>()
-        .len()
+        .len())
 }
 
 /// The user-visible output head predicate(s) of a stratum's epistemic-bearing
 /// rules. For a recursive stratum (`reach :- reach, know a`) this is the recursive
 /// head whose materialized relation is the stratum's output.
 fn epistemic_stratum_output_heads(program: &Program) -> Vec<String> {
-    program
+    epistemic_stratum_output_heads_core(program, &mut None)
+        .expect("unbounded output-head collection has no owner refusal")
+}
+
+fn epistemic_stratum_output_heads_core(
+    program: &Program,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<Vec<String>> {
+    let _heads_owner = reserve_compilation_tree::<String, ()>(scope, program.rules.len())?;
+    acquire_compilation_vector::<String>(scope, program.rules.len())?;
+    for rule in &program.rules {
+        if rule
+            .body
+            .iter()
+            .any(|literal| matches!(literal, BodyLiteral::Epistemic(_)))
+        {
+            acquire_compilation(scope, rule.head.predicate.len() as u64)?;
+        }
+    }
+    Ok(program
         .rules
         .iter()
         .filter(|rule| {
@@ -5828,21 +7753,28 @@ fn epistemic_stratum_output_heads(program: &Program) -> Vec<String> {
         .map(|rule| rule.head.predicate.clone())
         .collect::<BTreeSet<_>>()
         .into_iter()
-        .collect()
+        .collect())
 }
 
 fn epistemic_relation_ids(plan: &LogicExecutionPlan) -> Result<HashMap<String, RelId>> {
+    epistemic_relation_ids_core(plan, &mut None)
+}
+
+fn epistemic_relation_ids_core(
+    plan: &LogicExecutionPlan,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<HashMap<String, RelId>> {
     let mut rel_ids = HashMap::new();
     match plan {
         LogicExecutionPlan::EpistemicSingle(executable) => {
             for (name, rel_id) in &executable.relation_ids {
-                insert_epistemic_relation_id(&mut rel_ids, name, *rel_id)?;
+                insert_epistemic_relation_id_core(&mut rel_ids, name, *rel_id, scope)?;
             }
         }
         LogicExecutionPlan::EpistemicSplit(split) => {
             for component in &split.components {
                 for (name, rel_id) in &component.executable.relation_ids {
-                    insert_epistemic_relation_id(&mut rel_ids, name, *rel_id)?;
+                    insert_epistemic_relation_id_core(&mut rel_ids, name, *rel_id, scope)?;
                 }
             }
         }
@@ -5854,13 +7786,13 @@ fn epistemic_relation_ids(plan: &LogicExecutionPlan) -> Result<HashMap<String, R
                             // Each stratum is a distinct sub-program compiled with a
                             // fresh compiler, so relation ids legitimately differ
                             // across strata; keep the last writer per name.
-                            rel_ids.insert(name.clone(), *rel_id);
+                            insert_compilation_rel_id(&mut rel_ids, name, *rel_id, scope)?;
                         }
                     }
                     StratumPlanKind::Split(split) => {
                         for component in &split.components {
                             for (name, rel_id) in &component.executable.relation_ids {
-                                rel_ids.insert(name.clone(), *rel_id);
+                                insert_compilation_rel_id(&mut rel_ids, name, *rel_id, scope)?;
                             }
                         }
                     }
@@ -5874,14 +7806,14 @@ fn epistemic_relation_ids(plan: &LogicExecutionPlan) -> Result<HashMap<String, R
         LogicExecutionPlan::EpistemicWfsGpu(wfs) => {
             for plan in [&wfs.overapprox, &wfs.lower, &wfs.upper] {
                 for (name, rel_id) in &plan.rel_ids {
-                    rel_ids.insert(name.clone(), *rel_id);
+                    insert_compilation_rel_id(&mut rel_ids, name, *rel_id, scope)?;
                 }
             }
         }
         LogicExecutionPlan::EpistemicG91Compatibility(g91) => {
             for pass in [&g91.upper_bound, &g91.refinement] {
-                for (name, rel_id) in gpu_evaluation_pass_rel_ids(pass) {
-                    rel_ids.insert(name, rel_id);
+                for (name, rel_id) in gpu_evaluation_pass_rel_ids_core(pass, scope)? {
+                    insert_compilation_rel_id(&mut rel_ids, &name, rel_id, scope)?;
                 }
             }
         }
@@ -5895,14 +7827,27 @@ fn insert_epistemic_relation_id(
     name: &str,
     rel_id: RelId,
 ) -> Result<()> {
-    if let Some(previous) = rel_ids.insert(name.to_string(), rel_id) {
+    insert_epistemic_relation_id_core(rel_ids, name, rel_id, &mut None)
+}
+
+fn insert_epistemic_relation_id_core(
+    rel_ids: &mut HashMap<String, RelId>,
+    name: &str,
+    rel_id: RelId,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<()> {
+    if let Some(previous) = rel_ids.get(name).copied() {
         if previous != rel_id {
-            return Err(XlogError::Compilation(format!(
-                "epistemic split components assigned conflicting relation ids for {name}: \
+            return Err(compilation_diagnostic(
+                scope,
+                format_args!(
+                    "epistemic split components assigned conflicting relation ids for {name}: \
                  {previous:?} vs {rel_id:?}"
-            )));
+                ),
+            )?);
         }
     }
+    insert_compilation_rel_id(rel_ids, name, rel_id, scope)?;
     Ok(())
 }
 
@@ -6356,17 +8301,51 @@ fn fnv1a_64(s: &str) -> u64 {
 /// Used to retain epistemic provenance when a Case-A recursive reduction lowers the
 /// program to an ordinary executable plan.
 fn collect_eir_epistemic_literals(program: &Program) -> Vec<xlog_ir::EirEpistemicLiteral> {
+    collect_eir_epistemic_literals_core(program, &mut None)
+        .expect("unbounded EIR collection has no owner refusal")
+}
+
+fn collect_eir_epistemic_literals_core(
+    program: &Program,
+    scope: &mut Option<&mut CompilationAllocationScope<'_>>,
+) -> Result<Vec<xlog_ir::EirEpistemicLiteral>> {
     let mut lits = Vec::new();
-    if let Ok(eir) = xlog_logic::build_eir(program) {
+    let eir = compile_temporary(scope, |scope| {
+        Ok(match scope.as_deref_mut() {
+            Some(scope) => Some(xlog_logic::eir::build_eir_with_allocation_owner(
+                program, scope,
+            )?),
+            None => xlog_logic::build_eir(program).ok(),
+        })
+    })?;
+    if let Some(eir) = eir.value.as_ref() {
         for rule in &eir.rules {
             for lit in &rule.body {
                 if let xlog_ir::EirBodyLiteral::Epistemic(e) = lit {
+                    if lits.len() == lits.capacity() {
+                        acquire_compilation_vector::<xlog_ir::EirEpistemicLiteral>(
+                            scope,
+                            lits.len().checked_add(1).ok_or_else(|| {
+                                compilation_allocation_overflow(
+                                    "epistemic provenance count overflow",
+                                )
+                            })?,
+                        )?;
+                    }
+                    acquire_compilation(scope, e.atom.predicate.len() as u64)?;
+                    acquire_compilation_vector::<xlog_ir::EirTerm>(scope, e.atom.terms.len())?;
+                    for term in &e.atom.terms {
+                        acquire_compilation(
+                            scope,
+                            xlog_logic::eir::term_clone_allocation_bytes(term)?,
+                        )?;
+                    }
                     lits.push(e.clone());
                 }
             }
         }
     }
-    lits
+    Ok(lits)
 }
 
 /// JSON summary for an epistemic source that reduced to a high-level recursive

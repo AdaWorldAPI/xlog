@@ -141,6 +141,39 @@ pub struct Schema {
 }
 
 impl Schema {
+    /// Owned clone geometry of this original schema, including sort labels.
+    pub fn owned_allocation_bytes(&self) -> crate::Result<u64> {
+        let overflow = || crate::XlogError::allocation_extent_overflow("schema");
+        let columns = self
+            .columns
+            .len()
+            .checked_mul(std::mem::size_of::<(String, ScalarType)>())
+            .ok_or_else(overflow)?;
+        let keys = self
+            .key_columns
+            .len()
+            .checked_mul(std::mem::size_of::<usize>())
+            .ok_or_else(overflow)?;
+        let labels = self
+            .sort_labels
+            .len()
+            .checked_mul(std::mem::size_of::<String>())
+            .ok_or_else(overflow)?;
+        let mut bytes = columns
+            .checked_add(keys)
+            .and_then(|n| n.checked_add(labels))
+            .ok_or_else(overflow)?;
+        for name in self
+            .columns
+            .iter()
+            .map(|(name, _)| name)
+            .chain(self.sort_labels.iter())
+        {
+            bytes = bytes.checked_add(name.len()).ok_or_else(overflow)?;
+        }
+        u64::try_from(bytes).map_err(|_| overflow())
+    }
+
     /// Create a new schema with all columns as keys
     pub fn new(columns: Vec<(String, ScalarType)>) -> Self {
         let key_columns = (0..columns.len()).collect();

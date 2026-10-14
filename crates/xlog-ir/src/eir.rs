@@ -60,6 +60,47 @@ pub enum EirTerm {
     },
 }
 
+impl EirTerm {
+    /// Checked heap geometry of the original term clone. The inline enum is
+    /// already part of its containing vector or box; scalar terms add no heap
+    /// allocation here.
+    pub fn owned_allocation_bytes(&self) -> xlog_core::Result<u64> {
+        let overflow = || xlog_core::XlogError::AllocationRefused {
+            operation: "epistemic term clone",
+            reason: xlog_core::error::AllocationRefusal::ExtentOverflow,
+        };
+        let text = |text: &str| u64::try_from(text.len()).map_err(|_| overflow());
+        let terms = |terms: &[Self]| -> xlog_core::Result<u64> {
+            let mut bytes = terms
+                .len()
+                .checked_mul(std::mem::size_of::<Self>())
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .ok_or_else(overflow)?;
+            for term in terms {
+                bytes = bytes
+                    .checked_add(term.owned_allocation_bytes()?)
+                    .ok_or_else(overflow)?;
+            }
+            Ok(bytes)
+        };
+        match self {
+            Self::Variable(value) | Self::String(value) | Self::PredRef(value) => text(value),
+            Self::List(items) => terms(items),
+            Self::Cons { head, tail } => (2 * std::mem::size_of::<Self>() as u64)
+                .checked_add(head.owned_allocation_bytes()?)
+                .and_then(|bytes| bytes.checked_add(tail.owned_allocation_bytes().ok()?))
+                .ok_or_else(overflow),
+            Self::Compound { functor, args } => text(functor)?
+                .checked_add(terms(args)?)
+                .ok_or_else(overflow),
+            Self::Aggregate { op, variable } => {
+                text(op)?.checked_add(text(variable)?).ok_or_else(overflow)
+            }
+            Self::Anonymous | Self::Integer(_) | Self::FloatBits(_) | Self::Symbol(_) => Ok(0),
+        }
+    }
+}
+
 /// Atom summary carried across the EIR boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EirAtom {

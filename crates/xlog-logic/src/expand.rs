@@ -5,6 +5,7 @@ use crate::ast::{
 };
 use crate::function::{is_builtin, FunctionError, FunctionRegistry};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 const GENERATED_FUNCTION_VARIABLE_PREFIX: &str = "__XLOG_FUNCTION_";
 
@@ -182,6 +183,7 @@ pub struct ExpansionContext<'a> {
     depth: u32,
     max_depth: u32,
     fresh_counter: usize,
+    allocation_owner: Option<&'a mut dyn FnMut(u64) -> xlog_core::Result<Arc<dyn Send + Sync>>>,
 }
 
 impl<'a> ExpansionContext<'a> {
@@ -192,7 +194,131 @@ impl<'a> ExpansionContext<'a> {
             depth: 0,
             max_depth,
             fresh_counter: 0,
+            allocation_owner: None,
         }
+    }
+
+    fn acquire(&mut self, bytes: u64) -> Result<(), FunctionError> {
+        if bytes != 0 {
+            if let Some(allocate) = self.allocation_owner.as_deref_mut() {
+                allocate(bytes).map_err(|cause| FunctionError::AllocationRejected {
+                    cause: Arc::new(cause),
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn acquire_calculated(&mut self, bytes: xlog_core::Result<u64>) -> Result<(), FunctionError> {
+        if self.allocation_owner.is_some() {
+            self.acquire(bytes.map_err(|cause| FunctionError::AllocationRejected {
+                cause: Arc::new(cause),
+            })?)?;
+        }
+        Ok(())
+    }
+
+    fn acquire_substitution(
+        &mut self,
+        subst: &HashMap<String, ArithExpr>,
+    ) -> Result<(), FunctionError> {
+        if self.allocation_owner.is_some() {
+            let bytes = (|| -> xlog_core::Result<u64> {
+                let mut bytes =
+                    crate::compile::hash_allocation_bytes::<String, ArithExpr>(subst.len())?;
+                for (name, expr) in subst {
+                    let expression_bytes = expr.owned_allocation_bytes()?;
+                    bytes = bytes
+                        .checked_add(name.len() as u64)
+                        .and_then(|n| n.checked_add(expression_bytes))
+                        .ok_or_else(|| {
+                            xlog_core::XlogError::Compilation(
+                                "function substitution allocation extent overflow".into(),
+                            )
+                        })?;
+                }
+                Ok(bytes)
+            })();
+            self.acquire_calculated(bytes)?;
+        }
+        Ok(())
+    }
+
+    fn acquire_variables(&mut self, variables: &HashSet<String>) -> Result<(), FunctionError> {
+        if self.allocation_owner.is_some() {
+            let bytes = crate::compile::hash_allocation_bytes::<String, ()>(variables.len())
+                .and_then(|mut bytes| {
+                    for name in variables {
+                        bytes = bytes.checked_add(name.len() as u64).ok_or_else(|| {
+                            xlog_core::XlogError::Compilation(
+                                "function variable allocation extent overflow".into(),
+                            )
+                        })?;
+                    }
+                    Ok(bytes)
+                });
+            self.acquire_calculated(bytes)?;
+        }
+        Ok(())
+    }
+
+    fn reserve_vector<T>(
+        &mut self,
+        vector: &mut Vec<T>,
+        additional: usize,
+    ) -> Result<(), FunctionError> {
+        if self.allocation_owner.is_some() && vector.capacity() - vector.len() < additional {
+            let length = vector.len().checked_add(additional).ok_or_else(|| {
+                FunctionError::AllocationRejected {
+                    cause: Arc::new(xlog_core::XlogError::Compilation(
+                        "function vector allocation extent overflow".into(),
+                    )),
+                }
+            })?;
+            self.acquire_calculated(crate::compile::push_vector_allocation_bytes::<T>(length))?;
+            vector.reserve_exact(additional);
+        }
+        Ok(())
+    }
+
+    fn acquire_literal_variables(
+        &mut self,
+        head: Option<&Atom>,
+        body: &[BodyLiteral],
+    ) -> Result<(), FunctionError> {
+        if self.allocation_owner.is_some() {
+            let mut extent = Some((0usize, 0u64));
+            let mut visit = |name: &str| {
+                extent = extent.and_then(|(count, text)| {
+                    Some((count.checked_add(1)?, text.checked_add(name.len() as u64)?))
+                })
+            };
+            if let Some(head) = head {
+                head.visit_variables(&mut visit);
+            }
+            for literal in body {
+                literal.visit_variables(&mut visit);
+            }
+            let bytes = (|| -> xlog_core::Result<u64> {
+                let (count, text) = extent.ok_or_else(|| {
+                    xlog_core::XlogError::Compilation("function variable extent overflow".into())
+                })?;
+                crate::compile::hash_allocation_bytes::<String, ()>(count)?
+                    .checked_add(text)
+                    .and_then(|n| {
+                        n.checked_add(
+                            (count as u64).checked_mul(std::mem::size_of::<&str>() as u64)?,
+                        )
+                    })
+                    .ok_or_else(|| {
+                        xlog_core::XlogError::Compilation(
+                            "function variable extent overflow".into(),
+                        )
+                    })
+            })();
+            self.acquire_calculated(bytes)?;
+        }
+        Ok(())
     }
 
     /// Expand a scalar function call to its body with arguments substituted.
@@ -246,13 +372,37 @@ impl<'a> ExpansionContext<'a> {
         function_name: &str,
         source_name: &str,
         used_variables: &mut HashSet<String>,
-    ) -> String {
+    ) -> Result<String, FunctionError> {
         loop {
+            if self.allocation_owner.is_some() {
+                self.acquire(function_name.len() as u64)?;
+                self.acquire_calculated(crate::compile::formatted_text_allocation_bytes(
+                    format_args!(
+                        "{GENERATED_FUNCTION_VARIABLE_PREFIX}{function_name}_{source_name}_{}",
+                        self.fresh_counter
+                    ),
+                ))?;
+                if used_variables.len() == used_variables.capacity() {
+                    self.acquire_calculated(
+                        crate::compile::hash_allocation_bytes::<String, ()>(
+                            used_variables.len() + 1,
+                        )
+                        .and_then(|n| {
+                            n.checked_mul(2).ok_or_else(|| {
+                                xlog_core::XlogError::Compilation(
+                                    "function variable table extent overflow".into(),
+                                )
+                            })
+                        }),
+                    )?;
+                }
+            }
             let candidate =
                 generated_function_variable_name(function_name, source_name, self.fresh_counter);
             self.fresh_counter += 1;
+            self.acquire(candidate.len() as u64)?;
             if used_variables.insert(candidate.clone()) {
-                return candidate;
+                return Ok(candidate);
             }
         }
     }
@@ -266,6 +416,47 @@ impl<'a> ExpansionContext<'a> {
         mut subst: HashMap<String, ArithExpr>,
         used_variables: &mut HashSet<String>,
     ) -> Result<(Vec<PreparedPredicateLiteral>, ArithExpr), FunctionError> {
+        self.acquire_calculated(crate::compile::hash_allocation_bytes::<String, ()>(
+            subst.len(),
+        ))?;
+        for name in subst.keys() {
+            self.acquire(name.len() as u64)?;
+        }
+        if self.allocation_owner.is_some() {
+            let bytes = (|| -> xlog_core::Result<u64> {
+                let mut count = 1usize;
+                let mut text = result.len() as u64;
+                for literal in &body {
+                    let mut extent = Some((count, text));
+                    literal.visit_variables(&mut |name| {
+                        extent = extent.and_then(|(n, b)| {
+                            Some((n.checked_add(1)?, b.checked_add(name.len() as u64)?))
+                        })
+                    });
+                    (count, text) = extent.ok_or_else(|| {
+                        xlog_core::XlogError::Compilation(
+                            "function local allocation extent overflow".into(),
+                        )
+                    })?;
+                }
+                crate::compile::hash_allocation_bytes::<String, ()>(count)?
+                    .checked_add(crate::compile::push_vector_allocation_bytes::<String>(
+                        count,
+                    )?)
+                    .and_then(|n| n.checked_add(text.checked_mul(3)?))
+                    .and_then(|n| {
+                        n.checked_add(
+                            (count as u64).checked_mul(std::mem::size_of::<&str>() as u64)?,
+                        )
+                    })
+                    .ok_or_else(|| {
+                        xlog_core::XlogError::Compilation(
+                            "function local allocation extent overflow".into(),
+                        )
+                    })
+            })();
+            self.acquire_calculated(bytes)?;
+        }
         let parameter_names: HashSet<String> = subst.keys().cloned().collect();
         let mut local_names = Vec::new();
         let mut seen_locals = HashSet::new();
@@ -282,14 +473,30 @@ impl<'a> ExpansionContext<'a> {
         }
 
         for local in local_names {
-            let fresh = self.fresh_variable(function_name, &local, used_variables);
+            let fresh = self.fresh_variable(function_name, &local, used_variables)?;
+            if self.allocation_owner.is_some() && subst.len() == subst.capacity() {
+                self.acquire_calculated(
+                    crate::compile::hash_allocation_bytes::<String, ArithExpr>(subst.len() + 1)
+                        .and_then(|n| {
+                            n.checked_mul(2).ok_or_else(|| {
+                                xlog_core::XlogError::Compilation(
+                                    "function substitution table extent overflow".into(),
+                                )
+                            })
+                        }),
+                )?;
+            }
             subst.insert(local, ArithExpr::Variable(fresh));
         }
 
+        self.acquire_calculated(crate::compile::push_vector_allocation_bytes::<
+            PreparedPredicateLiteral,
+        >(body.len()))?;
         let substituted_body = body
             .into_iter()
             .map(|literal| {
                 if let BodyLiteral::IsExpr(binding) = literal {
+                    self.acquire_substitution(&subst)?;
                     Ok(PreparedPredicateLiteral::Binding {
                         target: self.substitute_binding_target(
                             function_name,
@@ -305,6 +512,9 @@ impl<'a> ExpansionContext<'a> {
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
+        if let Some(expression) = subst.get(&result) {
+            self.acquire_calculated(expression.owned_allocation_bytes())?;
+        }
         let expression = subst
             .get(&result)
             .cloned()
@@ -313,7 +523,7 @@ impl<'a> ExpansionContext<'a> {
     }
 
     fn substitute_literal(
-        &self,
+        &mut self,
         function_name: &str,
         lit: &BodyLiteral,
         subst: &HashMap<String, ArithExpr>,
@@ -344,11 +554,15 @@ impl<'a> ExpansionContext<'a> {
     }
 
     fn substitute_atom(
-        &self,
+        &mut self,
         function_name: &str,
         atom: &Atom,
         subst: &HashMap<String, ArithExpr>,
     ) -> Result<Atom, FunctionError> {
+        self.acquire(atom.predicate.len() as u64)?;
+        self.acquire_calculated(crate::compile::push_vector_allocation_bytes::<Term>(
+            atom.terms.len(),
+        ))?;
         Ok(Atom {
             predicate: atom.predicate.clone(),
             terms: atom
@@ -360,75 +574,100 @@ impl<'a> ExpansionContext<'a> {
     }
 
     fn substitute_term(
-        &self,
+        &mut self,
         function_name: &str,
         term: &Term,
         subst: &HashMap<String, ArithExpr>,
     ) -> Result<Term, FunctionError> {
+        self.acquire_calculated(crate::compile::push_vector_allocation_bytes::<
+            TermSubstitutionTask<'_>,
+        >(1))?;
         let mut tasks = vec![TermSubstitutionTask::Term(term)];
         let mut values = Vec::new();
 
         while let Some(task) = tasks.pop() {
+            let additional = match &task {
+                TermSubstitutionTask::Term(Term::List(items)) => items.len() + 1,
+                TermSubstitutionTask::Term(Term::Compound { args, .. }) => args.len() + 1,
+                TermSubstitutionTask::Term(Term::Cons { .. }) => 3,
+                _ => 0,
+            };
+            self.reserve_vector(&mut tasks, additional)?;
+            self.reserve_vector(&mut values, 1)?;
             match task {
-                TermSubstitutionTask::Term(term) => match term {
-                    Term::Variable(name) => values.push(match subst.get(name) {
-                        Some(ArithExpr::Variable(new_name)) => Term::Variable(new_name.clone()),
-                        Some(ArithExpr::Integer(value)) => Term::Integer(*value),
-                        Some(ArithExpr::Float(value)) => Term::Float(*value),
-                        Some(_) => {
-                            return Err(FunctionError::UnsupportedPredicateTermArgument {
-                                name: function_name.to_string(),
-                                parameter: name.clone(),
+                TermSubstitutionTask::Term(term) => {
+                    self.acquire_calculated(term.owned_allocation_bytes())?;
+                    match term {
+                        Term::Variable(name) => {
+                            if let Some(ArithExpr::Variable(new_name)) = subst.get(name) {
+                                self.acquire(new_name.len() as u64)?;
+                            }
+                            values.push(match subst.get(name) {
+                                Some(ArithExpr::Variable(new_name)) => {
+                                    Term::Variable(new_name.clone())
+                                }
+                                Some(ArithExpr::Integer(value)) => Term::Integer(*value),
+                                Some(ArithExpr::Float(value)) => Term::Float(*value),
+                                Some(_) => {
+                                    return Err(FunctionError::UnsupportedPredicateTermArgument {
+                                        name: function_name.to_string(),
+                                        parameter: name.clone(),
+                                    });
+                                }
+                                None => Term::Variable(name.clone()),
+                            })
+                        }
+                        Term::List(items) => {
+                            tasks.push(TermSubstitutionTask::FinishList(items.len()));
+                            for item in items.iter().rev() {
+                                tasks.push(TermSubstitutionTask::Term(item));
+                            }
+                        }
+                        Term::Cons { head, tail } => {
+                            tasks.push(TermSubstitutionTask::FinishCons);
+                            tasks.push(TermSubstitutionTask::Term(tail));
+                            tasks.push(TermSubstitutionTask::Term(head));
+                        }
+                        Term::Compound { functor, args } => {
+                            tasks.push(TermSubstitutionTask::FinishCompound {
+                                functor: functor.clone(),
+                                argument_count: args.len(),
                             });
+                            for argument in args.iter().rev() {
+                                tasks.push(TermSubstitutionTask::Term(argument));
+                            }
                         }
-                        None => Term::Variable(name.clone()),
-                    }),
-                    Term::List(items) => {
-                        tasks.push(TermSubstitutionTask::FinishList(items.len()));
-                        for item in items.iter().rev() {
-                            tasks.push(TermSubstitutionTask::Term(item));
+                        Term::Aggregate(aggregate) => {
+                            values.push(Term::Aggregate(crate::ast::AggExpr {
+                                op: aggregate.op,
+                                variable: self.substitute_binding_target(
+                                    function_name,
+                                    &aggregate.variable,
+                                    subst,
+                                )?,
+                            }));
                         }
+                        Term::Anonymous => values.push(Term::Anonymous),
+                        Term::Integer(value) => values.push(Term::Integer(*value)),
+                        Term::Float(value) => values.push(Term::Float(*value)),
+                        Term::String(value) => values.push(Term::String(value.clone())),
+                        Term::Symbol(value) => values.push(Term::Symbol(*value)),
+                        Term::PredRef(value) => values.push(Term::PredRef(value.clone())),
                     }
-                    Term::Cons { head, tail } => {
-                        tasks.push(TermSubstitutionTask::FinishCons);
-                        tasks.push(TermSubstitutionTask::Term(tail));
-                        tasks.push(TermSubstitutionTask::Term(head));
-                    }
-                    Term::Compound { functor, args } => {
-                        tasks.push(TermSubstitutionTask::FinishCompound {
-                            functor: functor.clone(),
-                            argument_count: args.len(),
-                        });
-                        for argument in args.iter().rev() {
-                            tasks.push(TermSubstitutionTask::Term(argument));
-                        }
-                    }
-                    Term::Aggregate(aggregate) => {
-                        values.push(Term::Aggregate(crate::ast::AggExpr {
-                            op: aggregate.op,
-                            variable: self.substitute_binding_target(
-                                function_name,
-                                &aggregate.variable,
-                                subst,
-                            )?,
-                        }));
-                    }
-                    Term::Anonymous => values.push(Term::Anonymous),
-                    Term::Integer(value) => values.push(Term::Integer(*value)),
-                    Term::Float(value) => values.push(Term::Float(*value)),
-                    Term::String(value) => values.push(Term::String(value.clone())),
-                    Term::Symbol(value) => values.push(Term::Symbol(*value)),
-                    Term::PredRef(value) => values.push(Term::PredRef(value.clone())),
-                },
+                }
                 TermSubstitutionTask::FinishList(item_count) => {
                     let start = values
                         .len()
                         .checked_sub(item_count)
                         .expect("list items produce substituted terms");
+                    self.acquire_calculated(crate::compile::push_vector_allocation_bytes::<Term>(
+                        item_count,
+                    ))?;
                     let items = values.split_off(start);
                     values.push(Term::List(items));
                 }
                 TermSubstitutionTask::FinishCons => {
+                    self.acquire(2 * std::mem::size_of::<Term>() as u64)?;
                     let tail = values.pop().expect("cons tail produces a substituted term");
                     let head = values.pop().expect("cons head produces a substituted term");
                     values.push(Term::Cons {
@@ -444,6 +683,9 @@ impl<'a> ExpansionContext<'a> {
                         .len()
                         .checked_sub(argument_count)
                         .expect("compound arguments produce substituted terms");
+                    self.acquire_calculated(crate::compile::push_vector_allocation_bytes::<Term>(
+                        argument_count,
+                    ))?;
                     let args = values.split_off(start);
                     values.push(Term::Compound { functor, args });
                 }
@@ -456,18 +698,24 @@ impl<'a> ExpansionContext<'a> {
     }
 
     fn substitute_binding_target(
-        &self,
+        &mut self,
         function_name: &str,
         variable: &str,
         subst: &HashMap<String, ArithExpr>,
     ) -> Result<String, FunctionError> {
         match subst.get(variable) {
-            Some(ArithExpr::Variable(new_name)) => Ok(new_name.clone()),
+            Some(ArithExpr::Variable(new_name)) => {
+                self.acquire(new_name.len() as u64)?;
+                Ok(new_name.clone())
+            }
             Some(_) => Err(FunctionError::InvalidPredicateBindingTarget {
                 name: function_name.to_string(),
                 parameter: variable.to_string(),
             }),
-            None => Ok(variable.to_string()),
+            None => {
+                self.acquire(variable.len() as u64)?;
+                Ok(variable.to_string())
+            }
         }
     }
 
@@ -477,12 +725,15 @@ impl<'a> ExpansionContext<'a> {
         used_variables: &mut HashSet<String>,
     ) -> Result<Vec<BodyLiteral>, FunctionError> {
         let BodyLiteral::IsExpr(binding) = literal else {
+            self.acquire_calculated(literal.owned_allocation_bytes())?;
             return Ok(vec![literal.clone()]);
         };
 
         let expanded =
             self.expand_expr_for_rule(&binding.expr, &HashMap::new(), used_variables, false)?;
         let mut literals = expanded.generated_literals;
+        self.reserve_vector(&mut literals, 1)?;
+        self.acquire(binding.target.len() as u64)?;
         literals.push(BodyLiteral::IsExpr(IsExpr {
             target: binding.target.clone(),
             expr: expanded.expression,
@@ -499,6 +750,7 @@ impl<'a> ExpansionContext<'a> {
     ) -> Result<ExpandedExpression, FunctionError> {
         let saved_depth = self.depth;
         let saved_fresh_counter = self.fresh_counter;
+        self.acquire_variables(used_variables)?;
         let saved_used_variables = used_variables.clone();
         let result =
             self.run_expansion_machine(expression, subst, used_variables, in_conditional_branch);
@@ -517,6 +769,9 @@ impl<'a> ExpansionContext<'a> {
         used_variables: &mut HashSet<String>,
         in_conditional_branch: bool,
     ) -> Result<ExpandedExpression, FunctionError> {
+        self.acquire_calculated(expression.owned_allocation_bytes())?;
+        self.acquire_substitution(subst)?;
+        self.acquire_calculated(crate::compile::push_vector_allocation_bytes::<ExpansionTask>(1))?;
         let mut tasks = vec![ExpansionTask::Expression {
             expression: expression.clone(),
             subst: subst.clone(),
@@ -526,18 +781,45 @@ impl<'a> ExpansionContext<'a> {
         let mut predicate_literal_values: Vec<Vec<BodyLiteral>> = Vec::new();
 
         while let Some(task) = tasks.pop() {
+            let additional = match &task {
+                ExpansionTask::Expression {
+                    expression: ArithExpr::FuncCall { args, .. },
+                    ..
+                } => args.len() + 1,
+                ExpansionTask::Expression {
+                    expression: ArithExpr::Conditional { .. },
+                    ..
+                }
+                | ExpansionTask::FunctionBody {
+                    body: FuncBody::Conditional(_),
+                    ..
+                } => 5,
+                ExpansionTask::FunctionBody {
+                    body: FuncBody::Predicate { body, .. },
+                    ..
+                } => body.len() + 1,
+                _ => 3,
+            };
+            self.reserve_vector(&mut tasks, additional)?;
+            self.reserve_vector(&mut values, 1)?;
+            self.reserve_vector(&mut predicate_literal_values, 1)?;
             match task {
                 ExpansionTask::Expression {
                     expression,
                     subst,
                     in_conditional_branch,
                 } => match expression {
-                    ArithExpr::Variable(name) => values.push(ExpandedExpression::value(
-                        subst
-                            .get(&name)
-                            .cloned()
-                            .unwrap_or(ArithExpr::Variable(name)),
-                    )),
+                    ArithExpr::Variable(name) => {
+                        if let Some(expr) = subst.get(&name) {
+                            self.acquire_calculated(expr.owned_allocation_bytes())?;
+                        }
+                        values.push(ExpandedExpression::value(
+                            subst
+                                .get(&name)
+                                .cloned()
+                                .unwrap_or(ArithExpr::Variable(name)),
+                        ))
+                    }
                     ArithExpr::Integer(_) | ArithExpr::Float(_) => {
                         values.push(ExpandedExpression::value(expression));
                     }
@@ -551,6 +833,7 @@ impl<'a> ExpansionContext<'a> {
                             in_conditional_branch,
                         });
                         for argument in args.into_iter().rev() {
+                            self.acquire_substitution(&subst)?;
                             tasks.push(ExpansionTask::Expression {
                                 expression: argument,
                                 subst: subst.clone(),
@@ -559,84 +842,84 @@ impl<'a> ExpansionContext<'a> {
                         }
                     }
                     ArithExpr::Add(left, right) => {
-                        Self::schedule_binary(
+                        self.schedule_binary(
                             &mut tasks,
                             *left,
                             *right,
                             subst,
                             in_conditional_branch,
                             ArithExpr::Add,
-                        );
+                        )?;
                     }
                     ArithExpr::Sub(left, right) => {
-                        Self::schedule_binary(
+                        self.schedule_binary(
                             &mut tasks,
                             *left,
                             *right,
                             subst,
                             in_conditional_branch,
                             ArithExpr::Sub,
-                        );
+                        )?;
                     }
                     ArithExpr::Mul(left, right) => {
-                        Self::schedule_binary(
+                        self.schedule_binary(
                             &mut tasks,
                             *left,
                             *right,
                             subst,
                             in_conditional_branch,
                             ArithExpr::Mul,
-                        );
+                        )?;
                     }
                     ArithExpr::Div(left, right) => {
-                        Self::schedule_binary(
+                        self.schedule_binary(
                             &mut tasks,
                             *left,
                             *right,
                             subst,
                             in_conditional_branch,
                             ArithExpr::Div,
-                        );
+                        )?;
                     }
                     ArithExpr::Mod(left, right) => {
-                        Self::schedule_binary(
+                        self.schedule_binary(
                             &mut tasks,
                             *left,
                             *right,
                             subst,
                             in_conditional_branch,
                             ArithExpr::Mod,
-                        );
+                        )?;
                     }
                     ArithExpr::Min(left, right) => {
-                        Self::schedule_binary(
+                        self.schedule_binary(
                             &mut tasks,
                             *left,
                             *right,
                             subst,
                             in_conditional_branch,
                             ArithExpr::Min,
-                        );
+                        )?;
                     }
                     ArithExpr::Max(left, right) => {
-                        Self::schedule_binary(
+                        self.schedule_binary(
                             &mut tasks,
                             *left,
                             *right,
                             subst,
                             in_conditional_branch,
                             ArithExpr::Max,
-                        );
+                        )?;
                     }
                     ArithExpr::Pow(left, right) => {
-                        Self::schedule_binary(
+                        self.schedule_binary(
                             &mut tasks,
                             *left,
                             *right,
                             subst,
                             in_conditional_branch,
                             ArithExpr::Pow,
-                        );
+                        )?;
                     }
                     ArithExpr::Abs(inner) => {
                         tasks.push(ExpansionTask::FinishAbs);
@@ -661,6 +944,9 @@ impl<'a> ExpansionContext<'a> {
                         then_expr,
                         else_expr,
                     } => {
+                        for _ in 0..3 {
+                            self.acquire_substitution(&subst)?;
+                        }
                         tasks.push(ExpansionTask::FinishConditional(cond_op));
                         tasks.push(ExpansionTask::Expression {
                             expression: *else_expr,
@@ -693,10 +979,20 @@ impl<'a> ExpansionContext<'a> {
                         .len()
                         .checked_sub(argument_count)
                         .expect("function arguments produce expansion values");
+                    self.acquire_calculated(crate::compile::push_vector_allocation_bytes::<
+                        ExpandedExpression,
+                    >(argument_count))?;
                     let argument_values = values.split_off(start);
                     let mut generated_literals = Vec::new();
+                    self.acquire_calculated(crate::compile::push_vector_allocation_bytes::<
+                        ArithExpr,
+                    >(argument_count))?;
                     let mut args = Vec::with_capacity(argument_count);
                     for argument in argument_values {
+                        self.reserve_vector(
+                            &mut generated_literals,
+                            argument.generated_literals.len(),
+                        )?;
                         generated_literals.extend(argument.generated_literals);
                         args.push(argument.expression);
                     }
@@ -723,6 +1019,10 @@ impl<'a> ExpansionContext<'a> {
                     args,
                     in_conditional_branch,
                 } => {
+                    if let Some(function) = self.registry.get(&name) {
+                        let bytes = function.owned_allocation_bytes();
+                        self.acquire_calculated(bytes)?;
+                    }
                     let func =
                         self.registry.get(&name).cloned().ok_or_else(|| {
                             FunctionError::UndefinedFunction { name: name.clone() }
@@ -739,6 +1039,14 @@ impl<'a> ExpansionContext<'a> {
                     }
 
                     self.depth += 1;
+                    self.acquire_calculated(crate::compile::hash_allocation_bytes::<
+                        String,
+                        ArithExpr,
+                    >(func.params.len()))?;
+                    for (parameter, argument) in func.params.iter().zip(&args) {
+                        self.acquire(parameter.name.len() as u64)?;
+                        self.acquire_calculated(argument.owned_allocation_bytes())?;
+                    }
                     let subst = func
                         .params
                         .iter()
@@ -788,6 +1096,10 @@ impl<'a> ExpansionContext<'a> {
                         }
                     }
                     FuncBody::Conditional(conditional) => {
+                        self.acquire(function_name.len() as u64)?;
+                        for _ in 0..3 {
+                            self.acquire_substitution(&subst)?;
+                        }
                         tasks.push(ExpansionTask::FinishConditional(conditional.cond_op));
                         tasks.push(ExpansionTask::FunctionBody {
                             function_name: function_name.clone(),
@@ -821,6 +1133,7 @@ impl<'a> ExpansionContext<'a> {
                     let mut expanded = values
                         .pop()
                         .expect("function call produces an expansion value");
+                    self.reserve_vector(&mut literals, expanded.generated_literals.len())?;
                     literals.append(&mut expanded.generated_literals);
                     expanded.generated_literals = literals;
                     values.push(expanded);
@@ -828,17 +1141,24 @@ impl<'a> ExpansionContext<'a> {
                 ExpansionTask::FinishBinary { constructor } => {
                     let right = values.pop().expect("right expression is expanded");
                     let mut left = values.pop().expect("left expression is expanded");
+                    self.reserve_vector(
+                        &mut left.generated_literals,
+                        right.generated_literals.len(),
+                    )?;
+                    self.acquire(2 * std::mem::size_of::<ArithExpr>() as u64)?;
                     left.generated_literals.extend(right.generated_literals);
                     left.expression =
                         constructor(Box::new(left.expression), Box::new(right.expression));
                     values.push(left);
                 }
                 ExpansionTask::FinishAbs => {
+                    self.acquire(std::mem::size_of::<ArithExpr>() as u64)?;
                     let mut expanded = values.pop().expect("absolute-value operand is expanded");
                     expanded.expression = ArithExpr::Abs(Box::new(expanded.expression));
                     values.push(expanded);
                 }
                 ExpansionTask::FinishCast(target) => {
+                    self.acquire(std::mem::size_of::<ArithExpr>() as u64)?;
                     let mut expanded = values.pop().expect("cast operand is expanded");
                     expanded.expression = ArithExpr::Cast(Box::new(expanded.expression), target);
                     values.push(expanded);
@@ -848,6 +1168,18 @@ impl<'a> ExpansionContext<'a> {
                     let then_value = values.pop().expect("then branch is expanded");
                     let right = values.pop().expect("condition right side is expanded");
                     let mut left = values.pop().expect("condition left side is expanded");
+                    let additional = right
+                        .generated_literals
+                        .len()
+                        .checked_add(then_value.generated_literals.len())
+                        .and_then(|n| n.checked_add(else_value.generated_literals.len()))
+                        .ok_or_else(|| FunctionError::AllocationRejected {
+                            cause: Arc::new(xlog_core::XlogError::Compilation(
+                                "function literal allocation extent overflow".into(),
+                            )),
+                        })?;
+                    self.reserve_vector(&mut left.generated_literals, additional)?;
+                    self.acquire(4 * std::mem::size_of::<ArithExpr>() as u64)?;
                     left.generated_literals.extend(right.generated_literals);
                     left.generated_literals
                         .extend(then_value.generated_literals);
@@ -876,6 +1208,7 @@ impl<'a> ExpansionContext<'a> {
                         });
                     }
                     PreparedPredicateLiteral::Literal(literal) => {
+                        self.acquire(std::mem::size_of::<BodyLiteral>() as u64)?;
                         predicate_literal_values.push(vec![literal]);
                     }
                 },
@@ -883,6 +1216,7 @@ impl<'a> ExpansionContext<'a> {
                     let mut expanded = values
                         .pop()
                         .expect("predicate-body binding expression is expanded");
+                    self.reserve_vector(&mut expanded.generated_literals, 1)?;
                     expanded
                         .generated_literals
                         .push(BodyLiteral::IsExpr(IsExpr {
@@ -899,11 +1233,26 @@ impl<'a> ExpansionContext<'a> {
                         .len()
                         .checked_sub(literal_count)
                         .expect("predicate literals produce expansion values");
-                    let generated_literals = predicate_literal_values
+                    self.acquire_calculated(crate::compile::push_vector_allocation_bytes::<
+                        Vec<BodyLiteral>,
+                    >(literal_count))?;
+                    let literal_extent = predicate_literal_values[start..]
+                        .iter()
+                        .try_fold(0usize, |n, literals| n.checked_add(literals.len()))
+                        .ok_or_else(|| FunctionError::AllocationRejected {
+                            cause: Arc::new(xlog_core::XlogError::Compilation(
+                                "function literal extent overflow".into(),
+                            )),
+                        })?;
+                    self.acquire_calculated(crate::compile::push_vector_allocation_bytes::<
+                        BodyLiteral,
+                    >(literal_extent))?;
+                    let generated_literals: Vec<BodyLiteral> = predicate_literal_values
                         .split_off(start)
                         .into_iter()
                         .flatten()
                         .collect();
+                    self.acquire_literal_variables(None, &generated_literals)?;
                     let (generated_literals, result) =
                         inline_trailing_predicate_result_binding(generated_literals, result);
                     values.push(ExpandedExpression {
@@ -923,13 +1272,15 @@ impl<'a> ExpansionContext<'a> {
     }
 
     fn schedule_binary(
+        &mut self,
         tasks: &mut Vec<ExpansionTask>,
         left: ArithExpr,
         right: ArithExpr,
         subst: HashMap<String, ArithExpr>,
         in_conditional_branch: bool,
         constructor: BinaryExpressionConstructor,
-    ) {
+    ) -> Result<(), FunctionError> {
+        self.acquire_substitution(&subst)?;
         tasks.push(ExpansionTask::FinishBinary { constructor });
         tasks.push(ExpansionTask::Expression {
             expression: right,
@@ -941,6 +1292,7 @@ impl<'a> ExpansionContext<'a> {
             subst,
             in_conditional_branch,
         });
+        Ok(())
     }
 
     #[cfg(test)]
@@ -981,15 +1333,66 @@ pub fn expand_program_functions_owned(
     expand_program_functions_impl(&program, max_depth)
 }
 
+/// Expand the original machine with custody from the caller's pool.
+pub fn expand_program_functions_owned_with_allocation_owner(
+    program: Program,
+    max_depth: u32,
+    allocations: &mut crate::compile::CompilationAllocationScope<'_>,
+) -> Result<Program, FunctionError> {
+    if program.functions.is_empty() {
+        return Ok(program);
+    }
+    let mut reserve = |bytes| allocations.acquire(bytes);
+    expand_program_functions_with_owner(&program, max_depth, Some(&mut reserve))
+}
+
 fn expand_program_functions_impl(
     program: &Program,
     max_depth: u32,
 ) -> Result<Program, FunctionError> {
+    expand_program_functions_with_owner(program, max_depth, None)
+}
+
+fn expand_program_functions_with_owner(
+    program: &Program,
+    max_depth: u32,
+    mut allocate: Option<&mut dyn FnMut(u64) -> xlog_core::Result<Arc<dyn Send + Sync>>>,
+) -> Result<Program, FunctionError> {
+    if let Some(allocate) = allocate.as_mut() {
+        let bytes = program.owned_allocation_bytes().map_err(|cause| {
+            FunctionError::AllocationRejected {
+                cause: Arc::new(cause),
+            }
+        })?;
+        allocate(bytes).map_err(|cause| FunctionError::AllocationRejected {
+            cause: Arc::new(cause),
+        })?;
+    }
     let mut registry = FunctionRegistry::new();
     for function in &program.functions {
-        registry.register(function.clone())?;
+        if let Some(allocate) = allocate.as_mut() {
+            let bytes = function.owned_allocation_bytes().map_err(|cause| {
+                FunctionError::AllocationRejected {
+                    cause: Arc::new(cause),
+                }
+            })?;
+            allocate(bytes).map_err(|cause| FunctionError::AllocationRejected {
+                cause: Arc::new(cause),
+            })?;
+            registry.register_owned(function.clone(), Some(&mut **allocate))?;
+        } else {
+            registry.register_owned(function.clone(), None)?;
+        }
     }
     let mut ctx = ExpansionContext::new(&registry, max_depth);
+    // Coerce the original callback inside the option: the context borrows it
+    // only for this expansion, independently of the caller's object lifetime.
+    ctx.allocation_owner = allocate
+        .as_deref_mut()
+        .map(|owner| owner as &mut dyn FnMut(u64) -> xlog_core::Result<Arc<dyn Send + Sync>>);
+    ctx.acquire_calculated(crate::compile::push_vector_allocation_bytes::<Rule>(
+        program.rules.len(),
+    ))?;
 
     // Expand function calls in each rule
     let expanded_rules: Result<Vec<Rule>, FunctionError> = program
@@ -997,6 +1400,9 @@ fn expand_program_functions_impl(
         .iter()
         .map(|rule| expand_rule_functions(&mut ctx, rule))
         .collect();
+    ctx.acquire_calculated(crate::compile::push_vector_allocation_bytes::<Constraint>(
+        program.constraints.len(),
+    ))?;
     let expanded_constraints: Result<Vec<Constraint>, FunctionError> = program
         .constraints
         .iter()
@@ -1024,6 +1430,8 @@ fn expand_program_functions_impl(
 
 /// Expand function calls in a single rule.
 fn expand_rule_functions(ctx: &mut ExpansionContext, rule: &Rule) -> Result<Rule, FunctionError> {
+    ctx.acquire_literal_variables(Some(&rule.head), &rule.body)?;
+    ctx.acquire_calculated(rule.head.owned_allocation_bytes())?;
     let mut used_variables: HashSet<String> = rule
         .head
         .variables()
@@ -1043,6 +1451,7 @@ fn expand_constraint_functions(
     ctx: &mut ExpansionContext,
     constraint: &Constraint,
 ) -> Result<Constraint, FunctionError> {
+    ctx.acquire_literal_variables(None, &constraint.body)?;
     let mut used_variables: HashSet<String> = constraint
         .body
         .iter()
@@ -1062,7 +1471,9 @@ fn expand_body_functions(
 ) -> Result<Vec<BodyLiteral>, FunctionError> {
     let mut expanded_body = Vec::new();
     for literal in body {
-        expanded_body.extend(ctx.expand_literal_for_rule(literal, used_variables)?);
+        let expanded = ctx.expand_literal_for_rule(literal, used_variables)?;
+        ctx.reserve_vector(&mut expanded_body, expanded.len())?;
+        expanded_body.extend(expanded);
     }
     Ok(expanded_body)
 }

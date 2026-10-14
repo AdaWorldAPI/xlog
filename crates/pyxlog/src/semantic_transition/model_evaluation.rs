@@ -2,8 +2,9 @@
 
 use super::*;
 use xlog_cuda::{
-    SemanticCancelledModelEvaluation, SemanticCompletedModelEvaluation, SemanticEvaluationCohort,
-    SemanticModelEvaluation, SemanticModelEvaluationResult,
+    SemanticCancelledEvaluationCapture, SemanticCancelledModelEvaluation,
+    SemanticCompletedModelEvaluation, SemanticEvaluationCohort, SemanticModelEvaluation,
+    SemanticModelEvaluationResult,
 };
 
 pyo3::create_exception!(
@@ -12,6 +13,42 @@ pyo3::create_exception!(
     PyRuntimeError,
     "An original evaluation or its cold producer awaits completion; retain its owners and never resubmit."
 );
+
+/// Known original non-submission, independent of the temporary capture owners.
+#[pyclass(
+    name = "SemanticCancelledModelEvaluation",
+    module = "pyxlog._native",
+    frozen
+)]
+pub(crate) struct PySemanticCancelledModelEvaluation {
+    inner: SemanticCancelledModelEvaluation,
+}
+
+#[pymethods]
+impl PySemanticCancelledModelEvaluation {
+    /// Native recorder entry is not a successful evaluation or Python completion.
+    #[getter]
+    fn capture_disposition(&self) -> &'static str {
+        match self.inner.capture_disposition() {
+            SemanticCancelledEvaluationCapture::NotEntered => "not-entered",
+            SemanticCancelledEvaluationCapture::EnteredAborted => "entered-aborted",
+            SemanticCancelledEvaluationCapture::RecordedAndCancelled => "recorded-and-cancelled",
+        }
+    }
+
+    /// Authenticate against the actual original invocation, never counts or flags.
+    fn belongs_to(&self, py: Python<'_>, original: &PySemanticModelEvaluation) -> PyResult<bool> {
+        let parent = original.parent.borrow(py);
+        let session = parent.session.borrow(py);
+        session.require_creator()?;
+        let owner = session.owner()?;
+        Ok(self.inner.belongs_to(&owner, &original.inner)
+            && self.inner.parent()
+                == owner
+                    .published_identity(&*parent.lease()?)
+                    .map_err(xlog_err)?)
+    }
+}
 
 /// Immutable completed observation, deliberately independent of the temporary
 /// evaluation's original model, selected cohort, reader and CUDA allocations.
@@ -120,7 +157,7 @@ pub(super) struct PendingEvaluationPreparation {
     parent: Py<PySemanticPublishedParent>,
     task_use: Py<PySemanticTransitionTaskUse>,
     requested_cohort: Option<Py<PySemanticEvaluationCohort>>,
-    capacity: usize,
+    capacity: Option<usize>,
     binding: (Option<String>, Vec<u8>),
     inner: Option<SemanticModelEvaluation>,
     cohort: Option<Py<PySemanticEvaluationCohort>>,
@@ -130,6 +167,61 @@ pub(super) struct PendingEvaluationPreparation {
 }
 
 impl PySemanticModelEvaluation {
+    pub(in crate::semantic_transition) fn issue_model_work_buffer_port(
+        &self,
+        py: Python<'_>,
+        stream: u64,
+    ) -> PyResult<xlog_cuda::SemanticModelWorkBufferPort> {
+        let parent = self.parent.borrow(py);
+        let session = parent.session.borrow(py);
+        session.require_creator()?;
+        let owner = session.owner()?;
+        self.check(py, &owner)?;
+        let result = owner
+            .evaluation_model_work_buffer_port(&*parent.lease()?, &self.inner, stream)
+            .map_err(xlog_err);
+        result
+    }
+
+    pub(in crate::semantic_transition) fn finalized_model_work_extent(
+        &self,
+        py: Python<'_>,
+        port: &xlog_cuda::SemanticModelWorkBufferPort,
+    ) -> PyResult<usize> {
+        let parent = self.parent.borrow(py);
+        let session = parent.session.borrow(py);
+        session.require_creator()?;
+        let owner = session.owner()?;
+        self.check(py, &owner)?;
+        let result = owner
+            .evaluation_model_work_buffer_port_finalized_extent(
+                &*parent.lease()?,
+                port,
+                &self.inner,
+            )
+            .map_err(xlog_err);
+        result
+    }
+
+    pub(in crate::semantic_transition) fn export_model_work_buffer_port(
+        &self,
+        py: Python<'_>,
+        port: &xlog_cuda::SemanticModelWorkBufferPort,
+    ) -> PyResult<(
+        xlog_cuda::SemanticModelWorkBufferExport,
+        Py<PySemanticTransitionSession>,
+    )> {
+        let parent = self.parent.borrow(py);
+        let session = parent.session.borrow(py);
+        session.require_creator()?;
+        let mut owner = session.owner()?;
+        self.check(py, &owner)?;
+        let result = owner
+            .export_evaluation_model_work_buffer_port(&*parent.lease()?, port, &self.inner)
+            .map_err(xlog_err)?;
+        Ok((result, parent.session.clone_ref(py)))
+    }
+
     pub(in crate::semantic_transition) fn prepare_cold_content(
         &self,
         py: Python<'_>,
@@ -419,6 +511,52 @@ impl Drop for PySemanticModelEvaluation {
 
 #[pymethods]
 impl PySemanticModelEvaluation {
+    /// Admit the complete original capture recipe before its work-slot export.
+    fn admit_plan(
+        &self,
+        py: Python<'_>,
+        operations: &Bound<'_, PyAny>,
+    ) -> PyResult<(u64, u64, u64)> {
+        if !operations.is_exact_instance_of::<PyTuple>() {
+            return Err(invalid(
+                "evaluation capture plan requires an exact immutable tuple",
+            ));
+        }
+        let mut recipe = Vec::new();
+        let operations = operations.cast::<PyTuple>()?;
+        recipe
+            .try_reserve_exact(operations.len())
+            .map_err(|_| invalid("evaluation capture plan reservation failed"))?;
+        for operation in operations.iter() {
+            if !operation.is_exact_instance_of::<PyTuple>()
+                || operation.cast::<PyTuple>()?.len() != 2
+            {
+                return Err(invalid(
+                    "evaluation capture plan requires exact kind and geometry pairs",
+                ));
+            }
+            let operation = operation.cast::<PyTuple>()?;
+            let kind = operation.get_item(0)?;
+            let dimensions = operation.get_item(1)?;
+            if !dimensions.is_exact_instance_of::<PyTuple>() {
+                return Err(invalid(
+                    "evaluation capture geometry requires an exact immutable tuple",
+                ));
+            }
+            let (kind, dimensions, rank) = parse_model_work(&kind, &dimensions)?;
+            recipe.push((kind, dimensions[..rank].to_vec()));
+        }
+        let parent = self.parent.borrow(py);
+        let session = parent.session.borrow(py);
+        session.require_creator()?;
+        let mut owner = session.owner()?;
+        self.check(py, &owner)?;
+        let quantities = owner
+            .admit_model_evaluation_plan(&*parent.lease()?, &self.inner, &recipe)
+            .map_err(xlog_err)?;
+        Ok((quantities[0], quantities[1], quantities[2]))
+    }
+
     #[getter]
     fn cohort(&self, py: Python<'_>) -> Py<PySemanticEvaluationCohort> {
         self.cohort.clone_ref(py)
@@ -431,6 +569,91 @@ impl PySemanticModelEvaluation {
         let owner = session.owner()?;
         self.check(py, &owner)?;
         owner.evaluation_stream(&self.inner).map_err(xlog_err)
+    }
+
+    /// Allocation-backed cohort geometry without resuming preparation.
+    #[pyo3(signature = (*, consumer_stream))]
+    fn training_view_layouts(
+        &self,
+        py: Python<'_>,
+        consumer_stream: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyTuple>> {
+        let stream = parse_witness_consumer_stream(consumer_stream, &mut 128)?;
+        let parent = self.parent.borrow(py);
+        let session = parent.session.borrow(py);
+        session.require_creator()?;
+        let owner = session.owner()?;
+        self.check(py, &owner)?;
+        let original = owner
+            .evaluation_training_view_layouts(&*parent.lease()?, &self.inner, stream)
+            .map_err(xlog_err)?;
+        let mut rows = Vec::with_capacity(original.len());
+        for (provenance, shape, strides, dtype) in original {
+            rows.push(
+                (
+                    Py::new(
+                        py,
+                        PyNativeTensorAllocation {
+                            provenance,
+                            policy_layout: None,
+                        },
+                    )?,
+                    PyTuple::new(py, shape)?,
+                    PyTuple::new(py, strides)?,
+                    dtype,
+                )
+                    .into_pyobject(py)?
+                    .unbind(),
+            );
+        }
+        Ok(PyTuple::new(py, rows)?.unbind())
+    }
+
+    /// Original capture counter ownership before its complete plan is frozen.
+    #[pyo3(signature = (*, consumer_stream))]
+    fn model_work_buffer_port(
+        slf: Py<Self>,
+        py: Python<'_>,
+        consumer_stream: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<super::model_work_port::PySemanticModelWorkBufferPort>> {
+        let stream = parse_witness_consumer_stream(consumer_stream, &mut 128)?;
+        let port = slf.borrow(py).issue_model_work_buffer_port(py, stream)?;
+        Py::new(
+            py,
+            super::model_work_port::PySemanticModelWorkBufferPort::new_evaluation(slf, port),
+        )
+    }
+
+    /// Original numerical scratch geometry, not the cold-report scratch.
+    #[pyo3(signature = (*, consumer_stream))]
+    fn model_work_buffer_layout(
+        &self,
+        py: Python<'_>,
+        consumer_stream: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyTuple>> {
+        let stream = parse_witness_consumer_stream(consumer_stream, &mut 128)?;
+        let parent = self.parent.borrow(py);
+        let session = parent.session.borrow(py);
+        session.require_creator()?;
+        let owner = session.owner()?;
+        self.check(py, &owner)?;
+        let (provenance, shape, strides, dtype) = owner
+            .evaluation_model_work_buffer_layout(&*parent.lease()?, &self.inner, stream)
+            .map_err(xlog_err)?;
+        Ok((
+            Py::new(
+                py,
+                PyNativeTensorAllocation {
+                    provenance,
+                    policy_layout: None,
+                },
+            )?,
+            PyTuple::new(py, shape)?,
+            PyTuple::new(py, strides)?,
+            dtype,
+        )
+            .into_pyobject(py)?
+            .unbind())
     }
 
     /// All seventeen original ports, unchanged for source and final models.
@@ -825,26 +1048,62 @@ impl PySemanticModelEvaluation {
         }
         self.restore_phase(py)
     }
+
+    /// Project only the retained proof of a known original native cancellation.
+    fn cancellation_proof(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<Py<PySemanticCancelledModelEvaluation>> {
+        let parent = self.parent.borrow(py);
+        let session = parent.session.borrow(py);
+        session.require_creator()?;
+        let owner = session.owner()?;
+        let retained = self
+            .cancelled
+            .lock()
+            .map_err(|_| invalid("evaluation cancellation custody is poisoned"))?;
+        let original = retained
+            .as_ref()
+            .ok_or_else(|| invalid("evaluation has no known original cancellation proof"))?;
+        if !original.belongs_to(&owner, &self.inner)
+            || original.parent()
+                != owner
+                    .published_identity(&*parent.lease()?)
+                    .map_err(xlog_err)?
+        {
+            return Err(invalid(
+                "evaluation cancellation changed its original invocation or parent",
+            ));
+        }
+        Py::new(
+            py,
+            PySemanticCancelledModelEvaluation {
+                inner: original.clone(),
+            },
+        )
+    }
 }
 
 #[pymethods]
 impl PySemanticTransitionController {
     /// Issue a genuine read-only owner on the acquired parent. Subsequent
     /// final observations pass the source's cohort, even across full restore.
-    #[pyo3(signature = (task_use, parent, *, model_work_capacity, cohort=None))]
+    #[pyo3(signature = (task_use, parent, *, model_work_capacity=None, cohort=None))]
     fn prepare_model_evaluation(
         &self,
         py: Python<'_>,
         task_use: Py<PySemanticTransitionTaskUse>,
         parent: Py<PySemanticPublishedParent>,
-        model_work_capacity: &Bound<'_, PyAny>,
+        model_work_capacity: Option<&Bound<'_, PyAny>>,
         cohort: Option<Py<PySemanticEvaluationCohort>>,
     ) -> PyResult<Py<PySemanticModelEvaluation>> {
-        let capacity =
-            usize::try_from(ColdValue::read(model_work_capacity, &mut 128, 0)?.unsigned()?)
-                .map_err(|_| {
+        let capacity = model_work_capacity
+            .map(|capacity| {
+                usize::try_from(ColdValue::read(capacity, &mut 128, 0)?.unsigned()?).map_err(|_| {
                     invalid("evaluation model work capacity exceeds native address space")
-                })?;
+                })
+            })
+            .transpose()?;
         let acquired = parent.borrow(py);
         let session = self.session.borrow(py);
         session.require_creator()?;
@@ -958,14 +1217,16 @@ impl PySemanticTransitionController {
         }
         let original = pending.as_mut().expect("retained preparation inputs");
         if original.inner.is_none() {
-            match owner.prepare_model_evaluation(
-                &lease,
-                original
-                    .requested_cohort
-                    .as_ref()
-                    .map(|value| Arc::clone(&value.borrow(py).inner)),
-                capacity,
-            ) {
+            let requested_cohort = original
+                .requested_cohort
+                .as_ref()
+                .map(|value| Arc::clone(&value.borrow(py).inner));
+            let prepared = if let Some(capacity) = capacity {
+                owner.prepare_model_evaluation(&lease, requested_cohort, capacity)
+            } else {
+                owner.prepare_model_evaluation_deferred(&lease, requested_cohort)
+            };
+            match prepared {
                 Ok(inner) => original.inner = Some(inner),
                 Err(error) => {
                     let error = xlog_err(error);

@@ -4,6 +4,36 @@ use crate::ast::{BodyLiteral, Program};
 use std::collections::{HashMap, HashSet};
 use xlog_core::{Result, XlogError};
 
+struct StratificationAllocations<'a, 'b> {
+    scope: Option<&'a mut crate::compile::CompilationAllocationScope<'b>>,
+}
+impl StratificationAllocations<'_, '_> {
+    fn acquire(&mut self, bytes: u64) -> Result<()> {
+        if bytes != 0 {
+            if let Some(scope) = self.scope.as_deref_mut() {
+                scope.acquire(bytes)?;
+            }
+        }
+        Ok(())
+    }
+    fn vector<T>(&mut self, count: usize) -> Result<()> {
+        if self.scope.is_some() {
+            self.acquire(crate::compile::push_vector_allocation_bytes::<T>(count)?)?;
+        }
+        Ok(())
+    }
+    fn hash<K, V>(&mut self, count: usize) -> Result<()> {
+        if self.scope.is_some() {
+            self.acquire(
+                crate::compile::hash_allocation_bytes::<K, V>(count)?
+                    .checked_mul(2)
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("stratification table"))?,
+            )?;
+        }
+        Ok(())
+    }
+}
+
 /// Dependency edge type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DepType {
@@ -68,25 +98,55 @@ impl DependencyGraph {
             None => Vec::new(),
         }
     }
+
+    pub(crate) fn outgoing_len(&self, pred: &str) -> usize {
+        self.adjacency.get(pred).map(Vec::len).unwrap_or(0)
+    }
 }
 
 /// Build dependency graph from program
 pub fn build_dependency_graph(program: &Program) -> DependencyGraph {
+    build_dependency_graph_with_owner(program, &mut StratificationAllocations { scope: None })
+        .expect("ordinary dependency construction has no allocation callback")
+}
+
+pub(crate) fn build_dependency_graph_with_allocation_owner(
+    program: &Program,
+    scope: &mut crate::compile::CompilationAllocationScope<'_>,
+) -> Result<DependencyGraph> {
+    build_dependency_graph_with_owner(
+        program,
+        &mut StratificationAllocations { scope: Some(scope) },
+    )
+}
+
+fn build_dependency_graph_with_owner(
+    program: &Program,
+    allocations: &mut StratificationAllocations<'_, '_>,
+) -> Result<DependencyGraph> {
     let mut graph = DependencyGraph::new();
 
     for rule in &program.rules {
         let head = &rule.head.predicate;
+        allocations.acquire(head.len() as u64)?;
+        if !graph.predicates.contains(head) && graph.predicates.len() == graph.predicates.capacity()
+        {
+            allocations.hash::<String, ()>(graph.predicates.len() + 1)?;
+        }
         graph.add_predicate(head.clone());
 
         for lit in &rule.body {
             match lit {
                 BodyLiteral::Positive(atom) => {
+                    acquire_edge(&graph, head, &atom.predicate, allocations)?;
                     graph.add_edge(head.clone(), atom.predicate.clone(), DepType::Positive);
                 }
                 BodyLiteral::Negated(atom) => {
+                    acquire_edge(&graph, head, &atom.predicate, allocations)?;
                     graph.add_edge(head.clone(), atom.predicate.clone(), DepType::Negative);
                 }
                 BodyLiteral::Epistemic(lit) => {
+                    acquire_edge(&graph, head, &lit.atom.predicate, allocations)?;
                     graph.add_edge(head.clone(), lit.atom.predicate.clone(), DepType::Negative);
                 }
                 BodyLiteral::Comparison(_) | BodyLiteral::IsExpr(_) | BodyLiteral::Univ(_) => {}
@@ -96,6 +156,7 @@ pub fn build_dependency_graph(program: &Program) -> DependencyGraph {
         if rule.has_aggregation() {
             for lit in &rule.body {
                 if let BodyLiteral::Positive(atom) = lit {
+                    acquire_edge(&graph, head, &atom.predicate, allocations)?;
                     graph.add_edge(head.clone(), atom.predicate.clone(), DepType::Aggregate);
                 }
             }
@@ -108,21 +169,105 @@ pub fn build_dependency_graph(program: &Program) -> DependencyGraph {
     // template's body predicates as positive dependencies.
     for lr in &program.learnable_rules {
         let head = &lr.head.predicate;
+        allocations.acquire(head.len() as u64)?;
+        if !graph.predicates.contains(head) && graph.predicates.len() == graph.predicates.capacity()
+        {
+            allocations.hash::<String, ()>(graph.predicates.len() + 1)?;
+        }
         graph.add_predicate(head.clone());
         for body_lit in &lr.body {
             if let Some(atom) = body_lit.atom() {
+                allocations.acquire(atom.predicate.len() as u64)?;
+                if !graph.predicates.contains(&atom.predicate)
+                    && graph.predicates.len() == graph.predicates.capacity()
+                {
+                    allocations.hash::<String, ()>(graph.predicates.len() + 1)?;
+                }
                 graph.add_predicate(atom.predicate.clone());
+                acquire_edge(&graph, head, &atom.predicate, allocations)?;
                 graph.add_edge(head.clone(), atom.predicate.clone(), DepType::Positive);
             }
         }
     }
 
-    graph
+    Ok(graph)
+}
+
+fn acquire_edge(
+    graph: &DependencyGraph,
+    from: &str,
+    to: &str,
+    allocations: &mut StratificationAllocations<'_, '_>,
+) -> Result<()> {
+    if allocations.scope.is_some() {
+        let text = (from.len() as u64)
+            .checked_mul(3)
+            .and_then(|n| n.checked_add((to.len() as u64).checked_mul(2)?))
+            .ok_or_else(|| XlogError::allocation_extent_overflow("dependency text"))?;
+        allocations.acquire(text)?;
+        if graph.predicates.capacity() - graph.predicates.len() < 2 {
+            allocations.hash::<String, ()>(graph.predicates.len() + 2)?;
+        }
+        if graph.edges.len() == graph.edges.capacity() {
+            allocations.vector::<DepEdge>(graph.edges.len() + 1)?;
+        }
+        if !graph.adjacency.contains_key(from)
+            && graph.adjacency.len() == graph.adjacency.capacity()
+        {
+            allocations.hash::<String, Vec<usize>>(graph.adjacency.len() + 1)?;
+        }
+        let (length, capacity) = graph
+            .adjacency
+            .get(from)
+            .map(|v| (v.len(), v.capacity()))
+            .unwrap_or((0, 0));
+        if length == capacity {
+            allocations.vector::<usize>(length + 1)?;
+        }
+    }
+    Ok(())
 }
 
 /// Find strongly connected components using Tarjan's algorithm
 /// Returns SCCs in reverse topological order (dependencies first)
 fn find_sccs(graph: &DependencyGraph) -> Vec<Vec<String>> {
+    find_sccs_with_owner(graph, &mut StratificationAllocations { scope: None })
+        .expect("ordinary SCC analysis has no allocation callback")
+}
+
+fn find_sccs_with_owner(
+    graph: &DependencyGraph,
+    allocations: &mut StratificationAllocations<'_, '_>,
+) -> Result<Vec<Vec<String>>> {
+    if allocations.scope.is_some() {
+        let count = graph.predicates.len();
+        let mut text = 0u64;
+        for name in &graph.predicates {
+            text = text
+                .checked_add(
+                    (name.len() as u64)
+                        .checked_mul(4)
+                        .ok_or_else(|| XlogError::allocation_extent_overflow("SCC text"))?,
+                )
+                .ok_or_else(|| XlogError::allocation_extent_overflow("SCC text"))?;
+        }
+        for edge in &graph.edges {
+            text = text
+                .checked_add(edge.to.len() as u64)
+                .and_then(|n| n.checked_add(edge.from.len() as u64))
+                .ok_or_else(|| XlogError::allocation_extent_overflow("SCC text"))?;
+        }
+        allocations.acquire(text)?;
+        allocations.hash::<String, usize>(count)?;
+        allocations.hash::<String, usize>(count)?;
+        allocations.hash::<String, ()>(count)?;
+        allocations.vector::<String>(count)?;
+        allocations.vector::<String>(count)?;
+        allocations.vector::<Vec<String>>(count)?;
+        allocations.vector::<&String>(count)?;
+        allocations.vector::<String>(graph.edges.len())?;
+        allocations.vector::<&DepEdge>(graph.edges.len())?;
+    }
     struct TarjanState<'a> {
         graph: &'a DependencyGraph,
         next_index: usize,
@@ -202,7 +347,7 @@ fn find_sccs(graph: &DependencyGraph) -> Vec<Vec<String>> {
         }
     }
 
-    state.components
+    Ok(state.components)
 }
 
 /// Check for cycles through negation/aggregation in an SCC
@@ -250,8 +395,28 @@ pub struct StratificationResult {
 
 /// Perform stratification analysis
 pub fn stratify(program: &Program) -> Result<Vec<Stratum>> {
-    let graph = build_dependency_graph(program);
-    let sccs = find_sccs(&graph);
+    stratify_with_owner(program, &mut StratificationAllocations { scope: None })
+}
+
+/// Stratify through the same original dependency and SCC cores with custody.
+pub fn stratify_with_allocation_owner(
+    program: &Program,
+    scope: &mut crate::compile::CompilationAllocationScope<'_>,
+) -> Result<Vec<Stratum>> {
+    stratify_with_owner(
+        program,
+        &mut StratificationAllocations { scope: Some(scope) },
+    )
+}
+
+fn stratify_with_owner(
+    program: &Program,
+    allocations: &mut StratificationAllocations<'_, '_>,
+) -> Result<Vec<Stratum>> {
+    let graph = build_dependency_graph_with_owner(program, allocations)?;
+    let sccs = find_sccs_with_owner(&graph, allocations)?;
+
+    acquire_scc_observations(&sccs, &graph, allocations)?;
 
     for scc in &sccs {
         if let Some(cycle) = check_scc_for_negation_cycle(scc, &graph) {
@@ -266,6 +431,7 @@ pub fn stratify(program: &Program) -> Result<Vec<Stratum>> {
         }
     }
 
+    acquire_stratum_map(&sccs, allocations)?;
     let mut stratum_map: HashMap<String, usize> = HashMap::new();
     let mut max_stratum = 0;
 
@@ -292,6 +458,12 @@ pub fn stratify(program: &Program) -> Result<Vec<Stratum>> {
         max_stratum = max_stratum.max(min_stratum);
     }
 
+    allocations.vector::<Stratum>(
+        max_stratum
+            .checked_add(1)
+            .ok_or_else(|| XlogError::allocation_extent_overflow("stratum"))?,
+    )?;
+    allocations.vector::<String>(graph.predicates.len())?;
     let mut strata: Vec<Stratum> = (0..=max_stratum)
         .map(|id| Stratum {
             id,
@@ -320,8 +492,29 @@ pub fn stratify(program: &Program) -> Result<Vec<Stratum>> {
 /// Analyze stratification for probabilistic inference
 /// Returns detailed information about SCCs and which ones are non-monotone
 pub fn analyze_stratification(program: &Program) -> StratificationResult {
-    let graph = build_dependency_graph(program);
-    let sccs = find_sccs(&graph);
+    analyze_stratification_with_owner(program, &mut StratificationAllocations { scope: None })
+        .expect("ordinary stratification analysis has no allocation callback")
+}
+
+/// Analyze the same original non-monotone SCCs with allocation custody.
+pub fn analyze_stratification_with_allocation_owner(
+    program: &Program,
+    scope: &mut crate::compile::CompilationAllocationScope<'_>,
+) -> Result<StratificationResult> {
+    analyze_stratification_with_owner(
+        program,
+        &mut StratificationAllocations { scope: Some(scope) },
+    )
+}
+
+fn analyze_stratification_with_owner(
+    program: &Program,
+    allocations: &mut StratificationAllocations<'_, '_>,
+) -> Result<StratificationResult> {
+    let graph = build_dependency_graph_with_owner(program, allocations)?;
+    let sccs = find_sccs_with_owner(&graph, allocations)?;
+    acquire_scc_observations(&sccs, &graph, allocations)?;
+    allocations.hash::<usize, ()>(sccs.len())?;
 
     let mut non_monotone_sccs: HashSet<usize> = HashSet::new();
     for (i, scc) in sccs.iter().enumerate() {
@@ -331,6 +524,7 @@ pub fn analyze_stratification(program: &Program) -> StratificationResult {
     }
 
     // Compute strata for predicates in stratified SCCs
+    acquire_stratum_map(&sccs, allocations)?;
     let mut strata: HashMap<String, usize> = HashMap::new();
     let mut max_stratum = 0;
 
@@ -357,17 +551,70 @@ pub fn analyze_stratification(program: &Program) -> StratificationResult {
         max_stratum = max_stratum.max(min_stratum);
     }
 
-    StratificationResult {
+    Ok(StratificationResult {
         sccs,
         non_monotone_sccs,
         strata,
+    })
+}
+
+fn acquire_scc_observations(
+    sccs: &[Vec<String>],
+    graph: &DependencyGraph,
+    allocations: &mut StratificationAllocations<'_, '_>,
+) -> Result<()> {
+    if allocations.scope.is_some() {
+        let count = sccs.iter().map(Vec::len).max().unwrap_or(0);
+        allocations.hash::<&str, ()>(count)?;
+        allocations.vector::<&DepEdge>(graph.edges.len())?;
+        allocations.vector::<String>(count)?;
+        let mut text = 0u64;
+        for scc in sccs {
+            for name in scc {
+                text = text
+                    .checked_add(name.len() as u64)
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("SCC copy"))?;
+            }
+        }
+        allocations.acquire(text)?;
     }
+    Ok(())
+}
+
+fn acquire_stratum_map(
+    sccs: &[Vec<String>],
+    allocations: &mut StratificationAllocations<'_, '_>,
+) -> Result<()> {
+    if allocations.scope.is_some() {
+        let mut count = 0usize;
+        let mut text = 0u64;
+        for scc in sccs {
+            count = count
+                .checked_add(scc.len())
+                .ok_or_else(|| XlogError::allocation_extent_overflow("stratum"))?;
+            for name in scc {
+                text = text
+                    .checked_add(name.len() as u64)
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("stratum copy"))?;
+            }
+        }
+        allocations.hash::<String, usize>(count)?;
+        allocations.acquire(text)?;
+    }
+    Ok(())
 }
 
 /// Find SCCs for the lowering phase
 /// Returns SCCs in reverse topological order (dependencies first)
 pub fn find_sccs_for_lowering(graph: &DependencyGraph) -> Vec<Vec<String>> {
     find_sccs(graph)
+}
+
+pub(crate) fn find_sccs_for_lowering_with_allocation_owner(
+    graph: &DependencyGraph,
+    scope: &mut crate::compile::CompilationAllocationScope<'_>,
+) -> Result<Vec<Vec<String>>> {
+    find_sccs_with_owner(graph, &mut StratificationAllocations { scope: Some(scope) })
 }
 
 #[cfg(test)]

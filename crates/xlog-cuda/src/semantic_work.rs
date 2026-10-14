@@ -384,6 +384,36 @@ impl ModelWorkPlan {
         self.next == self.events.len()
     }
 
+    /// The original consumed declared prefix and its physically recorded slots.
+    /// Only native region cancellation can advance the cursor without recording.
+    pub(crate) fn cursor_projection(
+        &self,
+        region: Option<usize>,
+    ) -> Result<(usize, usize, usize, usize, Vec<(usize, usize)>), &'static str> {
+        let (begin, end) = match region {
+            Some(index) => self.region(index)?,
+            None => (0, self.events.len()),
+        };
+        let mut skipped = Vec::new();
+        skipped
+            .try_reserve(self.recorded_indices.len().saturating_add(1))
+            .map_err(|_| "cold cursor projection reservation failed")?;
+        let mut position = 0;
+        for &recorded in &self.recorded_indices {
+            if recorded < position || recorded >= self.next {
+                return Err("cold cursor lost its original consumed occurrence order");
+            }
+            if position < recorded {
+                skipped.push((position, recorded));
+            }
+            position = recorded + 1;
+        }
+        if position < self.next {
+            skipped.push((position, self.next));
+        }
+        Ok((begin, end, self.next, self.recorded_indices.len(), skipped))
+    }
+
     pub(crate) fn require_recorded_trace(
         &self,
         recorded: &[ModelWorkEvent],

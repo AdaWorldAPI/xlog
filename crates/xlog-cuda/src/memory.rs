@@ -2125,6 +2125,13 @@ pub(crate) struct MemoryEnqueue<'a> {
 }
 
 impl MemoryEnqueue<'_> {
+    pub(crate) fn from_admission<'a>(
+        owner: &'a Arc<MemoryOperationOwner>,
+        submission: &'a crate::cuda_graph::StreamSubmissionPin<'a>,
+    ) -> MemoryEnqueue<'a> {
+        MemoryEnqueue { owner, submission }
+    }
+
     pub(crate) fn cuda_enqueue(
         &self,
     ) -> crate::device_runtime::ResourceResult<crate::launch::CudaEnqueue<'_>> {

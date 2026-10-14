@@ -49,6 +49,7 @@ pub mod module;
 pub mod module_diagnostics;
 pub mod optimizer;
 pub mod parser;
+mod program_custody;
 pub mod promote;
 pub mod proof_trace;
 pub mod resolver;

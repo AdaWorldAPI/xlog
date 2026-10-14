@@ -21,7 +21,8 @@ pub(super) struct PrivateCheckpoint {
     custody: Option<SemanticColdNativeWork>,
     save_entered: bool,
     save_admitted: bool,
-    saved: Option<Py<PyBytes>>,
+    serializer: Option<Py<PyAny>>,
+    saved: Option<Py<material_bytes::PySemanticMaterialBytes>>,
     error: Option<PyErr>,
     closed: bool,
     report: Option<SemanticColdModelWorkResult>,
@@ -72,17 +73,15 @@ impl PySemanticLearningPhaseTransition {
             {
                 return Err(invalid("final handoff precedes known checkpoint accounting or changed its selected owners"));
             }
-            (
-                Arc::<[u8]>::from(
-                    current
-                        .saved
-                        .as_ref()
-                        .ok_or_else(|| invalid("final handoff lost its saved full checkpoint"))?
-                        .bind(py)
-                        .as_bytes(),
-                ),
-                current.ordinal,
-            )
+            let task = current.owners.task.borrow(py);
+            let budget = task.checkpoint.material_sources.native_budget()?;
+            let checkpoint = current
+                .saved
+                .as_ref()
+                .ok_or_else(|| invalid("final handoff lost its saved full checkpoint"))?
+                .borrow(py)
+                .original_loaded(&budget)?;
+            (checkpoint, current.ordinal)
         };
         let next = self.scientific_owner.bind(py).getattr("next_operation")?;
         if !next.is_exact_instance_of::<PyTuple>() {
@@ -125,8 +124,10 @@ impl PySemanticLearningPhaseTransition {
                 ));
             }
         }
-        let manifest = SemanticCheckpointManifest::decode(&checkpoint)?;
-        let (_, saved_snapshot, _, _) = TaskCheckpointSeed::decode(&manifest.task)?;
+        let manifest = SemanticCheckpointManifest::decode_borrowed(checkpoint.as_bytes())?;
+        let material_sources = Arc::clone(&selected.task.borrow(py).checkpoint.material_sources);
+        let (_, saved_snapshot, _, _) =
+            TaskCheckpointSeed::decode_bound(manifest.task, &material_sources)?;
         verify_phase_checkpoint(
             py,
             &selected.task.borrow(py),
@@ -183,6 +184,8 @@ impl PySemanticLearningPhaseTransition {
         *retained = Some(PreparedCandidate {
             owner: Some(owner),
             checkpoint,
+            preparation_output: None,
+            preparation_output_cursor: 0,
             preparation_outcome: None,
         });
         Ok(())
@@ -191,7 +194,11 @@ impl PySemanticLearningPhaseTransition {
     pub(super) fn control_retirement_input(
         &self,
         py: Python<'_>,
-    ) -> PyResult<(EvaluationOwners, Py<PyBytes>, u64)> {
+    ) -> PyResult<(
+        EvaluationOwners,
+        Py<material_bytes::PySemanticMaterialBytes>,
+        u64,
+    )> {
         let retained = self.private_checkpoints()?;
         let current = retained
             .last()
@@ -389,6 +396,7 @@ impl PySemanticLearningPhaseTransition {
                 custody: None,
                 save_entered: false,
                 save_admitted: false,
+                serializer: None,
                 saved: None,
                 error: None,
                 closed: false,
@@ -439,9 +447,8 @@ impl PySemanticLearningPhaseTransition {
             let source = self.source.borrow(py);
             let work = source
                 .owner()?
-                .prepare_cold_model_work(
+                .prepare_cold_model_work_deferred(
                     &*self.parent.borrow(py).lease()?,
-                    self.preparation_inputs.cold_model_work_capacity,
                     ordinal,
                     self.records()?.confirmed_admission()?,
                     xlog_cuda::SemanticColdModelWorkPurpose::PrivateCheckpoint,
@@ -453,13 +460,13 @@ impl PySemanticLearningPhaseTransition {
                 .work = Some(work.clone());
             let callback_work = Py::new(
                 py,
-                PySemanticColdModelWork {
-                    parent: parent.clone_ref(py),
-                    reader: self.parent.clone_ref(py),
-                    inner: work.clone(),
-                    region: None,
-                    active: AtomicBool::new(false),
-                },
+                PySemanticColdModelWork::new(
+                    Some(parent.clone_ref(py)),
+                    self.parent.clone_ref(py),
+                    work.clone(),
+                    None,
+                    false,
+                ),
             )?;
             self.private_checkpoints()?
                 .last_mut()
@@ -503,30 +510,55 @@ impl PySemanticLearningPhaseTransition {
                 .as_ref()
                 .expect("original checkpoint registrar")
                 .clone_ref(py);
-            let serializer = self.model_owner(py, PhaseModelOwner::SerializeCandidate)?;
-            let selected = model.clone_ref(py);
-            let session = parent.borrow(py).session.clone_ref(py);
-            let snapshot_model = pyo3::types::PyCFunction::new_closure(
-                py,
-                None,
-                None,
-                move |args, kwargs| {
-                    let py = args.py();
-                    if !args.is_empty() || kwargs.is_some_and(|kwargs| !kwargs.is_empty()) {
-                        return Err(invalid("private checkpoint serializer accepts only its original zero-argument call"));
-                    }
-                    let session = session.borrow(py);
-                    let original = work.borrow(py);
-                    // The canonical save owns CheckpointReading before entering this
-                    // callback; the original model recorder retains its real owner.
-                    let _scope =
-                        ColdCallbackScope::enter(py, &session, &original, work.clone_ref(py))?;
-                    serializer
-                        .bind(py)
-                        .call1((selected.clone_ref(py),))
-                        .map(Bound::unbind)
-                },
-            )?;
+            let writer = self.prepare_model_checkpoint_writer(py, &model, &work)?;
+            let (capacity, working_bytes) = writer.borrow(py).original_cold_bounds()?;
+            let cached = self
+                .private_checkpoints()?
+                .last()
+                .expect("original checkpoint")
+                .serializer
+                .as_ref()
+                .map(|serializer| serializer.clone_ref(py));
+            let snapshot_model = if let Some(cached) = cached {
+                cached
+            } else {
+                let serializer = self.model_owner(py, PhaseModelOwner::SerializeCandidate)?;
+                let selected = model.clone_ref(py);
+                let session = parent.borrow(py).session.clone_ref(py);
+                let original_writer = writer.clone_ref(py);
+                let callback =
+                    pyo3::types::PyCFunction::new_closure(py, None, None, move |args, kwargs| {
+                        let py = args.py();
+                        if args.len() != 1
+                            || kwargs.is_some_and(|kwargs| !kwargs.is_empty())
+                            || !args.get_item(0)?.is(original_writer.bind(py).as_any())
+                        {
+                            return Err(invalid(
+                                "private checkpoint serializer requires its original writer object",
+                            ));
+                        }
+                        let session = session.borrow(py);
+                        let original = work.borrow(py);
+                        // The canonical save owns CheckpointReading before entering this
+                        // callback; the original model recorder retains its real owner.
+                        let _scope =
+                            ColdCallbackScope::enter(py, &session, &original, work.clone_ref(py))?;
+                        original_writer
+                            .borrow(py)
+                            .bind_original_cold_callback(py, &work)?;
+                        serializer
+                            .bind(py)
+                            .call1((selected.clone_ref(py), original_writer.clone_ref(py)))
+                            .map(Bound::unbind)
+                    })?
+                    .into_any()
+                    .unbind();
+                self.private_checkpoints()?
+                    .last_mut()
+                    .expect("original checkpoint")
+                    .serializer = Some(callback.clone_ref(py));
+                callback
+            };
             let fresh = self.refresh_snapshot.bind(py).call0()?;
             let authority =
                 AuthoritySnapshot::parse(&ColdValue::read(&fresh, &mut (16 * 1024 * 1024), 0)?)?;
@@ -544,14 +576,16 @@ impl PySemanticLearningPhaseTransition {
                 let _operation = PhaseOperation::begin(&self.private_checkpoint_active)?;
                 let original_controller = controller.borrow(py);
                 let issued = task.borrow(py);
-                let published = parent.borrow(py);
                 original_controller.save_checkpoint(
                     py,
                     &issued,
-                    &published,
+                    parent.bind(py),
                     streams.bind(py),
                     &fresh,
-                    snapshot_model.as_any(),
+                    snapshot_model.bind(py),
+                    capacity,
+                    working_bytes,
+                    Some(writer.clone_ref(py)),
                 )
             };
             let mut retained = self.private_checkpoints()?;
@@ -570,7 +604,7 @@ impl PySemanticLearningPhaseTransition {
         // These are the actual final full snapshots of both frozen branches.
         // Check the complete executed recipe before recording either snapshot
         // or retiring control; trajectory-start alone cannot change the phase.
-        self.require_executed_phase_lineage(saved.bind(py).as_bytes())?;
+        self.require_executed_phase_lineage(py, saved.borrow(py).as_bytes())?;
         let (work, closed, cached_report, custody) = {
             let retained = self.private_checkpoints()?;
             let current = retained.last().expect("original checkpoint");
@@ -654,9 +688,24 @@ impl PySemanticLearningPhaseTransition {
                 peak
             }
         };
-        let manifest = SemanticCheckpointManifest::decode(saved.bind(py).as_bytes())?;
-        let binding = SemanticTransitionSession::state_material_input_projection(&manifest.native)
+        let material = saved.borrow(py);
+        let manifest = SemanticCheckpointManifest::decode_borrowed(material.as_bytes())?;
+        let pool = task
+            .borrow(py)
+            .checkpoint
+            .material_sources
+            .native_budget()?;
+        let mut native = material
+            .original_loaded(&pool)?
+            .slice_payload(checkpoint_section_range(
+                material.as_bytes(),
+                manifest.native,
+            )?)
             .map_err(xlog_err)?;
+        let binding = native
+            .checkpoint_proof()
+            .map_err(xlog_err)?
+            .model_restore_context();
         let work = report
             .model_work
             .checked_add(report.native_work)
@@ -683,9 +732,9 @@ impl PySemanticLearningPhaseTransition {
         arguments.set_item(
             "model_binding",
             (
-                binding.model_generation,
-                PyBytes::new(py, binding.model_geometry_digest.as_bytes()),
-                PyBytes::new(py, binding.model_numerical_digest.as_bytes()),
+                binding.1,
+                PyBytes::new(py, binding.3 .0.as_bytes()),
+                PyBytes::new(py, binding.3 .1.as_bytes()),
             ),
         )?;
         arguments.set_item("full_checkpoint", saved.bind(py))?;

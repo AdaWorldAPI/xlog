@@ -335,32 +335,121 @@ pub fn plan_kclique_var_order<S: StatsSource>(
     shape: &KCliqueShape,
     stats: &S,
 ) -> Option<FullVariableOrder> {
-    if shape.edges.is_empty() {
-        return None;
-    }
-    valid_variable_count(shape.variable_count)?;
-    require_complete_stats(shape, stats)?;
+    plan_kclique_var_order_core(shape, stats, &mut None)
+        .expect("ordinary variable ordering has no allocation callback")
+}
 
-    let root_scores = root_scores(shape, stats)?;
+/// Owned planning uses the original parsed threshold attached to `scope`.
+/// Incomplete statistics decline before that configuration is needed.
+pub fn plan_kclique_var_order_with_allocation_owner<S: StatsSource>(
+    shape: &KCliqueShape,
+    stats: &S,
+    scope: &mut crate::compile::CompilationAllocationScope<'_>,
+) -> xlog_core::Result<Option<FullVariableOrder>> {
+    plan_kclique_var_order_core(shape, stats, &mut Some(scope))
+}
+
+fn plan_kclique_var_order_core<S: StatsSource>(
+    shape: &KCliqueShape,
+    stats: &S,
+    scope: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
+) -> xlog_core::Result<Option<FullVariableOrder>> {
+    if shape.edges.is_empty() {
+        return Ok(None);
+    }
+    if valid_variable_count(shape.variable_count).is_none()
+        || require_complete_stats(shape, stats).is_none()
+    {
+        return Ok(None);
+    }
+    let threshold = match scope.as_deref_mut() {
+        Some(scope) => {
+            let Some(threshold) = scope.planner_threshold() else {
+                let message = "complete owned planner statistics require the original parsed threshold configuration";
+                let mut reserve = |bytes| scope.reserve_allocation(bytes);
+                let producer = xlog_core::CompilationAllocationScope::prepare_diagnostic(
+                    Ok(message.len() as u64),
+                    Some(&mut reserve),
+                )?;
+                return Err(producer.finish(|| xlog_core::XlogError::Compilation(message.into())));
+            };
+            Some(threshold)
+        }
+        None => None,
+    };
+
+    let variables = usize::from(shape.variable_count());
+    let _scores_owner = reserve_temporary_vector::<(VertexId, f64)>(scope, variables)?;
+    let Some(root_scores) = root_scores(shape, stats) else {
+        return Ok(None);
+    };
+    let _remaining_owner = reserve_temporary_vector::<VertexId>(scope, variables)?;
+    reserve_plan_vector::<VertexId>(scope, variables)?;
     let variable_order = greedy_variable_order(shape, &root_scores);
+    let _positions_owner = reserve_temporary_vector::<usize>(scope, variables)?;
+    let _indexed_owner =
+        reserve_temporary_vector::<(usize, usize, usize, RelId)>(scope, shape.edges.len())?;
+    let _sort_owner =
+        reserve_temporary_vector::<(usize, usize, usize, RelId)>(scope, shape.edges.len())?;
+    reserve_plan_vector::<usize>(scope, shape.edges.len())?;
     let edge_permutation = edge_permutation(shape, &variable_order);
+    reserve_plan_vector::<VariableShare>(scope, variables)?;
+    let _share_sort_owner = reserve_temporary_vector::<VariableShare>(scope, variables)?;
     let variable_share_allocation = share_allocation(&root_scores);
-    let cost_prediction = cost_prediction(shape, stats, &root_scores)?;
+    let Some(cost_prediction) = cost_prediction(shape, stats, &root_scores) else {
+        return Ok(None);
+    };
     let predicted_winner = if cost_prediction.wcoj_cost <= cost_prediction.hash_cost {
         PredictedWinner::WcojPath
     } else {
         PredictedWinner::HashPath
     };
-    let helper_split_specs = helper_split_specs_for_buried_skew(shape, stats, &variable_order)?;
+    let _heat_owner = reserve_temporary_vector::<(VertexId, f64)>(scope, variables)?;
+    let _helper_vertices_owner = reserve_temporary_vector::<VertexId>(scope, 2)?;
+    reserve_plan_vector::<HelperSplitSpec>(scope, 1)?;
+    reserve_plan_vector::<u8>(scope, 3)?;
+    let Some(helper_split_specs) = (match threshold {
+        Some(threshold) => helper_split_specs_for_buried_skew_with_threshold(
+            shape,
+            stats,
+            &variable_order,
+            Some(threshold),
+        ),
+        None => helper_split_specs_for_buried_skew(shape, stats, &variable_order),
+    }) else {
+        return Ok(None);
+    };
 
-    Some(FullVariableOrder {
+    Ok(Some(FullVariableOrder {
         variable_order,
         edge_permutation,
         variable_share_allocation,
         cost_prediction,
         predicted_winner,
         helper_split_specs,
-    })
+    }))
+}
+
+fn reserve_temporary_vector<T>(
+    scope: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
+    count: usize,
+) -> xlog_core::Result<Option<std::sync::Arc<dyn Send + Sync>>> {
+    scope
+        .as_deref_mut()
+        .map(|scope| {
+            scope.reserve_allocation(crate::compile::push_vector_allocation_bytes::<T>(count)?)
+        })
+        .transpose()
+}
+
+fn reserve_plan_vector<T>(
+    scope: &mut Option<&mut crate::compile::CompilationAllocationScope<'_>>,
+    count: usize,
+) -> xlog_core::Result<()> {
+    if let Some(scope) = scope.as_deref_mut() {
+        scope.acquire(crate::compile::push_vector_allocation_bytes::<T>(count)?)?;
+    }
+    Ok(())
 }
 
 fn valid_variable_count(variable_count: u8) -> Option<()> {
@@ -522,6 +611,15 @@ fn helper_split_specs_for_buried_skew<S: StatsSource>(
     stats: &S,
     variable_order: &[VertexId],
 ) -> Option<Vec<HelperSplitSpec>> {
+    helper_split_specs_for_buried_skew_with_threshold(shape, stats, variable_order, None)
+}
+
+fn helper_split_specs_for_buried_skew_with_threshold<S: StatsSource>(
+    shape: &KCliqueShape,
+    stats: &S,
+    variable_order: &[VertexId],
+    threshold: Option<f64>,
+) -> Option<Vec<HelperSplitSpec>> {
     let leader = *variable_order.first()?;
     let variable_heat = per_variable_heat(shape, stats)?;
     let leader_heat = variable_heat
@@ -538,7 +636,7 @@ fn helper_split_specs_for_buried_skew<S: StatsSource>(
                 .total_cmp(&right.1)
                 .then_with(|| right.0.cmp(&left.0))
         })?;
-    let threshold = buried_skew_threshold();
+    let threshold = threshold.unwrap_or_else(buried_skew_threshold);
     if hot_heat / leader_heat < threshold {
         return Some(Vec::new());
     }

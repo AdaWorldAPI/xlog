@@ -1,6 +1,6 @@
 //! Relational IR node definitions
 
-use xlog_core::{AggOp, RelId, ScalarType};
+use xlog_core::{AggOp, RelId, ScalarType, XlogError};
 
 /// Join type variants
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -539,7 +539,290 @@ pub enum RirNode {
     },
 }
 
+fn expression_owned_extent(expr: &Expr) -> xlog_core::Result<usize> {
+    let overflow = || XlogError::allocation_extent_overflow("resident expression");
+    let add = |a: usize, b: usize| a.checked_add(b).ok_or_else(overflow);
+    let mut bytes = std::mem::size_of::<Expr>();
+    match expr {
+        Expr::Const(ConstValue::Symbol(text)) => bytes = add(bytes, text.len())?,
+        Expr::Const(_) | Expr::Column(_) => {}
+        Expr::Compare { left, right, .. }
+        | Expr::Add(left, right)
+        | Expr::Sub(left, right)
+        | Expr::Mul(left, right)
+        | Expr::Div(left, right)
+        | Expr::Mod(left, right)
+        | Expr::Min(left, right)
+        | Expr::Max(left, right)
+        | Expr::Pow(left, right) => {
+            bytes = add(
+                bytes,
+                add(
+                    expression_owned_extent(left)?,
+                    expression_owned_extent(right)?,
+                )?,
+            )?
+        }
+        Expr::And(items) | Expr::Or(items) => {
+            for item in items {
+                bytes = add(bytes, expression_owned_extent(item)?)?;
+            }
+        }
+        Expr::Not(input) | Expr::Abs(input) | Expr::Cast(input, _) => {
+            bytes = add(bytes, expression_owned_extent(input)?)?
+        }
+        Expr::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            bytes = add(
+                bytes,
+                add(
+                    expression_owned_extent(condition)?,
+                    add(
+                        expression_owned_extent(then_expr)?,
+                        expression_owned_extent(else_expr)?,
+                    )?,
+                )?,
+            )?
+        }
+    }
+    Ok(bytes)
+}
+
+impl Expr {
+    /// Checked owned clone geometry of this exact expression.
+    pub fn owned_allocation_bytes(&self) -> xlog_core::Result<u64> {
+        u64::try_from(expression_owned_extent(self)?)
+            .map_err(|_| XlogError::allocation_extent_overflow("expression"))
+    }
+}
+
+fn clique_owned_extent(plan: &KCliqueVariableOrder) -> xlog_core::Result<usize> {
+    let overflow = || XlogError::allocation_extent_overflow("resident variable-order");
+    let mut bytes = plan
+        .column_swaps
+        .len()
+        .checked_mul(std::mem::size_of::<ColumnSwap>())
+        .and_then(|n| n.checked_add(plan.sorted_layout_requirements.edge_slots.len()))
+        .ok_or_else(overflow)?;
+    for columns in &plan.sorted_layout_requirements.key_columns {
+        bytes = bytes
+            .checked_add(std::mem::size_of::<Vec<u8>>())
+            .and_then(|n| n.checked_add(columns.len()))
+            .ok_or_else(overflow)?;
+    }
+    for helper in &plan.helper_split_specs {
+        bytes = bytes
+            .checked_add(std::mem::size_of::<HelperSplitSpec>())
+            .and_then(|n| n.checked_add(helper.edge_slots.len()))
+            .ok_or_else(overflow)?;
+    }
+    Ok(bytes)
+}
+
+impl KCliqueVariableOrder {
+    /// Checked owned clone geometry of this original variable-order record.
+    pub fn owned_allocation_bytes(&self) -> xlog_core::Result<u64> {
+        u64::try_from(clique_owned_extent(self)?)
+            .map_err(|_| XlogError::allocation_extent_overflow("variable-order"))
+    }
+}
+
 impl RirNode {
+    /// Exact owned clone geometry plus reached node count and depth. This
+    /// does not validate, optimize, admit, or execute the relational plan.
+    pub fn owned_allocation_extent(&self) -> xlog_core::Result<(usize, usize, usize)> {
+        let node = self;
+        let overflow = || XlogError::allocation_extent_overflow("resident plan");
+        let add = |a: usize, b: usize| a.checked_add(b).ok_or_else(overflow);
+        let mul = |a: usize, b: usize| a.checked_mul(b).ok_or_else(overflow);
+        fn columns_extent(columns: &[ProjectExpr]) -> xlog_core::Result<usize> {
+            let mut bytes = columns
+                .len()
+                .checked_mul(std::mem::size_of::<ProjectExpr>())
+                .ok_or_else(|| XlogError::allocation_extent_overflow("resident projection"))?;
+            for column in columns {
+                if let ProjectExpr::Computed(expr, _) = column {
+                    bytes = bytes
+                        .checked_add(expression_owned_extent(expr)?)
+                        .ok_or_else(|| {
+                            XlogError::allocation_extent_overflow("resident projection")
+                        })?;
+                }
+            }
+            Ok(bytes)
+        }
+        let mut bytes = std::mem::size_of::<RirNode>();
+        let mut nodes = 1usize;
+        let mut depth = 0usize;
+        let mut child = |input: &RirNode| -> xlog_core::Result<()> {
+            let (child_bytes, child_nodes, child_depth) = input.owned_allocation_extent()?;
+            bytes = add(bytes, child_bytes)?;
+            nodes = add(nodes, child_nodes)?;
+            depth = depth.max(add(child_depth, 1)?);
+            Ok(())
+        };
+        let columns = match node {
+            RirNode::Project { input, columns } => {
+                child(input)?;
+                Some(columns)
+            }
+            RirNode::ChainJoin {
+                left,
+                right,
+                fallback,
+                output_columns,
+                ..
+            } => {
+                child(left)?;
+                child(right)?;
+                child(fallback)?;
+                Some(output_columns)
+            }
+            RirNode::Filter { input, .. } => {
+                child(input)?;
+                None
+            }
+            RirNode::Join { left, right, .. } => {
+                child(left)?;
+                child(right)?;
+                None
+            }
+            RirNode::Diff { left, right } => {
+                child(left)?;
+                child(right)?;
+                None
+            }
+            RirNode::GroupBy { input, .. } | RirNode::Distinct { input, .. } => {
+                child(input)?;
+                None
+            }
+            RirNode::Union { inputs } => {
+                for input in inputs {
+                    child(input)?;
+                }
+                None
+            }
+            RirNode::Fixpoint {
+                base, recursive, ..
+            } => {
+                child(base)?;
+                child(recursive)?;
+                None
+            }
+            RirNode::MultiWayJoin {
+                inputs,
+                output_columns,
+                fallback,
+                ..
+            } => {
+                for input in inputs {
+                    child(input)?;
+                }
+                child(fallback)?;
+                Some(output_columns)
+            }
+            RirNode::Unit | RirNode::Scan { .. } => None,
+            RirNode::TensorMaskedJoin { .. } => None,
+        };
+        if let Some(columns) = columns {
+            bytes = add(bytes, columns_extent(columns)?)?;
+        }
+        match node {
+            RirNode::Filter { predicate, .. } => {
+                bytes = add(bytes, expression_owned_extent(predicate)?)?
+            }
+            RirNode::Join {
+                left_keys,
+                right_keys,
+                ..
+            } => {
+                bytes = add(
+                    bytes,
+                    mul(
+                        add(left_keys.len(), right_keys.len())?,
+                        std::mem::size_of::<usize>(),
+                    )?,
+                )?
+            }
+            RirNode::GroupBy { key_cols, aggs, .. } => {
+                bytes = add(bytes, mul(key_cols.len(), std::mem::size_of::<usize>())?)?;
+                bytes = add(
+                    bytes,
+                    mul(aggs.len(), std::mem::size_of::<(usize, xlog_core::AggOp)>())?,
+                )?;
+            }
+            RirNode::Distinct { key_cols, .. } => {
+                bytes = add(bytes, mul(key_cols.len(), std::mem::size_of::<usize>())?)?;
+            }
+            RirNode::MultiWayJoin {
+                slot_vars,
+                plan,
+                var_order,
+                ..
+            } => {
+                for slot in slot_vars {
+                    bytes = add(
+                        bytes,
+                        add(
+                            std::mem::size_of::<Vec<Option<u32>>>(),
+                            mul(slot.len(), std::mem::size_of::<Option<u32>>())?,
+                        )?,
+                    )?;
+                }
+                if let Some(MultiwayPlan::WcojWithPlan(plan)) = plan {
+                    bytes = add(bytes, clique_owned_extent(plan)?)?;
+                }
+                if let Some(order) = var_order {
+                    bytes = add(
+                        bytes,
+                        mul(order.lookup_perms.len(), std::mem::size_of::<LookupPerm>())?,
+                    )?;
+                    bytes = add(bytes, columns_extent(&order.kernel_output_cols)?)?;
+                    if let Some(plan) = &order.kclique {
+                        bytes = add(bytes, clique_owned_extent(plan)?)?;
+                    }
+                }
+            }
+            RirNode::TensorMaskedJoin {
+                mask_name,
+                left_keys,
+                right_keys,
+                rel_index,
+                head_rel_name,
+                head_projection,
+                ..
+            } => {
+                bytes = add(bytes, add(mask_name.len(), head_rel_name.len())?)?;
+                bytes = add(
+                    bytes,
+                    mul(
+                        add(
+                            add(left_keys.len(), right_keys.len())?,
+                            head_projection.len(),
+                        )?,
+                        std::mem::size_of::<usize>(),
+                    )?,
+                )?;
+                for (_, name) in rel_index {
+                    bytes = add(
+                        bytes,
+                        add(std::mem::size_of::<(RelId, String)>(), name.len())?,
+                    )?;
+                }
+            }
+            _ => {}
+        }
+        Ok((bytes, nodes, depth))
+    }
+
+    /// Checked owned clone geometry of this exact relational plan.
+    pub fn owned_allocation_bytes(&self) -> xlog_core::Result<u64> {
+        u64::try_from(self.owned_allocation_extent()?.0)
+            .map_err(|_| XlogError::allocation_extent_overflow("plan"))
+    }
     /// Check if this node is a leaf (Scan)
     pub fn is_leaf(&self) -> bool {
         matches!(self, RirNode::Scan { .. })
@@ -548,30 +831,31 @@ impl RirNode {
     /// Get all relation IDs referenced in this subtree
     pub fn referenced_relations(&self) -> Vec<RelId> {
         let mut rels = Vec::new();
-        self.collect_relations(&mut rels);
+        self.visit_referenced_relations(&mut |rel| rels.push(rel));
         rels
     }
 
-    fn collect_relations(&self, rels: &mut Vec<RelId>) {
+    /// Visit the original relation roster without allocating a second roster.
+    pub fn visit_referenced_relations(&self, visit: &mut dyn FnMut(RelId)) {
         match self {
             RirNode::Unit => {}
-            RirNode::Scan { rel } => rels.push(*rel),
+            RirNode::Scan { rel } => visit(*rel),
             RirNode::Filter { input, .. } | RirNode::Project { input, .. } => {
-                input.collect_relations(rels);
+                input.visit_referenced_relations(visit);
             }
             RirNode::Join { left, right, .. }
             | RirNode::ChainJoin { left, right, .. }
             | RirNode::Diff { left, right } => {
-                left.collect_relations(rels);
-                right.collect_relations(rels);
+                left.visit_referenced_relations(visit);
+                right.visit_referenced_relations(visit);
             }
             RirNode::Union { inputs } => {
                 for input in inputs {
-                    input.collect_relations(rels);
+                    input.visit_referenced_relations(visit);
                 }
             }
             RirNode::GroupBy { input, .. } | RirNode::Distinct { input, .. } => {
-                input.collect_relations(rels);
+                input.visit_referenced_relations(visit);
             }
             RirNode::Fixpoint {
                 base,
@@ -580,14 +864,14 @@ impl RirNode {
                 full_rel,
                 ..
             } => {
-                base.collect_relations(rels);
-                recursive.collect_relations(rels);
-                rels.push(*delta_rel);
-                rels.push(*full_rel);
+                base.visit_referenced_relations(visit);
+                recursive.visit_referenced_relations(visit);
+                visit(*delta_rel);
+                visit(*full_rel);
             }
             RirNode::TensorMaskedJoin { rel_index, .. } => {
                 for (rel_id, _) in rel_index {
-                    rels.push(*rel_id);
+                    visit(*rel_id);
                 }
             }
             RirNode::MultiWayJoin { inputs, .. } => {
@@ -595,7 +879,7 @@ impl RirNode {
                 // the same set by promoter invariant; walking both would
                 // double-count.
                 for input in inputs {
-                    input.collect_relations(rels);
+                    input.visit_referenced_relations(visit);
                 }
             }
         }

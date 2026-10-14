@@ -14,8 +14,8 @@ use xlog_cuda::{
 };
 
 use super::{
-    invalid, xlog_err, CheckpointSources, ProposalExpense, PySemanticTransitionController,
-    PySemanticTransitionSession,
+    invalid, material_owner, xlog_err, CheckpointSources, ProposalExpense,
+    PySemanticTransitionController, PySemanticTransitionSession,
 };
 
 const MAX_POSITION: u64 = 262_144;
@@ -28,6 +28,43 @@ pub(super) struct EditableTaskSource {
     pub input_facts: String,
     pub statements: Vec<(String, u8)>,
     pub query_records: Vec<u32>,
+    allocations: Option<Arc<EditableTaskAllocations>>,
+}
+
+struct EditableTaskAllocations {
+    _vectors: xlog_cuda::SemanticReplayMaterialReservation,
+    _text: xlog_cuda::SemanticReplayMaterialReservation,
+    _program: xlog_gpu::logic::PositiveBinaryTaskAllocations,
+}
+
+pub(super) struct EditableProgramOwner {
+    pub(super) program: Arc<xlog_cuda::SemanticProgramAdmission>,
+    _allocations: Option<Arc<EditableTaskAllocations>>,
+    #[cfg(feature = "semantic-policy")]
+    _actor_metadata: Option<Arc<super::actor_refresh::ActorConstructionMetadata>>,
+}
+
+impl EditableTaskSource {
+    pub(super) fn program_owner(&self) -> Arc<EditableProgramOwner> {
+        Arc::new(EditableProgramOwner {
+            program: Arc::clone(&self.program),
+            _allocations: self.allocations.as_ref().map(Arc::clone),
+            #[cfg(feature = "semantic-policy")]
+            _actor_metadata: None,
+        })
+    }
+
+    #[cfg(feature = "semantic-policy")]
+    pub(super) fn actor_program_owner(
+        &self,
+        metadata: Arc<super::actor_refresh::ActorConstructionMetadata>,
+    ) -> Arc<EditableProgramOwner> {
+        Arc::new(EditableProgramOwner {
+            program: Arc::clone(&self.program),
+            _allocations: self.allocations.as_ref().map(Arc::clone),
+            _actor_metadata: Some(metadata),
+        })
+    }
 }
 
 /// Recover executable source only from the canonical typed cold admission.
@@ -35,6 +72,21 @@ pub(super) struct EditableTaskSource {
 /// serialized rule words are never accepted as an alternative source.
 pub(super) fn editable_source_from_admission(
     admission: &SemanticAdmissionRecords,
+) -> PyResult<Option<EditableTaskSource>> {
+    editable_source_from_admission_owned(admission, None)
+}
+
+pub(super) fn editable_source_from_admission_bound(
+    admission: &SemanticAdmissionRecords,
+    material_sources: &Arc<super::material_source::MaterialSourceRegistry>,
+) -> PyResult<Option<EditableTaskSource>> {
+    let budget = material_sources.native_budget()?;
+    editable_source_from_admission_owned(admission, Some(&budget))
+}
+
+fn editable_source_from_admission_owned(
+    admission: &SemanticAdmissionRecords,
+    budget: Option<&xlog_cuda::SemanticReplayMaterialBudget>,
 ) -> PyResult<Option<EditableTaskSource>> {
     if admission.predicates.len() != 3
         || admission.predicates[0].predicate != RelId(1)
@@ -107,10 +159,154 @@ pub(super) fn editable_source_from_admission(
             "editable task admission has incomplete source records",
         ));
     }
+    let overflow = || invalid("editable source allocation extent overflow");
+    let add = |a: usize, b: usize| a.checked_add(b).ok_or_else(overflow);
+    let mul = |a: usize, b: usize| a.checked_mul(b).ok_or_else(overflow);
+    let symbol_count = admission
+        .records
+        .iter()
+        .flat_map(|record| &record.arguments)
+        .filter(|argument| matches!(argument, SemanticArgument::Symbol(_)))
+        .count();
+    let vector_bytes = add(
+        mul(
+            statement_count,
+            std::mem::size_of::<String>()
+                + std::mem::size_of::<u8>()
+                + std::mem::size_of::<(String, u8)>()
+                + std::mem::size_of::<&str>(),
+        )?,
+        add(
+            mul(
+                source_count,
+                std::mem::size_of::<String>() + std::mem::size_of::<u32>(),
+            )?,
+            add(
+                mul(
+                    query_count,
+                    std::mem::size_of::<u32>() + std::mem::size_of::<&str>(),
+                )?,
+                add(
+                    mul(symbol_count, std::mem::size_of::<u32>())?,
+                    std::mem::size_of::<EditableTaskAllocations>()
+                        + std::mem::size_of::<EditableProgramOwner>()
+                        + 4 * std::mem::size_of::<usize>(),
+                )?,
+            )?,
+        )?,
+    )?;
+    let vectors = budget
+        .map(|budget| {
+            budget
+                .reserve_auxiliary(vector_bytes as u64)
+                .map_err(xlog_err)
+        })
+        .transpose()?;
+    let symbol_ids = budget.map(|_| {
+        admission
+            .records
+            .iter()
+            .flat_map(|record| &record.arguments)
+            .filter_map(|argument| match argument {
+                SemanticArgument::Symbol(id) => Some(*id),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    });
+    let snapshot = match (budget, symbol_ids.as_ref()) {
+        (Some(budget), Some(ids)) => Some(
+            xlog_core::symbol::snapshot_checked_with_allocation_owner(
+                ids,
+                ids.len(),
+                usize::MAX,
+                &mut |count, utf8| {
+                    let bytes = count
+                        .checked_mul(std::mem::size_of::<(u32, Box<str>)>())
+                        .and_then(|n| n.checked_mul(2))
+                        .and_then(|n| utf8.checked_mul(2).and_then(|text| n.checked_add(text)))
+                        .ok_or_else(|| {
+                            xlog_core::symbol::SymbolSnapshotError::AllocationRejected {
+                                detail: "editable symbol allocation extent overflow".into(),
+                            }
+                        })?;
+                    let owner = budget.reserve_auxiliary(bytes as u64).map_err(|error| {
+                        xlog_core::symbol::SymbolSnapshotError::AllocationRejected {
+                            detail: error.to_string(),
+                        }
+                    })?;
+                    Ok(Arc::new(owner) as Arc<dyn Send + Sync>)
+                },
+            )
+            .map_err(|error| invalid(&error.to_string()))?,
+        ),
+        _ => None,
+    };
+    let symbol_text = |argument: &SemanticArgument| -> PyResult<&str> {
+        let SemanticArgument::Symbol(id) = argument else {
+            return Err(invalid("editable task source must be an admitted symbol"));
+        };
+        snapshot
+            .as_ref()
+            .and_then(|(snapshot, _)| {
+                snapshot
+                    .entries()
+                    .iter()
+                    .find(|(original, _)| original == id)
+            })
+            .map(|(_, text)| text.as_ref())
+            .ok_or_else(|| invalid("editable task source symbol is unavailable"))
+    };
+    let text_owner = if let Some(budget) = budget {
+        let mut text = 0usize;
+        for record in &admission.records[..selector_begin] {
+            let argument = record
+                .arguments
+                .get(1)
+                .ok_or_else(|| invalid("editable task source has invalid typed arguments"))?;
+            text = add(text, symbol_text(argument)?.len())?;
+        }
+        let source_text = |index: usize| {
+            admission.records[statement_count + index]
+                .arguments
+                .get(1)
+                .ok_or_else(|| invalid("editable task input has invalid typed arguments"))
+                .and_then(symbol_text)
+        };
+        // The source carrier and its actual Session/actor projections can own
+        // three copies of each original text. The selected initial source has
+        // its real ordered selector multiplicity, not all-history bytes.
+        let mut initial = add(add(source_text(0)?.len(), source_text(1)?.len())?, 2)?;
+        for record in &admission.records[selector_begin..] {
+            let Some(SemanticArgument::U32(statement)) = record.arguments.get(1) else {
+                return Err(invalid(
+                    "editable task query selector has invalid typed arguments",
+                ));
+            };
+            let statement = admission
+                .records
+                .get(*statement as usize)
+                .filter(|_| (*statement as usize) < statement_count)
+                .and_then(|record| record.arguments.get(1))
+                .ok_or_else(|| {
+                    invalid("editable task query selection differs from its admission")
+                })?;
+            initial = add(initial, add(symbol_text(statement)?.len(), 5)?)?;
+        }
+        Some(
+            budget
+                .reserve_auxiliary(mul(add(text, initial)?, 3)? as u64)
+                .map_err(xlog_err)?,
+        )
+    } else {
+        None
+    };
     let symbol = |argument: &SemanticArgument| -> PyResult<String> {
         let SemanticArgument::Symbol(id) = argument else {
             return Err(invalid("editable task source must be an admitted symbol"));
         };
+        if snapshot.is_some() {
+            return symbol_text(argument).map(str::to_owned);
+        }
         xlog_core::symbol::resolve_checked(*id)
             .ok_or_else(|| invalid("editable task source symbol is unavailable"))
     };
@@ -175,13 +371,42 @@ pub(super) fn editable_source_from_admission(
         query_records.push(*statement);
     }
     let statement_texts = statements.iter().map(String::as_str).collect::<Vec<_>>();
-    let program = xlog_gpu::logic::compile_positive_binary_task(
-        &sources[0],
-        &sources[1],
-        &statement_texts,
-        &query_records,
-    )
-    .map_err(xlog_err)?;
+    let (program, allocations) = match budget {
+        Some(budget) => {
+            let (program, native) =
+                xlog_gpu::logic::compile_positive_binary_task_with_allocation_owner(
+                    &sources[0],
+                    &sources[1],
+                    &statement_texts,
+                    &query_records,
+                    &mut |bytes| {
+                        budget
+                            .reserve_auxiliary(bytes)
+                            .map(|owner| Arc::new(owner) as Arc<dyn Send + Sync>)
+                            .map_err(|error| xlog_core::XlogError::Compilation(error.to_string()))
+                    },
+                )
+                .map_err(xlog_err)?;
+            (
+                program,
+                Some(Arc::new(EditableTaskAllocations {
+                    _vectors: vectors.expect("original source vector allocation owner"),
+                    _text: text_owner.expect("original source text allocation owner"),
+                    _program: native,
+                })),
+            )
+        }
+        None => (
+            xlog_gpu::logic::compile_positive_binary_task(
+                &sources[0],
+                &sources[1],
+                &statement_texts,
+                &query_records,
+            )
+            .map_err(xlog_err)?,
+            None,
+        ),
+    };
     Ok(Some(EditableTaskSource {
         program: Arc::new(program),
         observer_source: sources.get(2).cloned(),
@@ -197,6 +422,7 @@ pub(super) fn editable_source_from_admission(
         input_facts: sources[1].clone(),
         statements: statements.into_iter().zip(masks).collect(),
         query_records,
+        allocations,
     }))
 }
 
@@ -405,7 +631,7 @@ impl PySemanticTransitionColdTask {
 #[pymethods]
 impl PySemanticTransitionColdTask {
     #[new]
-    #[pyo3(signature = (*, initial_theory, input_facts, observer_program, statements, query_records, task_ground, training_canary_source, capacities, admission_limits, device_ordinal, memory_bytes, provenance_capacity_records, prefix_capacity, feedback_capacity, pad_token, terminal_tokens, final_intent_payload_bytes, intent_effect, intent_entry_capacity, intent_payload_capacity_bytes, acknowledgement_payload_capacity_bytes, authority_decisions_capacity_bytes, generations, training_cursor, training_rng, fuel, rng, private_replay_child=None, prepared_actor_refresh=None, actor_refresh_bank=None))]
+    #[pyo3(signature = (*, initial_theory, input_facts, observer_program, statements, query_records, task_ground, training_canary_source, capacities, admission_limits, device_ordinal, memory_bytes, provenance_capacity_records, prefix_capacity, feedback_capacity, pad_token, terminal_tokens, final_intent_payload_bytes, intent_effect, intent_entry_capacity, intent_payload_capacity_bytes, acknowledgement_payload_capacity_bytes, authority_decisions_capacity_bytes, generations, training_cursor, training_rng, fuel, rng, material_source=None, private_replay_child=None, prepared_actor_refresh=None, actor_refresh_bank=None))]
     #[expect(
         clippy::too_many_arguments,
         reason = "the cold producer receives independent native resource budgets"
@@ -439,6 +665,7 @@ impl PySemanticTransitionColdTask {
         training_rng: [u64; 4],
         fuel: u64,
         rng: (u64, u8, u32),
+        material_source: Option<&Bound<'_, PyAny>>,
         private_replay_child: Option<&Bound<'_, PyAny>>,
         prepared_actor_refresh: Option<&Bound<'_, PyAny>>,
         actor_refresh_bank: Option<usize>,
@@ -465,6 +692,38 @@ impl PySemanticTransitionColdTask {
                     .map(|child| Arc::clone(&child.inner))
             })
             .transpose()?;
+        let explicit_material_sources = material_source
+            .map(material_owner::original_registry)
+            .transpose()?;
+        #[cfg(feature = "semantic-policy")]
+        let inherited_material_sources = if let Some(child) = &replay_custody {
+            Some(Arc::clone(
+                &child.source_checkpoint(py)?.seed.material_sources,
+            ))
+        } else if let Some(owner) = &actor_custody {
+            Some(Arc::clone(&owner.source_checkpoint().seed.material_sources))
+        } else {
+            None
+        };
+        #[cfg(not(feature = "semantic-policy"))]
+        let inherited_material_sources: Option<
+            Arc<super::material_source::MaterialSourceRegistry>,
+        > = None;
+        let material_sources =
+            match (inherited_material_sources, explicit_material_sources) {
+                (Some(original), Some(supplied)) => {
+                    if !Arc::ptr_eq(&original, &supplied) {
+                        return Err(invalid(
+                            "dependent task requires its original process material source",
+                        ));
+                    }
+                    original
+                }
+                (Some(original), None) | (None, Some(original)) => original,
+                (None, None) => return Err(invalid(
+                    "fresh task requires its original native material source before construction",
+                )),
+            };
         #[cfg(feature = "semantic-policy")]
         let allocation = replay_custody
             .as_ref()
@@ -512,8 +771,8 @@ impl PySemanticTransitionColdTask {
             xlog_cuda::SemanticTaskGround::Logical => {
                 Some(exact_text(observer_program, "observer_program")?)
             }
-            xlog_cuda::SemanticTaskGround::Coding(_) if observer_program.is_none() => None,
-            xlog_cuda::SemanticTaskGround::Coding(_) => {
+            xlog_cuda::SemanticTaskGround::Coding { .. } if observer_program.is_none() => None,
+            xlog_cuda::SemanticTaskGround::Coding { .. } => {
                 return Err(invalid("coding task has no independent observer reference"))
             }
         };
@@ -687,6 +946,7 @@ impl PySemanticTransitionColdTask {
                     memory_bytes,
                     proposal_expense,
                     checkpoint_sources,
+                    material_sources,
                     allocation,
                     canary,
                 )
@@ -718,7 +978,7 @@ impl PySemanticTransitionColdTask {
                 let content = (|| {
                     let native_session = session.borrow(py);
                     if let Some(editable) = native_session.editable_program.as_ref() {
-                        program = program.with_editable_program(Arc::clone(editable));
+                        program = program.with_editable_program(Arc::clone(&editable.program));
                     }
                     #[cfg(feature = "semantic-policy")]
                     if let Some(owner) = &actor_custody {

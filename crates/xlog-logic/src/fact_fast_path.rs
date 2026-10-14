@@ -72,11 +72,20 @@ pub(crate) struct FastFact<'a> {
 impl FastFact<'_> {
     /// Finish the fact: intern its symbols (now, in merge order) and return it.
     pub(crate) fn into_rule(self) -> AstRule {
+        self.into_rule_with_allocation_owner(&mut crate::parser::SymbolAllocationOwner::ordinary())
+            .expect("ordinary global symbol interning")
+    }
+
+    pub(crate) fn into_rule_with_allocation_owner(
+        self,
+        reserve: &mut crate::parser::SymbolAllocationOwner<'_>,
+    ) -> xlog_core::Result<AstRule> {
         let mut rule = self.rule;
         for (index, text) in self.symbols {
-            rule.head.terms[index] = Term::Symbol(symbol::intern(text));
+            let id = reserve.intern(text)?;
+            rule.head.terms[index] = Term::Symbol(id);
         }
-        rule
+        Ok(rule)
     }
 }
 

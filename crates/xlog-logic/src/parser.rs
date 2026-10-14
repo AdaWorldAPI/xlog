@@ -7,6 +7,8 @@
     reason = "`pest_derive` emits a public grammar Rule enum and helpers without documentation hooks"
 )]
 
+use std::sync::Arc;
+
 use pest::iterators::Pair;
 use pest::Parser;
 use pest_derive::Parser;
@@ -28,6 +30,153 @@ pub struct XlogParser;
 /// Parse result containing the parsed pairs (for low-level access)
 pub type ParseResult<'a> = pest::iterators::Pairs<'a, Rule>;
 
+pub(crate) struct SymbolAllocationOwner<'a> {
+    reserve: Option<&'a mut dyn FnMut(usize) -> Result<Arc<dyn Send + Sync>>>,
+    refused: bool,
+}
+
+impl SymbolAllocationOwner<'_> {
+    pub(crate) fn ordinary() -> Self {
+        Self {
+            reserve: None,
+            refused: false,
+        }
+    }
+
+    pub(crate) fn intern(&mut self, text: &str) -> Result<u32> {
+        let result = match self.reserve.as_deref_mut() {
+            Some(reserve) => symbol::intern_with_allocation_owner(text, reserve),
+            None => Ok(symbol::intern(text)),
+        };
+        self.refused |= result.is_err();
+        result
+    }
+}
+
+/// Parse through the original fast-fact and reference pipeline while the
+/// canonical global symbol registry retains each actual allocation owner.
+/// Parser and AST storage must be reserved by the caller before entry.
+pub fn parse_program_with_symbol_allocation_owner(
+    input: &str,
+    reserve: &mut dyn FnMut(usize) -> Result<Arc<dyn Send + Sync>>,
+) -> Result<Program> {
+    let mut owner = SymbolAllocationOwner {
+        reserve: Some(reserve),
+        refused: false,
+    };
+    parse_program_with_stats_owned(input, &mut owner).map(|(program, _)| program)
+}
+
+/// Checked capacity envelope for the original source parser before its first
+/// fast-fact, Pest queue, diagnostic, or AST allocation. This is a host-storage
+/// bound, not executed work or a claim that the input is accepted.
+pub fn parse_program_allocation_bound(input: &str) -> Result<u64> {
+    let overflow = || XlogError::Compilation("source parser allocation extent overflow".into());
+    let add = |left: usize, right: usize| left.checked_add(right).ok_or_else(overflow);
+    let mul = |left: usize, right: usize| left.checked_mul(right).ok_or_else(overflow);
+    let source = add(input.len(), 1)?;
+    // Every recursive grammar edge consumes a delimiter before descending;
+    // between consuming edges at most one full named-rule chain is retained.
+    // Count the actual included grammar declarations, without parsing source
+    // through an alternative syntax or trusting caller-supplied node counts.
+    let grammar_rules = include_str!("grammar.pest")
+        .lines()
+        .filter(|line| {
+            let line = line.trim_start();
+            let name_end = line
+                .bytes()
+                .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                .count();
+            name_end != 0 && line[name_end..].trim_start().starts_with('=')
+        })
+        .count();
+    let named_nodes = add(mul(source, grammar_rules)?, 1)?;
+    let queue_slots = add(mul(named_nodes, 4)?, 4)?;
+    // Pest 2.9 stores Start/End queue entries. The tuple includes the largest
+    // End fields and its enum tag/alignment; both entries and Vec growth are
+    // included. No PUSH/POP storage exists in the canonical grammar.
+    let queue = mul(
+        queue_slots,
+        std::mem::size_of::<(usize, Rule, Option<&str>, usize, usize)>(),
+    )?;
+    // Diagnostic rule attempts, token strings, and fixed-sized call-stack
+    // records also exist when detailed errors are enabled. Tokens are grammar
+    // literals, so their UTF-8 extent cannot exceed the included grammar.
+    let mut token_utf8 = 0usize;
+    for line in include_str!("grammar.pest").lines() {
+        if line.trim_start().starts_with("//") {
+            continue;
+        }
+        let mut literal = None;
+        let mut escaped = false;
+        for (index, byte) in line.bytes().enumerate() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if literal.is_some() && byte == b'\\' {
+                escaped = true;
+                continue;
+            }
+            if byte == b'"' {
+                match literal.take() {
+                    Some(start) => token_utf8 = token_utf8.max(index - start),
+                    None => literal = Some(index + 1),
+                }
+            }
+        }
+    }
+    let diagnostic_slot = add(
+        std::mem::size_of::<(String, usize, usize, Rule, Rule, Rule)>(),
+        token_utf8,
+    )?;
+    // Pest's initial diagnostic capacities are 20 call-stack records and two
+    // 30-token arrays, even with detailed diagnostics disabled.
+    let diagnostics = mul(add(mul(named_nodes, 4)?, 80)?, diagnostic_slot)?;
+    // For each AST carrier at most source.len()+1 entries can be emitted:
+    // each node consumes a source token/delimiter. Separate typed carriers
+    // include collection growth, recursively boxed terms, and fast facts.
+    let ast_slot = [
+        std::mem::size_of::<Term>(),
+        std::mem::size_of::<TypeRef>(),
+        std::mem::size_of::<Atom>(),
+        std::mem::size_of::<Comparison>(),
+        std::mem::size_of::<IsExpr>(),
+        std::mem::size_of::<Univ>(),
+        std::mem::size_of::<AggExpr>(),
+        std::mem::size_of::<AstRule>(),
+        std::mem::size_of::<BodyLiteral>(),
+        std::mem::size_of::<PredDecl>(),
+        std::mem::size_of::<PredColumn>(),
+        std::mem::size_of::<FuncDef>(),
+        std::mem::size_of::<FuncParam>(),
+        std::mem::size_of::<FuncBody>(),
+        std::mem::size_of::<CondExpr>(),
+        std::mem::size_of::<ArithExpr>(),
+        std::mem::size_of::<Constraint>(),
+        std::mem::size_of::<Query>(),
+        std::mem::size_of::<DomainDecl>(),
+        std::mem::size_of::<UseDecl>(),
+        std::mem::size_of::<ProbFact>(),
+        std::mem::size_of::<AnnotatedDisjunction>(),
+        std::mem::size_of::<Evidence>(),
+        std::mem::size_of::<ProbQuery>(),
+        std::mem::size_of::<NeuralPredDecl>(),
+        std::mem::size_of::<LearnableRule>(),
+        std::mem::size_of::<crate::fact_fast_path::FastFact<'_>>(),
+        std::mem::size_of::<(usize, &str)>(),
+    ]
+    .into_iter()
+    .try_fold(0usize, add)?;
+    let ast = mul(add(mul(source, 2)?, 4)?, ast_slot)?;
+    // Source residual, owned identifier/string bytes and failure diagnostics;
+    // a failed residual may retain its error while the reference parser runs.
+    let text = mul(mul(source, grammar_rules)?, 4)?;
+    let parser = std::mem::size_of::<pest::ParserState<'_, Rule>>();
+    let bytes = add(add(add(queue, diagnostics)?, add(ast, text)?)?, parser)?;
+    u64::try_from(bytes).map_err(|_| overflow())
+}
+
 /// Parse an XLOG program string into an AST Program.
 ///
 /// Simple ground facts (`p(1, "a", sym, X, _).`) take a hand-written fast
@@ -40,10 +189,17 @@ pub fn parse_program(input: &str) -> Result<Program> {
 /// Pure-pest reference parser: the whole source through the grammar, no fast
 /// path. `parse_program` is specified to be observationally equal to this.
 pub fn parse_program_reference(input: &str) -> Result<Program> {
+    parse_program_reference_owned(input, &mut SymbolAllocationOwner::ordinary())
+}
+
+fn parse_program_reference_owned(
+    input: &str,
+    symbol_owner: &mut SymbolAllocationOwner<'_>,
+) -> Result<Program> {
     let pairs =
         XlogParser::parse(Rule::program, input).map_err(|e| XlogError::Parse(e.to_string()))?;
 
-    build_program(pairs)
+    build_program(pairs, symbol_owner)
 }
 
 /// How much of a parse the fact fast path handled.
@@ -60,6 +216,13 @@ pub struct FastParseStats {
 
 /// [`parse_program`] plus fast-path statistics (for probes and tests).
 pub fn parse_program_with_stats(input: &str) -> Result<(Program, FastParseStats)> {
+    parse_program_with_stats_owned(input, &mut SymbolAllocationOwner::ordinary())
+}
+
+fn parse_program_with_stats_owned(
+    input: &str,
+    symbol_owner: &mut SymbolAllocationOwner<'_>,
+) -> Result<(Program, FastParseStats)> {
     let mut scan = crate::fact_fast_path::scan(input);
     if scan.facts.is_empty() {
         let stats = FastParseStats {
@@ -67,7 +230,7 @@ pub fn parse_program_with_stats(input: &str) -> Result<(Program, FastParseStats)
             residual_bytes: input.len(),
             fell_back: false,
         };
-        return parse_program_reference(input).map(|program| (program, stats));
+        return parse_program_reference_owned(input, symbol_owner).map(|program| (program, stats));
     }
     let mut stats = FastParseStats {
         fast_facts: scan.facts.len(),
@@ -77,14 +240,17 @@ pub fn parse_program_with_stats(input: &str) -> Result<(Program, FastParseStats)
     let facts = std::mem::take(&mut scan.facts);
     let merged = XlogParser::parse(Rule::program, &scan.residual)
         .map_err(|e| XlogError::Parse(e.to_string()))
-        .and_then(|pairs| build_program_merged(pairs, facts));
+        .and_then(|pairs| build_program_merged(pairs, facts, symbol_owner));
     match merged {
         Ok(program) => Ok((program, stats)),
-        Err(_) => {
+        Err(error) => {
+            if symbol_owner.refused {
+                return Err(error);
+            }
             // Any failure on the residual: report exactly what the reference
             // parser reports for the original source (positions included).
             stats.fell_back = true;
-            parse_program_reference(input).map(|program| (program, stats))
+            parse_program_reference_owned(input, symbol_owner).map(|program| (program, stats))
         }
     }
 }
@@ -112,6 +278,7 @@ pub fn parse_atom(input: &str) -> Result<ParseResult<'_>> {
 fn build_program_merged(
     pairs: ParseResult<'_>,
     facts: Vec<crate::fact_fast_path::FastFact<'_>>,
+    symbol_owner: &mut SymbolAllocationOwner<'_>,
 ) -> Result<Program> {
     let mut program = Program::new();
     let mut facts = facts.into_iter().peekable();
@@ -125,19 +292,26 @@ fn build_program_merged(
             }
             let stmt_offset = inner.as_span().start();
             while let Some(fact) = facts.next_if(|fact| fact.offset < stmt_offset) {
-                program.rules.push(fact.into_rule());
+                program
+                    .rules
+                    .push(fact.into_rule_with_allocation_owner(symbol_owner)?);
             }
-            build_statement(inner, &mut program)?;
+            build_statement(inner, &mut program, symbol_owner)?;
         }
     }
     for fact in facts {
-        program.rules.push(fact.into_rule());
+        program
+            .rules
+            .push(fact.into_rule_with_allocation_owner(symbol_owner)?);
     }
     Ok(program)
 }
 
 /// Build a Program AST from parsed pest pairs
-fn build_program(pairs: ParseResult<'_>) -> Result<Program> {
+fn build_program(
+    pairs: ParseResult<'_>,
+    symbol_owner: &mut SymbolAllocationOwner<'_>,
+) -> Result<Program> {
     let mut program = Program::new();
 
     for pair in pairs {
@@ -145,7 +319,7 @@ fn build_program(pairs: ParseResult<'_>) -> Result<Program> {
             for inner in pair.into_inner() {
                 match inner.as_rule() {
                     Rule::statement => {
-                        build_statement(inner, &mut program)?;
+                        build_statement(inner, &mut program, symbol_owner)?;
                     }
                     Rule::EOI => {}
                     _ => {}
@@ -158,7 +332,11 @@ fn build_program(pairs: ParseResult<'_>) -> Result<Program> {
 }
 
 /// Build a statement and add it to the program
-fn build_statement(pair: Pair<'_, Rule>, program: &mut Program) -> Result<()> {
+fn build_statement(
+    pair: Pair<'_, Rule>,
+    program: &mut Program,
+    symbol_owner: &mut SymbolAllocationOwner<'_>,
+) -> Result<()> {
     for inner in pair.into_inner() {
         match inner.as_rule() {
             Rule::use_stmt => {
@@ -174,41 +352,49 @@ fn build_statement(pair: Pair<'_, Rule>, program: &mut Program) -> Result<()> {
                 apply_pragma(inner, program)?;
             }
             Rule::rule_def => {
-                program.rules.push(build_rule(inner)?);
+                program.rules.push(build_rule(inner, symbol_owner)?);
             }
             Rule::fact => {
-                program.rules.push(build_fact(inner)?);
+                program.rules.push(build_fact(inner, symbol_owner)?);
             }
             Rule::prob_fact => {
-                program.prob_facts.push(build_prob_fact(inner)?);
+                program
+                    .prob_facts
+                    .push(build_prob_fact(inner, symbol_owner)?);
             }
             Rule::annotated_disjunction => {
                 program
                     .annotated_disjunctions
-                    .push(build_annotated_disjunction(inner)?);
+                    .push(build_annotated_disjunction(inner, symbol_owner)?);
             }
             Rule::evidence_stmt => {
-                program.evidence.push(build_evidence(inner)?);
+                program.evidence.push(build_evidence(inner, symbol_owner)?);
             }
             Rule::prob_query => {
-                program.prob_queries.push(build_prob_query(inner)?);
+                program
+                    .prob_queries
+                    .push(build_prob_query(inner, symbol_owner)?);
             }
             Rule::constraint => {
-                program.constraints.push(build_constraint(inner)?);
+                program
+                    .constraints
+                    .push(build_constraint(inner, symbol_owner)?);
             }
             Rule::query => {
-                program.queries.push(build_query(inner)?);
+                program.queries.push(build_query(inner, symbol_owner)?);
             }
             Rule::func_def => {
-                program.functions.push(parse_func_def(inner)?);
+                program.functions.push(parse_func_def(inner, symbol_owner)?);
             }
             Rule::neural_pred_decl => {
                 program
                     .neural_predicates
-                    .push(build_neural_pred_decl(inner)?);
+                    .push(build_neural_pred_decl(inner, symbol_owner)?);
             }
             Rule::learnable_rule => {
-                program.learnable_rules.push(build_learnable_rule(inner)?);
+                program
+                    .learnable_rules
+                    .push(build_learnable_rule(inner, symbol_owner)?);
             }
             _ => {}
         }
@@ -589,7 +775,10 @@ fn parse_cmp_op(pair: Pair<'_, Rule>) -> CompOp {
 }
 
 /// Parse a conditional expression: if X < 0 then 0 - X else X
-fn parse_cond_expr(pair: Pair<'_, Rule>) -> Result<CondExpr> {
+fn parse_cond_expr(
+    pair: Pair<'_, Rule>,
+    symbol_owner: &mut SymbolAllocationOwner<'_>,
+) -> Result<CondExpr> {
     let mut inner = pair.into_inner();
 
     // Parse condition test
@@ -614,16 +803,20 @@ fn parse_cond_expr(pair: Pair<'_, Rule>) -> Result<CondExpr> {
     )?;
 
     // Parse then branch
-    let then_branch =
-        Box::new(parse_func_body(inner.next().ok_or_else(|| {
-            XlogError::Parse("Missing then branch".to_string())
-        })?)?);
+    let then_branch = Box::new(parse_func_body(
+        inner
+            .next()
+            .ok_or_else(|| XlogError::Parse("Missing then branch".to_string()))?,
+        symbol_owner,
+    )?);
 
     // Parse else branch
-    let else_branch =
-        Box::new(parse_func_body(inner.next().ok_or_else(|| {
-            XlogError::Parse("Missing else branch".to_string())
-        })?)?);
+    let else_branch = Box::new(parse_func_body(
+        inner
+            .next()
+            .ok_or_else(|| XlogError::Parse("Missing else branch".to_string()))?,
+        symbol_owner,
+    )?);
 
     Ok(CondExpr {
         cond_left,
@@ -635,7 +828,10 @@ fn parse_cond_expr(pair: Pair<'_, Rule>) -> Result<CondExpr> {
 }
 
 /// Parse a function body: arithmetic, conditional, or predicate-based
-fn parse_func_body(pair: Pair<'_, Rule>) -> Result<FuncBody> {
+fn parse_func_body(
+    pair: Pair<'_, Rule>,
+    symbol_owner: &mut SymbolAllocationOwner<'_>,
+) -> Result<FuncBody> {
     let inner = pair
         .into_inner()
         .next()
@@ -652,6 +848,7 @@ fn parse_func_body(pair: Pair<'_, Rule>) -> Result<FuncBody> {
                 parts
                     .next()
                     .ok_or_else(|| XlogError::Parse("Missing predicate body".to_string()))?,
+                symbol_owner,
             )?;
             Ok(FuncBody::Predicate { result, body })
         }
@@ -661,7 +858,10 @@ fn parse_func_body(pair: Pair<'_, Rule>) -> Result<FuncBody> {
                 .next()
                 .ok_or_else(|| XlogError::Parse("Empty arithmetic body".to_string()))?;
             match arith_inner.as_rule() {
-                Rule::cond_expr => Ok(FuncBody::Conditional(parse_cond_expr(arith_inner)?)),
+                Rule::cond_expr => Ok(FuncBody::Conditional(parse_cond_expr(
+                    arith_inner,
+                    symbol_owner,
+                )?)),
                 _ => Ok(FuncBody::Arithmetic(build_arith_expr(arith_inner)?)),
             }
         }
@@ -673,7 +873,10 @@ fn parse_func_body(pair: Pair<'_, Rule>) -> Result<FuncBody> {
 }
 
 /// Parse a function definition
-fn parse_func_def(pair: Pair<'_, Rule>) -> Result<FuncDef> {
+fn parse_func_def(
+    pair: Pair<'_, Rule>,
+    symbol_owner: &mut SymbolAllocationOwner<'_>,
+) -> Result<FuncDef> {
     let mut inner = pair.into_inner();
     let mut is_private = false;
 
@@ -713,7 +916,7 @@ fn parse_func_def(pair: Pair<'_, Rule>) -> Result<FuncDef> {
                 )?);
             }
             Rule::func_body => {
-                body = Some(parse_func_body(p)?);
+                body = Some(parse_func_body(p, symbol_owner)?);
             }
             _ => {}
         }
@@ -729,39 +932,48 @@ fn parse_func_def(pair: Pair<'_, Rule>) -> Result<FuncDef> {
 }
 
 /// Build a rule (with body)
-fn build_rule(pair: Pair<'_, Rule>) -> Result<AstRule> {
+fn build_rule(
+    pair: Pair<'_, Rule>,
+    symbol_owner: &mut SymbolAllocationOwner<'_>,
+) -> Result<AstRule> {
     let mut inner = pair.into_inner();
     let head_pair = inner
         .next()
         .ok_or_else(|| XlogError::Parse("Missing rule head".to_string()))?;
-    let head = build_head(head_pair)?;
+    let head = build_head(head_pair, symbol_owner)?;
 
     let body_pair = inner
         .next()
         .ok_or_else(|| XlogError::Parse("Missing rule body".to_string()))?;
-    let body = build_body(body_pair)?;
+    let body = build_body(body_pair, symbol_owner)?;
 
     Ok(AstRule { head, body })
 }
 
 /// Build a fact (rule with empty body)
-fn build_fact(pair: Pair<'_, Rule>) -> Result<AstRule> {
+fn build_fact(
+    pair: Pair<'_, Rule>,
+    symbol_owner: &mut SymbolAllocationOwner<'_>,
+) -> Result<AstRule> {
     let mut inner = pair.into_inner();
     let atom_pair = inner
         .next()
         .ok_or_else(|| XlogError::Parse("Missing fact atom".to_string()))?;
-    let head = build_atom(atom_pair)?;
+    let head = build_atom(atom_pair, symbol_owner)?;
 
     Ok(AstRule { head, body: vec![] })
 }
 
 /// Build a constraint
-fn build_constraint(pair: Pair<'_, Rule>) -> Result<Constraint> {
+fn build_constraint(
+    pair: Pair<'_, Rule>,
+    symbol_owner: &mut SymbolAllocationOwner<'_>,
+) -> Result<Constraint> {
     let mut inner = pair.into_inner();
     let body_pair = inner
         .next()
         .ok_or_else(|| XlogError::Parse("Missing constraint body".to_string()))?;
-    let body = build_body(body_pair)?;
+    let body = build_body(body_pair, symbol_owner)?;
 
     Ok(Constraint {
         authored_index: None,
@@ -770,29 +982,38 @@ fn build_constraint(pair: Pair<'_, Rule>) -> Result<Constraint> {
 }
 
 /// Build a query
-fn build_query(pair: Pair<'_, Rule>) -> Result<Query> {
+fn build_query(
+    pair: Pair<'_, Rule>,
+    symbol_owner: &mut SymbolAllocationOwner<'_>,
+) -> Result<Query> {
     let mut inner = pair.into_inner();
     let atom_pair = inner
         .next()
         .ok_or_else(|| XlogError::Parse("Missing query atom".to_string()))?;
-    let atom = build_atom(atom_pair)?;
+    let atom = build_atom(atom_pair, symbol_owner)?;
 
     Ok(Query { atom })
 }
 
-fn build_prob_fact(pair: Pair<'_, Rule>) -> Result<ProbFact> {
+fn build_prob_fact(
+    pair: Pair<'_, Rule>,
+    symbol_owner: &mut SymbolAllocationOwner<'_>,
+) -> Result<ProbFact> {
     let choice = pair
         .into_inner()
         .next()
         .ok_or_else(|| XlogError::Parse("Missing probabilistic fact".to_string()))?;
-    build_prob_choice(choice)
+    build_prob_choice(choice, symbol_owner)
 }
 
-fn build_annotated_disjunction(pair: Pair<'_, Rule>) -> Result<AnnotatedDisjunction> {
+fn build_annotated_disjunction(
+    pair: Pair<'_, Rule>,
+    symbol_owner: &mut SymbolAllocationOwner<'_>,
+) -> Result<AnnotatedDisjunction> {
     let mut choices = Vec::new();
     for inner in pair.into_inner() {
         if inner.as_rule() == Rule::prob_choice {
-            choices.push(build_prob_choice(inner)?);
+            choices.push(build_prob_choice(inner, symbol_owner)?);
         }
     }
     if choices.is_empty() {
@@ -803,7 +1024,10 @@ fn build_annotated_disjunction(pair: Pair<'_, Rule>) -> Result<AnnotatedDisjunct
     Ok(AnnotatedDisjunction { choices })
 }
 
-fn build_prob_choice(pair: Pair<'_, Rule>) -> Result<ProbFact> {
+fn build_prob_choice(
+    pair: Pair<'_, Rule>,
+    symbol_owner: &mut SymbolAllocationOwner<'_>,
+) -> Result<ProbFact> {
     let mut inner = pair.into_inner();
     let prob_pair = inner
         .next()
@@ -816,17 +1040,20 @@ fn build_prob_choice(pair: Pair<'_, Rule>) -> Result<ProbFact> {
     let atom_pair = inner
         .next()
         .ok_or_else(|| XlogError::Parse("Missing probabilistic atom".to_string()))?;
-    let atom = build_atom(atom_pair)?;
+    let atom = build_atom(atom_pair, symbol_owner)?;
 
     Ok(ProbFact { prob, atom })
 }
 
-fn build_evidence(pair: Pair<'_, Rule>) -> Result<Evidence> {
+fn build_evidence(
+    pair: Pair<'_, Rule>,
+    symbol_owner: &mut SymbolAllocationOwner<'_>,
+) -> Result<Evidence> {
     let mut inner = pair.into_inner();
     let atom_pair = inner
         .next()
         .ok_or_else(|| XlogError::Parse("Missing evidence atom".to_string()))?;
-    let atom = build_atom(atom_pair)?;
+    let atom = build_atom(atom_pair, symbol_owner)?;
 
     let value_pair = inner
         .next()
@@ -845,18 +1072,24 @@ fn build_evidence(pair: Pair<'_, Rule>) -> Result<Evidence> {
     Ok(Evidence { atom, value })
 }
 
-fn build_prob_query(pair: Pair<'_, Rule>) -> Result<ProbQuery> {
+fn build_prob_query(
+    pair: Pair<'_, Rule>,
+    symbol_owner: &mut SymbolAllocationOwner<'_>,
+) -> Result<ProbQuery> {
     let atom_pair = pair
         .into_inner()
         .next()
         .ok_or_else(|| XlogError::Parse("Missing query atom".to_string()))?;
-    let atom = build_atom(atom_pair)?;
+    let atom = build_atom(atom_pair, symbol_owner)?;
     Ok(ProbQuery { atom })
 }
 
 /// Build a neural predicate declaration
 /// Syntax: nn(network, [inputs], output, [labels]) :: pred(args).
-fn build_neural_pred_decl(pair: Pair<'_, Rule>) -> Result<NeuralPredDecl> {
+fn build_neural_pred_decl(
+    pair: Pair<'_, Rule>,
+    symbol_owner: &mut SymbolAllocationOwner<'_>,
+) -> Result<NeuralPredDecl> {
     let mut inner = pair.into_inner();
 
     // Parse network name (ident)
@@ -911,12 +1144,12 @@ fn build_neural_pred_decl(pair: Pair<'_, Rule>) -> Result<NeuralPredDecl> {
         let atom_pair = inner.next().ok_or_else(|| {
             XlogError::Parse("Missing predicate after labels in neural predicate".to_string())
         })?;
-        let predicate = build_atom(atom_pair)?;
+        let predicate = build_atom(atom_pair, symbol_owner)?;
 
         (Some(label_vec), predicate)
     } else {
         // No labels, next is the atom (embedding mode)
-        let predicate = build_atom(next)?;
+        let predicate = build_atom(next, symbol_owner)?;
         (None, predicate)
     };
 
@@ -932,7 +1165,10 @@ fn build_neural_pred_decl(pair: Pair<'_, Rule>) -> Result<NeuralPredDecl> {
 /// Build a learnable rule from a parsed pair.
 /// Grammar: learnable_rule = { "learnable" ~ "(" ~ ident ~ ")" ~ "::" ~ head ~ ":-" ~ body ~ "." }
 /// Uses build_head instead of build_atom because the grammar produces a `head` pair.
-fn build_learnable_rule(pair: Pair<'_, Rule>) -> Result<LearnableRule> {
+fn build_learnable_rule(
+    pair: Pair<'_, Rule>,
+    symbol_owner: &mut SymbolAllocationOwner<'_>,
+) -> Result<LearnableRule> {
     let mut inner = pair.into_inner();
     let mask_name = inner
         .next()
@@ -943,11 +1179,13 @@ fn build_learnable_rule(pair: Pair<'_, Rule>) -> Result<LearnableRule> {
         inner
             .next()
             .ok_or_else(|| XlogError::Parse("Missing learnable head".into()))?,
+        symbol_owner,
     )?;
     let body = build_body(
         inner
             .next()
             .ok_or_else(|| XlogError::Parse("Missing learnable body".into()))?,
+        symbol_owner,
     )?;
     Ok(LearnableRule {
         mask_name,
@@ -957,7 +1195,7 @@ fn build_learnable_rule(pair: Pair<'_, Rule>) -> Result<LearnableRule> {
 }
 
 /// Build a head (atom that may contain aggregates)
-fn build_head(pair: Pair<'_, Rule>) -> Result<Atom> {
+fn build_head(pair: Pair<'_, Rule>, symbol_owner: &mut SymbolAllocationOwner<'_>) -> Result<Atom> {
     let mut inner = pair.into_inner();
     let predicate = inner
         .next()
@@ -969,7 +1207,7 @@ fn build_head(pair: Pair<'_, Rule>) -> Result<Atom> {
     for term_list in inner {
         if term_list.as_rule() == Rule::head_term_list {
             for head_term in term_list.into_inner() {
-                terms.push(build_head_term(head_term)?);
+                terms.push(build_head_term(head_term, symbol_owner)?);
             }
         }
     }
@@ -978,7 +1216,10 @@ fn build_head(pair: Pair<'_, Rule>) -> Result<Atom> {
 }
 
 /// Build a head term (can be aggregate or regular term)
-fn build_head_term(pair: Pair<'_, Rule>) -> Result<Term> {
+fn build_head_term(
+    pair: Pair<'_, Rule>,
+    symbol_owner: &mut SymbolAllocationOwner<'_>,
+) -> Result<Term> {
     let inner = pair
         .into_inner()
         .next()
@@ -994,12 +1235,12 @@ fn build_head_term(pair: Pair<'_, Rule>) -> Result<Term> {
                 .ok_or_else(|| XlogError::Parse("Empty agg_term".to_string()))?;
             match agg_inner.as_rule() {
                 Rule::aggregate => build_aggregate(agg_inner),
-                Rule::term => build_term(agg_inner),
-                _ => build_term(agg_inner),
+                Rule::term => build_term(agg_inner, symbol_owner),
+                _ => build_term(agg_inner, symbol_owner),
             }
         }
-        Rule::term => build_term(inner),
-        _ => build_term(inner),
+        Rule::term => build_term(inner, symbol_owner),
+        _ => build_term(inner, symbol_owner),
     }
 }
 
@@ -1032,7 +1273,7 @@ fn build_aggregate(pair: Pair<'_, Rule>) -> Result<Term> {
 }
 
 /// Build an atom
-fn build_atom(pair: Pair<'_, Rule>) -> Result<Atom> {
+fn build_atom(pair: Pair<'_, Rule>, symbol_owner: &mut SymbolAllocationOwner<'_>) -> Result<Atom> {
     let mut inner = pair.into_inner();
     let predicate = inner
         .next()
@@ -1044,7 +1285,7 @@ fn build_atom(pair: Pair<'_, Rule>) -> Result<Atom> {
     for term_list in inner {
         if term_list.as_rule() == Rule::term_list {
             for term in term_list.into_inner() {
-                terms.push(build_term(term)?);
+                terms.push(build_term(term, symbol_owner)?);
             }
         }
     }
@@ -1053,38 +1294,47 @@ fn build_atom(pair: Pair<'_, Rule>) -> Result<Atom> {
 }
 
 /// Build a body (list of literals)
-fn build_body(pair: Pair<'_, Rule>) -> Result<Vec<BodyLiteral>> {
+fn build_body(
+    pair: Pair<'_, Rule>,
+    symbol_owner: &mut SymbolAllocationOwner<'_>,
+) -> Result<Vec<BodyLiteral>> {
     let mut literals = Vec::new();
 
     for lit in pair.into_inner() {
-        literals.push(build_body_literal(lit)?);
+        literals.push(build_body_literal(lit, symbol_owner)?);
     }
 
     Ok(literals)
 }
 
 /// Build a body literal
-fn build_body_literal(pair: Pair<'_, Rule>) -> Result<BodyLiteral> {
+fn build_body_literal(
+    pair: Pair<'_, Rule>,
+    symbol_owner: &mut SymbolAllocationOwner<'_>,
+) -> Result<BodyLiteral> {
     let inner = pair
         .into_inner()
         .next()
         .ok_or_else(|| XlogError::Parse("Empty body literal".to_string()))?;
 
     match inner.as_rule() {
-        Rule::nested_modal_chain => build_nested_modal_chain(inner),
-        Rule::negated_epistemic_atom => build_epistemic_literal(inner, true),
-        Rule::epistemic_atom => build_epistemic_literal(inner, false),
+        Rule::nested_modal_chain => build_nested_modal_chain(inner, symbol_owner),
+        Rule::negated_epistemic_atom => build_epistemic_literal(inner, true, symbol_owner),
+        Rule::epistemic_atom => build_epistemic_literal(inner, false, symbol_owner),
         Rule::negated_atom => {
             let atom_pair = inner
                 .into_inner()
                 .next()
                 .ok_or_else(|| XlogError::Parse("Missing negated atom".to_string()))?;
-            Ok(BodyLiteral::Negated(build_atom(atom_pair)?))
+            Ok(BodyLiteral::Negated(build_atom(atom_pair, symbol_owner)?))
         }
-        Rule::atom => Ok(BodyLiteral::Positive(build_atom(inner)?)),
-        Rule::comparison => Ok(BodyLiteral::Comparison(build_comparison(inner)?)),
+        Rule::atom => Ok(BodyLiteral::Positive(build_atom(inner, symbol_owner)?)),
+        Rule::comparison => Ok(BodyLiteral::Comparison(build_comparison(
+            inner,
+            symbol_owner,
+        )?)),
         Rule::is_expr => Ok(BodyLiteral::IsExpr(build_is_expr(inner)?)),
-        Rule::univ => Ok(BodyLiteral::Univ(build_univ(inner)?)),
+        Rule::univ => Ok(BodyLiteral::Univ(build_univ(inner, symbol_owner)?)),
         _ => Err(XlogError::Parse(format!(
             "Unknown body literal: {:?}",
             inner.as_rule()
@@ -1092,7 +1342,11 @@ fn build_body_literal(pair: Pair<'_, Rule>) -> Result<BodyLiteral> {
     }
 }
 
-fn build_epistemic_literal(pair: Pair<'_, Rule>, negated: bool) -> Result<BodyLiteral> {
+fn build_epistemic_literal(
+    pair: Pair<'_, Rule>,
+    negated: bool,
+    symbol_owner: &mut SymbolAllocationOwner<'_>,
+) -> Result<BodyLiteral> {
     let epistemic_pair = if pair.as_rule() == Rule::negated_epistemic_atom {
         pair.into_inner()
             .next()
@@ -1122,7 +1376,7 @@ fn build_epistemic_literal(pair: Pair<'_, Rule>, negated: bool) -> Result<BodyLi
     Ok(BodyLiteral::Epistemic(EpistemicLiteral {
         op,
         negated,
-        atom: build_atom(atom_pair)?,
+        atom: build_atom(atom_pair, symbol_owner)?,
     }))
 }
 
@@ -1154,7 +1408,10 @@ fn build_epistemic_literal(pair: Pair<'_, Rule>, negated: bool) -> Result<BodyLi
 /// collapse, all outer modal operators preserve the already-global inner modal
 /// truth value, so the final single-level literal is determined by the
 /// atom-adjacent operator, atom negation duality, and parity of `not` placements.
-fn build_nested_modal_chain(pair: Pair<'_, Rule>) -> Result<BodyLiteral> {
+fn build_nested_modal_chain(
+    pair: Pair<'_, Rule>,
+    symbol_owner: &mut SymbolAllocationOwner<'_>,
+) -> Result<BodyLiteral> {
     // Walk the chain left-to-right. Each `not_kw` negates whatever named token
     // follows it (the next operator, or the trailing atom). We record the
     // operators in order plus the negation that immediately precedes each, and
@@ -1226,34 +1483,39 @@ fn build_nested_modal_chain(pair: Pair<'_, Rule>) -> Result<BodyLiteral> {
     Ok(BodyLiteral::Epistemic(EpistemicLiteral {
         op,
         negated,
-        atom: build_atom(atom_pair)?,
+        atom: build_atom(atom_pair, symbol_owner)?,
     }))
 }
 
 /// Build a finite univ literal.
-fn build_univ(pair: Pair<'_, Rule>) -> Result<Univ> {
+fn build_univ(pair: Pair<'_, Rule>, symbol_owner: &mut SymbolAllocationOwner<'_>) -> Result<Univ> {
     let mut inner = pair.into_inner();
     let term = build_term(
         inner
             .next()
             .ok_or_else(|| XlogError::Parse("Missing univ term".to_string()))?,
+        symbol_owner,
     )?;
     let parts = build_term(
         inner
             .next()
             .ok_or_else(|| XlogError::Parse("Missing univ parts".to_string()))?,
+        symbol_owner,
     )?;
     Ok(Univ { term, parts })
 }
 
 /// Build a comparison
-fn build_comparison(pair: Pair<'_, Rule>) -> Result<Comparison> {
+fn build_comparison(
+    pair: Pair<'_, Rule>,
+    symbol_owner: &mut SymbolAllocationOwner<'_>,
+) -> Result<Comparison> {
     let mut inner = pair.into_inner();
 
     let left_pair = inner
         .next()
         .ok_or_else(|| XlogError::Parse("Missing comparison left operand".to_string()))?;
-    let left = build_term(left_pair)?;
+    let left = build_term(left_pair, symbol_owner)?;
 
     let op_pair = inner
         .next()
@@ -1276,13 +1538,13 @@ fn build_comparison(pair: Pair<'_, Rule>) -> Result<Comparison> {
     let right_pair = inner
         .next()
         .ok_or_else(|| XlogError::Parse("Missing comparison right operand".to_string()))?;
-    let right = build_term(right_pair)?;
+    let right = build_term(right_pair, symbol_owner)?;
 
     Ok(Comparison { left, op, right })
 }
 
 /// Build a term
-fn build_term(pair: Pair<'_, Rule>) -> Result<Term> {
+fn build_term(pair: Pair<'_, Rule>, symbol_owner: &mut SymbolAllocationOwner<'_>) -> Result<Term> {
     // term can directly contain variable, integer, etc. or be wrapped
     let inner = if pair.as_rule() == Rule::term {
         pair.into_inner()
@@ -1333,7 +1595,7 @@ fn build_term(pair: Pair<'_, Rule>) -> Result<Term> {
         Rule::list_literal => {
             let items = inner
                 .into_inner()
-                .map(build_term)
+                .map(|pair| build_term(pair, symbol_owner))
                 .collect::<Result<Vec<_>>>()?;
             Ok(Term::List(items))
         }
@@ -1346,8 +1608,8 @@ fn build_term(pair: Pair<'_, Rule>) -> Result<Term> {
                 .next()
                 .ok_or_else(|| XlogError::Parse("Missing cons tail".to_string()))?;
             Ok(Term::Cons {
-                head: Box::new(build_term(head)?),
-                tail: Box::new(build_term(tail)?),
+                head: Box::new(build_term(head, symbol_owner)?),
+                tail: Box::new(build_term(tail, symbol_owner)?),
             })
         }
         Rule::compound_term => {
@@ -1360,12 +1622,12 @@ fn build_term(pair: Pair<'_, Rule>) -> Result<Term> {
             let mut args = Vec::new();
             if let Some(term_list) = parts.next() {
                 for term in term_list.into_inner() {
-                    args.push(build_term(term)?);
+                    args.push(build_term(term, symbol_owner)?);
                 }
             }
             Ok(Term::Compound { functor, args })
         }
-        Rule::ident => Ok(Term::Symbol(symbol::intern(inner.as_str()))),
+        Rule::ident => symbol_owner.intern(inner.as_str()).map(Term::Symbol),
         _ => Err(XlogError::Parse(format!(
             "Unknown term type: {:?}",
             inner.as_rule()
