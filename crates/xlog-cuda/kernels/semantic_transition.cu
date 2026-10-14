@@ -2793,7 +2793,7 @@ extern "C" __global__ void semantic_publication_prepare_model_update_admissibili
        objective.row_count!=selection.row_count || objective.capacity!=inputs.capacity ||
        objective.protected_member_count!=inputs.protected_member_count ||
        !selection.row_count || selection.row_count>inputs.row_count || selection.capacity!=inputs.capacity ||
-        task[0]!=7 || !task[1] ||
+        task[0]!=8 || !task[1] ||
         !task_program_bank(task,inputs.task_words,&program_bank) ||
        !publication_identity_equal(objective.task_identity,task+2)) {
         semantic_content_integrity_trap();return;
@@ -4677,6 +4677,7 @@ __device__ TaskProgramQueryOutcome task_program_queries(const Descriptor& descri
     work=semantic_graph::NativeWorkTally{};
     *derived_count=closure.derived_count;
     auto& facts=state->task_evaluation.facts[slot];
+    facts.g=0;facts.p=0;
     bool hard=true;
     for(uint32_t query=0;query<view.queries;++query) {
         const auto query_fact=semantic_program::bank_fact(bank.program,query);
@@ -4719,8 +4720,23 @@ __device__ TaskProgramQueryOutcome task_program_queries(const Descriptor& descri
         ++state->task_evaluation.query_count;
         hard&=(view.query(query)[6] & (uint64_t(1)<<truth))!=0;
         record.truth=truth;
-        record.attained=view.coding ? semantic_task_ground::attained(view,plane,query,truth,
-            fact_index,closure.fact_count,support) : truth==view.query(query)[5];
+        record.attained=view.coding ? 0 : truth==view.query(query)[5];
+        if(!view.coding)facts.g+=record.attained;
+    }
+    if(view.coding)for(uint32_t rank=0;rank<view.queries;++rank) {
+        const uint32_t query=uint32_t(view.attainment_order[rank]);
+        auto& record=plane.query(slot,query);
+        const auto query_fact=semantic_program::bank_fact(bank.program,query);
+        uint32_t fact_index=0;
+        for(;fact_index<closure.fact_count;++fact_index) {
+            semantic_graph::charge_native(&work,semantic_graph::NativeWorkEvent::TableSlot,1);
+            if(output[fact_index].predicate==query_fact.predicate &&
+               output[fact_index].first==query_fact.first && output[fact_index].second==query_fact.second)break;
+        }
+        uint64_t inspected=0;
+        record.attained=semantic_task_ground::attained(view,plane,slot,query,record.truth,
+            fact_index,closure.fact_count,support,&inspected);
+        semantic_graph::charge_native(&work,semantic_graph::NativeWorkEvent::TableSlot,inspected);
         facts.g+=record.attained;
     }
     execution_work_merge_native(state->execution_work,work);
@@ -5237,7 +5253,7 @@ __device__ void semantic_policy_backward(const Descriptor& descriptor,
                         *status=1;
                     } else {
                         const auto* task=reinterpret_cast<const uint64_t*>(descriptor.task);
-                        if(!task || task[0]!=7) {
+                        if(!task || task[0]!=8) {
                             *status=1;
                         } else {
                             const auto* goal=backward_program_bank.task.goal_witness;
@@ -5804,7 +5820,7 @@ __device__ uint64_t publication_initialize(const Descriptor& descriptor,Publicat
        !contract.model_generation || bank.header.model_generation>UINT32_MAX ||
        (restored ? bank.header.model_generation<contract.model_generation : bank.header.model_generation!=contract.model_generation) ||
        bank.header.authority_generation!=contract.authority_generation ||
-        !publication_identity_equal(contract.task_identity,task+2) || task[0]!=7 || task[1]!=descriptor.arena[1] ||
+        !publication_identity_equal(contract.task_identity,task+2) || task[0]!=8 || task[1]!=descriptor.arena[1] ||
        !publication_identity_equal(control.instance,bank.header.instance) || bank.header.range_count!=inactive.header.range_count ||
        (contract.terminal_token_count && !contract.terminal_tokens))return 1;
     uint64_t end=0;
@@ -7616,7 +7632,7 @@ extern "C" __global__ void semantic_transition_execute(Descriptor descriptor) {
                    !publication_identity_equal(pending.instance,lease.instance) || contract.abi!=1 ||
                    !publication_identity_equal(pending.topology_identity,contract.topology_identity) ||
                    !publication_identity_equal(pending.table_identity,contract.table_identity) ||
-                    !task || task[0]!=7 || task[1]!=descriptor.arena[1] ||
+                    !task || task[0]!=8 || task[1]!=descriptor.arena[1] ||
                    !publication_identity_equal(contract.task_identity,task+2)) {
                     semantic_content_integrity_trap();return;
                 }
@@ -7674,7 +7690,7 @@ extern "C" __global__ void semantic_transition_execute(Descriptor descriptor) {
                 transition_kind=reinterpret_cast<const PendingContinuation*>(control.continuation)->transition_kind;
             }
         }
-        if(!failed && task && (task[0]!=7 || task[1]!=descriptor.arena[1])) {
+        if(!failed && task && (task[0]!=8 || task[1]!=descriptor.arena[1])) {
             failed=1;state->status=7;
         }
         if(!failed && task)state->actor_eligible=program_bank.task.actor_eligible;

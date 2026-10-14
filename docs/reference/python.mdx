@@ -130,6 +130,37 @@ Truth masks follow the selected original statements. Current dependencies must
 cover the union of selected statements and every original protected observation
 statement, together with the task's original `observer:0` or `program:0` source.
 
+Pass one exact `task_ground=(kind, bindings, requirements)` tuple throughout
+cold construction, import and restoration. Logical ground is
+`("logical", (), ())`. Coding ground retains its original eight-field bindings
+and a complete tuple of `(query, required_goal_ordinals,
+required_binding_ordinals)` rows, ordered by query from zero through `Q-1`.
+Indices are exact unsigned 32-bit integers, excluding Boolean values. Each
+dependency tuple is strictly increasing. Native admission rejects missing rows,
+cycles, empty unproved leaves and binding dependencies whose protected
+`observation_record` is not that row's queried statement. Each coding query also
+requires its own explicit priority target. The existing binding's goal label
+does not change when a leaf references its original receipt ordinal.
+
+Coding attainment is distinct from raw Truth4. Native first materializes every
+query's truth and provenance, then folds the protected graph in topological
+order. A query must have its required truth and all its explicit prerequisites.
+An observation prerequisite additionally requires a present, authenticated
+positive-only receipt and its original provenance bit in that query's positive
+lineage. Missing, negative, contradictory or foreign observations cannot supply
+success. A missing leaf invalidates its dependent aggregates, not independent
+goals. Base and executed candidates use this same predicate for priority
+progress, attained counts, all-goals, selection and completed output.
+
+The graph belongs to the existing task-ground owner and is committed by task
+content and the authority's `mandatory_links_root`; it is not a separate mutable
+goal store. Exact checkpoint custody retains all three fields. Completed
+task-ground material uses version 5 and includes the full ordered graph before
+its raw query plane; the invocation plane uses version 2. Older two-field
+carriers, receipts and checkpoints are not reinterpreted under this semantics.
+Cold ingress and export remain separate from the resident GPU fold; source
+integration alone does not certify runtime execution or measured ZERO TRANSFER.
+
 The constructor, task import and checkpoint restore also require
 `training_canary_source`: the same open original Logical `ColdTask`, or explicit
 `None` when no symbolic training source is needed. Prospective training retains
@@ -668,20 +699,22 @@ selector can locate an existing independent pin, but cannot create that trust.
 ### Semantic task authority
 
 The semantic controller's `task_observation_roots` and `import_task` methods
-share five explicit keyword arguments in addition to their admission and
+share explicit keyword arguments in addition to their admission and
 authority inputs. `import_task` also requires `task_priority_levels`:
 
 | Argument | Meaning |
 | --- | --- |
 | `task_program_source` | Complete authored XLOG source, including concrete input facts; imports and external relation inputs are not accepted by this adapter. |
-| `task_query_ordinals` | Three zero-based query ordinals, in admitted statement order; all queries must return zero-arity results. |
+| `task_query_ordinals` | The original `Q` zero-based query ordinals, in admitted statement order; all queries must return zero-arity results. |
 | `task_scoring` | Six nonnegative `u32` coefficients in order: correct, all-correct, work, improvement, refusal, spent. |
-| `task_priority_levels` (`import_task` only) | Ordered tuple of levels; each level is a nonempty ordered tuple of `(query_ordinal, target_truth_code, weight)` goals. Truth codes are `0=Neither`, `1=True`, `2=False`, `3=Both`; weights are positive `u32`. At most three levels and three goals fit the three-query bank, and a query may occur only once. An explicit empty tuple is valid for tasks without a priority level. |
-| `admissible_truth_masks` | Three nonzero four-bit masks, one per query; bit `n` permits truth value `n`. |
+| `task_priority_levels` (`import_task` only) | Ordered tuple of levels; each level is a nonempty ordered tuple of `(query_ordinal, target_truth_code, weight)` goals. Truth codes are `0=Neither`, `1=True`, `2=False`, `3=Both`; weights are positive `u32`. There are at most `Q` goals and levels, and each query occurs at most once. Coding requires an explicit target for every query; Logical may use an empty priority tuple. |
+| `admissible_truth_masks` | `Q` nonzero four-bit masks, one per query; bit `n` permits truth value `n`. |
 | `actor_eligible` | Required Boolean application decision, frozen into the task before any action draw; it is never inferred from the winner or result. |
+| `task_ground` | The exact original `(kind, bindings, requirements)` carrier described under semantic task binding. |
 
 Import runs the authored program through XLOG's native GPU evaluator and derives
-expected Boolean answers from its completed results. There is no expected-answer
+Logical reference Truth4 answers from its completed results; Coding retains its
+actual initial program result without a reference answer. There is no expected-answer
 argument or built-in task. Source, selected queries, observed results, scoring,
 ordered priorities, masks, and actor eligibility become part of the task identity
 checked during restoration. The imported `TaskUse.task_priority_levels()` returns
@@ -690,8 +723,9 @@ returns the same record after execution. `TaskUse.semantic_goal_root()` returns
 the existing bound 32-byte native goal root after import and before Proposal;
 completed task ground retains that exact root. The read requires the creator
 thread and current issued task use, and does not recompute the goal or grant
-execution authority. For each goal the native truth match is
-normalized to zero or one. Selection compares weighted progress against the
+execution authority. For each goal, native attainment is
+normalized to zero or one, using the protected dependency graph for Coding.
+Selection compares weighted progress against the
 acquired base of the current step, level by level; forbidden truth statuses
 exclude a candidate before ranking. Predictive query agreement, lower measured
 cost, then lowest candidate index break remaining ties. The six scoring

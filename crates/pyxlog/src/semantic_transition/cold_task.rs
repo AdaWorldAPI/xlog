@@ -763,8 +763,8 @@ impl PySemanticTransitionColdTask {
             xlog_cuda::SemanticTaskGround::Logical => {
                 Some(exact_text(observer_program, "observer_program")?)
             }
-            xlog_cuda::SemanticTaskGround::Coding(_) if observer_program.is_none() => None,
-            xlog_cuda::SemanticTaskGround::Coding(_) => {
+            xlog_cuda::SemanticTaskGround::Coding { .. } if observer_program.is_none() => None,
+            xlog_cuda::SemanticTaskGround::Coding { .. } => {
                 return Err(invalid("coding task has no independent observer reference"))
             }
         };

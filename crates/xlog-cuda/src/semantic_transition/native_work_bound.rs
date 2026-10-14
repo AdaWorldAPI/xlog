@@ -2139,6 +2139,24 @@ pub(super) fn group_critic_native_work_ceiling(
     Ok(ceiling)
 }
 
+/// The protected attainment fold visits actual closure facts and explicit
+/// edges. This bounds the same reached TableSlot events, not structural cost.
+fn attainment_native_work_ceiling(
+    task: &SemanticTaskEvaluationSpec,
+) -> Result<[u64; 9], SemanticTransitionError> {
+    let mut ceiling = [0; 9];
+    if task.task_ground.code() == 1 {
+        ceiling[1] = ceiling_sum([
+            ceiling_product(
+                task.statement_records.len() as u64,
+                crate::semantic_program::RESIDENT_PROGRAM_FACT_CAPACITY as u64 + 1,
+            )?,
+            task.task_ground.mandatory_edge_count()?,
+        ])?;
+    }
+    Ok(ceiling)
+}
+
 /// Enclose the reached event counters of the original embedded transitions.
 /// These are capacity bounds, not observed work or structural selection cost.
 /// The initializer has its own separate finite occurrence and is not included.
@@ -2258,6 +2276,8 @@ pub(super) fn actor_refresh_transition_native_work_ceilings(
         let io = child.prepared_kernel_io(&handles[index], index)?;
         let descriptor = child.descriptor_with(&io);
         let ceiling = &mut result[index];
+        // Base and both executed lanes share one protected graph predicate.
+        repeat_native_ceiling(ceiling, attainment_native_work_ceiling(&task.0.spec)?, 3)?;
         // A numerical refusal snapshots the original root; an admitted slot
         // snapshots/preflights it instead. Keeping both covers either outcome.
         repeat_native_ceiling(ceiling, snapshot, 2)?;

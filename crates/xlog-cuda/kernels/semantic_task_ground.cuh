@@ -17,6 +17,7 @@ struct Task {
     uint64_t coding, support_count, level_count, goal_count;
     const uint64_t *scoring, *goal_witness, *query_rows, *supports, *levels, *goals, *binding_rows;
     const uint64_t* observation_rows;
+    const uint64_t *requirements, *requirement_offsets, *attainment_order;
     uint64_t actor_eligible;
     semantic_program::Bank program;
     bool editable;
@@ -41,7 +42,7 @@ struct Task {
 // One exact decoder for the native owner's variable-length task bank. No
 // consumer derives an extent from a public pointer or an unbounded sentinel.
 __device__ bool decode(const uint64_t* words,uint64_t count,Task* output) {
-    if(!words || !output || count<38 || words[0]!=7 || !words[1] ||
+    if(!words || !output || count<39 || words[0]!=8 || !words[1] ||
        !words[6] || words[6]>UINT32_MAX || words[7]>UINT32_MAX || words[8]>1 ||
        (words[8]==0 ? words[7]!=0 : words[7]==0) || words[10]>words[6] ||
        words[11]>words[6] || words[37]>1)return false;
@@ -57,7 +58,48 @@ __device__ bool decode(const uint64_t* words,uint64_t count,Task* output) {
     if(!take(task.queries,7,&task.query_rows) || !take(task.support_count,5,&task.supports) ||
        !take(task.level_count,1,&task.levels) || !take(task.goal_count,3,&task.goals) ||
        !take(task.bindings,kBindingWords,&task.binding_rows) ||
-       !take(task.bindings,7,&task.observation_rows) || words[12]!=count-offset)return false;
+       !take(task.bindings,7,&task.observation_rows) || offset==count)return false;
+    const uint64_t requirement_words=words[offset++];
+    if(requirement_words>count-offset)return false;
+    if(task.coding) {
+        if(task.goal_count!=task.queries || requirement_words<1+uint64_t(task.queries)*5 ||
+           words[offset]!=task.queries)return false;
+        task.requirements=words+offset;
+        task.requirement_offsets=task.requirements+1;
+        task.attainment_order=task.requirement_offsets+task.queries;
+        uint64_t row_offset=1+uint64_t(task.queries)*2;
+        for(uint32_t query=0;query<task.queries;++query) {
+            if(task.requirement_offsets[query]!=row_offset || requirement_words-row_offset<3)return false;
+            const auto* row=task.requirements+row_offset;
+            if(row[0]!=query || row[1]>task.queries || row[2]>task.bindings ||
+               (!row[1]&&!row[2]) || row[1]+row[2]>requirement_words-row_offset-3)return false;
+            for(uint64_t index=0;index<row[1];++index)
+                if(row[3+index]>=task.queries || row[3+index]==query ||
+                   (index && row[3+index-1]>=row[3+index]))return false;
+            for(uint64_t index=0;index<row[2];++index) {
+                const uint64_t binding=row[3+row[1]+index];
+                if(binding>=task.bindings || (index && row[3+row[1]+index-1]>=binding) ||
+                   task.binding(uint32_t(binding))[1]!=task.query(query)[4])return false;
+            }
+            row_offset+=3+row[1]+row[2];
+        }
+        if(row_offset!=requirement_words)return false;
+        for(uint32_t rank=0;rank<task.queries;++rank) {
+            const uint64_t query=task.attainment_order[rank];
+            if(query>=task.queries)return false;
+            for(uint32_t before=0;before<rank;++before)
+                if(task.attainment_order[before]==query)return false;
+            const auto* row=task.requirements+task.requirement_offsets[query];
+            for(uint64_t index=0;index<row[1];++index) {
+                bool earlier=false;
+                for(uint32_t before=0;before<rank;++before)
+                    earlier|=task.attainment_order[before]==row[3+index];
+                if(!earlier)return false;
+            }
+        }
+    } else if(requirement_words)return false;
+    offset+=requirement_words;
+    if(words[12]!=count-offset)return false;
     task.editable=words[12]!=0;
     if(task.editable && (!semantic_program::decode_bank(words+offset,words[12],&task.program) ||
        task.program.query_count!=task.queries || task.program.rule_count>semantic_program::kRuleCapacity))return false;
@@ -108,7 +150,7 @@ __device__ bool decode_plane(uint64_t address,uint64_t bytes,const Task& task,Pl
     const uint64_t capacity=task.editable ? semantic_program::kRuleCapacity-uint64_t(task.program.rule_count) : 0;
     const uint64_t query_offset=64+uint64_t(task.bindings)*sizeof(Observation);
     const uint64_t rule_offset=query_offset+3*uint64_t(task.queries)*sizeof(Query);
-    if(header[0]!=kMagic || header[1]!=1 || header[2]!=task.queries || header[3]!=task.bindings ||
+    if(header[0]!=kMagic || header[1]!=2 || header[2]!=task.queries || header[3]!=task.bindings ||
        header[4]!=kQueryWords || header[5]!=kObservationWords || header[6]>capacity || header[7]!=capacity ||
        bytes!=rule_offset+capacity*sizeof(semantic_program::Rule))return false;
     Plane plane{header,reinterpret_cast<Observation*>(address+64),
@@ -147,31 +189,32 @@ struct Observations {
     }
 };
 
-// A lineage bit is a source reference, not a vote or an invented conjunction.
-// The actual authored join determines derivability. Attainment additionally
-// requires the original binding to name this goal and the matching channel.
-__device__ bool attained(const Task& task,const Plane& plane,uint32_t query,
+// Raw derivability is unchanged. Attainment consumes the original protected
+// dependency graph after every query truth has been materialized.
+__device__ bool attained(const Task& task,const Plane& plane,uint32_t slot,uint32_t query,
         uint64_t truth,uint32_t fact_index,uint32_t fact_count,
-        const semantic_program::DualSupport& support) {
+        const semantic_program::DualSupport& support,uint64_t* inspected) {
+    ++*inspected;
     uint64_t target=0;
     if(!task.target(query,&target) || truth!=target)return false;
-    bool positive=false,negative=false,neither=false;
-    const auto query_fact=semantic_program::bank_fact(task.program,query);
-    for(uint32_t binding=0;binding<task.bindings;++binding) {
-        const auto& observation=plane.observations[binding];
-        if(task.binding(binding)[0]!=query || observation.present!=1)continue;
-        semantic_program::Fact observed{};task.observation_fact(binding,&observed);
-        if(observation.truth==0 && observed.predicate==query_fact.predicate &&
-           observed.first==query_fact.first && observed.second==query_fact.second)neither=true;
-        if(fact_index==fact_count)continue;
-        for(uint32_t channel=0;channel<2;++channel) {
-            if(!(observation.truth&(uint64_t(1)<<channel)))continue;
-            const uint64_t sources=support.lineage[(uint64_t(fact_index)*2+channel)*support.words+binding/64];
-            if(!(sources&(uint64_t(1)<<(binding%64))))continue;
-            if(channel==0)positive=true;else negative=true;
-        }
+    const auto* row=task.requirements+task.requirement_offsets[query];
+    for(uint64_t index=0;index<row[1];++index) {
+        ++*inspected;
+        if(plane.query(slot,uint32_t(row[3+index])).attained!=1)return false;
     }
-    return target==0 ? neither : target==1 ? positive : target==2 ? negative : positive && negative;
+    const auto query_fact=semantic_program::bank_fact(task.program,query);
+    for(uint64_t index=0;index<row[2];++index) {
+        ++*inspected;
+        const uint32_t binding=uint32_t(row[3+row[1]+index]);
+        const auto& observation=plane.observations[binding];
+        if(observation.present!=1 || observation.truth!=1 || fact_index==fact_count)return false;
+        semantic_program::Fact observed{};task.observation_fact(binding,&observed);
+        if(observed.predicate!=query_fact.predicate || observed.first!=query_fact.first ||
+           observed.second!=query_fact.second)return false;
+        const uint64_t sources=support.lineage[(uint64_t(fact_index)*2)*support.words+binding/64];
+        if(!(sources&(uint64_t(1)<<(binding%64))))return false;
+    }
+    return true;
 }
 
 } // namespace semantic_task_ground

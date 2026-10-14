@@ -509,7 +509,11 @@ pub(super) fn verify_acquired_receipts<B: AsRef<[u8]>>(
     key: &[u8; 32],
     budget: Option<&SemanticReplayMaterialBudget>,
 ) -> Result<AuthenticatedTaskResults, SemanticTransitionError> {
-    let SemanticTaskGround::Coding(bindings) = ground else {
+    let SemanticTaskGround::Coding {
+        bindings,
+        requirements,
+    } = ground
+    else {
         return Err(invalid_receipt());
     };
     if materials.len() != bindings.len()
@@ -521,7 +525,20 @@ pub(super) fn verify_acquired_receipts<B: AsRef<[u8]>>(
     {
         return Err(invalid_receipt());
     }
-    let mut owned_bytes = (2 * size_of::<Value>() + "coding".len()) as u64;
+    let mut owned_bytes = (3 * size_of::<Value>() + "coding".len()) as u64;
+    for row in requirements {
+        let nodes = 6usize
+            .checked_add(row.required_goal_ordinals.len())
+            .and_then(|n| n.checked_add(row.required_binding_ordinals.len()))
+            .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        owned_bytes = owned_bytes
+            .checked_add(
+                (nodes as u64)
+                    .checked_mul(size_of::<Value>() as u64)
+                    .ok_or(SemanticTransitionError::GenerationExhausted)?,
+            )
+            .ok_or(SemanticTransitionError::GenerationExhausted)?;
+    }
     for binding in bindings {
         let binding_bytes =
             (size_of::<Value>() * 8 + 2 * 20 + 4 * 64 + binding.receipt_family.name().len())
@@ -559,6 +576,30 @@ pub(super) fn verify_acquired_receipts<B: AsRef<[u8]>>(
     let original_ground = Value::Array(vec![
         "coding".into(),
         Value::Array(bindings.iter().map(binding_json).collect()),
+        Value::Array(
+            requirements
+                .iter()
+                .map(|row| {
+                    Value::Array(vec![
+                        row.query.into(),
+                        Value::Array(
+                            row.required_goal_ordinals
+                                .iter()
+                                .copied()
+                                .map(Value::from)
+                                .collect(),
+                        ),
+                        Value::Array(
+                            row.required_binding_ordinals
+                                .iter()
+                                .copied()
+                                .map(Value::from)
+                                .collect(),
+                        ),
+                    ])
+                })
+                .collect(),
+        ),
     ]);
     let mut observations = Vec::with_capacity(bindings.len());
     let mut receipt_identities = BTreeSet::new();

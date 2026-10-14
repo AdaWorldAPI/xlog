@@ -113,7 +113,7 @@ pub use semantic_transition::{
     SemanticTaskObservationRoots, SemanticTaskObservationRootsOwner, SemanticTaskPriorityGoal,
     SemanticTaskPriorityLevel,
     SemanticTaskProgram, SemanticTaskReceiptFamily, SemanticTaskRefusal, SemanticTaskScoring,
-    SemanticTaskVerificationBinding, SemanticTensorContentWitness, SemanticTensorInput,
+    SemanticTaskAttainmentRequirement, SemanticTaskVerificationBinding, SemanticTensorContentWitness, SemanticTensorInput,
     SemanticTensorLayout, SemanticTextRow, SemanticTextSlot, SemanticTokenProvenance,
     SemanticTransitionError, SemanticTransitionHostIoStats, SemanticTransitionKind,
     SemanticTransitionLane, SemanticTransitionObservation, SemanticTransitionOutcome,

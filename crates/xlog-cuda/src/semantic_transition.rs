@@ -101,7 +101,7 @@ use std::{
     },
 };
 pub use task_ground::{
-    SemanticTaskGround, SemanticTaskMeasurementBinding, SemanticTaskReceiptFamily,
+    SemanticTaskAttainmentRequirement, SemanticTaskGround, SemanticTaskMeasurementBinding, SemanticTaskReceiptFamily,
     SemanticTaskVerificationBinding,
 };
 
@@ -702,7 +702,8 @@ impl SemanticTaskEvaluationSpec {
         }
         self.scoring
             .validate(self.program.editable_program().is_some(), query_count_u32)?;
-        self.task_ground.validate(records, query_count)?;
+        self.task_ground
+            .validate(records, &self.statement_records)?;
         if let Some(domain) = &self.training_domain {
             domain.validate()?;
         }
@@ -735,6 +736,11 @@ impl SemanticTaskEvaluationSpec {
                     ));
                 }
             }
+        }
+        if self.task_ground.code() == 1 && seen_queries.iter().any(|seen| !seen) {
+            return Err(invalid(
+                "coding attainment requires an explicit target for every query",
+            ));
         }
         if self
             .admissible_truth_masks
@@ -835,6 +841,7 @@ pub(crate) struct TaskEvaluationBinding {
     observation: SemanticTaskObservation,
     goal_witness: Option<SemanticTaskGoalWitness>,
     objective_law: SemanticTaskObjectiveLaw,
+    _requirement_allocation: Option<SemanticReplayMaterialReservation>,
 }
 
 type TaskContentSelection = (
@@ -926,7 +933,7 @@ fn task_content_identity(
     theory_program.update(b"xlog.semantic.task-theory-program.v1\0");
     theory_program.update(admission_identity.as_bytes());
     theory_program.update(schema_generation.as_bytes());
-    theory_program.update(b"xlog.semantic.task-ground.v1\0");
+    theory_program.update(b"xlog.semantic.task-ground.v2\0");
     theory_program.update(task_ground.code().to_le_bytes());
     theory_program.update((task_ground.bindings().len() as u64).to_le_bytes());
     for binding in task_ground.bindings() {
@@ -934,6 +941,7 @@ fn task_content_identity(
             theory_program.update(word.to_le_bytes());
         }
     }
+    task_ground.visit_requirement_words(|word| theory_program.update(word.to_le_bytes()));
     theory_program.update((allowed_supports.len() as u64).to_le_bytes());
     for (record, support) in allowed_supports {
         theory_program.update(record.to_le_bytes());
@@ -1035,6 +1043,7 @@ impl TaskEvaluationBinding {
             observation,
             goal_witness: None,
             objective_law,
+            _requirement_allocation: None,
         })
     }
 
@@ -1067,7 +1076,7 @@ impl TaskEvaluationBinding {
             hash.update((truth as u64).to_le_bytes());
         }
         hash.update(&self.spec.admissible_truth_masks);
-        hash.update(b"xlog.semantic.task-ground.v1\0");
+        hash.update(b"xlog.semantic.task-ground.v2\0");
         hash.update(self.spec.task_ground.code().to_le_bytes());
         hash.update((self.spec.task_ground.bindings().len() as u64).to_le_bytes());
         for binding in self.spec.task_ground.bindings() {
@@ -1075,6 +1084,9 @@ impl TaskEvaluationBinding {
                 hash.update(word.to_le_bytes());
             }
         }
+        self.spec
+            .task_ground
+            .visit_requirement_words(|word| hash.update(word.to_le_bytes()));
         hash.update([u8::from(self.spec.actor_eligible)]);
         for weight in self.spec.scoring.words() {
             hash.update(weight.to_le_bytes());
@@ -1246,7 +1258,7 @@ impl TaskEvaluationBinding {
             .iter()
             .map(|level| level.goals.len())
             .sum::<usize>();
-        let mut words = vec![7, owner];
+        let mut words = vec![8, owner];
         words.extend(identity_words(*self.identity().as_bytes()));
         words.extend([
             self.statements.len() as u64,
@@ -1304,6 +1316,13 @@ impl TaskEvaluationBinding {
                 u64::from(fact.second),
             ]);
         }
+        let requirements = self
+            .spec
+            .task_ground
+            .device_requirement_words()
+            .expect("immutable task binding retains its validated attainment graph");
+        words.push(requirements.len() as u64);
+        words.extend(requirements);
         if let Some(program) = program {
             words.extend(program);
         }
@@ -27172,6 +27191,9 @@ impl SemanticTransitionSession {
             5 * 8,
             repeated_material_extent(task.spec().statement_records.len(), 8)?,
             repeated_material_extent(task.spec().task_ground.bindings().len(), 36 * 8)?,
+            repeated_material_extent(task.spec().task_ground.requirement_word_count()?, 8)?,
+            usize::try_from(task.spec().task_ground.requirement_allocation_bytes()?)
+                .map_err(|_| SemanticTransitionError::GenerationExhausted)?,
             self.task_ground
                 .as_ref()
                 .ok_or(SemanticTransitionError::NotBound)?
@@ -27968,7 +27990,7 @@ impl SemanticTransitionSession {
             });
         let mut ground_bytes = Vec::new();
         ground_bytes.extend_from_slice(b"XLOG-COMPLETED-TASK-GROUND\0");
-        material_u64(&mut ground_bytes, 4);
+        material_u64(&mut ground_bytes, 5);
         let structural_cost = objective_law.structural_cost;
         ground_bytes.extend_from_slice(structural_cost.unit.as_bytes());
         material_u64(&mut ground_bytes, structural_cost.cap);
@@ -28021,6 +28043,7 @@ impl SemanticTransitionSession {
                 material_u64(&mut ground_bytes, word);
             }
         }
+        original_task_ground.visit_requirement_words(|word| material_u64(&mut ground_bytes, word));
         material_u64(&mut ground_bytes, query_ground.len() as u64);
         ground_bytes.extend_from_slice(&query_ground);
         for facts in &task_facts {
@@ -40255,7 +40278,19 @@ impl SemanticTransitionSession {
         } else {
             Some(budget.reserve_ordered_index::<[u64; 36], ()>(spec.task_ground.bindings().len())?)
         };
+        let requirement_validation = if spec.task_ground.requirements().is_empty() {
+            None
+        } else {
+            Some(
+                budget.reserve_auxiliary(
+                    (spec.task_ground.requirements().len() as u64)
+                        .checked_mul((size_of::<u32>() + size_of::<bool>()) as u64)
+                        .ok_or(SemanticTransitionError::GenerationExhausted)?,
+                )?,
+            )
+        };
         spec.validate_records(admission.records())?;
+        drop(requirement_validation);
         drop(coding_validation);
         drop(query_validation);
         if let Some(replay) = replay {
@@ -40404,6 +40439,34 @@ impl SemanticTransitionSession {
             .graph
             .admission()
             .ok_or(SemanticTransitionError::NotBound)?;
+        let requirement_allocation = if spec.task_ground.requirements().is_empty() {
+            None
+        } else {
+            Some(
+                self.replay_material_budget
+                    .as_ref()
+                    .ok_or_else(|| {
+                        publication_input_error(
+                            "task attainment requires its original shared material pool",
+                        )
+                    })?
+                    .reserve_auxiliary(spec.task_ground.requirement_allocation_bytes()?)?,
+            )
+        };
+        let requirement_workspace = if spec.task_ground.requirements().is_empty() {
+            None
+        } else {
+            Some(
+                self.replay_material_budget
+                    .as_ref()
+                    .ok_or_else(|| {
+                        publication_input_error(
+                            "task attainment workspace requires its original shared material pool",
+                        )
+                    })?
+                    .reserve_auxiliary(spec.task_ground.requirement_workspace_bytes()?)?,
+            )
+        };
         let next_epoch = self
             .task_epoch
             .checked_add(1)
@@ -40425,7 +40488,8 @@ impl SemanticTransitionSession {
             .inspect_err(|_error| {
                 self.poisoned = true;
             })?;
-        let binding = TaskEvaluationBinding::bind(admission, spec, observation)?;
+        let mut binding = TaskEvaluationBinding::bind(admission, spec, observation)?;
+        binding._requirement_allocation = requirement_allocation;
         if self
             .cold_content
             .as_ref()
@@ -40512,6 +40576,7 @@ impl SemanticTransitionSession {
             CudaStream::synchronize,
         )?;
         self.validate_ranges()?;
+        drop(requirement_workspace);
         self.task_epoch = next_epoch;
         Ok(identity)
     }

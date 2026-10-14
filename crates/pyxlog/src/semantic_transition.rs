@@ -3277,7 +3277,7 @@ impl PySemanticTransitionSession {
                 &spec.allowed_support_records,
                 &spec.task_ground,
             )?;
-            let goal_witness = authority.goal_witness(observations.roots());
+            let goal_witness = authority.goal_witness(observations.roots(), &spec.task_ground)?;
             drop(observations);
             owner.bind_task_evaluation(spec).map_err(xlog_err)?;
             owner
@@ -9225,7 +9225,7 @@ fn read_task_ground(value: &Bound<'_, PyAny>, budget: &mut usize) -> PyResult<Co
         }
         Ok(fields)
     }
-    let fields = tuple(value, Some(2), *budget)?;
+    let fields = tuple(value, Some(3), *budget)?;
     let tag = ColdValue::read(&fields[0], budget, 0)?;
     let bindings = tuple(&fields[1], None, *budget)?;
     if bindings.len() > u32::MAX as usize {
@@ -9261,20 +9261,52 @@ fn read_task_ground(value: &Bound<'_, PyAny>, budget: &mut usize) -> PyResult<Co
         });
         rows.push(ColdValue::Sequence(row));
     }
-    let result = ColdValue::Sequence(vec![tag, ColdValue::Sequence(rows)]);
+    let index = |value: &Bound<'_, PyAny>, budget: &mut usize| -> PyResult<ColdValue> {
+        if !value.is_exact_instance_of::<PyInt>() || value.extract::<u32>().is_err() {
+            return Err(invalid(
+                "task attainment index requires an exact u32 integer",
+            ));
+        }
+        ColdValue::read(value, budget, 0)
+    };
+    let mut requirements = Vec::new();
+    for requirement in tuple(&fields[2], None, *budget)? {
+        let row = tuple(&requirement, Some(3), *budget)?;
+        let query = index(&row[0], budget)?;
+        let mut dependencies = Vec::with_capacity(2);
+        for field in &row[1..] {
+            dependencies.push(ColdValue::Sequence(
+                tuple(field, None, *budget)?
+                    .iter()
+                    .map(|value| index(value, budget))
+                    .collect::<PyResult<Vec<_>>>()?,
+            ));
+        }
+        requirements.push(ColdValue::Sequence(vec![
+            query,
+            dependencies.remove(0),
+            dependencies.remove(0),
+        ]));
+    }
+    let result = ColdValue::Sequence(vec![
+        tag,
+        ColdValue::Sequence(rows),
+        ColdValue::Sequence(requirements),
+    ]);
     task_ground_value(&result)?;
     Ok(result)
 }
 
 fn task_ground_value(value: &ColdValue) -> PyResult<xlog_cuda::SemanticTaskGround> {
     use xlog_cuda::{
-        SemanticTaskGround, SemanticTaskMeasurementBinding, SemanticTaskReceiptFamily,
-        SemanticTaskVerificationBinding,
+        SemanticTaskAttainmentRequirement, SemanticTaskGround, SemanticTaskMeasurementBinding,
+        SemanticTaskReceiptFamily, SemanticTaskVerificationBinding,
     };
-    let fields = value.fields(2)?;
+    let fields = value.fields(3)?;
     let bindings = fields[1].sequence()?;
+    let requirements = fields[2].sequence()?;
     match fields[0].text()? {
-        "logical" if bindings.is_empty() => Ok(SemanticTaskGround::Logical),
+        "logical" if bindings.is_empty() && requirements.is_empty() => Ok(SemanticTaskGround::Logical),
         "coding" if !bindings.is_empty() && bindings.len() <= u32::MAX as usize => {
             let identity = |value: &ColdValue| -> PyResult<Identity256> {
                 let ColdValue::Bytes(bytes) = value else {
@@ -9330,10 +9362,18 @@ fn task_ground_value(value: &ColdValue) -> PyResult<xlog_cuda::SemanticTaskGroun
                         measurement,
                     });
             }
-            Ok(SemanticTaskGround::Coding(original_bindings))
+            let original_requirements = requirements.iter().map(|requirement| {
+                let row = requirement.fields(3)?;
+                Ok(SemanticTaskAttainmentRequirement {
+                    query: index(&row[0])?,
+                    required_goal_ordinals: row[1].sequence()?.iter().map(index).collect::<PyResult<_>>()?,
+                    required_binding_ordinals: row[2].sequence()?.iter().map(index).collect::<PyResult<_>>()?,
+                })
+            }).collect::<PyResult<Vec<_>>>()?;
+            Ok(SemanticTaskGround::Coding { bindings: original_bindings, requirements: original_requirements })
         }
         _ => Err(invalid(
-            "task ground must be logical with no bindings or coding with its original roster",
+            "task ground must be logical with no bindings or requirements, or coding with its original roster and attainment graph",
         )),
     }
 }
@@ -9462,10 +9502,10 @@ fn task_evaluation_spec_core(
     let task_ground = task_ground_value(&values[7])?;
     let source = match (&task_ground, &values[2]) {
         (xlog_cuda::SemanticTaskGround::Logical, source) => source.text()?.to_owned(),
-        (xlog_cuda::SemanticTaskGround::Coding(_), ColdValue::None) => initial_program_source
+        (xlog_cuda::SemanticTaskGround::Coding { .. }, ColdValue::None) => initial_program_source
             .ok_or_else(|| invalid("coding task requires its original admitted initial program"))?
             .to_owned(),
-        (xlog_cuda::SemanticTaskGround::Coding(_), _) => {
+        (xlog_cuda::SemanticTaskGround::Coding { .. }, _) => {
             return Err(invalid("coding task has no independent observer reference"));
         }
     };
@@ -9490,7 +9530,7 @@ fn task_evaluation_spec_core(
                 .iter()
                 .zip(&statement_records)
                 .all(|(ordinal, record)| *ordinal == *record as usize),
-            xlog_cuda::SemanticTaskGround::Coding(_) => query_ordinals
+            xlog_cuda::SemanticTaskGround::Coding { .. } => query_ordinals
                 .iter()
                 .enumerate()
                 .all(|(index, ordinal)| *ordinal == index),
@@ -10359,7 +10399,7 @@ impl TaskAuthority {
             .chain(std::iter::once((
                 match ground {
                     xlog_cuda::SemanticTaskGround::Logical => "observer",
-                    xlog_cuda::SemanticTaskGround::Coding(_) => "program",
+                    xlog_cuda::SemanticTaskGround::Coding { .. } => "program",
                 },
                 0,
             )))
@@ -10427,13 +10467,14 @@ impl TaskAuthority {
     fn goal_witness(
         &self,
         observations: &xlog_cuda::SemanticTaskObservationRoots,
-    ) -> SemanticTaskGoalWitness {
+        ground: &xlog_cuda::SemanticTaskGround,
+    ) -> PyResult<SemanticTaskGoalWitness> {
         fn text(hash: &mut Sha256, value: &str) {
             hash.update((value.len() as u64).to_le_bytes());
             hash.update(value.as_bytes());
         }
         let mut links = Sha256::new();
-        links.update(b"xlog.task-authority.mandatory-links.v1\0");
+        links.update(b"xlog.task-authority.mandatory-links.v2\0");
         for node in &self.dependencies {
             text(&mut links, &node.identity);
             text(&mut links, &node.kind);
@@ -10465,6 +10506,10 @@ impl TaskAuthority {
             }
         }
 
+        ground.visit_requirement_words(|word| links.update(word.to_le_bytes()));
+        let mandatory_link_count = (self.dependencies.len() as u64)
+            .checked_add(ground.mandatory_edge_count().map_err(xlog_err)?)
+            .ok_or_else(|| invalid("task mandatory dependency count overflow"))?;
         let mut constraints = Sha256::new();
         constraints.update(b"xlog.task-authority.constraints.v1\0");
         constraints.update((self.canonical.len() as u64).to_le_bytes());
@@ -10504,18 +10549,18 @@ impl TaskAuthority {
                 }
             }
         }
-        SemanticTaskGoalWitness {
+        Ok(SemanticTaskGoalWitness {
             semantic_root: observations.root_digest,
             authority_root: self.authority_root(),
             mandatory_links_root: Identity256::from_bytes(links.finalize().into()),
             constraints_root: Identity256::from_bytes(constraints.finalize().into()),
-            mandatory_link_count: self.dependencies.len() as u64,
+            mandatory_link_count,
             constraint_count: (self.scope.len()
                 + self.feedback_roots.len()
                 + self.publication.len()
                 + self.inference.len()
                 + self.training.len()) as u64,
-        }
+        })
     }
 
     fn check_snapshot(&self, snapshot: &AuthoritySnapshot) -> PyResult<i64> {
@@ -22982,7 +23027,7 @@ impl PySemanticTransitionController {
             &spec.allowed_support_records,
             &spec.task_ground,
         )?;
-        let goal_witness = authority.goal_witness(observations.roots());
+        let goal_witness = authority.goal_witness(observations.roots(), &spec.task_ground)?;
         drop(observations);
         let operation = ColdValue::read(replay_operation, &mut budget, 0)?;
         let (phase, transition) = if let Some(material) = &selected_material {
