@@ -1225,6 +1225,7 @@ pub(crate) struct OriginalDeviceWrite {
     tracked: bool,
     admitted: bool,
     completed: bool,
+    completion_pending: bool,
     retired: bool,
     host_reservation: Option<Arc<SemanticReplayMaterialReservation>>,
     #[cfg(feature = "semantic-policy")]
@@ -1275,6 +1276,7 @@ impl OriginalDeviceWrite {
             tracked,
             admitted: false,
             completed: bytes == 0,
+            completion_pending: false,
             retired: false,
             host_reservation,
             #[cfg(feature = "semantic-policy")]
@@ -1290,6 +1292,13 @@ impl OriginalDeviceWrite {
 
     pub(crate) fn pending(&self) -> bool {
         self.entered() && !self.completed && !self.retired
+    }
+
+    /// Result resolution is possible only for a confirmed original submission
+    /// whose completion remains unknown. Lifetime custody is broader: an
+    /// entered but unconfirmed write still must be retained/retired, not retried.
+    pub(crate) fn completion_pending(&self) -> bool {
+        self.completion_pending && self.pending() && self.transfer.submitted()
     }
 
     pub(crate) fn resolve(
@@ -1321,6 +1330,7 @@ impl OriginalDeviceWrite {
         may_submit: bool,
         allowance: Option<&Arc<Mutex<ColdNativeAllowance>>>,
     ) -> Result<(), SemanticTransitionError> {
+        self.completion_pending = false;
         if self.dma_allowance.as_ref().is_some_and(|original| {
             allowance.is_none_or(|allowance| !original.ptr_eq(&Arc::downgrade(allowance)))
         }) {
@@ -1343,6 +1353,7 @@ impl OriginalDeviceWrite {
         may_submit: bool,
         #[cfg(feature = "semantic-policy")] allowance: Option<&Arc<Mutex<ColdNativeAllowance>>>,
     ) -> Result<(), SemanticTransitionError> {
+        self.completion_pending = false;
         if self.retired {
             return Err(publication_input_error("original device write has retired"));
         }
@@ -1371,12 +1382,16 @@ impl OriginalDeviceWrite {
             let result = self.transfer.enqueue(domain, stream, poisoned);
             #[cfg(feature = "semantic-policy")]
             self.record_submitted_dma(allowance)?;
-            result?;
+            if let Err(error) = result {
+                self.completion_pending = self.transfer.submitted();
+                return Err(error);
+            }
         }
         #[cfg(feature = "semantic-policy")]
         self.record_submitted_dma(allowance)?;
         self.transfer.resolve().map_err(|error| {
             *poisoned |= self.entered();
+            self.completion_pending = self.transfer.submitted();
             error
         })?;
         self.completed = true;
@@ -1413,6 +1428,7 @@ impl OriginalDeviceWrite {
             self.transfer.retire_without_result(stream)?;
         }
         self.retired = true;
+        self.completion_pending = false;
         self.host_reservation = None;
         Ok(())
     }

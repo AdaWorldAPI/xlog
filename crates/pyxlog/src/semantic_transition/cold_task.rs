@@ -1077,9 +1077,15 @@ impl PySemanticTransitionColdTask {
     /// model. Calling again after Unknown resolves the same native operation.
     /// The common model identity is then available through Session.policy_layout;
     /// TaskUse.feedback_schema retains the shared shape and each own payload.
-    fn freeze_model_contexts(&self, py: Python<'_>, next: PyRef<'_, Self>) -> PyResult<()> {
-        let left = self.session.borrow(py);
-        let right = next.session.borrow(py);
+    fn freeze_model_contexts(
+        slf: Bound<'_, Self>,
+        py: Python<'_>,
+        next: Bound<'_, Self>,
+    ) -> PyResult<()> {
+        let source_cold = slf.borrow();
+        let target_cold = next.borrow();
+        let left = source_cold.session.borrow(py);
+        let right = target_cold.session.borrow(py);
         left.require_creator()?;
         right.require_creator()?;
         if Arc::ptr_eq(&left.inner, &right.inner) {
@@ -1087,8 +1093,8 @@ impl PySemanticTransitionColdTask {
                 "model context domain requires two original cold owners",
             ));
         }
-        let left_parent = self.parent.borrow(py);
-        let right_parent = next.parent.borrow(py);
+        let left_parent = source_cold.parent.borrow(py);
+        let right_parent = target_cold.parent.borrow(py);
         if left.device_ordinal != right.device_ordinal
             || left.memory_bytes != right.memory_bytes
             || left_parent.prefix_capacity != right_parent.prefix_capacity
@@ -1100,11 +1106,23 @@ impl PySemanticTransitionColdTask {
                 "model contexts require the same original device and finite model input envelope",
             ));
         }
+        // Construct the recoverable Python custody before the first native
+        // effect, so a late error cannot lose either original cold owner.
+        let pending = super::SemanticModelContextFreezePending::new_err(
+            "retain source and target, then repeat source.freeze_model_contexts(target); do not import, replace or abort either pending owner",
+        );
+        pending.value(py).setattr("source", &slf)?;
+        pending.value(py).setattr("target", &next)?;
         let mut source = left.owner()?;
         let mut target = right.owner()?;
-        source
-            .freeze_model_contexts(&mut target)
-            .map_err(xlog_err)?;
+        if let Err(original) = source.freeze_model_contexts(&mut target) {
+            let original = xlog_err(original);
+            if source.model_contexts_pending(&target) {
+                pending.set_cause(py, Some(original));
+                return Err(pending);
+            }
+            return Err(original);
+        }
         Ok(())
     }
 

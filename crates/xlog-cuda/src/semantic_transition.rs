@@ -20184,6 +20184,38 @@ impl PinnedObservation {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ImportedTaskReleaseState {
+    Idle,
+    Joining,
+    Joined,
+}
+
+/// Original terminal allocation retirement of one joined model-free import.
+/// A late allocator error retains its actual pending deallocations here.
+pub struct SemanticImportedTaskRelease {
+    original: Option<SemanticTransitionSession>,
+    memory: Arc<crate::memory::GpuMemoryManager>,
+    completed: bool,
+}
+
+impl SemanticImportedTaskRelease {
+    pub fn resolve(&mut self) -> Result<(), SemanticTransitionError> {
+        if self.completed {
+            return Ok(());
+        }
+        if let Some(original) = self.original.take() {
+            original.finish_joined_allocation_release()?;
+        } else {
+            self.memory
+                .reap_pending_deallocations()
+                .map_err(|error| runtime_error("original import allocation retirement", error))?;
+        }
+        self.completed = true;
+        Ok(())
+    }
+}
+
 /// Single owner of one serial transition stream, graph, scratch, and receipt bank.
 /// Retains the provider independently of the caller's handle.
 pub struct SemanticTransitionSession {
@@ -20283,6 +20315,9 @@ pub struct SemanticTransitionSession {
     next_proposal: u64,
     pending: bool,
     poisoned: bool,
+    // One terminal join for an authentic imported task with no model/publication.
+    // A late wait error retains this owner and only that same join may resume.
+    imported_task_release: ImportedTaskReleaseState,
     stream_waits: u64,
     // All captured work and storage retire before their driver/allocation owner.
     provider: Arc<CudaKernelProvider>,
@@ -22516,7 +22551,8 @@ impl Drop for SemanticTransitionSession {
         });
         #[cfg(not(feature = "semantic-policy"))]
         let embedded_pending = false;
-        if self.pending_replay_delivery.is_some()
+        if self.imported_task_release == ImportedTaskReleaseState::Joining
+            || self.pending_replay_delivery.is_some()
             || self.resident_model_activation.is_some()
             || (self.construction_pending.load(Ordering::Acquire)
                 && self.constructor_effect_entered())
@@ -40477,6 +40513,7 @@ impl SemanticTransitionSession {
             next_proposal: 0,
             pending: false,
             poisoned: false,
+            imported_task_release: ImportedTaskReleaseState::Idle,
             stream_waits: 0,
         };
         Ok(session)
@@ -40539,6 +40576,7 @@ impl SemanticTransitionSession {
 
     fn has_independent_session_native_effect_except_retired_preparation(&self) -> bool {
         self.poisoned
+            || self.imported_task_release != ImportedTaskReleaseState::Idle
             || self.construction_pending.load(Ordering::Acquire)
             || self
                 .prepared_segment
@@ -40778,6 +40816,94 @@ impl SemanticTransitionSession {
             return Err(runtime_error("fresh cold observer completion", error));
         }
         Ok(())
+    }
+
+    /// Join the real ordinary import before releasing its model-free,
+    /// unpublished storage. An Unknown wait retains the same terminal join;
+    /// it never makes the imported task usable again.
+    pub fn join_imported_task_release(&mut self) -> Result<(), SemanticTransitionError> {
+        if self.imported_task_release == ImportedTaskReleaseState::Joined {
+            return Ok(());
+        }
+        if self.imported_task_release == ImportedTaskReleaseState::Idle {
+            self.ensure_quiescent()?;
+            if self.training_canary_source_borrowed()
+                || self.cold_content.is_none()
+                || self.task.is_none()
+                || self.task_epoch == 0
+                || self.task_observed
+                || self.publication.is_some()
+                || self.captured.is_some()
+                || !self.model_owners.is_empty()
+                || self.resident_model_activation.is_some()
+                || self.text_binding.is_some()
+                || self.continuation_base.is_some()
+                || self.admitted_transition.is_some()
+                || self.next_proposal != 0
+                || !self.readers.is_empty()
+                || !self.steps.is_empty()
+                || self.prepared_segment.is_some()
+                || !self.prepared_resources.is_empty()
+                || self.initial_prefill.is_some()
+                || self.retained_initial_prefill.is_some()
+                || self.checkpoint_initial_prefill.is_some()
+                || self.state_material_restore.is_some()
+                || self.publication_preparation.is_some()
+            {
+                return Err(publication_input_error(
+                    "import release requires an authentic model-free unpublished task",
+                ));
+            }
+            #[cfg(feature = "semantic-policy")]
+            if self.policy.is_some()
+                || self.pending_policy.is_some()
+                || self.prepared_policy.is_some()
+                || !self.policy_tapes.is_empty()
+                || self.actor_refresh_construction.is_some()
+                || self.actor_refresh.is_some()
+                || !self.actor_refresh_work.is_empty()
+            {
+                return Err(publication_input_error(
+                    "import release cannot interrupt model or private construction custody",
+                ));
+            }
+            self.require_completed_graph_retirements()?;
+            self.stream
+                .context()
+                .bind_to_thread()
+                .map_err(|error| runtime_error("import release context binding", error))?;
+            self.imported_task_release = ImportedTaskReleaseState::Joining;
+        }
+        let result = self
+            .stream
+            .context()
+            .bind_to_thread()
+            .and_then(|_| self.stream.context().synchronize());
+        if let Err(error) = result {
+            self.poisoned = true;
+            return Err(runtime_error("original import terminal join", error));
+        }
+        self.imported_task_release = ImportedTaskReleaseState::Joined;
+        Ok(())
+    }
+
+    pub fn imported_task_release_pending(&self) -> bool {
+        self.imported_task_release == ImportedTaskReleaseState::Joining
+    }
+
+    /// Retain actual allocator custody across Session destruction and a late
+    /// deallocation error. Only a known joined original import can issue this.
+    pub fn prepare_imported_task_release(
+        self,
+    ) -> Result<SemanticImportedTaskRelease, SemanticTransitionError> {
+        if self.imported_task_release != ImportedTaskReleaseState::Joined {
+            return Err(publication_input_error("import release has not joined"));
+        }
+        Ok(SemanticImportedTaskRelease {
+            memory: Arc::clone(self.provider.memory()),
+            original: Some(self),
+            completed: false,
+        })
     }
 
     /// Destroy the joined cold owner outside the Python Session mutex, then
