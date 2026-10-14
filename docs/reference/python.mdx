@@ -158,6 +158,11 @@ goal store. Exact checkpoint custody retains all three fields. Completed
 task-ground material uses version 5 and includes the full ordered graph before
 its raw query plane; the invocation plane uses version 2. Older two-field
 carriers, receipts and checkpoints are not reinterpreted under this semantics.
+`SemanticCompletedTaskGround.task_ground` returns this same three-field tuple
+from the completed material's retained native ground, including all original
+binding identities, measurement descriptors and requirement rows. It does not
+look up a current TaskUse or recompute the graph, so historical episode assembly
+reads the ground of the original completed invocation.
 Cold ingress and export remain separate from the resident GPU fold; source
 integration alone does not certify runtime execution or measured ZERO TRANSFER.
 

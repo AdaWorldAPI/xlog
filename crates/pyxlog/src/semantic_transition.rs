@@ -14090,6 +14090,64 @@ impl PySemanticCompletedTaskGround {
         completed_action_material(py, &self.inner.witness)
     }
     #[getter]
+    fn task_ground(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+        let ground = &self.inner.ground;
+        let mut bindings = Vec::with_capacity(ground.bindings().len());
+        for binding in ground.bindings() {
+            let measurement = binding
+                .measurement
+                .as_ref()
+                .map(|measurement| {
+                    (
+                        PyBytes::new(py, measurement.metric_identity.as_bytes()),
+                        PyBytes::new(py, measurement.comparator_identity.as_bytes()),
+                        PyBytes::new(py, measurement.tolerance_identity.as_bytes()),
+                        PyBytes::new(py, measurement.environment_identity.as_bytes()),
+                    )
+                        .into_pyobject(py)
+                        .map(Bound::unbind)
+                })
+                .transpose()?;
+            bindings.push(
+                (
+                    binding.query,
+                    binding.observation_record,
+                    PyBytes::new(py, binding.obligation_identity.as_bytes()),
+                    PyBytes::new(py, binding.requirement_identity.as_bytes()),
+                    PyBytes::new(py, binding.verifier_plan_identity.as_bytes()),
+                    PyBytes::new(py, binding.acceptance_condition_identity.as_bytes()),
+                    binding.receipt_family.name(),
+                    measurement,
+                )
+                    .into_pyobject(py)?
+                    .unbind(),
+            );
+        }
+        let mut requirements = Vec::with_capacity(ground.requirements().len());
+        for requirement in ground.requirements() {
+            requirements.push(
+                (
+                    requirement.query,
+                    PyTuple::new(py, requirement.required_goal_ordinals.iter().copied())?,
+                    PyTuple::new(py, requirement.required_binding_ordinals.iter().copied())?,
+                )
+                    .into_pyobject(py)?
+                    .unbind(),
+            );
+        }
+        let kind = match ground {
+            xlog_cuda::SemanticTaskGround::Logical => "logical",
+            xlog_cuda::SemanticTaskGround::Coding { .. } => "coding",
+        };
+        Ok((
+            kind,
+            PyTuple::new(py, bindings)?,
+            PyTuple::new(py, requirements)?,
+        )
+            .into_pyobject(py)?
+            .unbind())
+    }
+    #[getter]
     fn scoring_law(&self, py: Python<'_>) -> PyResult<Py<PySemanticCompletedMaterial>> {
         completed_action_material(py, &self.inner.scoring_law)
     }
