@@ -300,7 +300,9 @@ impl SemanticTransitionSession {
                     "learning transition requires its original admitted material",
                 )
             })?;
-            let budget = self.replay_material_budget.as_ref()
+            let budget = self
+                .replay_material_budget
+                .as_ref()
                 .ok_or(SemanticTransitionError::NotBound)?;
             admission.require_budget(budget)?;
         }
@@ -459,7 +461,9 @@ impl SemanticTransitionSession {
             ));
         }
         if let Some(transition) = transition {
-            let budget = self.replay_material_budget.as_ref()
+            let budget = self
+                .replay_material_budget
+                .as_ref()
                 .ok_or(SemanticTransitionError::NotBound)?;
             let bytes = learning_phase::record_allocation_bound(
                 &transition.recipe,
@@ -467,17 +471,28 @@ impl SemanticTransitionSession {
                 material.learning_phases.capacity(),
             )?;
             phase_metadata = Some(Arc::new(budget.reserve_auxiliary(bytes)?));
-            material.learning_phases.try_reserve_exact(1)
+            material
+                .learning_phases
+                .try_reserve_exact(1)
                 .map_err(|_| publication_input_error("learning history allocation failed"))?;
         } else if let Some(budget) = self.replay_material_budget.as_ref() {
             if !material.learning_phases.is_empty() {
-                let bytes = material.learning_phases.len()
+                let bytes = material
+                    .learning_phases
+                    .len()
                     .checked_mul(size_of::<SemanticLearningPhaseRecord>())
-                    .and_then(|bytes| bytes.checked_add(size_of::<SemanticReplayMaterialReservation>() + 2 * size_of::<usize>()))
+                    .and_then(|bytes| {
+                        bytes.checked_add(
+                            size_of::<SemanticReplayMaterialReservation>() + 2 * size_of::<usize>(),
+                        )
+                    })
                     .ok_or(SemanticTransitionError::GenerationExhausted)?;
-                phase_metadata = Some(Arc::new(budget.reserve_auxiliary(
-                    u64::try_from(bytes).map_err(|_| SemanticTransitionError::GenerationExhausted)?,
-                )?));
+                phase_metadata = Some(Arc::new(
+                    budget.reserve_auxiliary(
+                        u64::try_from(bytes)
+                            .map_err(|_| SemanticTransitionError::GenerationExhausted)?,
+                    )?,
+                ));
             }
         }
         if retain_current_models {
@@ -514,7 +529,9 @@ impl SemanticTransitionSession {
         let mut rng = header.rng_binding()?;
         let mut fold = None;
         if let Some(transition) = transition {
-            let metadata = phase_metadata.as_ref().expect("original learning history allocation");
+            let metadata = phase_metadata
+                .as_ref()
+                .expect("original learning history allocation");
             let (record, absorption) = transition.apply(&mut material, Arc::clone(metadata))?;
             material.learning_phases.push(record);
             fold = absorption;

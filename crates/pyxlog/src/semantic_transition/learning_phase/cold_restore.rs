@@ -182,7 +182,9 @@ impl<'a> BoundCheckpointContext<'a> {
             entry = original.data.next.as_ref();
         }
         let metadata_extent = std::mem::size_of::<NativeProofData>()
-            .checked_add(std::mem::size_of::<xlog_cuda::SemanticReplayMaterialReservation>())
+            .checked_add(std::mem::size_of::<
+                xlog_cuda::SemanticReplayMaterialReservation,
+            >())
             .and_then(|bytes| bytes.checked_add(2 * std::mem::size_of::<usize>()))
             .ok_or_else(|| invalid("original native checkpoint proof metadata extent overflow"))?;
         let metadata = Arc::new(
@@ -207,7 +209,10 @@ impl<'a> BoundCheckpointContext<'a> {
         };
         original.data.next = cache.take();
         *cache = Some(original);
-        let original = &mut cache.as_mut().expect("retained native checkpoint proof").data;
+        let original = &mut cache
+            .as_mut()
+            .expect("retained native checkpoint proof")
+            .data;
         // Retain the first owner before entering its one decoder. Both a proof
         // and a refusal are immutable; neither permits another decode.
         original.outcome = Some(original.loaded.checkpoint_proof());

@@ -999,34 +999,85 @@ impl PrivateReplayChildCustody {
     ) -> PyResult<(Py<PySemanticTransitionSession>, SemanticPreparedStep)> {
         self.require_preparation(py)?;
         let state = self.state()?;
-        if state.released || state.import_returned || state.prepared_import.as_ref()
-            .is_none_or(|original| !std::ptr::eq(&*original.borrow(py), prepared)) {
-            return Err(invalid("SOURCE structural target changed its original prepared import"));
+        if state.released
+            || state.import_returned
+            || state
+                .prepared_import
+                .as_ref()
+                .is_none_or(|original| !std::ptr::eq(&*original.borrow(py), prepared))
+        {
+            return Err(invalid(
+                "SOURCE structural target changed its original prepared import",
+            ));
         }
         drop(state);
-        let instruction = self.instruction.upgrade().ok_or_else(|| invalid("SOURCE target lost its original instruction"))?;
+        let instruction = self
+            .instruction
+            .upgrade()
+            .ok_or_else(|| invalid("SOURCE target lost its original instruction"))?;
         let original = instruction.preparation()?;
-        let phase = self.phase.lock().map_err(|_| invalid("original replay phase custody is poisoned"))?.as_ref().map(|phase| phase.clone_ref(py));
+        let phase = self
+            .phase
+            .lock()
+            .map_err(|_| invalid("original replay phase custody is poisoned"))?
+            .as_ref()
+            .map(|phase| phase.clone_ref(py));
         let step = if let Some(phase) = phase {
             let phase = phase.borrow(py);
             let retained = phase.private_group()?;
-            let group = retained.as_ref().ok_or_else(|| invalid("SOURCE target lost its original private group"))?;
-            if group.ordinal != self.group_ordinal || group.native_retired || !group.replay_children.iter().any(|child| std::ptr::eq(self, child.as_ref())) {
-                return Err(invalid("SOURCE target changed its original private group membership"));
+            let group = retained
+                .as_ref()
+                .ok_or_else(|| invalid("SOURCE target lost its original private group"))?;
+            if group.ordinal != self.group_ordinal
+                || group.native_retired
+                || !group
+                    .replay_children
+                    .iter()
+                    .any(|child| std::ptr::eq(self, child.as_ref()))
+            {
+                return Err(invalid(
+                    "SOURCE target changed its original private group membership",
+                ));
             }
-            group.native_steps.get(self.step_index).cloned().ok_or_else(|| invalid("SOURCE target lost its original Update"))?
+            group
+                .native_steps
+                .get(self.step_index)
+                .cloned()
+                .ok_or_else(|| invalid("SOURCE target lost its original Update"))?
         } else {
             let session = self.session.borrow(py);
-            let retained = session.prepared_segment.lock().map_err(|_| invalid("prepared segment mutex is poisoned"))?;
-            let retained = retained.as_ref().ok_or_else(|| invalid("SOURCE target lost its original prepared segment"))?;
-            if original.scope.as_ref().is_none_or(|scope| !Arc::ptr_eq(scope, &retained.scope)) || retained.task_use.as_ptr() != self.task.as_ptr() {
+            let retained = session
+                .prepared_segment
+                .lock()
+                .map_err(|_| invalid("prepared segment mutex is poisoned"))?;
+            let retained = retained
+                .as_ref()
+                .ok_or_else(|| invalid("SOURCE target lost its original prepared segment"))?;
+            if original
+                .scope
+                .as_ref()
+                .is_none_or(|scope| !Arc::ptr_eq(scope, &retained.scope))
+                || retained.task_use.as_ptr() != self.task.as_ptr()
+            {
                 return Err(invalid("SOURCE target changed its original prepared scope"));
             }
-            let step = retained.steps.get(self.step_index).ok_or_else(|| invalid("SOURCE target lost its original Update"))?.borrow(py).inner.clone();
+            let step = retained
+                .steps
+                .get(self.step_index)
+                .ok_or_else(|| invalid("SOURCE target lost its original Update"))?
+                .borrow(py)
+                .inner
+                .clone();
             step
         };
-        if original.native_steps.get(self.step_index).is_none_or(|target| !target.same_handle(&step)) {
-            return Err(invalid("SOURCE target changed its original native instruction member"));
+        if original
+            .native_steps
+            .get(self.step_index)
+            .is_none_or(|target| !target.same_handle(&step))
+        {
+            return Err(invalid(
+                "SOURCE target changed its original native instruction member",
+            ));
         }
         Ok((self.session.clone_ref(py), step))
     }
@@ -1189,14 +1240,19 @@ impl PrivateReplayChildCustody {
         py: Python<'_>,
         prepared: &prepared_import::PySemanticPreparedTaskImport,
     ) -> PyResult<()> {
-        self.cancelled_prepared_import_proof(py, prepared).map(|_| ())
+        self.cancelled_prepared_import_proof(py, prepared)
+            .map(|_| ())
     }
 
     pub(in crate::semantic_transition) fn cancelled_prepared_import_proof(
         &self,
         py: Python<'_>,
         prepared: &prepared_import::PySemanticPreparedTaskImport,
-    ) -> PyResult<(Py<PySemanticTransitionSession>, SemanticPreparedStep, xlog_cuda::SemanticPreparedSegmentNonSubmission)> {
+    ) -> PyResult<(
+        Py<PySemanticTransitionSession>,
+        SemanticPreparedStep,
+        xlog_cuda::SemanticPreparedSegmentNonSubmission,
+    )> {
         let state = self.state()?;
         if self.failed.load(Ordering::Acquire)
             || !state.retirement_entered
@@ -1219,7 +1275,14 @@ impl PrivateReplayChildCustody {
         self.cancelled_target_final_use_proof(py).map(|_| ())
     }
 
-    fn cancelled_target_final_use_proof(&self, py: Python<'_>) -> PyResult<(Py<PySemanticTransitionSession>, SemanticPreparedStep, xlog_cuda::SemanticPreparedSegmentNonSubmission)> {
+    fn cancelled_target_final_use_proof(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<(
+        Py<PySemanticTransitionSession>,
+        SemanticPreparedStep,
+        xlog_cuda::SemanticPreparedSegmentNonSubmission,
+    )> {
         let session = self.session.borrow(py);
         if !session.retiring.load(Ordering::Acquire) {
             return Err(invalid(

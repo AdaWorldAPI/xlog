@@ -1387,9 +1387,9 @@ fn expand_program_functions_with_owner(
     let mut ctx = ExpansionContext::new(&registry, max_depth);
     // Coerce the original callback inside the option: the context borrows it
     // only for this expansion, independently of the caller's object lifetime.
-    ctx.allocation_owner = allocate.as_deref_mut().map(|owner| {
-        owner as &mut dyn FnMut(u64) -> xlog_core::Result<Arc<dyn Send + Sync>>
-    });
+    ctx.allocation_owner = allocate
+        .as_deref_mut()
+        .map(|owner| owner as &mut dyn FnMut(u64) -> xlog_core::Result<Arc<dyn Send + Sync>>);
     ctx.acquire_calculated(crate::compile::push_vector_allocation_bytes::<Rule>(
         program.rules.len(),
     ))?;

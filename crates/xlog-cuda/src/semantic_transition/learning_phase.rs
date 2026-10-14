@@ -157,7 +157,11 @@ pub(super) fn record_allocation_bound(
         .len()
         .checked_mul(size_of::<SemanticLearningCopyReset>())
         .and_then(|bytes| bytes.checked_add(2 * size_of::<usize>()))
-        .and_then(|bytes| bytes.checked_add(size_of::<SemanticReplayMaterialReservation>() + 2 * size_of::<usize>()))
+        .and_then(|bytes| {
+            bytes.checked_add(
+                size_of::<SemanticReplayMaterialReservation>() + 2 * size_of::<usize>(),
+            )
+        })
         .ok_or(SemanticTransitionError::GenerationExhausted)?;
     let history_bytes = history_length
         .checked_add(1)
@@ -165,10 +169,12 @@ pub(super) fn record_allocation_bound(
         .ok_or(SemanticTransitionError::GenerationExhausted)?;
     // The restored Session owns a distinct record array, even though each
     // record shares its original recipe, admission and allocation receipt.
-    bytes = bytes.checked_add(history_bytes)
+    bytes = bytes
+        .checked_add(history_bytes)
         .ok_or(SemanticTransitionError::GenerationExhausted)?;
     if history_length == history_capacity {
-        bytes = bytes.checked_add(history_bytes)
+        bytes = bytes
+            .checked_add(history_bytes)
             .ok_or(SemanticTransitionError::GenerationExhausted)?;
     }
     u64::try_from(bytes).map_err(|_| SemanticTransitionError::GenerationExhausted)
@@ -240,7 +246,10 @@ impl SemanticLearningPhaseTransition {
                 SemanticLearningPhase::Consolidation,
                 SemanticLearningPhase::Fast
             )
-        ) || self.admission.as_ref().is_none_or(SemanticLearningPhaseAdmission::is_empty)
+        ) || self
+            .admission
+            .as_ref()
+            .is_none_or(SemanticLearningPhaseAdmission::is_empty)
             || self.phase_index == self.completed_updates_index
         {
             return Err(publication_input_error(
@@ -368,7 +377,11 @@ impl SemanticLearningPhaseTransition {
                 completed_updates: updates as u64,
                 recipe_digest: self.recipe_digest(),
                 recipe: Arc::from(self.recipe.as_slice()),
-                admission: self.admission.as_ref().expect("checked original learning admission").clone(),
+                admission: self
+                    .admission
+                    .as_ref()
+                    .expect("checked original learning admission")
+                    .clone(),
                 _metadata: Some(metadata),
             },
             fold,
@@ -1440,14 +1453,18 @@ pub(super) fn encode_history(
                 material_u64(bytes, value);
             }
         }
-        material_bytes(bytes, record.admission.as_bytes()).map_err(SemanticTransitionError::Semantic)?;
+        material_bytes(bytes, record.admission.as_bytes())
+            .map_err(SemanticTransitionError::Semantic)?;
     }
     Ok(())
 }
 
 pub(super) fn decode_history(
     reader: &mut SemanticMaterialReader<'_>,
-    mut admission_owner: impl FnMut(&[u8]) -> Result<SemanticLearningPhaseAdmission, SemanticTransitionError>,
+    mut admission_owner: impl FnMut(
+        &[u8],
+    )
+        -> Result<SemanticLearningPhaseAdmission, SemanticTransitionError>,
 ) -> Result<Vec<SemanticLearningPhaseRecord>, SemanticTransitionError> {
     let count = reader
         .count(7 * 8 + 4 * 32 + 4)
@@ -1507,7 +1524,8 @@ pub(super) fn decode_history(
                 }
             });
         }
-        let admission = admission_owner(reader.bytes().map_err(SemanticTransitionError::Semantic)?)?;
+        let admission =
+            admission_owner(reader.bytes().map_err(SemanticTransitionError::Semantic)?)?;
         history.push(SemanticLearningPhaseRecord {
             source,
             target,
@@ -1566,8 +1584,14 @@ pub(super) fn validate_history<B: PublicationByteStorage>(
             || record.model_generation > material.bank.header.model_generation
             || record.predecessor.instance == Identity256::default()
             || record.recipe_digest == Identity256::default()
-            || record.recipe_digest != learning_recipe_digest(record.source, record.target,
-                record.phase_index, record.completed_updates_index, record.recipe())
+            || record.recipe_digest
+                != learning_recipe_digest(
+                    record.source,
+                    record.target,
+                    record.phase_index,
+                    record.completed_updates_index,
+                    record.recipe(),
+                )
             || !matches!(
                 (record.source, record.target),
                 (

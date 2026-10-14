@@ -1284,7 +1284,10 @@ fn pyxlog(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<semantic_transition::publication_material::PySemanticPublicationMaterialProjection>()?;
     m.add_class::<semantic_transition::material_owner::PySemanticMaterialSource>()?;
     m.add_class::<semantic_transition::material_owner::PySemanticMaterialReadWorkspace>()?;
-    m.add_function(wrap_pyfunction!(semantic_transition::material_owner::prepare_material_source, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        semantic_transition::material_owner::prepare_material_source,
+        m
+    )?)?;
     m.add_class::<semantic_transition::resident_model_memory::PySemanticPreparedResidentModelMemory>()?;
     #[cfg(feature = "semantic-policy")]
     m.add_class::<semantic_transition::resident_model_memory::PySemanticResidentModelRead>()?;

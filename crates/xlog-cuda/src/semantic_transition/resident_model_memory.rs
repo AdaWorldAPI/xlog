@@ -112,8 +112,11 @@ impl SemanticResidentModelRead {
                 scratch.prepare_readback_loan(
                     &original.storage.model_memory.allocation_bytes,
                     codec_staging_bytes,
-                    Arc::clone(original.checkpoint_geometry.as_ref().ok_or_else(||
-                        publication_input_error("checkpoint readback lost its original producer metadata"))?),
+                    Arc::clone(original.checkpoint_geometry.as_ref().ok_or_else(|| {
+                        publication_input_error(
+                            "checkpoint readback lost its original producer metadata",
+                        )
+                    })?),
                     publication_readback::CheckpointReadbackOrigin::Selected,
                 )?
             }
@@ -641,8 +644,13 @@ impl SemanticPreparedResidentModelMemory {
                 source_identity: self.owner.identity,
                 consumer_stream: self.owner.consumer_stream,
                 geometry: geometry.clone(),
-                checkpoint_geometry: Arc::clone(self.owner.checkpoint_geometry.as_ref().ok_or_else(||
-                    publication_input_error("resident restoration lost its original producer metadata"))?),
+                checkpoint_geometry: Arc::clone(
+                    self.owner.checkpoint_geometry.as_ref().ok_or_else(|| {
+                        publication_input_error(
+                            "resident restoration lost its original producer metadata",
+                        )
+                    })?,
+                ),
                 keys: self.owner.keys.clone(),
                 layouts,
                 ceiling: self.owner.native_guard_ceiling()?,
@@ -812,7 +820,9 @@ impl SemanticTransitionSession {
         #[cfg(feature = "semantic-policy")]
         let checkpoint_geometry = if self.replay_material_budget.is_some() {
             Some(self.checkpoint_readback_geometry(&storage, &lease.directory)?)
-        } else { None };
+        } else {
+            None
+        };
         Ok(SemanticPreparedResidentModelMemory {
             owner: Arc::new(ResidentModelMemoryOwner {
                 issuer: Arc::clone(&lease.issuer),

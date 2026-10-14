@@ -1,6 +1,6 @@
 use super::*;
-use std::sync::Weak;
 use crate::types::PreparedDiagnosticHandoff;
+use std::sync::Weak;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct MaterialStoreIdentity(pub(super) [u64; 2]);
@@ -60,7 +60,9 @@ impl ReplayPayload {
     }
 
     pub(super) fn original_loaded(&self) -> PyResult<xlog_cuda::SemanticReplayLoadedMaterial> {
-        self.payload.require_budget(&self.source()?.native_budget()?).map_err(xlog_err)?;
+        self.payload
+            .require_budget(&self.source()?.native_budget()?)
+            .map_err(xlog_err)?;
         self.payload
             .slice_payload(0..self.payload.as_bytes().len())
             .map_err(xlog_err)
@@ -227,7 +229,9 @@ impl MaterialSourceRegistry {
             Ok(cached) => cached,
             Err(poison) => {
                 let cached = poison.into_inner();
-                return Err(cached.blocking.as_ref()
+                return Err(cached
+                    .blocking
+                    .as_ref()
                     .expect("poisoned compiler entry retains its original outcome")
                     .clone_ref(py));
             }
@@ -235,7 +239,9 @@ impl MaterialSourceRegistry {
         if cached.available.is_some() && !cached.loaned {
             Ok(())
         } else {
-            Err(cached.blocking.as_ref()
+            Err(cached
+                .blocking
+                .as_ref()
                 .expect("reentered compiler entry retains its original outcome")
                 .clone_ref(py))
         }
@@ -289,8 +295,8 @@ impl MaterialSourceRegistry {
             // and must keep its already-published original outcome available.
             return Err(blocking.expect("original compiler diagnostic loan cannot be reentered"));
         }
-        let blocking = blocking
-            .expect("original compiler diagnostic requires its admitted family or outcome");
+        let blocking =
+            blocking.expect("original compiler diagnostic requires its admitted family or outcome");
         self.compiler_diagnostic_acquiring
             .store(true, Ordering::Release);
         let acquisition = CompilerDiagnosticAcquisition {
@@ -362,7 +368,9 @@ impl MaterialSourceRegistry {
                     return Err(error);
                 }
                 return Err(self.publish_compiler_failure(
-                    py, family, compiler_diagnostic_custody_refusal(),
+                    py,
+                    family,
+                    compiler_diagnostic_custody_refusal(),
                 ));
             }
         };
@@ -907,12 +915,7 @@ impl MaterialSourceRegistry {
                     .map_err(|_| invalid("stored material loader metadata exceeds u64"))?,
             )
             .map_err(xlog_err)?;
-        let writer = material_bytes::PySemanticMaterialWriter::prepare(
-            py,
-            budget,
-            capacity,
-            0,
-        )?;
+        let writer = material_bytes::PySemanticMaterialWriter::prepare(py, budget, capacity, 0)?;
         let payload =
             resolver
                 .bind(py)
@@ -1139,14 +1142,28 @@ impl MaterialSourceRegistry {
             .map(|(_, binding)| binding.clone()))
     }
 
-    pub(super) fn bind_native_checkpoint_source(&self, key: &str, digest: [u8; 32]) -> PyResult<()> {
-        let mut retained = self.native_bindings.lock()
+    pub(super) fn bind_native_checkpoint_source(
+        &self,
+        key: &str,
+        digest: [u8; 32],
+    ) -> PyResult<()> {
+        let mut retained = self
+            .native_bindings
+            .lock()
             .map_err(|_| invalid("native replay material cache is poisoned"))?;
-        let binding = retained.entries.iter_mut().find(|(original, _)| original == key)
+        let binding = retained
+            .entries
+            .iter_mut()
+            .find(|(original, _)| original == key)
             .map(|(_, binding)| binding)
             .ok_or_else(|| invalid("checkpoint source lost its already-decoded replay owner"))?;
-        if binding.checkpoint_source.is_some_and(|original| original != digest) {
-            return Err(invalid("original replay changed its verified checkpoint source"));
+        if binding
+            .checkpoint_source
+            .is_some_and(|original| original != digest)
+        {
+            return Err(invalid(
+                "original replay changed its verified checkpoint source",
+            ));
         }
         binding.checkpoint_source = Some(digest);
         Ok(())

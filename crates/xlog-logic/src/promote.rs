@@ -114,9 +114,7 @@ fn promotion_allocation_bytes(
         arities: &HashMap<RelId, usize>,
         binary: bool,
     ) -> xlog_core::Result<(usize, usize, usize)> {
-        let overflow = || {
-            xlog_core::XlogError::allocation_extent_overflow("promotion graph")
-        };
+        let overflow = || xlog_core::XlogError::allocation_extent_overflow("promotion graph");
         match node {
             RirNode::Scan { rel } => Ok((
                 1,
@@ -345,9 +343,7 @@ fn aggregate_allocation_bytes(
     else {
         return Ok(0);
     };
-    let overflow = || {
-        xlog_core::XlogError::allocation_extent_overflow("aggregate promotion")
-    };
+    let overflow = || xlog_core::XlogError::allocation_extent_overflow("aggregate promotion");
     let mut bytes = promotion_allocation_bytes(inner, arities, shape)?;
     // Canonical synthetic input is cloned from this real inner tree. The
     // triangle/cycle normalizer can own one further exact inner-tree clone.
@@ -2389,9 +2385,10 @@ fn try_promote_clique_k_with_owner(
                         for helper in &full_order.helper_split_specs {
                             bytes = bytes.checked_add(helper.edge_slots.len() as u64).or_else(
                                 || {
-                                    failure = Some(xlog_core::XlogError::allocation_extent_overflow(
-                                        "helper-split clone",
-                                    ));
+                                    failure =
+                                        Some(xlog_core::XlogError::allocation_extent_overflow(
+                                            "helper-split clone",
+                                        ));
                                     None
                                 },
                             )?;

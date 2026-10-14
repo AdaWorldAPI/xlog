@@ -55,7 +55,11 @@ impl MagicAllocations<'_, '_> {
         Ok(())
     }
 
-    fn append_custody(&mut self, into: &mut PayloadCustody, from: &mut PayloadCustody) -> Result<()> {
+    fn append_custody(
+        &mut self,
+        into: &mut PayloadCustody,
+        from: &mut PayloadCustody,
+    ) -> Result<()> {
         if let Some(scope) = self.scope.as_deref_mut() {
             into.append_from(from, scope)?;
         }
@@ -404,24 +408,14 @@ fn rewrite_enabled_with_owner(
         let reason = "no bound recursive query eligible for magic_sets";
         allocations.vector::<String>(1)?;
         allocations.acquire(reason.len() as u64)?;
-        return decline_or_error(
-            program,
-            mode,
-            vec![reason.to_string()],
-            allocations,
-        );
+        return decline_or_error(program, mode, vec![reason.to_string()], allocations);
     }
 
     if program.value.is_probabilistic_profile() {
         let reason = "probabilistic profiles are handled outside deterministic magic_sets";
         allocations.vector::<String>(1)?;
         allocations.acquire(reason.len() as u64)?;
-        return decline_or_error(
-            program,
-            mode,
-            vec![reason.to_string()],
-            allocations,
-        );
+        return decline_or_error(program, mode, vec![reason.to_string()], allocations);
     }
 
     let mut target_preds: BTreeSet<String> = BTreeSet::new();
@@ -471,12 +465,15 @@ fn rewrite_enabled_with_owner(
         adorned_predicates: adorned_predicates.into_iter().collect(),
         declined_reasons: Vec::new(),
     };
-    rewrite_rules(&mut program, &target_preds, &adornments, &seeds, allocations)?;
+    rewrite_rules(
+        &mut program,
+        &target_preds,
+        &adornments,
+        &seeds,
+        allocations,
+    )?;
 
-    Ok(RetainedMagicSetRewrite {
-        program,
-        report,
-    })
+    Ok(RetainedMagicSetRewrite { program, report })
 }
 
 fn with_status(program: Program, status: MagicSetStatus) -> MagicSetRewrite {
@@ -491,7 +488,10 @@ fn with_status(program: Program, status: MagicSetStatus) -> MagicSetRewrite {
     }
 }
 
-fn with_retained_status(program: RetainedProgram, status: MagicSetStatus) -> RetainedMagicSetRewrite {
+fn with_retained_status(
+    program: RetainedProgram,
+    status: MagicSetStatus,
+) -> RetainedMagicSetRewrite {
     RetainedMagicSetRewrite {
         program,
         report: MagicSetReport {
@@ -739,8 +739,7 @@ fn rewrite_rules(
             .iter()
             .filter(|rule| rule.head.predicate == adornment.pred)
         {
-            let generated =
-                propagation_rules(rule, &adornment.pattern, target_preds, allocations)?;
+            let generated = propagation_rules(rule, &adornment.pattern, target_preds, allocations)?;
             let generated_custody = generated.custody;
             let payloads = generated_custody.elements.into_iter();
             let values = generated.value.into_iter();

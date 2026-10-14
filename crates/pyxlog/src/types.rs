@@ -1,6 +1,6 @@
-use pyo3::PyErr;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::PyAnyMethods;
+use pyo3::PyErr;
 use xlog_core::ScalarType;
 
 mod owned_diagnostic;

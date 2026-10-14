@@ -178,7 +178,10 @@ enum ConstantDataAllocation<'a> {
 fn group_proper_rules_with_owner<'p>(
     program: &'p Program,
     allocations: &mut LoweringAllocations<'_, '_>,
-) -> Result<(HashMap<&'p str, Vec<&'p Rule>>, Option<Arc<dyn Send + Sync>>)> {
+) -> Result<(
+    HashMap<&'p str, Vec<&'p Rule>>,
+    Option<Arc<dyn Send + Sync>>,
+)> {
     match allocations.scope.as_deref_mut() {
         Some(scope) => {
             let mut stage = scope.child_scope();
@@ -204,8 +207,7 @@ fn group_proper_rules_core<'p>(
     let mut rules_by_pred: HashMap<&str, Vec<&Rule>> = HashMap::new();
     for rule in program.proper_rules() {
         let predicate = rule.head.predicate.as_str();
-        if !rules_by_pred.contains_key(predicate)
-            && rules_by_pred.len() == rules_by_pred.capacity()
+        if !rules_by_pred.contains_key(predicate) && rules_by_pred.len() == rules_by_pred.capacity()
         {
             allocations.hash::<&str, Vec<&Rule>>(rules_by_pred.len() + 1)?;
         }

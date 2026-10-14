@@ -27,9 +27,7 @@ impl StratificationAllocations<'_, '_> {
             self.acquire(
                 crate::compile::hash_allocation_bytes::<K, V>(count)?
                     .checked_mul(2)
-                    .ok_or_else(|| {
-                        XlogError::allocation_extent_overflow("stratification table")
-                    })?,
+                    .ok_or_else(|| XlogError::allocation_extent_overflow("stratification table"))?,
             )?;
         }
         Ok(())
@@ -205,9 +203,7 @@ fn acquire_edge(
         let text = (from.len() as u64)
             .checked_mul(3)
             .and_then(|n| n.checked_add((to.len() as u64).checked_mul(2)?))
-            .ok_or_else(|| {
-                XlogError::allocation_extent_overflow("dependency text")
-            })?;
+            .ok_or_else(|| XlogError::allocation_extent_overflow("dependency text"))?;
         allocations.acquire(text)?;
         if graph.predicates.capacity() - graph.predicates.len() < 2 {
             allocations.hash::<String, ()>(graph.predicates.len() + 2)?;
@@ -248,20 +244,18 @@ fn find_sccs_with_owner(
         let mut text = 0u64;
         for name in &graph.predicates {
             text = text
-                .checked_add((name.len() as u64).checked_mul(4).ok_or_else(|| {
-                    XlogError::allocation_extent_overflow("SCC text")
-                })?)
-                .ok_or_else(|| {
-                    XlogError::allocation_extent_overflow("SCC text")
-                })?;
+                .checked_add(
+                    (name.len() as u64)
+                        .checked_mul(4)
+                        .ok_or_else(|| XlogError::allocation_extent_overflow("SCC text"))?,
+                )
+                .ok_or_else(|| XlogError::allocation_extent_overflow("SCC text"))?;
         }
         for edge in &graph.edges {
             text = text
                 .checked_add(edge.to.len() as u64)
                 .and_then(|n| n.checked_add(edge.from.len() as u64))
-                .ok_or_else(|| {
-                    XlogError::allocation_extent_overflow("SCC text")
-                })?;
+                .ok_or_else(|| XlogError::allocation_extent_overflow("SCC text"))?;
         }
         allocations.acquire(text)?;
         allocations.hash::<String, usize>(count)?;

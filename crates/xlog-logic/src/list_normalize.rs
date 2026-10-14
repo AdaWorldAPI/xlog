@@ -1780,9 +1780,11 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
 
     fn concat_lists(&mut self, left_id: u64, right_id: u64) -> Result<u64> {
         let mut items = self.clone_list_items(left_id)?;
-        let left_type = Self::list_by_id(&self.lists, left_id, &mut self.allocation_owner)?.elem_type;
+        let left_type =
+            Self::list_by_id(&self.lists, left_id, &mut self.allocation_owner)?.elem_type;
         let right_items = self.clone_list_items(right_id)?;
-        let right_type = Self::list_by_id(&self.lists, right_id, &mut self.allocation_owner)?.elem_type;
+        let right_type =
+            Self::list_by_id(&self.lists, right_id, &mut self.allocation_owner)?.elem_type;
         if left_type != right_type {
             return Err(list_error(
                 format_args!(
@@ -2219,10 +2221,7 @@ impl<'a, 'pool> ListNormalizer<'a, 'pool> {
         let uppercase_owner = self.reserve_temporary(prefix.len() as u64)?;
         let uppercase = prefix.to_ascii_uppercase();
         let fresh_counter = self.fresh_counter;
-        self.acquire_format(
-            payload,
-            format_args!("__XLOG_{prefix}_{}", fresh_counter),
-        )?;
+        self.acquire_format(payload, format_args!("__XLOG_{prefix}_{}", fresh_counter))?;
         let var = format!("__XLOG_{}_{}", uppercase, fresh_counter);
         drop(uppercase);
         drop(uppercase_owner);

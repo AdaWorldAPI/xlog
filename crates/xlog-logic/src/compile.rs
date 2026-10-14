@@ -1008,9 +1008,12 @@ fn set_compilation_cardinality_hints_core(
     if let Some(snapshot) = stats_snapshot {
         if !snapshot.rel_names.is_empty() {
             let _lookup_owner = match scope.as_deref_mut() {
-                Some(scope) => Some(scope.reserve_allocation(
-                    hash_allocation_bytes::<RelId, &str>(snapshot.rel_names.len())?,
-                )?),
+                Some(scope) => Some(scope.reserve_allocation(hash_allocation_bytes::<
+                    RelId,
+                    &str,
+                >(
+                    snapshot.rel_names.len()
+                )?)?),
                 None => None,
             };
             let rel_name_by_id: HashMap<RelId, &str> = snapshot
@@ -1105,9 +1108,9 @@ fn compilation_statistics_core(
     {
         let fact_count = program.facts().count();
         let _counts_owner = match scope.as_deref_mut() {
-            Some(scope) => Some(scope.reserve_allocation(
-                hash_allocation_bytes::<&str, u64>(fact_count)?,
-            )?),
+            Some(scope) => {
+                Some(scope.reserve_allocation(hash_allocation_bytes::<&str, u64>(fact_count)?)?)
+            }
             None => None,
         };
         let mut fact_counts: HashMap<&str, u64> = HashMap::with_capacity(fact_count);
@@ -1133,9 +1136,12 @@ fn compilation_statistics_core(
             mgr.merge_snapshot(snapshot);
         } else {
             let _lookup_owner = match scope.as_deref_mut() {
-                Some(scope) => Some(scope.reserve_allocation(
-                    hash_allocation_bytes::<RelId, &str>(snapshot.rel_names.len())?,
-                )?),
+                Some(scope) => Some(scope.reserve_allocation(hash_allocation_bytes::<
+                    RelId,
+                    &str,
+                >(
+                    snapshot.rel_names.len()
+                )?)?),
                 None => None,
             };
             let rel_name_by_id: HashMap<RelId, &str> = snapshot
@@ -1608,7 +1614,9 @@ fn desugar_queries_and_constraints_with_owner(
         .and_then(|n| n.checked_add(out.queries.len()))
         .ok_or_else(|| XlogError::allocation_extent_overflow("frontend rule"))?;
     if let Some(custody) = custody.as_deref_mut() {
-        let scope = scope.as_deref_mut().expect("original Program custody scope");
+        let scope = scope
+            .as_deref_mut()
+            .expect("original Program custody scope");
         custody
             .rules
             .prepare_elements(final_rules - out.rules.len(), scope)?;
@@ -1635,7 +1643,9 @@ fn desugar_queries_and_constraints_with_owner(
             .as_ref()
             .map(|_| crate::program_custody::PayloadCustody::default());
         if let Some(payload) = payload.as_mut() {
-            let scope = scope.as_deref_mut().expect("original Program custody scope");
+            let scope = scope
+                .as_deref_mut()
+                .expect("original Program custody scope");
             payload.reserve_unit(
                 formatted_text_allocation_bytes(format_args!(
                     "__xlog_constraint_{authored_index}"
@@ -1643,10 +1653,8 @@ fn desugar_queries_and_constraints_with_owner(
                 scope,
             )?;
             payload.reserve_unit(std::mem::size_of::<Term>() as u64, scope)?;
-            let mut body = crate::program_custody::PayloadCustody::for_body_clone(
-                &constraint.body,
-                scope,
-            )?;
+            let mut body =
+                crate::program_custody::PayloadCustody::for_body_clone(&constraint.body, scope)?;
             payload.append_from(&mut body, scope)?;
         } else {
             acquire_frontend_format(scope, format_args!("__xlog_constraint_{authored_index}"))?;
@@ -1682,7 +1690,9 @@ fn desugar_queries_and_constraints_with_owner(
         if let Some(payload) = payload.as_mut() {
             payload.reserve_unit(
                 formatted_text_allocation_bytes(format_args!("__xlog_query_{index}"))?,
-                scope.as_deref_mut().expect("original Program custody scope"),
+                scope
+                    .as_deref_mut()
+                    .expect("original Program custody scope"),
             )?;
         } else {
             acquire_frontend_format(scope, format_args!("__xlog_query_{index}"))?;
@@ -1710,16 +1720,17 @@ fn desugar_queries_and_constraints_with_owner(
                 if seen.contains(name) {
                     continue;
                 }
-                let next_seen_owner = if seen.len() == seen.capacity() {
-                    match scope.as_deref_mut() {
-                        Some(scope) => Some(scope.reserve_allocation(
-                            hash_allocation_bytes::<&str, ()>(seen.len() + 1)?,
-                        )?),
-                        None => None,
-                    }
-                } else {
-                    None
-                };
+                let next_seen_owner =
+                    if seen.len() == seen.capacity() {
+                        match scope.as_deref_mut() {
+                            Some(scope) => Some(scope.reserve_allocation(
+                                hash_allocation_bytes::<&str, ()>(seen.len() + 1)?,
+                            )?),
+                            None => None,
+                        }
+                    } else {
+                        None
+                    };
                 let next_head_terms_owner = if head_terms.len() == head_terms.capacity() {
                     if payload.is_some() {
                         Some(
@@ -1742,7 +1753,9 @@ fn desugar_queries_and_constraints_with_owner(
                 if let Some(payload) = payload.as_mut() {
                     payload.reserve_unit(
                         name.len() as u64,
-                        scope.as_deref_mut().expect("original Program custody scope"),
+                        scope
+                            .as_deref_mut()
+                            .expect("original Program custody scope"),
                     )?;
                 } else {
                     acquire_frontend(scope, name.len() as u64)?;
@@ -1773,7 +1786,9 @@ fn desugar_queries_and_constraints_with_owner(
             head_terms.push(Term::Integer(1));
         }
         if let Some(payload) = payload.as_mut() {
-            let scope = scope.as_deref_mut().expect("original Program custody scope");
+            let scope = scope
+                .as_deref_mut()
+                .expect("original Program custody scope");
             if let Some(owner) = head_terms_owner.as_ref() {
                 payload.retain_original(owner, scope)?;
             }

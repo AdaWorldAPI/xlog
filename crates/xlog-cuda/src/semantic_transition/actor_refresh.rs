@@ -2348,12 +2348,11 @@ impl SemanticTransitionSession {
 
     pub(super) fn has_unresolved_actor_refresh_metadata(&self) -> bool {
         self.actor_refresh_work.values().any(|work| {
-            work.initialization
-                .lock()
-                .map_or(true, |original| original.iter().any(|write| write.unresolved()))
-                || work.uploads.lock().map_or(true, |original| {
-                    original.iter().flatten().any(|write| write.unresolved())
-                })
+            work.initialization.lock().map_or(true, |original| {
+                original.iter().any(|write| write.unresolved())
+            }) || work.uploads.lock().map_or(true, |original| {
+                original.iter().flatten().any(|write| write.unresolved())
+            })
         })
     }
 

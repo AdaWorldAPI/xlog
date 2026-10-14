@@ -1214,7 +1214,10 @@ impl ExecutionCompletion {
         })
     }
 
-    pub(crate) fn renew(&self, context: &Arc<CudarcContext>) -> std::result::Result<Self, DriverError> {
+    pub(crate) fn renew(
+        &self,
+        context: &Arc<CudarcContext>,
+    ) -> std::result::Result<Self, DriverError> {
         Self::new_with_owner(context, self.allocation_owner.clone())
     }
 

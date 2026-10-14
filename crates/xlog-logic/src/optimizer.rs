@@ -93,8 +93,7 @@ fn reserve_optimizer_vector<T>(
 }
 
 fn column_collection_allocation_bytes(expression: &Expr) -> xlog_core::Result<(usize, u64)> {
-    let overflow =
-        || xlog_core::XlogError::allocation_extent_overflow("column collection");
+    let overflow = || xlog_core::XlogError::allocation_extent_overflow("column collection");
     let mut count = 0usize;
     let mut bytes = 0u64;
     let mut child = |expression: &Expr| -> xlog_core::Result<()> {
@@ -1699,9 +1698,7 @@ pub mod selectivity_pass {
     }
 
     fn reorder_allocation_bytes(atoms: usize) -> xlog_core::Result<u64> {
-        let overflow = || {
-            xlog_core::XlogError::allocation_extent_overflow("selectivity rewrite")
-        };
+        let overflow = || xlog_core::XlogError::allocation_extent_overflow("selectivity rewrite");
         let nodes = atoms
             .checked_mul(2)
             .and_then(|n| n.checked_sub(1))
@@ -1740,9 +1737,7 @@ pub mod helper_split_pass {
     use xlog_stats::StatsManager;
 
     fn checked_extent(bytes: Option<u64>) -> xlog_core::Result<u64> {
-        bytes.ok_or_else(|| {
-            xlog_core::XlogError::allocation_extent_overflow("helper")
-        })
+        bytes.ok_or_else(|| xlog_core::XlogError::allocation_extent_overflow("helper"))
     }
 
     fn graph_allocation_geometry(
@@ -1771,9 +1766,7 @@ pub mod helper_split_pass {
                     graph_allocation_geometry(left, schemas)?;
                 let (right_leaves, right_width, right_equalities, right_bytes) =
                     graph_allocation_geometry(right, schemas)?;
-                let overflow = || {
-                    xlog_core::XlogError::allocation_extent_overflow("helper graph")
-                };
+                let overflow = || xlog_core::XlogError::allocation_extent_overflow("helper graph");
                 let leaves = left_leaves.checked_add(right_leaves).ok_or_else(overflow)?;
                 let width = left_width.checked_add(right_width).ok_or_else(overflow)?;
                 let equalities = left_equalities
@@ -1844,16 +1837,14 @@ pub mod helper_split_pass {
             .get(&linear.leaves[pair_start + 1])
             .map(Schema::arity)
             .unwrap_or(0);
-        let width = left.checked_add(right).ok_or_else(|| {
-            xlog_core::XlogError::allocation_extent_overflow("helper candidate")
-        })?;
+        let width = left
+            .checked_add(right)
+            .ok_or_else(|| xlog_core::XlogError::allocation_extent_overflow("helper candidate"))?;
         let all = linear
             .leaf_classes
             .iter()
             .try_fold(0usize, |n, classes| n.checked_add(classes.len()))
-            .ok_or_else(|| {
-                xlog_core::XlogError::allocation_extent_overflow("helper class")
-            })?;
+            .ok_or_else(|| xlog_core::XlogError::allocation_extent_overflow("helper class"))?;
         let keys = linear
             .joins
             .get(pair_start)
@@ -1877,9 +1868,7 @@ pub mod helper_split_pass {
         for index in 0..width {
             bytes = checked_extent(
                 bytes.checked_add(text(format_args!("c{index}"))?.checked_mul(2).ok_or_else(
-                    || {
-                        xlog_core::XlogError::allocation_extent_overflow("helper text")
-                    },
+                    || xlog_core::XlogError::allocation_extent_overflow("helper text"),
                 )?),
             )?;
         }

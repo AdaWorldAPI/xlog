@@ -663,10 +663,7 @@ impl PhaseRecords {
             let preparation = preparation
                 .slice_payload(0..preparation.as_bytes().len())
                 .map_err(xlog_err)?;
-            Ok((
-                [Some(admission), Some(preparation), Some(completion)],
-                3,
-            ))
+            Ok(([Some(admission), Some(preparation), Some(completion)], 3))
         } else {
             Ok(([Some(admission), Some(completion), None], 2))
         }

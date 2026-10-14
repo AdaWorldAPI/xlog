@@ -553,18 +553,32 @@ impl PySemanticLearningPhaseTransition {
                     "intermediate recipe cannot replace its original signed admission",
                 ));
             }
-            let pool = self.task_use.borrow(py).checkpoint.material_sources.native_budget()?;
-            let extent = original.inner.recipe.len()
+            let pool = self
+                .task_use
+                .borrow(py)
+                .checkpoint
+                .material_sources
+                .native_budget()?;
+            let extent = original
+                .inner
+                .recipe
+                .len()
                 .checked_mul(std::mem::size_of::<SemanticLearningCopyReset>())
                 .ok_or_else(|| invalid("intermediate recipe metadata extent overflow"))?;
-            recipe_metadata = Some(pool.reserve_auxiliary(
-                u64::try_from(extent)
-                    .map_err(|_| invalid("intermediate recipe metadata exceeds its native index"))?,
-            ).map_err(xlog_err)?);
+            recipe_metadata = Some(
+                pool.reserve_auxiliary(u64::try_from(extent).map_err(|_| {
+                    invalid("intermediate recipe metadata exceeds its native index")
+                })?)
+                .map_err(xlog_err)?,
+            );
             let mut native = original.inner.clone();
-            native.admission = Some(xlog_cuda::SemanticLearningPhaseAdmission::from_loaded(
-                self.records()?.confirmed_admission()?, &pool,
-            ).map_err(xlog_err)?);
+            native.admission = Some(
+                xlog_cuda::SemanticLearningPhaseAdmission::from_loaded(
+                    self.records()?.confirmed_admission()?,
+                    &pool,
+                )
+                .map_err(xlog_err)?,
+            );
             Some(native)
         };
         let mut retained = self.intermediate()?;
@@ -1348,15 +1362,26 @@ impl PySemanticLearningPhaseTransition {
         let (entered, restored, recipe, resident_restoration) = {
             let retained = self.intermediate()?;
             let current = retained.as_ref().expect("original intermediate restore");
-            _recipe_metadata = current.recipe.as_ref().map(|recipe| {
-                let extent = recipe.recipe.len()
-                    .checked_mul(std::mem::size_of::<SemanticLearningCopyReset>())
-                    .ok_or_else(|| invalid("intermediate restore recipe extent overflow"))?;
-                self.task_use.borrow(py).checkpoint.material_sources.native_budget()?
-                    .reserve_auxiliary(u64::try_from(extent)
-                        .map_err(|_| invalid("intermediate restore recipe exceeds its native index"))?)
-                    .map_err(xlog_err)
-            }).transpose()?;
+            _recipe_metadata = current
+                .recipe
+                .as_ref()
+                .map(|recipe| {
+                    let extent = recipe
+                        .recipe
+                        .len()
+                        .checked_mul(std::mem::size_of::<SemanticLearningCopyReset>())
+                        .ok_or_else(|| invalid("intermediate restore recipe extent overflow"))?;
+                    self.task_use
+                        .borrow(py)
+                        .checkpoint
+                        .material_sources
+                        .native_budget()?
+                        .reserve_auxiliary(u64::try_from(extent).map_err(|_| {
+                            invalid("intermediate restore recipe exceeds its native index")
+                        })?)
+                        .map_err(xlog_err)
+                })
+                .transpose()?;
             (
                 current.restore_entered,
                 current.restored.as_ref().map(|value| value.clone_ref(py)),

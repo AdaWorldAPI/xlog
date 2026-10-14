@@ -1226,10 +1226,7 @@ impl PySemanticPreparedSourceContentGeometry {
             )?;
             let metadata = self.reserve(add(
                 python_metadata_tuple_extent(py, count)?,
-                multiply(
-                    count,
-                    add(layout_extent, std::mem::size_of::<Py<PyAny>>())?,
-                )?,
+                multiply(count, add(layout_extent, std::mem::size_of::<Py<PyAny>>())?)?,
             )?)?;
             let mut rows = Vec::with_capacity(count);
             for layout in layouts {
@@ -1485,12 +1482,14 @@ pub(super) fn source_content_geometry_seed(
     if needs_compiler {
         // Replacement Python construction and previous-error retirement may
         // execute GC callbacks. Complete both before the geometry cache lock.
-        if let Err(blocking) = Python::attach(|py| {
-            source.seed.material_sources.ensure_compiler_diagnostic(py)
-        }) {
+        if let Err(blocking) =
+            Python::attach(|py| source.seed.material_sources.ensure_compiler_diagnostic(py))
+        {
             // A reentrant callback may have completed this exact cached task.
             // Reuse that known result; a separate blocking report is not a veto.
-            let ready = source.task_geometry.lock()
+            let ready = source
+                .task_geometry
+                .lock()
                 .map_err(|_| invalid("original source task geometry custody is poisoned"))?
                 .is_some();
             if !ready {
@@ -1532,8 +1531,7 @@ pub(super) fn source_content_geometry_seed(
         let budget = source.seed.material_sources.native_budget()?;
         let metadata: Arc<dyn Send + Sync> = budget
             .reserve_compiler_allocation(
-                u64::try_from(extent)
-                    .map_err(|_| invalid("original task geometry exceeds u64"))?,
+                u64::try_from(extent).map_err(|_| invalid("original task geometry exceeds u64"))?,
             )
             .map_err(xlog_err)?;
         let observer = source

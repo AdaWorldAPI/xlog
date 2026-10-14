@@ -697,25 +697,33 @@ impl PySemanticTransitionColdTask {
             .transpose()?;
         #[cfg(feature = "semantic-policy")]
         let inherited_material_sources = if let Some(child) = &replay_custody {
-            Some(Arc::clone(&child.source_checkpoint(py)?.seed.material_sources))
+            Some(Arc::clone(
+                &child.source_checkpoint(py)?.seed.material_sources,
+            ))
         } else if let Some(owner) = &actor_custody {
             Some(Arc::clone(&owner.source_checkpoint().seed.material_sources))
         } else {
             None
         };
         #[cfg(not(feature = "semantic-policy"))]
-        let inherited_material_sources: Option<Arc<super::material_source::MaterialSourceRegistry>> =
-            None;
-        let material_sources = match (inherited_material_sources, explicit_material_sources) {
-            (Some(original), Some(supplied)) => {
-                if !Arc::ptr_eq(&original, &supplied) {
-                    return Err(invalid("dependent task requires its original process material source"));
+        let inherited_material_sources: Option<
+            Arc<super::material_source::MaterialSourceRegistry>,
+        > = None;
+        let material_sources =
+            match (inherited_material_sources, explicit_material_sources) {
+                (Some(original), Some(supplied)) => {
+                    if !Arc::ptr_eq(&original, &supplied) {
+                        return Err(invalid(
+                            "dependent task requires its original process material source",
+                        ));
+                    }
+                    original
                 }
-                original
-            }
-            (Some(original), None) | (None, Some(original)) => original,
-            (None, None) => return Err(invalid("fresh task requires its original native material source before construction")),
-        };
+                (Some(original), None) | (None, Some(original)) => original,
+                (None, None) => return Err(invalid(
+                    "fresh task requires its original native material source before construction",
+                )),
+            };
         #[cfg(feature = "semantic-policy")]
         let allocation = replay_custody
             .as_ref()

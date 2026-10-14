@@ -389,7 +389,8 @@ pub(crate) struct ColdNativeAllowance {
     submitted_dma: [u64; 9],
     submitted_dma_ceiling: [u64; 9],
     native_initialization_claimed: bool,
-    model_input_generations: Option<std::sync::Weak<prepared_source_content::OriginalModelInputGenerations>>,
+    model_input_generations:
+        Option<std::sync::Weak<prepared_source_content::OriginalModelInputGenerations>>,
     model_scratch_ceiling: Option<[u64; 9]>,
     prepared_scratch_initialization: [u64; 9],
 }
@@ -427,8 +428,10 @@ impl FrozenColdResidentReads {
             }
             let read_bytes = reads
                 .len()
-                .checked_mul(size_of::<(usize, SemanticResidentModelRead, [u64; 9], bool)>()
-                    + size_of::<Option<(SemanticPublicationReadbackLoan, bool)>>())
+                .checked_mul(
+                    size_of::<(usize, SemanticResidentModelRead, [u64; 9], bool)>()
+                        + size_of::<Option<(SemanticPublicationReadbackLoan, bool)>>(),
+                )
                 .ok_or(SemanticTransitionError::GenerationExhausted)?;
             let restoration_bytes = reads
                 .len()
@@ -454,7 +457,8 @@ impl FrozenColdResidentReads {
             .map_err(|error| runtime_error("resident read declaration reservation", error))?;
         let mut total = [0; 9];
         let mut readbacks = Vec::new();
-        readbacks.try_reserve_exact(reads.len())
+        readbacks
+            .try_reserve_exact(reads.len())
             .map_err(|error| runtime_error("native readback declaration reservation", error))?;
         let mut restorations = Vec::new();
         restorations
@@ -474,7 +478,10 @@ impl FrozenColdResidentReads {
             let ceiling = read.native_work_ceiling()?;
             add_native_work_ceiling(&mut total, ceiling)?;
             add_native_work_ceiling(&mut total, read.checkpoint_readback_ceiling())?;
-            readbacks.push(read.checkpoint_readback_loan().map(|loan| (loan.clone(), false)));
+            readbacks.push(
+                read.checkpoint_readback_loan()
+                    .map(|loan| (loan.clone(), false)),
+            );
             if let Some(issuer) = read.restoration_issuer()? {
                 issuer.require_report(work, *region)?;
                 if restorations.iter().any(
@@ -719,7 +726,9 @@ impl ColdNativeAllowance {
         original: &Arc<prepared_source_content::OriginalModelInputGenerations>,
     ) -> Result<(), SemanticTransitionError> {
         if self.model_input_generations.is_some() {
-            return Err(publication_input_error("original model input generation roster is registered once"));
+            return Err(publication_input_error(
+                "original model input generation roster is registered once",
+            ));
         }
         self.model_input_generations = Some(Arc::downgrade(original));
         Ok(())
@@ -728,8 +737,13 @@ impl ColdNativeAllowance {
     pub(super) fn model_input_generations(
         &self,
         instruction: &Arc<[u8]>,
-    ) -> Result<Option<Arc<prepared_source_content::OriginalModelInputGenerations>>, SemanticTransitionError> {
-        let Some(original) = &self.model_input_generations else { return Ok(None); };
+    ) -> Result<
+        Option<Arc<prepared_source_content::OriginalModelInputGenerations>>,
+        SemanticTransitionError,
+    > {
+        let Some(original) = &self.model_input_generations else {
+            return Ok(None);
+        };
         let original = original.upgrade().ok_or_else(|| {
             publication_input_error("original model input generation roster has retired")
         })?;
@@ -856,19 +870,39 @@ impl ColdNativeAllowance {
         &mut self,
         loan: &SemanticPublicationReadbackLoan,
     ) -> Result<(), SemanticTransitionError> {
-        let reads = self.resident_reads.as_mut().ok_or_else(||
-            publication_input_error("checkpoint readback precedes its original finite admission"))?;
-        let index = reads.readbacks.iter().position(|entry|
-            entry.as_ref().is_some_and(|(original, _)| original.same_loan(loan)))
-            .ok_or_else(|| publication_input_error("checkpoint readback is outside its original resident roster"))?;
+        let reads = self.resident_reads.as_mut().ok_or_else(|| {
+            publication_input_error("checkpoint readback precedes its original finite admission")
+        })?;
+        let index = reads
+            .readbacks
+            .iter()
+            .position(|entry| {
+                entry
+                    .as_ref()
+                    .is_some_and(|(original, _)| original.same_loan(loan))
+            })
+            .ok_or_else(|| {
+                publication_input_error(
+                    "checkpoint readback is outside its original resident roster",
+                )
+            })?;
         if index >= reads.cursor || reads.reads[index].3 {
-            return Err(publication_input_error("checkpoint readback has not entered its original resident occurrence"));
+            return Err(publication_input_error(
+                "checkpoint readback has not entered its original resident occurrence",
+            ));
         }
-        let (original, claimed) = reads.readbacks[index].as_mut().expect("original admitted readback loan");
+        let (original, claimed) = reads.readbacks[index]
+            .as_mut()
+            .expect("original admitted readback loan");
         if *claimed || original.native_work_ceiling() != loan.native_work_ceiling() {
-            return Err(publication_input_error("checkpoint readback repeated or changed its original DMA entitlement"));
+            return Err(publication_input_error(
+                "checkpoint readback repeated or changed its original DMA entitlement",
+            ));
         }
-        add_native_work_ceiling(&mut self.submitted_dma_ceiling, original.submitted_dma_ceiling())?;
+        add_native_work_ceiling(
+            &mut self.submitted_dma_ceiling,
+            original.submitted_dma_ceiling(),
+        )?;
         *claimed = true;
         Ok(())
     }

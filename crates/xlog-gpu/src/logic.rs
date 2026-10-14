@@ -488,8 +488,9 @@ struct ResidentEvaluationOwner {
 }
 
 struct LogicProgramIdentity {
-    resident_certification:
-        OnceLock<std::result::Result<Arc<ResidentGraphCertifiedPlan>, ResidentCertificationFailure>>,
+    resident_certification: OnceLock<
+        std::result::Result<Arc<ResidentGraphCertifiedPlan>, ResidentCertificationFailure>,
+    >,
     resident_evaluation_owner: Mutex<Option<ResidentEvaluationOwner>>,
     #[cfg(test)]
     resident_certification_initializations: AtomicU64,
@@ -1271,16 +1272,17 @@ impl SemanticLogicTaskProgram {
         scope: &mut Option<&mut xlog_logic::compile::CompilationAllocationScope<'_>>,
     ) -> Result<Self> {
         if query_ordinals.is_empty() || query_ordinals.len() > u32::MAX as usize {
-            return Err(semantic_task_compilation_error(scope, format_args!(
-                "semantic task requires a finite nonempty query roster"
-            )));
+            return Err(semantic_task_compilation_error(
+                scope,
+                format_args!("semantic task requires a finite nonempty query roster"),
+            ));
         }
         let (program, compiler_allocations) = match scope.as_deref_mut() {
             Some(scope) => {
                 let (program, owner) =
-                    LogicProgram::compile_source_with_allocation_owner(
-                        &source, &mut |bytes| scope.reserve_allocation(bytes),
-                    )?;
+                    LogicProgram::compile_source_with_allocation_owner(&source, &mut |bytes| {
+                        scope.reserve_allocation(bytes)
+                    })?;
                 (program, Some(owner))
             }
             None => (LogicProgram::compile(&source)?, None),
@@ -1290,24 +1292,38 @@ impl SemanticLogicTaskProgram {
             _owner: compiler_allocations,
         };
         if !program.value.source_program.imports.is_empty() {
-            return Err(semantic_task_compilation_error(scope, format_args!(
-                "semantic task source must contain its complete program without imports"
-            )));
+            return Err(semantic_task_compilation_error(
+                scope,
+                format_args!(
+                    "semantic task source must contain its complete program without imports"
+                ),
+            ));
         }
         for &ordinal in &query_ordinals {
-            let query = program.value.source_program.queries.get(ordinal).ok_or_else(|| {
-                semantic_task_compilation_error(scope, format_args!(
-                    "semantic task query ordinal {ordinal} is absent"
-                ))
-            })?;
+            let query = program
+                .value
+                .source_program
+                .queries
+                .get(ordinal)
+                .ok_or_else(|| {
+                    semantic_task_compilation_error(
+                        scope,
+                        format_args!("semantic task query ordinal {ordinal} is absent"),
+                    )
+                })?;
             let _validation_owner = match scope.as_deref_mut() {
-                Some(scope) => Some(scope.reserve_allocation(semantic_query_validation_allocation_bytes(query)?)?),
+                Some(scope) => Some(
+                    scope.reserve_allocation(semantic_query_validation_allocation_bytes(query)?)?,
+                ),
                 None => None,
             };
             if !query_output_vars(query).is_empty() {
-                return Err(semantic_task_compilation_error(scope, format_args!(
-                    "semantic task query ordinal {ordinal} must have a zero-arity result",
-                )));
+                return Err(semantic_task_compilation_error(
+                    scope,
+                    format_args!(
+                        "semantic task query ordinal {ordinal} must have a zero-arity result",
+                    ),
+                ));
             }
         }
         Ok(Self {

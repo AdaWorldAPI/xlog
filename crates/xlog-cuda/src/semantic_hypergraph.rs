@@ -1258,7 +1258,8 @@ impl SemanticRootMaterial {
         &self,
         admission: &SemanticAdmission,
         query_records: &[u32],
-    ) -> Result<crate::semantic_transition::SemanticTaskObservationRoots, SemanticHypergraphError> {
+    ) -> Result<crate::semantic_transition::SemanticTaskObservationRoots, SemanticHypergraphError>
+    {
         self.task_observation_roots_with_allocations(
             admission,
             query_records,
@@ -1297,9 +1298,12 @@ impl SemanticRootMaterial {
         for (ordinal, query) in queries.into_iter().enumerate() {
             let query = query.map_err(&error)?;
             for insertion in &self.insertions {
-                let key =
-                    material_statement_key(admission, insertion.statement, &insertion.reconstruction)
-                        .map_err(&error)?;
+                let key = material_statement_key(
+                    admission,
+                    insertion.statement,
+                    &insertion.reconstruction,
+                )
+                .map_err(&error)?;
                 if key.identity == query.identity {
                     contributors.push((ordinal as u32, insertion.statement, insertion.support));
                 }
@@ -3287,7 +3291,8 @@ pub(crate) struct SemanticRootExport {
     arena_dma_recorded: bool,
     arena: crate::device::RetainedDeviceRead<u64>,
     material: Option<SemanticRootMaterial>,
-    _material_allocation: Option<Arc<crate::semantic_transition::SemanticReplayMaterialReservation>>,
+    _material_allocation:
+        Option<Arc<crate::semantic_transition::SemanticReplayMaterialReservation>>,
 }
 
 // Both the graph and original export retain this actual issuance allocation.
@@ -3965,7 +3970,8 @@ impl SemanticHypergraph {
         let records = &admission.records;
         let mut prefix = b"XLOGROOT".len() + 4;
         let mut add = |count: usize, width: usize| -> Result<(), SemanticHypergraphError> {
-            prefix = prefix.checked_add(count.checked_mul(width).ok_or_else(size_overflow)?)
+            prefix = prefix
+                .checked_add(count.checked_mul(width).ok_or_else(size_overflow)?)
                 .ok_or_else(size_overflow)?;
             Ok(())
         };
@@ -3975,8 +3981,12 @@ impl SemanticHypergraph {
             add(1, 4 + 1 + 4 + 4)?;
             u32::try_from(predicate.schema.columns.len()).map_err(|_| size_overflow())?;
             u32::try_from(predicate.schema.key_columns.len()).map_err(|_| size_overflow())?;
-            for ((name, _), label) in predicate.schema.columns.iter()
-                .zip(predicate.schema.sort_labels()) {
+            for ((name, _), label) in predicate
+                .schema
+                .columns
+                .iter()
+                .zip(predicate.schema.sort_labels())
+            {
                 u32::try_from(name.len()).map_err(|_| size_overflow())?;
                 u32::try_from(label.len()).map_err(|_| size_overflow())?;
                 add(1, 4 + 1 + 4)?;
@@ -3995,11 +4005,13 @@ impl SemanticHypergraph {
             for argument in &record.arguments {
                 let width = match argument {
                     SemanticArgument::Bool(_) => 1,
-                    SemanticArgument::U32(_) | SemanticArgument::I32(_)
+                    SemanticArgument::U32(_)
+                    | SemanticArgument::I32(_)
                     | SemanticArgument::F32Bits(_) => 4,
                     SemanticArgument::Symbol(index) => {
-                        let (accepted, text) = symbols.next()
-                            .ok_or_else(|| admission_error("retained admission symbol is missing"))?;
+                        let (accepted, text) = symbols.next().ok_or_else(|| {
+                            admission_error("retained admission symbol is missing")
+                        })?;
                         if index != accepted {
                             return Err(admission_error("retained admission symbol order differs"));
                         }
@@ -4008,7 +4020,8 @@ impl SemanticHypergraph {
                         add(1, text.len())?;
                         4
                     }
-                    SemanticArgument::U64(_) | SemanticArgument::I64(_)
+                    SemanticArgument::U64(_)
+                    | SemanticArgument::I64(_)
                     | SemanticArgument::F64Bits(_) => 8,
                 };
                 add(1, 1 + width)?;
@@ -4452,15 +4465,22 @@ impl SemanticHypergraph {
     ) -> Result<SemanticRootExportGeometry, SemanticHypergraphError> {
         let arena_bytes = self.arena_words.checked_mul(8).ok_or_else(size_overflow)?;
         if usize::try_from(arena_bytes).ok() != self.arena.len().checked_mul(8) {
-            return Err(admission_error("root export arena changed its original geometry"));
+            return Err(admission_error(
+                "root export arena changed its original geometry",
+            ));
         }
-        let bytes = arena_bytes.checked_add(std::mem::size_of::<DeviceCommand>() as u64)
+        let bytes = arena_bytes
+            .checked_add(std::mem::size_of::<DeviceCommand>() as u64)
             .and_then(|bytes| bytes.checked_add(std::mem::size_of::<DeviceReceipt>() as u64))
             .ok_or_else(size_overflow)?;
         Ok(SemanticRootExportGeometry {
             arena_bytes,
-            capacities: [self.capacities.roots as u64, self.capacities.statements as u64,
-                self.capacities.supports as u64, self.capacities.versions as u64],
+            capacities: [
+                self.capacities.roots as u64,
+                self.capacities.statements as u64,
+                self.capacities.supports as u64,
+                self.capacities.versions as u64,
+            ],
             dma_ceiling: [3, 0, 0, 0, 0, 0, 0, 0, bytes],
             kernel_ceiling: Self::snapshot_kernel_work_ceiling(),
         })
@@ -4753,8 +4773,13 @@ impl SemanticHypergraph {
             }
             #[cfg(feature = "semantic-policy")]
             if let Some(allowance) = self.original_command_dma_allowance(&original.command)? {
-                allowance.lock().map_err(|_| admission_error("original cold allowance is poisoned"))?
-                    .require_submitted_dma(self.arena.len().checked_mul(8).ok_or_else(size_overflow)?, original.arena_dma_recorded)
+                allowance
+                    .lock()
+                    .map_err(|_| admission_error("original cold allowance is poisoned"))?
+                    .require_submitted_dma(
+                        self.arena.len().checked_mul(8).ok_or_else(size_overflow)?,
+                        original.arena_dma_recorded,
+                    )
                     .map_err(|error| admission_error(error.to_string()))?;
             }
             if !original.arena_admitted {
@@ -4765,7 +4790,8 @@ impl SemanticHypergraph {
                     })?;
                 original.arena_admitted = true;
             }
-            let result = self.enqueue_original_read(&mut original.arena, &mut original.command.poisoned);
+            let result =
+                self.enqueue_original_read(&mut original.arena, &mut original.command.poisoned);
             #[cfg(feature = "semantic-policy")]
             self.record_root_export_arena_dma(original)?;
             result?;
@@ -4776,27 +4802,46 @@ impl SemanticHypergraph {
     }
 
     #[cfg(feature = "semantic-policy")]
-    fn record_root_export_arena_dma(&self, original: &mut SemanticRootExport) -> Result<(), SemanticHypergraphError> {
+    fn record_root_export_arena_dma(
+        &self,
+        original: &mut SemanticRootExport,
+    ) -> Result<(), SemanticHypergraphError> {
         let allowance = self.original_command_dma_allowance(&original.command)?;
         if original.arena.submitted() && !original.arena_dma_recorded {
             if let Some(allowance) = allowance {
-                allowance.lock().map_err(|_| admission_error("original cold allowance is poisoned"))?
-                    .record_submitted_dma(self.arena.len().checked_mul(8).ok_or_else(size_overflow)?, &mut original.arena_dma_recorded)
+                allowance
+                    .lock()
+                    .map_err(|_| admission_error("original cold allowance is poisoned"))?
+                    .record_submitted_dma(
+                        self.arena.len().checked_mul(8).ok_or_else(size_overflow)?,
+                        &mut original.arena_dma_recorded,
+                    )
                     .map_err(|error| admission_error(error.to_string()))?;
-            } else { original.arena_dma_recorded = true; }
+            } else {
+                original.arena_dma_recorded = true;
+            }
         }
         Ok(())
     }
 
     #[cfg(feature = "semantic-policy")]
     fn original_command_dma_allowance(
-        &self, original: &OriginalSemanticCommand,
-    ) -> Result<Option<Arc<Mutex<crate::semantic_transition::ColdNativeAllowance>>>, SemanticHypergraphError> {
+        &self,
+        original: &OriginalSemanticCommand,
+    ) -> Result<
+        Option<Arc<Mutex<crate::semantic_transition::ColdNativeAllowance>>>,
+        SemanticHypergraphError,
+    > {
         let actual = self.cold_work_allowance();
         if original.dma_allowance.as_ref().is_some_and(|issued| {
-            actual.as_ref().is_none_or(|actual| !issued.ptr_eq(&Arc::downgrade(actual)))
-        }) || original.dma_allowance.is_none() && actual.is_some() {
-            return Err(admission_error("original semantic command changed its native tally owner"));
+            actual
+                .as_ref()
+                .is_none_or(|actual| !issued.ptr_eq(&Arc::downgrade(actual)))
+        }) || original.dma_allowance.is_none() && actual.is_some()
+        {
+            return Err(admission_error(
+                "original semantic command changed its native tally owner",
+            ));
         }
         Ok(actual)
     }
@@ -4977,7 +5022,8 @@ impl SemanticHypergraph {
             ordered,
             lineage,
         );
-        let material = poison_after_reconciliation_error(&mut self.poisoned, result).map_err(&error)?;
+        let material =
+            poison_after_reconciliation_error(&mut self.poisoned, result).map_err(&error)?;
         drop(arena);
         self.retire_transition_root_export_readback(original);
         let cached_allocation = reserve_cache(
@@ -6189,9 +6235,10 @@ impl SemanticHypergraph {
                 return Err(SemanticHypergraphError::Poisoned);
             }
             if original.completion_entered {
-                original.completion =
-                    original.completion.renew(self.stream.context())
-                        .map_err(|error| runtime_error("semantic completion allocation", error))?;
+                original.completion = original
+                    .completion
+                    .renew(self.stream.context())
+                    .map_err(|error| runtime_error("semantic completion allocation", error))?;
                 original.completion_entered = false;
             }
             let next_launches = self.next_launch_count()?;

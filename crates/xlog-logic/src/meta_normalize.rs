@@ -277,8 +277,10 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
                 .checked_add(1)
                 .and_then(|count| count.max(4).checked_next_power_of_two())
                 .ok_or_else(|| XlogError::allocation_extent_overflow("meta constructor stack"))?;
-            let owner = self.reserve_temporary(meta_storage_bytes::<Option<PayloadCustody>>(count)?)?;
-            self.capture_stack.reserve_exact(count - self.capture_stack.len());
+            let owner =
+                self.reserve_temporary(meta_storage_bytes::<Option<PayloadCustody>>(count)?)?;
+            self.capture_stack
+                .reserve_exact(count - self.capture_stack.len());
             self._capture_stack_storage = owner;
         }
         self.capture_stack.push(self.active_capture.take());
@@ -295,7 +297,11 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         result.map(|value| RetainedMetaValue { value, custody })
     }
 
-    fn append_custody(&mut self, into: &mut PayloadCustody, from: &mut PayloadCustody) -> Result<()> {
+    fn append_custody(
+        &mut self,
+        into: &mut PayloadCustody,
+        from: &mut PayloadCustody,
+    ) -> Result<()> {
         if let Some(scope) = self.allocation_owner.as_deref_mut() {
             into.append_from(from, scope)?;
         }
@@ -345,7 +351,9 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
             .iter()
             .zip(&mut program.custody.annotated_disjunctions.elements)
         {
-            custody.choices.prepare_elements(value.choices.len(), scope)?;
+            custody
+                .choices
+                .prepare_elements(value.choices.len(), scope)?;
             custody
                 .choices
                 .elements
@@ -795,7 +803,8 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
             }
             pred_columns.insert(name.to_string(), columns);
         }
-        let mut source_facts: HashMap<String, Vec<Atom>> = HashMap::with_capacity(fact_roster.len());
+        let mut source_facts: HashMap<String, Vec<Atom>> =
+            HashMap::with_capacity(fact_roster.len());
         for (name, count) in fact_roster {
             source_facts.insert(name.to_string(), Vec::with_capacity(count));
         }
@@ -870,8 +879,8 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         for (index, constraint) in out.value.constraints.iter_mut().enumerate() {
             let (capacity, _bound_owner) = self.reserve_binding_map(&constraint.body)?;
             let mut bound = HashMap::with_capacity(capacity);
-            let replacement = self
-                .capture(|normalizer| normalizer.normalize_body(&constraint.body, &mut bound))?;
+            let replacement =
+                self.capture(|normalizer| normalizer.normalize_body(&constraint.body, &mut bound))?;
             constraint.body = replacement.value;
             if self.allocation_owner.is_some() {
                 out.custody.constraints.elements[index] = replacement.custody;
@@ -887,7 +896,8 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         }
 
         for (index, pf) in out.value.prob_facts.iter_mut().enumerate() {
-            let replacement = self.capture(|normalizer| normalizer.normalize_atom_values(&pf.atom))?;
+            let replacement =
+                self.capture(|normalizer| normalizer.normalize_atom_values(&pf.atom))?;
             pf.atom = replacement.value;
             if self.allocation_owner.is_some() {
                 out.custody.prob_facts.elements[index] = replacement.custody;
@@ -914,7 +924,8 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
             }
         }
         for (index, query) in out.value.prob_queries.iter_mut().enumerate() {
-            let replacement = self.capture(|normalizer| normalizer.normalize_atom_values(&query.atom))?;
+            let replacement =
+                self.capture(|normalizer| normalizer.normalize_atom_values(&query.atom))?;
             query.atom = replacement.value;
             if self.allocation_owner.is_some() {
                 out.custody.prob_queries.elements[index] = replacement.custody;
@@ -1026,8 +1037,7 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         storage_owner: &mut Option<Arc<dyn Send + Sync>>,
         literal: BodyLiteral,
     ) -> Result<()> {
-        let next_owner =
-            self.reserve_vector_growth::<BodyLiteral>(out.len(), out.capacity())?;
+        let next_owner = self.reserve_vector_growth::<BodyLiteral>(out.len(), out.capacity())?;
         out.push(literal);
         if let Some(next_owner) = next_owner {
             *storage_owner = Some(next_owner);
@@ -1147,9 +1157,8 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
                 }
                 let mut values = Vec::with_capacity(items.len());
                 for item in items {
-                    values.push(
-                        self.normalize_untyped_value_with_receipt(item, temporary_receipt)?,
-                    );
+                    values
+                        .push(self.normalize_untyped_value_with_receipt(item, temporary_receipt)?);
                 }
                 Ok(Term::List(values))
             }
@@ -1376,11 +1385,11 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
                 .ok_or_else(|| XlogError::allocation_extent_overflow("finite findall columns"))?,
         )?;
         for (idx, name) in &group_positions {
-            let typ = self
-                .cloned_column_type(&goal.predicate, *idx)?
-                .unwrap_or(RetainedTypeRef::scalar(
-                    bound.get(name).copied().unwrap_or(ScalarType::U64),
-                ));
+            let typ =
+                self.cloned_column_type(&goal.predicate, *idx)?
+                    .unwrap_or(RetainedTypeRef::scalar(
+                        bound.get(name).copied().unwrap_or(ScalarType::U64),
+                    ));
             self.push_helper_column(&mut columns, name, typ, true)?;
         }
         let results_type =
@@ -1453,7 +1462,8 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
                 .get(&key.text)
                 .map(|group| (group.values.len(), group.values.capacity()))
                 .unwrap_or((0, 0));
-            let values_storage = self.reserve_vector_growth::<RetainedTermValue>(length, capacity)?;
+            let values_storage =
+                self.reserve_vector_growth::<RetainedTermValue>(length, capacity)?;
             let group = groups
                 .entry(key.text)
                 .or_insert_with(|| RetainedFindallGroup {
@@ -1499,12 +1509,10 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
             if self.allocation_owner.is_some()
                 && group.terms.values.len() == group.terms.values.capacity()
             {
-                let count = group
-                    .terms
-                    .values
-                    .len()
-                    .checked_add(1)
-                    .ok_or_else(|| XlogError::allocation_extent_overflow("finite findall row"))?;
+                let count =
+                    group.terms.values.len().checked_add(1).ok_or_else(|| {
+                        XlogError::allocation_extent_overflow("finite findall row")
+                    })?;
                 let owner = self.reserve_temporary(meta_storage_bytes::<Term>(count)?)?;
                 group.terms.values.reserve_exact(1);
                 group.terms.storage_owner = owner;
@@ -1643,7 +1651,8 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
                 .into_list(&mut self.allocation_owner)?;
         self.push_helper_column(&mut columns, "output", helper_output_type, false)?;
         self.register_helper_decl(&helper, columns)?;
-        let mut outputs = self.maplist_binary_outputs(pred_name, &input_list, &output_type.value)?;
+        let mut outputs =
+            self.maplist_binary_outputs(pred_name, &input_list, &output_type.value)?;
         drop(output_type);
         for mut output in std::mem::take(&mut outputs.rows) {
             if let (Some(scope), Some(owner)) = (
@@ -1984,7 +1993,7 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
                 let mut values = Vec::with_capacity(items.len());
                 for item in items {
                     values.push(Term::Integer(
-                        self.register_term(item, ExpectedTerm::Any)? as i64,
+                        self.register_term(item, ExpectedTerm::Any)? as i64
                     ));
                 }
                 Ok(Term::List(values))
@@ -2212,11 +2221,10 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         }
         let id = self.next_term_id;
         self.next_term_id += 1;
-        let term_ids_storage =
-            self.reserve_hash_growth::<String, RegisteredTermId>(
-                self.term_ids.len(),
-                self.term_ids.capacity(),
-            )?;
+        let term_ids_storage = self.reserve_hash_growth::<String, RegisteredTermId>(
+            self.term_ids.len(),
+            self.term_ids.capacity(),
+        )?;
         let term_records_storage = self.reserve_vector_growth::<TermRecord>(
             self.term_records.len(),
             self.term_records.capacity(),
@@ -2247,8 +2255,9 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
 
         let existing_owner = if self.allocation_owner.is_some() {
             let overflow = || XlogError::allocation_extent_overflow("meta helper output");
-            let mut bytes =
-                crate::compile::hash_allocation_bytes::<String, ()>(program.value.predicates.len())?;
+            let mut bytes = crate::compile::hash_allocation_bytes::<String, ()>(
+                program.value.predicates.len(),
+            )?;
             for predicate in &program.value.predicates {
                 bytes = bytes
                     .checked_add(predicate.name.len() as u64)
@@ -2276,8 +2285,14 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
                 .allocation_owner
                 .as_deref_mut()
                 .expect("original helper allocation scope");
-            program.custody.predicates.prepare_elements(additions, scope)?;
-            program.custody.rules.prepare_elements(self.helper_facts.len(), scope)?;
+            program
+                .custody
+                .predicates
+                .prepare_elements(additions, scope)?;
+            program
+                .custody
+                .rules
+                .prepare_elements(self.helper_facts.len(), scope)?;
             let predicates = program
                 .value
                 .predicates
@@ -2285,7 +2300,8 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
                 .checked_add(additions)
                 .ok_or_else(overflow)?;
             if predicates > program.value.predicates.capacity() {
-                let owner = scope.reserve_allocation(meta_storage_bytes::<PredDecl>(predicates)?)?;
+                let owner =
+                    scope.reserve_allocation(meta_storage_bytes::<PredDecl>(predicates)?)?;
                 program.value.predicates.reserve_exact(additions);
                 program.custody.predicates.backing_owner = Some(owner);
             }
@@ -2378,10 +2394,7 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
                     for id in parts {
                         values.push(Term::Integer(id as i64));
                     }
-                    Ok(vec![
-                        Term::Integer(record.id as i64),
-                        Term::List(values),
-                    ])
+                    Ok(vec![Term::Integer(record.id as i64), Term::List(values)])
                 })?;
                 self.add_helper_fact(univ_pred(), terms)?;
                 for (idx, arg_id) in args.into_iter().enumerate() {
@@ -2491,7 +2504,8 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
             self.helper_fact_keys.len(),
             self.helper_fact_keys.capacity(),
         )?;
-        self.helper_fact_keys.insert(key.text, key._allocation_owner);
+        self.helper_fact_keys
+            .insert(key.text, key._allocation_owner);
         if let Some(storage) = key_storage {
             self._helper_fact_keys_storage = Some(storage);
         }
@@ -2509,8 +2523,8 @@ impl<'a, 'pool> MetaNormalizer<'a, 'pool> {
         if let Some(scope) = self.allocation_owner.as_deref_mut() {
             self.helper_facts_custody.prepare_elements(1, scope)?;
         }
-        let facts_storage =
-            self.reserve_vector_growth::<Rule>(self.helper_facts.len(), self.helper_facts.capacity())?;
+        let facts_storage = self
+            .reserve_vector_growth::<Rule>(self.helper_facts.len(), self.helper_facts.capacity())?;
         self.helper_facts.push(Rule {
             head: Atom {
                 predicate: name.value,
@@ -2777,25 +2791,21 @@ fn cartesian_product(
             .len()
             .checked_mul(choice.len())
             .ok_or_else(|| XlogError::allocation_extent_overflow("finite meta product"))?;
-        let next_owner =
-            if let Some(allocate) = allocate.as_deref_mut() {
-                Some(allocate.reserve_allocation(
-                    meta_storage_bytes::<RetainedTermRow>(next_rows)?,
-                )?)
-            } else {
-                None
-            };
+        let next_owner = if let Some(allocate) = allocate.as_deref_mut() {
+            Some(allocate.reserve_allocation(meta_storage_bytes::<RetainedTermRow>(next_rows)?)?)
+        } else {
+            None
+        };
         let mut next = RetainedTermRows {
             rows: Vec::with_capacity(next_rows),
             _allocation_owner: next_owner,
         };
         for row in &rows.rows {
             for value in choice {
-                let count = row
-                    .values
-                    .len()
-                    .checked_add(1)
-                    .ok_or_else(|| XlogError::allocation_extent_overflow("finite meta product"))?;
+                let count =
+                    row.values.len().checked_add(1).ok_or_else(|| {
+                        XlogError::allocation_extent_overflow("finite meta product")
+                    })?;
                 let mut custody = PayloadCustody::default();
                 if let Some(scope) = allocate.as_deref_mut() {
                     custody.reserve_unit(meta_storage_bytes::<Term>(count)?, scope)?;
