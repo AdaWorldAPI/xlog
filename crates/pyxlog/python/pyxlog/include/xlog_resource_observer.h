@@ -7,8 +7,8 @@
 extern "C" {
 #endif
 
-#define XLOG_RESOURCE_OBSERVER_ABI_VERSION UINT32_C(5)
-#define XLOG_RESOURCE_OBSERVER_CAPSULE_NAME "xlog.resource_observer.v5"
+#define XLOG_RESOURCE_OBSERVER_ABI_VERSION UINT32_C(6)
+#define XLOG_RESOURCE_OBSERVER_CAPSULE_NAME "xlog.resource_observer.v6"
 #define XLOG_RESOURCE_MEMORY_UNIT "owned-gpu-backing-peak-bytes"
 #define XLOG_RESOURCE_MEMORY_ADMISSION "whole-device-total-physical-bytes"
 
@@ -194,6 +194,50 @@ typedef struct XlogResourceStaticConfirmation {
     uint32_t reserved_tail;
 } XlogResourceStaticConfirmation;
 
+#define XLOG_RESOURCE_MODULE_FUNCTION_RUNTIME_ARGUMENT_VALID UINT64_C(1)
+#define XLOG_RESOURCE_MODULE_FUNCTION_RUNTIME_RESULT_VALID UINT64_C(2)
+#define XLOG_RESOURCE_MODULE_FUNCTION_LOOKUP_ARGUMENT_VALID UINT64_C(4)
+#define XLOG_RESOURCE_MODULE_FUNCTION_LOOKUP_RESULT_VALID UINT64_C(8)
+
+/* Original typed runtime FUNCTION argument and its nested cuModuleGetFunction,
+ * captured synchronously on the same host thread, never joined by callback
+ * arrival order, time proximity or symbol name. Variable-symbol arguments are
+ * not function arguments. The collector associates the lookup's actual module
+ * input and context with this lease's original live load identity, including
+ * lookups made after loading; a reused CUmodule is not the same load.
+ *
+ * ARGUMENT_VALID qualifies the corresponding callback/correlation and original
+ * input fields. RESULT_VALID qualifies the matching original API_EXIT status;
+ * UINT32_MAX means that status is unavailable, not success. function_handle is
+ * the original successful lookup output only when LOOKUP_RESULT_VALID is set
+ * and lookup_status is CUDA_SUCCESS. Failed outputs are not read or fabricated.
+ * record_id identifies the original lookup, not its array index.
+ *
+ * A runtime argument can also be cudaKernel_t, not a registered host symbol.
+ * These raw facts therefore prove neither registration nor CUDA ownership and
+ * never grant a right to dereference runtime_function_argument. An external
+ * producer must first hold its actual runtime/object/context owners, exclude
+ * permitted unregister/unload/reset throughout queries, establish the SAME
+ * runtime instance and cold-confirm the registered function/module identity.
+ * Failed getters cannot create ownership or trigger a replacement loader.
+ * Multiple original observations are retained, not selected by arrival order.
+ * Native module owners retain their existing ownership without runtime rows. */
+typedef struct XlogResourceOriginalModuleFunction {
+    uint32_t struct_size;
+    uint32_t reserved;
+    uint64_t record_id;
+    uint64_t valid_fields;
+    uint32_t runtime_callback_id;
+    uint32_t runtime_correlation_id;
+    uint32_t runtime_status;
+    uint32_t lookup_callback_id;
+    uint32_t lookup_correlation_id;
+    uint32_t lookup_status;
+    uint64_t runtime_function_argument;
+    uint64_t function_handle;
+    uint64_t module_handle;
+} XlogResourceOriginalModuleFunction;
+
 /* The original successful load API output, context and correlation establish
  * the module association. A resource callback's moduleId or delivery order is
  * not a CUmodule. actual_cubin_sha256 is copied from the original loaded image
@@ -210,7 +254,13 @@ typedef struct XlogResourceStaticConfirmation {
  * original_image_bytes=0 means its size is unavailable. LIBRARY_HANDLE_VALID
  * qualifies the original successful CUlibrary output, separately from CUmodule.
  * UNLOAD_OBSERVED/RESET_OBSERVED preserve original invalidation history; their
- * absence alone does not exclude concurrent destruction during a native query. */
+ * absence alone does not exclude concurrent destruction during a native query.
+ * functions is an immutable array of original runtime/function lookup facts,
+ * pinned by this SAME lease through known unload acknowledgement, including on
+ * a non-COMPLETE read. function_size is exactly sizeof its record; a zero count
+ * means no such facts, not runtime ownership. No borrowed collector lock crosses
+ * the cold-query boundary. Changing this view requires the exact new ABI, not
+ * reinterpretation of reserved fields in an already published version. */
 typedef struct XlogResourceModuleOriginalView {
     uint32_t struct_size;
     uint32_t state;
@@ -234,6 +284,9 @@ typedef struct XlogResourceModuleOriginalView {
     uint64_t library_handle;
     uint64_t original_image_pointer;
     uint64_t original_image_bytes;
+    const XlogResourceOriginalModuleFunction *functions;
+    uint64_t function_count;
+    uint64_t function_size;
 } XlogResourceModuleOriginalView;
 
 /* One real module lifecycle, not a second loader or a synthetic allocation.

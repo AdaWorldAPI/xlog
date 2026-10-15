@@ -99,6 +99,9 @@ pub struct ModuleOriginalView {
     pub library_handle: u64,
     pub original_image_pointer: u64,
     pub original_image_bytes: u64,
+    pub functions: *const OriginalModuleFunction,
+    pub function_count: u64,
+    pub function_size: u64,
 }
 
 impl Default for ModuleOriginalView {
@@ -126,8 +129,33 @@ impl Default for ModuleOriginalView {
             library_handle: 0,
             original_image_pointer: 0,
             original_image_bytes: 0,
+            functions: std::ptr::null(),
+            function_count: 0,
+            function_size: std::mem::size_of::<OriginalModuleFunction>() as u64,
         }
     }
+}
+
+/// Original typed runtime function argument and nested driver lookup, copied by
+/// the same immutable collector lease. These raw facts do not establish CUDA
+/// ownership or grant a right to dereference the argument. The native module's
+/// actual owner needs no runtime rows and does not dereference this array.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct OriginalModuleFunction {
+    pub struct_size: u32,
+    pub reserved: u32,
+    pub record_id: u64,
+    pub valid_fields: u64,
+    pub runtime_callback_id: u32,
+    pub runtime_correlation_id: u32,
+    pub runtime_status: u32,
+    pub lookup_callback_id: u32,
+    pub lookup_correlation_id: u32,
+    pub lookup_status: u32,
+    pub runtime_function_argument: u64,
+    pub function_handle: u64,
+    pub module_handle: u64,
 }
 
 /// Exact original static activity fields; absent fields are never synthesized.
@@ -214,7 +242,8 @@ impl StaticConfirmation {
 
 const _: () = {
     assert!(std::mem::size_of::<ModuleObservation>() == 128);
-    assert!(std::mem::size_of::<ModuleOriginalView>() == 168);
+    assert!(std::mem::size_of::<ModuleOriginalView>() == 192);
+    assert!(std::mem::size_of::<OriginalModuleFunction>() == 72);
     assert!(std::mem::size_of::<OriginalStaticRecord>() == 96);
     assert!(std::mem::size_of::<StaticConfirmation>() == 152);
 };
@@ -432,6 +461,7 @@ impl ModuleBacking {
             || view.flags & (MODULE_ORIGINAL_UNLOAD_OBSERVED | MODULE_ORIGINAL_RESET_OBSERVED) != 0
             || view.original_load_start > view.original_load_end
             || view.record_size != std::mem::size_of::<OriginalStaticRecord>() as u64
+            || view.function_size != std::mem::size_of::<OriginalModuleFunction>() as u64
         {
             return Err(invalid(
                 "original module lease identity, state or layout is invalid",

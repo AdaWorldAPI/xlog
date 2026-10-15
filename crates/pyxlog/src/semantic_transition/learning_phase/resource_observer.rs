@@ -115,13 +115,14 @@ const _: () = assert!(
         && size_of::<DeviceCertificate>() == 120
         && size_of::<xlog_cuda::memory::GpuBackingRoot>() == 64
         && size_of::<xlog_cuda::module_backing::ModuleObservation>() == 128
-        && size_of::<xlog_cuda::module_backing::ModuleOriginalView>() == 168
+        && size_of::<xlog_cuda::module_backing::ModuleOriginalView>() == 192
+        && size_of::<xlog_cuda::module_backing::OriginalModuleFunction>() == 72
         && size_of::<xlog_cuda::module_backing::OriginalStaticRecord>() == 96
         && size_of::<xlog_cuda::module_backing::StaticConfirmation>() == 152
 );
 
 fn checked_api(capsule: &Bound<'_, PyCapsule>) -> PyResult<(usize, Api)> {
-    let pointer = capsule.pointer_checked(Some(c"xlog.resource_observer.v5"))?;
+    let pointer = capsule.pointer_checked(Some(c"xlog.resource_observer.v6"))?;
     if !(pointer.as_ptr() as usize).is_multiple_of(align_of::<Api>()) {
         return Err(invalid(
             "resource observer table has invalid C ABI alignment",
@@ -130,7 +131,7 @@ fn checked_api(capsule: &Bound<'_, PyCapsule>) -> PyResult<(usize, Api)> {
     // SAFETY: original trusted capsule pins its immutable C table. Read only
     // the common header before checking the exact new layout, never an old ABI.
     let header = unsafe { &*pointer.as_ptr().cast::<ApiHeader>() };
-    if header.abi_version != 5 || header.struct_size as usize != size_of::<Api>() {
+    if header.abi_version != 6 || header.struct_size as usize != size_of::<Api>() {
         return Err(invalid(
             "resource observer requires the exact installed C ABI table",
         ));
@@ -190,7 +191,7 @@ impl xlog_cuda::memory::GpuBackingObserver for ProcessBackingObserver {
                  confirmation_count={} confirmation_size={} \
                  returned_state={:?} returned_lease_id={:?} \
                  returned_generation={:?} returned_context={:?} returned_module={:?} \
-                 returned_flags={:?}",
+                 returned_flags={:?} returned_function_count={:?} returned_function_size={:?}",
                 observation.struct_size,
                 observation.operation,
                 observation.owner_generation,
@@ -209,6 +210,8 @@ impl xlog_cuda::memory::GpuBackingObserver for ProcessBackingObserver {
                 returned.map(|view| view.context_handle),
                 returned.map(|view| view.module_handle),
                 returned.map(|view| view.flags),
+                returned.map(|view| view.function_count),
+                returned.map(|view| view.function_size),
             )));
         }
         Ok(())
@@ -551,7 +554,7 @@ impl ResourceObserver {
             || self
                 .capsule
                 .bind(py)
-                .pointer_checked(Some(c"xlog.resource_observer.v5"))?
+                .pointer_checked(Some(c"xlog.resource_observer.v6"))?
                 .as_ptr() as usize
                 != self.table
         {
