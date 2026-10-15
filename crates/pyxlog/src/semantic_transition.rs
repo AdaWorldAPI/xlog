@@ -770,15 +770,15 @@ impl PySemanticTransitionSession {
             });
             self.issuance.fetch_add(1, Ordering::AcqRel);
         }
-        if let Err(original) = retained
+        // This owner is issued only after the original terminal join succeeded.
+        // A failed allocation retirement retains its custody, but does not grant
+        // another terminal-join continuation through the Python Pending protocol.
+        retained
             .as_mut()
             .expect("retained original allocation retirement")
             .owner
             .resolve()
-        {
-            pending.set_cause(py, Some(xlog_err(original)));
-            return Err(pending);
-        }
+            .map_err(xlog_err)?;
         self.training_canary_owner
             .lock()
             .map_err(|_| invalid("symbolic canary owner mutex is poisoned"))?
@@ -23407,7 +23407,9 @@ impl PySemanticTransitionController {
     /// Terminally release a genuine completed ordinary import that has never
     /// allocated a model, bound a parent, or executed a segment. A retained
     /// immutable model-context token does not retain this Session's GPU storage.
-    /// Unknown retains the original TaskUse and terminal join for the same call.
+    /// An unfinished terminal join retains the original TaskUse for the same call.
+    /// An allocation retirement error after that join retains its owner without
+    /// granting another pending terminal-join continuation.
     fn close_imported_task(
         slf: &Bound<'_, Self>,
         py: Python<'_>,
