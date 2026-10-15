@@ -160,9 +160,21 @@ impl xlog_cuda::memory::GpuBackingObserver for ProcessBackingObserver {
         // thread-safe and never enters Python/CUDA, including on cold reapers.
         let status = unsafe { (self.record)(self.context as *mut c_void, root) };
         if status != COMPLETE {
-            return Err(xlog_cuda::device_runtime::ResourceError::Driver(
-                "original backing root registration is unknown; retain its owner".into(),
-            ));
+            return Err(xlog_cuda::device_runtime::ResourceError::Driver(format!(
+                "original backing root registration did not complete; retain its owner: \
+                 status={status} struct_size={} kind={} owner_generation={} \
+                 context_handle={:#x} base={:#x} bytes={} device_uuid={:02x?} \
+                 device_ordinal={} reserved={}",
+                root.struct_size,
+                root.kind,
+                root.owner_generation,
+                root.context_handle,
+                root.base,
+                root.bytes,
+                root.device_uuid,
+                root.device_ordinal,
+                root.reserved,
+            )));
         }
         Ok(())
     }
