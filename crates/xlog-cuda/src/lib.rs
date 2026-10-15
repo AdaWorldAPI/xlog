@@ -63,7 +63,10 @@ pub use semantic_hypergraph::{
     SemanticSupportRecord, SemanticSupportRef, SemanticTruth, SemanticTypedRecord,
     SemanticVersionHandle, SemanticVersionIdentity, SemanticVersionRef, SemanticView,
 };
-pub use semantic_program::{SemanticProgramAdmission, SemanticProgramFact, SemanticProgramRule};
+pub use semantic_program::{
+    SemanticProgramAdmission, SemanticProgramAtom, SemanticProgramFact, SemanticProgramRule,
+    SemanticProgramTerm,
+};
 pub use semantic_training_view::{
     validate_training_view_layout, SemanticSelectedTrainingView, SemanticTrainingCanary,
     SemanticTrainingCanaryKind, SemanticTrainingCanaryRecord, SemanticTrainingCanaryRefusalReason,

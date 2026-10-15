@@ -3006,51 +3006,18 @@ fn policy_viability_category_ceiling(
 fn rule_prefix_native_work_ceiling(
     predicate_bound: u64,
 ) -> Result<[u64; 9], SemanticTransitionError> {
-    // prefix_completes admits seven trailing nulls and examines three predicate
-    // positions. Owned-range checks add two slots in admission and two in the
-    // typed decoder, independently of external support. The prefix also reads
-    // its own two structural range endpoints instead of the global table end.
-    let predicate_categories = ceiling_product(3, ceiling_product(2, predicate_bound)?.max(3))?;
-    let predicate_slots = ceiling_sum([
-        3,
-        ceiling_product(16, predicate_bound)?.max(15),
-        ceiling_product(2, ceiling_product(12, predicate_bound)?.max(11))?,
-    ])?;
-    // Every first/second pair can visit four positions, sixteen covering masks
-    // per position, four variable candidates per mask, and sixteen final masks.
-    // available_variable includes its rejected candidate, admitted coordinate,
-    // and the context-bound operand decoder: Category 3 and TableSlot 11 at most.
-    let pairs = ceiling_product(4, 4)?;
-    let covering_visits = ceiling_product(pairs, ceiling_product(4, 16)?)?;
-    let final_visits = ceiling_product(pairs, 16)?;
-    let variable_calls = ceiling_sum([4, pairs, ceiling_product(covering_visits, 4)?])?;
-    let loop_slots = ceiling_sum([
-        4,
-        pairs,
-        ceiling_product(pairs, 4)?,
-        covering_visits,
-        final_visits,
-    ])?;
+    // The arity-aware prefix scans at most three predicate ranges: one head
+    // descriptor (17 TableSlot events) and two body descriptors (13 each)
+    // per predicate, including admission and context checks.
+    // Constant work covers seven trailing NULLs, three optional unary NULLs,
+    // 24 variable probes (11 TableSlot / 3 Category each), three 4-by-4
+    // atom-mask constructions, and two 15-by-15 coverage scans. Fixed
+    // predicates and the three outer position visits fit these same bounds.
     let ceiling = [
         0,
-        ceiling_sum([
-            7,
-            2, // Original context structural range endpoints.
-            predicate_slots,
-            11, // Optional fixed-variable validation.
-            ceiling_product(variable_calls, 11)?,
-            loop_slots,
-        ])?,
+        ceiling_sum([ceiling_product(43, predicate_bound)?, 834])?,
         0,
-        ceiling_sum([
-            1,
-            7,
-            predicate_categories,
-            3, // Optional fixed-variable validation.
-            ceiling_product(variable_calls, 3)?,
-            covering_visits,
-            final_visits,
-        ])?,
+        ceiling_sum([ceiling_product(6, predicate_bound)?, 566])?,
         0,
         0,
         0,
@@ -3650,7 +3617,7 @@ pub(super) fn actor_refresh_transition_native_work_ceilings(
                     0,
                     0,
                     0,
-                    2 * 40 + 8,
+                    2 * std::mem::size_of::<crate::SemanticProgramRule>() as u64 + 8,
                 ],
             )?;
         } else {

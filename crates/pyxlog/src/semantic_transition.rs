@@ -19654,22 +19654,10 @@ impl PySemanticPolicyInvocation {
             .map(|lane| {
                 PyTuple::new(
                     py,
-                    lane.program_rules.iter().map(|rule| {
-                        rule.map(|rule| {
-                            (
-                                rule.head_predicate,
-                                rule.left_predicate,
-                                rule.right_predicate,
-                                rule.body_count,
-                                rule.head_variables[0],
-                                rule.head_variables[1],
-                                rule.left_variables[0],
-                                rule.left_variables[1],
-                                rule.right_variables[0],
-                                rule.right_variables[1],
-                            )
-                        })
-                    }),
+                    lane.program_rules
+                        .iter()
+                        .map(|rule| rule.map(|rule| PyTuple::new(py, rule.words())).transpose())
+                        .collect::<PyResult<Vec<_>>>()?,
                 )
             })
             .collect::<PyResult<Vec<_>>>()?;
@@ -20242,8 +20230,10 @@ fn descriptor_meaning_object(
                 .into_pyobject(py)?
                 .into_any()
         }
-        SemanticActionDescriptor::RulePredicate { predicate } => {
-            ("rule_predicate", *predicate).into_pyobject(py)?.into_any()
+        SemanticActionDescriptor::RulePredicate { predicate, arity } => {
+            ("rule_predicate", *predicate, *arity)
+                .into_pyobject(py)?
+                .into_any()
         }
         SemanticActionDescriptor::RuleVariable { index } => {
             ("rule_variable", *index).into_pyobject(py)?.into_any()

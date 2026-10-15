@@ -1147,6 +1147,7 @@ impl TaskEvaluationBinding {
         for (statement, fact) in &self.observation_statements {
             hash.update(statement.identity().as_bytes());
             hash.update(fact.predicate.to_le_bytes());
+            hash.update(fact.arity.to_le_bytes());
             hash.update(fact.first.to_le_bytes());
             hash.update(fact.second.to_le_bytes());
         }
@@ -1279,7 +1280,7 @@ impl TaskEvaluationBinding {
             .iter()
             .map(|level| level.goals.len())
             .sum::<usize>();
-        let mut words = vec![8, owner];
+        let mut words = vec![9, owner];
         words.extend(identity_words(*self.identity().as_bytes()));
         words.extend([
             self.statements.len() as u64,
@@ -1333,6 +1334,7 @@ impl TaskEvaluationBinding {
             words.extend(identity_words(*statement.identity().as_bytes()));
             words.extend([
                 u64::from(fact.predicate),
+                u64::from(fact.arity),
                 u64::from(fact.first),
                 u64::from(fact.second),
             ]);
@@ -1590,6 +1592,7 @@ pub enum SemanticActionDescriptor {
     },
     RulePredicate {
         predicate: u32,
+        arity: u32,
     },
     RuleVariable {
         index: u32,
@@ -1611,20 +1614,58 @@ struct SemanticDecodedRuleInsertion {
     bytes: Vec<u8>,
 }
 
-fn semantic_program_rule_words(rule: crate::SemanticProgramRule) -> [u64; 10] {
-    [
-        rule.head_predicate,
-        rule.left_predicate,
-        rule.right_predicate,
+fn semantic_program_rule_words(rule: crate::SemanticProgramRule) -> [u64; 25] {
+    rule.words()
+}
+
+fn semantic_generated_rule_receipt_words(
+    rule: crate::SemanticProgramRule,
+    program: &crate::SemanticProgramAdmission,
+) -> Result<[u64; 10], SemanticTransitionError> {
+    if program.predicate_arities.len() != program.predicate_count as usize
+        || rule.body_count != 2
+        || rule.body[2] != crate::SemanticProgramAtom::default()
+    {
+        return Err(SemanticTransitionError::ObservationMismatch);
+    }
+    for atom in [&rule.head, &rule.body[0], &rule.body[1]] {
+        if !(1..=2).contains(&atom.arity)
+            || program.predicate_arities.get(atom.predicate as usize) != Some(&atom.arity)
+            || atom.terms[..atom.arity as usize]
+                .iter()
+                .any(|term| term.kind != 0 || term.value >= 4)
+            || atom.terms[atom.arity as usize..]
+                .iter()
+                .any(|term| *term != crate::SemanticProgramTerm::default())
+        {
+            return Err(SemanticTransitionError::ObservationMismatch);
+        }
+    }
+    let bound = rule.body[..2]
+        .iter()
+        .flat_map(|atom| &atom.terms[..atom.arity as usize])
+        .fold(0u8, |set, term| set | (1 << term.value));
+    if rule.head.terms[..rule.head.arity as usize]
+        .iter()
+        .any(|term| bound & (1 << term.value) == 0)
+    {
+        return Err(SemanticTransitionError::ObservationMismatch);
+    }
+    // This projection is lossless only for generated variable rules under the
+    // bound predicate declarations. Authored rules retain the full atom words.
+    Ok([
+        rule.head.predicate,
+        rule.body[0].predicate,
+        rule.body[1].predicate,
         rule.body_count,
-        rule.head_variables[0],
-        rule.head_variables[1],
-        rule.left_variables[0],
-        rule.left_variables[1],
-        rule.right_variables[0],
-        rule.right_variables[1],
+        rule.head.terms[0].value,
+        rule.head.terms[1].value,
+        rule.body[0].terms[0].value,
+        rule.body[0].terms[1].value,
+        rule.body[1].terms[0].value,
+        rule.body[1].terms[1].value,
     ]
-    .map(u64::from)
+    .map(u64::from))
 }
 
 struct ActionCodebooks {
@@ -1658,7 +1699,7 @@ impl ActionCodebooks {
 
     fn program_binding(program: &crate::SemanticProgramAdmission) -> Identity256 {
         let mut hash = Sha256::new();
-        hash.update(b"xlog.semantic.rule-codebook.program.v1\0");
+        hash.update(b"xlog.semantic.rule-codebook.program.v2\0");
         for word in program.words() {
             hash.update(word.to_le_bytes());
         }
@@ -1686,10 +1727,11 @@ impl ActionCodebooks {
                 .ok_or(SemanticTransitionError::ObservationMismatch)
         }
         let predicate = |entry: &SemanticActionDescriptor| match entry {
-            SemanticActionDescriptor::RulePredicate { predicate }
-                if *predicate < program.predicate_count =>
+            SemanticActionDescriptor::RulePredicate { predicate, arity }
+                if (1..=2).contains(arity)
+                    && program.predicate_arities.get(*predicate as usize) == Some(arity) =>
             {
-                Ok(*predicate)
+                Ok((*predicate, *arity))
             }
             _ => Err(SemanticTransitionError::ObservationMismatch),
         };
@@ -1697,47 +1739,41 @@ impl ActionCodebooks {
             SemanticActionDescriptor::RuleVariable { index } if *index < 4 => Ok(*index),
             _ => Err(SemanticTransitionError::ObservationMismatch),
         };
-        let rule = crate::SemanticProgramRule {
-            head_predicate: predicate(chosen(&self.targets, self.local_category(2, choices[2]))?)?,
-            left_predicate: predicate(chosen(&self.operands, self.local_category(3, choices[3]))?)?,
-            right_predicate: predicate(chosen(
-                &self.operands,
-                self.local_category(4, choices[4]),
-            )?)?,
+        let predicates = [
+            predicate(chosen(&self.targets, self.local_category(2, choices[2]))?)?,
+            predicate(chosen(&self.operands, self.local_category(3, choices[3]))?)?,
+            predicate(chosen(&self.operands, self.local_category(4, choices[4]))?)?,
+        ];
+        let mut rule = crate::SemanticProgramRule {
             body_count: 2,
-            head_variables: [
-                variable(chosen(&self.operands, self.local_category(5, choices[5]))?)?,
-                variable(chosen(&self.operands, self.local_category(6, choices[6]))?)?,
-            ],
-            left_variables: [
-                variable(chosen(&self.operands, self.local_category(7, choices[7]))?)?,
-                variable(chosen(&self.operands, self.local_category(8, choices[8]))?)?,
-            ],
-            right_variables: [
-                variable(chosen(&self.operands, self.local_category(9, choices[9]))?)?,
-                variable(chosen(
-                    &self.operands,
-                    self.local_category(10, choices[10]),
-                )?)?,
-            ],
+            ..Default::default()
         };
-        let bound = rule
-            .left_variables
-            .into_iter()
-            .chain(rule.right_variables)
-            .fold(0u8, |set, index| set | (1 << index));
-        if rule
-            .head_variables
-            .iter()
-            .any(|index| bound & (1 << index) == 0)
-        {
-            return Err(SemanticTransitionError::ObservationMismatch);
+        for (atom_index, (predicate, arity)) in predicates.into_iter().enumerate() {
+            let atom = if atom_index == 0 {
+                &mut rule.head
+            } else {
+                &mut rule.body[atom_index - 1]
+            };
+            atom.predicate = predicate;
+            atom.arity = arity;
+            for argument in 0..2 {
+                let field = 5 + 2 * atom_index + argument;
+                if argument < arity as usize {
+                    atom.terms[argument].value = variable(chosen(
+                        &self.operands,
+                        self.local_category(field as u32, choices[field]),
+                    )?)?;
+                } else if choices[field] != 0 {
+                    return Err(SemanticTransitionError::ObservationMismatch);
+                }
+            }
         }
+        semantic_generated_rule_receipt_words(rule, program)?;
         #[cfg(any(feature = "semantic-policy", test))]
         let bytes = {
             let mut bytes = Vec::new();
             bytes.extend_from_slice(b"XLOG-DECODED-RULE-INSERTION\0");
-            material_u64(&mut bytes, 1);
+            material_u64(&mut bytes, 2);
             bytes.extend_from_slice(self.binding.digest.as_bytes());
             bytes.extend_from_slice(Self::program_binding(program).as_bytes());
             for &choice in choices {
@@ -2042,8 +2078,20 @@ impl ActionCodebooks {
             .collect();
         if let Some(program) = program {
             for predicate in 0..program.predicate_count {
-                words.extend([u64::from(predicate), u64::MAX, 0, 0, 0, 0, 0, 0, 0, 0]);
-                target_views.push(SemanticActionDescriptor::RulePredicate { predicate });
+                let arity = program.predicate_arities[predicate as usize];
+                words.extend([
+                    u64::from(predicate),
+                    u64::MAX,
+                    u64::from(arity),
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ]);
+                target_views.push(SemanticActionDescriptor::RulePredicate { predicate, arity });
             }
         }
         words[2] = words.len() as u64;
@@ -2066,8 +2114,9 @@ impl ActionCodebooks {
             .collect();
         if let Some(program) = program {
             for predicate in 0..program.predicate_count {
-                words.extend([0, 0, 0, 1, u64::from(predicate), 0]);
-                operand_views.push(SemanticActionDescriptor::RulePredicate { predicate });
+                let arity = program.predicate_arities[predicate as usize];
+                words.extend([0, 0, 0, 1, u64::from(predicate), u64::from(arity)]);
+                operand_views.push(SemanticActionDescriptor::RulePredicate { predicate, arity });
             }
             for index in 0..4 {
                 words.extend([0, 0, 0, 2, u64::from(index), 0]);
@@ -2123,7 +2172,7 @@ impl ActionCodebooks {
                 .map(|v| u64::from_le_bytes(*v)),
         );
         let mut hash = Sha256::new();
-        hash.update(b"xlog.semantic.action-binding.v4\0");
+        hash.update(b"xlog.semantic.action-binding.v5\0");
         hash.update(CATALOGUE_DIGEST);
         hash.update(admission.identity().as_bytes());
         let program_binding = program.map(Self::program_binding);
@@ -8557,14 +8606,17 @@ fn validated_rule_receipt(
         None => None,
         _ => return Err(mismatch()),
     };
-    let previous_fields = previous.map(semantic_program_rule_words).unwrap_or([0; 10]);
+    let previous_fields = previous
+        .map(|rule| semantic_generated_rule_receipt_words(rule, program))
+        .transpose()?
+        .unwrap_or([0; 10]);
     if receipt[0] != 0
         || receipt[1] != 3
         || receipt[2] != lane as u64 + 1
         || receipt[3] != slot as u64
         || receipt[4..8] != identity_words(*task_identity.as_bytes())
         || receipt[8..12] != identity_words(*codebooks.binding.digest.as_bytes())
-        || receipt[12..22] != semantic_program_rule_words(decoded.rule)
+        || receipt[12..22] != semantic_generated_rule_receipt_words(decoded.rule, program)?
         || receipt[22] != program.initial_facts.len() as u64
         || receipt[23] != program.initial_rules.len() as u64
         || receipt[24] != u64::from(previous.is_some())
@@ -8624,11 +8676,11 @@ fn completed_theory_delta_for_slot(
             previous_choices,
             hard_decode,
         )?;
-        let previous_fields = previous.map(semantic_program_rule_words).unwrap_or([0; 10]);
+        let previous_fields = previous.map(semantic_program_rule_words).unwrap_or([0; 25]);
         let program_binding = ActionCodebooks::program_binding(program);
         let theory_generation = if previous.is_some() {
             let mut hash = Sha256::new();
-            hash.update(b"xlog.semantic.program-theory.v1\0");
+            hash.update(b"xlog.semantic.program-theory.v2\0");
             hash.update(program_binding.as_bytes());
             for word in previous_fields {
                 hash.update(word.to_le_bytes());
@@ -8808,7 +8860,7 @@ fn validate_program_query_receipts(
         }
         for (query, receipt) in receipts.iter().enumerate() {
             let mut expected = [0u64; 42];
-            expected[1] = 0x5850524f47515545;
+            expected[1] = 0x5850524f47515532;
             expected[2] = facts.truth[query];
             expected[3] = slot as u64;
             expected[4] = query as u64;
@@ -8817,7 +8869,7 @@ fn validate_program_query_receipts(
             expected[13] = rules.len() as u64;
             for (edit, rule) in rules.iter().enumerate() {
                 expected[14 + edit * 10..24 + edit * 10]
-                    .copy_from_slice(&semantic_program_rule_words(*rule));
+                    .copy_from_slice(&semantic_generated_rule_receipt_words(*rule, program)?);
             }
             let query_fact = program.queries[query];
             expected[34..37].copy_from_slice(&[
@@ -20677,7 +20729,7 @@ pub struct SemanticTransitionLane {
     /// remains an actual owner error, distinct from an evaluator decision.
     pub root: Option<Result<(SemanticRootHandle, SemanticRootSnapshot), SemanticHypergraphError>>,
     pub task_refusal: Option<SemanticTaskRefusal>,
-    /// Decoded binary rules attempted in the two edit slots, including a lane
+    /// Decoded typed rules attempted in the two edit slots, including a lane
     /// later rejected by a hard constraint. Graph support edits remain in `edits`.
     pub program_rules: [Option<crate::SemanticProgramRule>; 2],
     pub edits: [Result<Option<SemanticInsertOutcome>, SemanticHypergraphError>; 2],
@@ -28322,7 +28374,7 @@ impl SemanticTransitionSession {
             (
                 b"theory-rule-delta".as_slice(),
                 b"theory-rule-delta-evidence".as_slice(),
-                b"XLOG-DECODED-RULE-INSERTION\0".len() + 8 + 2 * 32 + (18 + 10) * 4,
+                b"XLOG-DECODED-RULE-INSERTION\0".len() + 8 + 2 * 32 + (18 + 25) * 4,
                 2 * 32 + 3 * 8,
             )
         } else {
