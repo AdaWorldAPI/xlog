@@ -46,22 +46,30 @@ pub struct GpuBackingRoot {
 /// events and deduplicates them in the same ledger as external allocator roots.
 pub trait GpuBackingObserver: Send + Sync {
     fn record(&self, root: &GpuBackingRoot) -> crate::device_runtime::ResourceResult<()>;
+
+    fn observe_module(
+        &self,
+        observation: &crate::module_backing::ModuleObservation,
+        original: Option<&mut crate::module_backing::ModuleOriginalView>,
+    ) -> crate::device_runtime::ResourceResult<()>;
 }
 
 struct BackingObservationRegistry {
     observer: Option<Arc<dyn GpuBackingObserver>>,
-    allocation_entered: bool,
+    native_owner_entered: bool,
     next_generation: u64,
+    module_failure: Option<Arc<ResourceError>>,
 }
 
 static BACKING_OBSERVATION: std::sync::Mutex<BackingObservationRegistry> =
     std::sync::Mutex::new(BackingObservationRegistry {
         observer: None,
-        allocation_entered: false,
+        native_owner_entered: false,
         next_generation: 1,
+        module_failure: None,
     });
 
-/// Attach the original process collector before the first native allocation.
+/// Attach the original process collector before native allocation or module loading.
 /// There is no reset, replacement or late baseline synthesized from live views.
 pub fn install_gpu_backing_observer(
     observer: Arc<dyn GpuBackingObserver>,
@@ -69,13 +77,44 @@ pub fn install_gpu_backing_observer(
     let mut registry = BACKING_OBSERVATION.lock().map_err(|_| {
         ResourceError::Driver("native backing observation registry poisoned".into())
     })?;
-    if registry.allocation_entered || registry.observer.is_some() {
+    if registry.native_owner_entered || registry.observer.is_some() {
         return Err(ResourceError::Driver(
-            "process backing observer must be installed once before native allocation".into(),
+            "process backing observer must be installed once before native allocation or module loading"
+                .into(),
         ));
     }
     registry.observer = Some(observer);
     Ok(())
+}
+
+/// Freeze collector custody and mint one identity before entering a native owner.
+/// Direct allocations and loaded modules share this one generation domain.
+pub(crate) fn begin_gpu_backing_observation(
+) -> crate::device_runtime::ResourceResult<(Option<Arc<dyn GpuBackingObserver>>, u64)> {
+    let mut registry = BACKING_OBSERVATION.lock().map_err(|_| {
+        ResourceError::Driver("native backing observation registry poisoned".into())
+    })?;
+    if let Some(cause) = &registry.module_failure {
+        return Err(ResourceError::Driver(format!(
+            "native backing admission retains an original module observation failure: {cause}"
+        )));
+    }
+    registry.native_owner_entered = true;
+    let generation = registry.next_generation;
+    registry.next_generation = generation
+        .checked_add(1)
+        .ok_or_else(|| ResourceError::Driver("native backing owner generation exhausted".into()))?;
+    Ok((registry.observer.clone(), generation))
+}
+
+/// The process has one continuous collector ledger. Share the actual capsule's
+/// first error and prohibit fresh allocation/load work after its uncertainty.
+/// A later acknowledgement never resets the original observation history.
+pub(crate) fn retain_gpu_module_observation_failure(cause: Arc<ResourceError>) {
+    let mut registry = BACKING_OBSERVATION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    registry.module_failure.get_or_insert(cause);
 }
 
 #[cfg(test)]
@@ -927,17 +966,7 @@ impl RawDeviceAllocation {
         // Preserve the caller-prefix ordering previously carried by a private
         // ready event without retaining an event per allocation.
         stream.synchronize()?;
-        let (backing_observer, generation) = {
-            let mut registry = BACKING_OBSERVATION.lock().map_err(|_| {
-                ResourceError::Driver("native backing observation registry poisoned".into())
-            })?;
-            registry.allocation_entered = true;
-            let generation = registry.next_generation;
-            registry.next_generation = generation.checked_add(1).ok_or_else(|| {
-                ResourceError::Driver("native backing owner generation exhausted".into())
-            })?;
-            (registry.observer.clone(), generation)
-        };
+        let (backing_observer, generation) = begin_gpu_backing_observation()?;
         let mut backing_root = GpuBackingRoot {
             struct_size: std::mem::size_of::<GpuBackingRoot>() as u32,
             kind: 3,

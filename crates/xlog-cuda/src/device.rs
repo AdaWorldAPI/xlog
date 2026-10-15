@@ -23,6 +23,9 @@ use xlog_core::{Result, XlogError};
 
 use crate::device_runtime::{Access, ResourceResult};
 use crate::memory::{with_memory_access, DeviceMemoryView, DeviceRead, DeviceWrite};
+use crate::module_backing::{
+    ModuleBacking, MODULE_INPUT_CUBIN, MODULE_INPUT_FILE, MODULE_INPUT_PTX,
+};
 
 #[derive(Clone, Copy, Debug, Default)]
 enum HostTransferCompletion {
@@ -1372,6 +1375,7 @@ pub(crate) struct LoadedModule {
     artifact_sha256: Option<[u8; 32]>,
     context: Arc<CudarcContext>,
     completion: Mutex<ExecutionCompletion>,
+    backing: Option<Mutex<ModuleBacking>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1584,16 +1588,41 @@ impl Drop for LoadedModule {
                 .get_mut()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
         );
+        let backing = self.backing.take();
         crate::cuda_graph::retire_resources_after_completion(
-            (module, context, completion),
-            |(_, context, completion)| context.bind_to_thread().and_then(|()| completion.wait()),
-            |(module, _, _)| {
+            (module, context, completion, backing),
+            |(_, context, completion, backing)| {
+                if let Some(backing) = backing {
+                    backing
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .ready()?;
+                }
+                context.bind_to_thread().and_then(|()| completion.wait())
+            },
+            |(module, _, _, _)| {
                 // SAFETY: direct submissions are complete; captured submissions
                 // retained this module through their graph's retirement fence.
                 unsafe { result::module::unload(*module as sys::CUmodule) }
             },
-            |_| Ok(()),
-            |(_, context, _), error| context.record_err::<()>(Err(error)),
+            |(_, _, _, backing)| {
+                if let Some(backing) = backing {
+                    backing
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .unloaded()?;
+                }
+                Ok(())
+            },
+            |(_, context, _, backing), error| {
+                if let Some(backing) = backing {
+                    backing
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .unknown(Some(&error));
+                }
+                context.record_err::<()>(Err(error));
+            },
         );
     }
 }
@@ -2001,6 +2030,7 @@ impl CudaDeviceInner {
         artifact_sha256: Option<[u8; 32]>,
         cu_module: sys::CUmodule,
         kernels: &[&str],
+        backing: Option<ModuleBacking>,
     ) -> std::result::Result<(), DriverError> {
         // Establish ownership before fallible symbol lookup. A rejected module
         // is retired without leaking it or disturbing the previous registry entry.
@@ -2012,11 +2042,24 @@ impl CudaDeviceInner {
             artifact_sha256,
             context: self.context.clone(),
             completion: Mutex::default(),
+            backing: backing.map(Mutex::new),
         };
+        if let Some(backing) = &mut module.backing {
+            backing
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .loaded(cu_module)?;
+        }
         for &kernel in kernels {
             let name_c = CString::new(kernel).unwrap();
             let cu_function = unsafe { result::module::get_function(cu_module, name_c) }?;
             module.functions.insert(Arc::from(kernel), cu_function);
+        }
+        if let Some(backing) = &mut module.backing {
+            backing
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .read_static(&self.context)?;
         }
 
         let previous = self
@@ -2068,21 +2111,23 @@ impl CudaDeviceInner {
             .and_then(|name| name.to_str())
             .unwrap_or("file-artifact")
             .to_string();
-        if let Ok(bytes) = std::fs::read(path) {
-            let is_cubin = path.extension().and_then(|value| value.to_str()) == Some("cubin");
-            return self.load_artifact_bytes(
-                &bytes,
-                is_cubin,
-                module_name,
-                &artifact_name,
-                kernels,
-            );
-        }
+        let artifact_sha256 = std::fs::read(path)
+            .ok()
+            .map(|bytes| Sha256::digest(bytes).into());
         crate::cuda_graph::with_module_loading(|| {
             self.context.bind_to_thread()?;
+            let backing =
+                ModuleBacking::prepare(&self.context, MODULE_INPUT_FILE, artifact_sha256)?;
             let name_c = CString::new(path.to_string_lossy().as_bytes()).unwrap();
             let cu_module = result::module::load(name_c)?;
-            self.insert_module(module_name, &artifact_name, None, cu_module, kernels)
+            self.insert_module(
+                module_name,
+                &artifact_name,
+                artifact_sha256,
+                cu_module,
+                kernels,
+                backing,
+            )
         })
     }
 
@@ -2097,6 +2142,15 @@ impl CudaDeviceInner {
         let artifact_sha256 = Sha256::digest(bytes).into();
         crate::cuda_graph::with_module_loading(|| {
             self.context.bind_to_thread()?;
+            let backing = ModuleBacking::prepare(
+                &self.context,
+                if is_cubin {
+                    MODULE_INPUT_CUBIN
+                } else {
+                    MODULE_INPUT_PTX
+                },
+                Some(artifact_sha256),
+            )?;
             let cu_module = if is_cubin {
                 unsafe { result::module::load_data(bytes.as_ptr().cast()) }?
             } else {
@@ -2109,6 +2163,7 @@ impl CudaDeviceInner {
                 Some(artifact_sha256),
                 cu_module,
                 kernels,
+                backing,
             )
         })
     }
@@ -2131,19 +2186,25 @@ impl CudaDeviceInner {
     ) -> std::result::Result<(), DriverError> {
         crate::cuda_graph::with_module_loading(|| {
             self.context.bind_to_thread()?;
-            let (cu_module, artifact_sha256) = if let Some(bytes) = ptx.as_bytes() {
+            let (cu_module, artifact_sha256, backing) = if let Some(bytes) = ptx.as_bytes() {
                 let digest = Sha256::digest(bytes).into();
+                let backing =
+                    ModuleBacking::prepare(&self.context, MODULE_INPUT_PTX, Some(digest))?;
                 (
                     unsafe { result::module::load_data(bytes.as_ptr() as *const _) }?,
                     digest,
+                    backing,
                 )
             } else {
                 let source = ptx.to_src();
                 let digest = Sha256::digest(source.as_bytes()).into();
                 let src = CString::new(source).unwrap();
+                let backing =
+                    ModuleBacking::prepare(&self.context, MODULE_INPUT_PTX, Some(digest))?;
                 (
                     unsafe { result::module::load_data(src.as_ptr() as *const _) }?,
                     digest,
+                    backing,
                 )
             };
             self.insert_module(
@@ -2152,6 +2213,7 @@ impl CudaDeviceInner {
                 Some(artifact_sha256),
                 cu_module,
                 kernels,
+                backing,
             )
         })
     }

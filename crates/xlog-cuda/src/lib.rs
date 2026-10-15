@@ -12,6 +12,7 @@ pub mod joint_solver;
 pub mod kernel_manifest_data;
 pub mod launch;
 pub mod memory;
+pub mod module_backing;
 pub mod multi_gpu_memory;
 pub mod provider;
 mod semantic_hypergraph;

@@ -33,6 +33,11 @@ type ReadCertificate = unsafe extern "C" fn(*mut c_void, *const u8, *mut DeviceC
 type RecordRoot =
     unsafe extern "C" fn(*mut c_void, *const xlog_cuda::memory::GpuBackingRoot) -> u32;
 type ResolveStepCancellation = unsafe extern "C" fn(*mut c_void, *mut c_void, u64, u64, u64) -> u32;
+type ObserveModule = unsafe extern "C" fn(
+    *mut c_void,
+    *const xlog_cuda::module_backing::ModuleObservation,
+    *mut xlog_cuda::module_backing::ModuleOriginalView,
+) -> u32;
 
 // These are the exact layouts of the installed xlog_resource_observer.h.
 // Event storage remains producer-owned; this memory consumer never dereferences it.
@@ -57,6 +62,7 @@ struct Api {
     read_certificate: Option<ReadCertificate>,
     record_root: Option<RecordRoot>,
     resolve_step_cancellation: Option<ResolveStepCancellation>,
+    observe_module: Option<ObserveModule>,
 }
 
 #[repr(C)]
@@ -104,14 +110,18 @@ struct TraceView {
 }
 
 const _: () = assert!(
-    size_of::<Api>() == 88
+    size_of::<Api>() == 96
         && size_of::<TraceView>() == 240
         && size_of::<DeviceCertificate>() == 120
         && size_of::<xlog_cuda::memory::GpuBackingRoot>() == 64
+        && size_of::<xlog_cuda::module_backing::ModuleObservation>() == 128
+        && size_of::<xlog_cuda::module_backing::ModuleOriginalView>() == 168
+        && size_of::<xlog_cuda::module_backing::OriginalStaticRecord>() == 96
+        && size_of::<xlog_cuda::module_backing::StaticConfirmation>() == 152
 );
 
 fn checked_api(capsule: &Bound<'_, PyCapsule>) -> PyResult<(usize, Api)> {
-    let pointer = capsule.pointer_checked(Some(c"xlog.resource_observer.v4"))?;
+    let pointer = capsule.pointer_checked(Some(c"xlog.resource_observer.v5"))?;
     if !(pointer.as_ptr() as usize).is_multiple_of(align_of::<Api>()) {
         return Err(invalid(
             "resource observer table has invalid C ABI alignment",
@@ -120,7 +130,7 @@ fn checked_api(capsule: &Bound<'_, PyCapsule>) -> PyResult<(usize, Api)> {
     // SAFETY: original trusted capsule pins its immutable C table. Read only
     // the common header before checking the exact new layout, never an old ABI.
     let header = unsafe { &*pointer.as_ptr().cast::<ApiHeader>() };
-    if header.abi_version != 4 || header.struct_size as usize != size_of::<Api>() {
+    if header.abi_version != 5 || header.struct_size as usize != size_of::<Api>() {
         return Err(invalid(
             "resource observer requires the exact installed C ABI table",
         ));
@@ -131,6 +141,7 @@ fn checked_api(capsule: &Bound<'_, PyCapsule>) -> PyResult<(usize, Api)> {
         || api.record_root.is_none()
         || api.read_certificate.is_none()
         || api.resolve_step_cancellation.is_none()
+        || api.observe_module.is_none()
     {
         return Err(invalid(
             "resource observer requires its original backing producer and device certificate",
@@ -145,12 +156,64 @@ struct ProcessBackingObserver {
     context: usize,
     creator: ThreadId,
     record: RecordRoot,
+    observe_module: ObserveModule,
     certificate: Mutex<Option<DeviceCertificate>>,
 }
 
 static PROCESS_BACKING_OBSERVER: Mutex<Option<Arc<ProcessBackingObserver>>> = Mutex::new(None);
 
 impl xlog_cuda::memory::GpuBackingObserver for ProcessBackingObserver {
+    fn observe_module(
+        &self,
+        observation: &xlog_cuda::module_backing::ModuleObservation,
+        mut original: Option<&mut xlog_cuda::module_backing::ModuleOriginalView>,
+    ) -> xlog_cuda::device_runtime::ResourceResult<()> {
+        let original_pointer = original
+            .as_deref_mut()
+            .map_or(std::ptr::null_mut(), |view| view as *mut _);
+        // SAFETY: the process-owned capsule pins this exact immutable C table.
+        // Native holds the actual module/context owner and any original lease.
+        // The cold collector call returns before native performs CUDA queries;
+        // it must not retain a borrowed collector mutex across this boundary.
+        let status = unsafe {
+            (self.observe_module)(self.context as *mut c_void, observation, original_pointer)
+        };
+        if status != COMPLETE {
+            // A failed READ_STATIC can still have issued an original lease.
+            // Preserve that output and distinguish absence from returned zero.
+            let returned = original.as_deref();
+            return Err(xlog_cuda::device_runtime::ResourceError::Driver(format!(
+                "original module observation did not complete; retain its owner: \
+                 status={status} struct_size={} operation={} owner_generation={} \
+                 context_handle={:#x} module_handle={:#x} device_uuid={:02x?} \
+                 device_ordinal={} input_kind={} flags={} lease_id={} \
+                 confirmation_count={} confirmation_size={} \
+                 returned_state={:?} returned_lease_id={:?} \
+                 returned_generation={:?} returned_context={:?} returned_module={:?} \
+                 returned_flags={:?}",
+                observation.struct_size,
+                observation.operation,
+                observation.owner_generation,
+                observation.context_handle,
+                observation.module_handle,
+                observation.device_uuid,
+                observation.device_ordinal,
+                observation.input_kind,
+                observation.flags,
+                observation.lease_id,
+                observation.confirmation_count,
+                observation.confirmation_size,
+                returned.map(|view| view.state),
+                returned.map(|view| view.lease_id),
+                returned.map(|view| view.owner_generation),
+                returned.map(|view| view.context_handle),
+                returned.map(|view| view.module_handle),
+                returned.map(|view| view.flags),
+            )));
+        }
+        Ok(())
+    }
+
     fn record(
         &self,
         root: &xlog_cuda::memory::GpuBackingRoot,
@@ -205,6 +268,9 @@ pub(crate) fn register_process_resource_observer(capsule: &Bound<'_, PyCapsule>)
         context: api.context as usize,
         creator: thread::current().id(),
         record: api.record_root.expect("checked original root callback"),
+        observe_module: api
+            .observe_module
+            .expect("checked original module callback"),
         certificate: Mutex::new(None),
     });
     xlog_cuda::memory::install_gpu_backing_observer(
@@ -485,7 +551,7 @@ impl ResourceObserver {
             || self
                 .capsule
                 .bind(py)
-                .pointer_checked(Some(c"xlog.resource_observer.v4"))?
+                .pointer_checked(Some(c"xlog.resource_observer.v5"))?
                 .as_ptr() as usize
                 != self.table
         {
