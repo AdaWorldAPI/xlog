@@ -536,9 +536,16 @@ impl ModuleBacking {
         record: &OriginalStaticRecord,
         name: Option<&std::ffi::CStr>,
     ) -> ResourceResult<()> {
-        let mut global = StaticConfirmation::new(record.record_id);
+        // Allocate the owner's slot before any query. In particular, another
+        // mapping can consume capacity reserved for later original rows.
+        self.confirmations
+            .try_reserve(1)
+            .map_err(|_| invalid("cannot retain original static query facts"))?;
+        let mut index = self.confirmations.len();
+        self.confirmations
+            .push(StaticConfirmation::new(record.record_id));
+        let global = &mut self.confirmations[index];
         let Some(name) = name.filter(|name| !name.is_empty()) else {
-            self.confirmations.push(global);
             return Ok(());
         };
         // Only original device-static allocation rows describe live symbols.
@@ -547,7 +554,6 @@ impl ModuleBacking {
             || record.operation != ALLOCATION
             || record.address == 0
         {
-            self.confirmations.push(global);
             return Ok(());
         }
         let mut global_bytes = 0usize;
@@ -571,17 +577,18 @@ impl ModuleBacking {
             // Keep the original successful status and raw outputs, but do not
             // certify this row's membership from a same-named foreign symbol.
             global.valid_queries &= !(1 << QUERY_GLOBAL);
-            self.confirmations.push(global);
             return Ok(());
         }
         let Some(end) = global.global_address.checked_add(global.global_bytes) else {
             global.valid_queries &= !(1 << QUERY_GLOBAL);
-            self.confirmations.push(global);
             return Ok(());
         };
+        let global = *global;
         let mut cursor = global.global_address;
         loop {
-            let mut confirmation = global;
+            // Every actual status and output is written into retained storage,
+            // including when a later slot allocation or callback fails.
+            let confirmation = &mut self.confirmations[index];
             let mut allocation_bytes = 0usize;
             // SAFETY: cursor remains inside this exact live global span. No
             // address outside the symbol is probed to discover a larger extent.
@@ -648,10 +655,6 @@ impl ModuleBacking {
                 CU_POINTER_ATTRIBUTE_BUFFER_ID,
                 &mut confirmation.buffer_id
             );
-            self.confirmations
-                .try_reserve(1)
-                .map_err(|_| invalid("cannot retain another original static mapping"))?;
-            self.confirmations.push(confirmation);
             let next = confirmation
                 .mapping_base
                 .checked_add(confirmation.mapping_bytes);
@@ -665,6 +668,13 @@ impl ModuleBacking {
                 break;
             }
             cursor = next.expect("validated actual mapping boundary");
+            // No CUDA query for the next piece precedes this fallible growth.
+            // A failure leaves every previously observed piece in its owner.
+            self.confirmations
+                .try_reserve(1)
+                .map_err(|_| invalid("cannot retain another original static mapping"))?;
+            index = self.confirmations.len();
+            self.confirmations.push(global);
         }
         Ok(())
     }
