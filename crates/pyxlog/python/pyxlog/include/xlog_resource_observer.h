@@ -161,8 +161,11 @@ typedef struct XlogResourceOriginalStaticRecord {
     uint64_t source_size;
 } XlogResourceOriginalStaticRecord;
 
-/* Native confirmation of this original row under a LIVE module owner. The
- * global pointer must equal original.address; symbol bytes are not root bytes.
+/* Native confirmation of this original row under a LIVE module owner. GLOBAL
+ * validity requires its nonempty, nonoverflowing global address/bytes to equal
+ * original.address/bytes. A same-named foreign symbol keeps its original CUDA
+ * status and raw outputs but has no GLOBAL validity or dependent query facts.
+ * Symbol bytes are not root bytes.
  * allocation_* comes from successful cuMemGetAddressRange, mapping_* from the
  * actual mapping attributes, and physical_block_id from MEMORY_BLOCK_ID.
  * These are distinct facts: neither a mapping nor its ID proves the full size

@@ -151,7 +151,8 @@ pub struct OriginalStaticRecord {
     pub source_size: u64,
 }
 
-/// Successful-query bits qualify values; every attempted CUDA status is retained.
+/// Successful-query bits qualify values; GLOBAL also requires original-row
+/// membership. Every attempted CUDA status is retained, including mismatches.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct StaticConfirmation {
@@ -534,12 +535,17 @@ impl ModuleBacking {
         global.record_status(QUERY_GLOBAL, status);
         if !global.has(QUERY_GLOBAL)
             || global.global_address != record.address
+            || global.global_bytes != record.bytes
             || global.global_bytes == 0
         {
+            // Keep the original successful status and raw outputs, but do not
+            // certify this row's membership from a same-named foreign symbol.
+            global.valid_queries &= !(1 << QUERY_GLOBAL);
             self.confirmations.push(global);
             return Ok(());
         }
         let Some(end) = global.global_address.checked_add(global.global_bytes) else {
+            global.valid_queries &= !(1 << QUERY_GLOBAL);
             self.confirmations.push(global);
             return Ok(());
         };
