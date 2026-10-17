@@ -23,7 +23,6 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
-- *(python)* preserve durable training authority during fast learning while keeping request-local adaptation restricted to the fast phase and its original data scope.
 - *(runtime)* encode each resident-route certificate node from its local fields once, avoiding repeated recursive plan formatting for deep unary plans while preserving exact expression constants and route identity.
 - *(runtime)* preserve nullary schemas when initializing mutually recursive predicates.
 - *(runtime)* serialize execution statistics through a JSON encoder so diagnostic text and operation names are escaped correctly.
