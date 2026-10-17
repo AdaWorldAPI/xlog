@@ -13297,23 +13297,29 @@ impl PySemanticTransitionTaskUse {
             return Ok(());
         }
         self.checkpoint.proposal_expense()?.require_learning()?;
-        if let Some(record) = owner.learning_phase_history().last() {
-            let purpose = match record.target {
-                xlog_cuda::SemanticLearningPhase::Fast => "current-request-fast-adaptation",
-                xlog_cuda::SemanticLearningPhase::Alignment
-                | xlog_cuda::SemanticLearningPhase::Consolidation => "durable-slow-consolidation",
-            };
-            if self.authority.training.is_empty()
-                || self
-                    .authority
-                    .training
-                    .iter()
-                    .any(|grant| grant.learning_purpose.as_deref() != Some(purpose))
-            {
-                return Err(invalid(
-                    "training grant purpose differs from the actual native learning phase",
-                ));
-            }
+        // Native phase lineage begins in alignment. Parameter speed does not
+        // turn durably admitted training data into request-local material.
+        let phase = owner
+            .learning_phase_history()
+            .last()
+            .map_or(xlog_cuda::SemanticLearningPhase::Alignment, |record| {
+                record.target
+            });
+        if self.authority.training.is_empty()
+            || !self.authority.training.iter().all(|grant| {
+                matches!(
+                    (phase, grant.learning_purpose.as_deref()),
+                    (_, Some("durable-slow-consolidation"))
+                        | (
+                            xlog_cuda::SemanticLearningPhase::Fast,
+                            Some("current-request-fast-adaptation")
+                        )
+                )
+            })
+        {
+            return Err(invalid(
+                "training grant purpose does not permit the actual native learning phase",
+            ));
         }
         Ok(())
     }
