@@ -10020,14 +10020,26 @@ fn task_ground_value(value: &ColdValue) -> PyResult<xlog_cuda::SemanticTaskGroun
                         measurement,
                     });
             }
-            let original_requirements = requirements.iter().map(|requirement| {
+            let mut original_requirements = Vec::with_capacity(requirements.len());
+            for requirement in requirements {
                 let row = requirement.fields(3)?;
-                Ok(SemanticTaskAttainmentRequirement {
-                    query: index(&row[0])?,
-                    required_goal_ordinals: row[1].sequence()?.iter().map(index).collect::<PyResult<_>>()?,
-                    required_binding_ordinals: row[2].sequence()?.iter().map(index).collect::<PyResult<_>>()?,
-                })
-            }).collect::<PyResult<Vec<_>>>()?;
+                let query = index(&row[0])?;
+                let goals = row[1].sequence()?;
+                let mut required_goal_ordinals = Vec::with_capacity(goals.len());
+                for goal in goals {
+                    required_goal_ordinals.push(index(goal)?);
+                }
+                let bindings = row[2].sequence()?;
+                let mut required_binding_ordinals = Vec::with_capacity(bindings.len());
+                for binding in bindings {
+                    required_binding_ordinals.push(index(binding)?);
+                }
+                original_requirements.push(SemanticTaskAttainmentRequirement {
+                    query,
+                    required_goal_ordinals,
+                    required_binding_ordinals,
+                });
+            }
             Ok(SemanticTaskGround::Coding { bindings: original_bindings, requirements: original_requirements })
         }
         _ => Err(invalid(
@@ -10121,6 +10133,8 @@ fn task_evaluation_spec_core(
     let input_owner = material_budget
         .map(|budget| -> PyResult<Arc<dyn Send + Sync>> {
             let overflow = || invalid("task evaluator metadata allocation extent overflow");
+            let ground = values[7].fields(3)?;
+            let requirements = ground[2].sequence()?;
             let mut extent = std::mem::size_of::<xlog_cuda::SemanticTaskEvaluationSpec>()
                 .checked_add(std::mem::size_of::<xlog_gpu::logic::SemanticLogicTaskProgram>())
                 .ok_or_else(overflow)?
@@ -10132,15 +10146,33 @@ fn task_evaluation_spec_core(
                 (values[3].sequence()?.len(), std::mem::size_of::<usize>()),
                 (values[5].sequence()?.len(), std::mem::size_of::<u8>()),
                 (
-                    values[7].fields(2)?[1].sequence()?.len(),
+                    ground[1].sequence()?.len(),
                     std::mem::size_of::<xlog_cuda::SemanticTaskVerificationBinding>(),
+                ),
+                (
+                    requirements.len(),
+                    std::mem::size_of::<xlog_cuda::SemanticTaskAttainmentRequirement>(),
                 ),
             ] {
                 extent = extent
                     .checked_add(count.checked_mul(width).ok_or_else(overflow)?)
                     .ok_or_else(overflow)?;
             }
-            let source = match (&values[7].fields(2)?[0], &values[2]) {
+            for requirement in requirements {
+                let row = requirement.fields(3)?;
+                for ordinals in &row[1..] {
+                    extent = extent
+                        .checked_add(
+                            ordinals
+                                .sequence()?
+                                .len()
+                                .checked_mul(std::mem::size_of::<u32>())
+                                .ok_or_else(overflow)?,
+                        )
+                        .ok_or_else(overflow)?;
+                }
+            }
+            let source = match (&ground[0], &values[2]) {
                 (ground, ColdValue::None) if ground.text()? == "coding" => initial_program_source
                     .ok_or_else(|| {
                     invalid("coding task requires its original admitted initial program")
