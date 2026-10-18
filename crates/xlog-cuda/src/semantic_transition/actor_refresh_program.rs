@@ -884,7 +884,6 @@ impl ActorRefreshProgram {
                                 &[
                                     "cohort_case",
                                     "memory_capacity_bytes",
-                                    "model_work_capacity",
                                     "forward_calls",
                                     "other_external_cuda_bytes",
                                 ],
@@ -893,11 +892,7 @@ impl ActorRefreshProgram {
                             if integer(&evaluation["forward_calls"])? != 1 {
                                 return Err(invalid_program());
                             }
-                            for field in [
-                                "memory_capacity_bytes",
-                                "model_work_capacity",
-                                "other_external_cuda_bytes",
-                            ] {
+                            for field in ["memory_capacity_bytes", "other_external_cuda_bytes"] {
                                 if integer(&evaluation[field])? == 0 {
                                     return Err(invalid_program());
                                 }
