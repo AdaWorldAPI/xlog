@@ -13,6 +13,7 @@ pub(super) const PRIVATE_EVALUATION_CANCELLED: &str = "private-evaluation-cancel
 pub(super) const PRIVATE_SEGMENT_BUDGET_REFUSED: &str = "private-segment-budget-refused";
 pub(super) const PRIVATE_SEGMENT_CANCELLED: &str = "private-segment-cancelled";
 
+#[cfg(feature = "semantic-policy")]
 pub(super) fn cancelled_evaluation_reason(
     proof: &xlog_cuda::SemanticCancelledModelEvaluation,
     cause: &str,

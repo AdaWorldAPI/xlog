@@ -15604,6 +15604,7 @@ impl PySemanticPreparedStep {
                 .lock()
                 .map_err(|_| invalid("continuation producer ownership mutex is poisoned"))?,
         );
+        #[cfg(feature = "semantic-policy")]
         let policy = std::mem::take(
             &mut *self
                 .policy_inputs
@@ -15623,6 +15624,7 @@ impl PySemanticPreparedStep {
             })?);
         // Python finalizers never run while a roster or Session lock is held.
         drop(continuation);
+        #[cfg(feature = "semantic-policy")]
         drop(policy);
         drop(ordinary);
         #[cfg(feature = "semantic-policy")]
