@@ -11895,10 +11895,7 @@ impl TaskCheckpointSeed {
             ));
         }
         let expense = self.proposal_expense()?;
-        let assignments: Option<xlog_cuda::SemanticReplayLoadedMaterial> = if expense
-            .original_admission
-            .is_some()
-        {
+        let assignments = if expense.original_admission.is_some() {
             #[cfg(not(feature = "semantic-policy"))]
             {
                 let _ = owner;
@@ -11915,7 +11912,7 @@ impl TaskCheckpointSeed {
                 )
             }
         } else {
-            None
+            None::<xlog_cuda::SemanticReplayLoadedMaterial>
         };
         ColdValue::checked_canonical_bytes(&snapshot.canonical, false)?;
         // Archived snapshot metadata uses the same scalar/sequence tags as the
