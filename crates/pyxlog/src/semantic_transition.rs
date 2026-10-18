@@ -11895,7 +11895,10 @@ impl TaskCheckpointSeed {
             ));
         }
         let expense = self.proposal_expense()?;
-        let assignments = if expense.original_admission.is_some() {
+        let assignments: Option<xlog_cuda::SemanticReplayLoadedMaterial> = if expense
+            .original_admission
+            .is_some()
+        {
             #[cfg(not(feature = "semantic-policy"))]
             {
                 let _ = owner;
