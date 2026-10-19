@@ -11912,7 +11912,7 @@ impl TaskCheckpointSeed {
                 )
             }
         } else {
-            None
+            None::<xlog_cuda::SemanticReplayLoadedMaterial>
         };
         ColdValue::checked_canonical_bytes(&snapshot.canonical, false)?;
         // Archived snapshot metadata uses the same scalar/sequence tags as the
@@ -15604,6 +15604,7 @@ impl PySemanticPreparedStep {
                 .lock()
                 .map_err(|_| invalid("continuation producer ownership mutex is poisoned"))?,
         );
+        #[cfg(feature = "semantic-policy")]
         let policy = std::mem::take(
             &mut *self
                 .policy_inputs
@@ -15623,6 +15624,7 @@ impl PySemanticPreparedStep {
             })?);
         // Python finalizers never run while a roster or Session lock is held.
         drop(continuation);
+        #[cfg(feature = "semantic-policy")]
         drop(policy);
         drop(ordinary);
         #[cfg(feature = "semantic-policy")]
