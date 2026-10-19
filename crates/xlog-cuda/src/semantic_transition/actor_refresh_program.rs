@@ -1,70 +1,91 @@
 use super::*;
-use serde::Deserialize;
 use serde_json::Value;
 
 const PROGRAM_BYTES: usize = 16 * 1024 * 1024;
+const PROGRAM_JSON_DEPTH: u8 = 128;
 const CONTEXT_CONTINUATION_MAGIC: &[u8] = b"XLOG-ORIGINAL-MODEL-CONTEXT-CONTINUATION\0";
 const CONTEXT_CONTINUATION_BYTES: usize = CONTEXT_CONTINUATION_MAGIC.len() + 8 + 64 + 5 * 8;
 
-struct UniqueJson(Value);
+struct UniqueJson {
+    remaining_depth: u8,
+}
 
-impl<'de> Deserialize<'de> for UniqueJson {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct Visitor;
-        impl<'de> serde::de::Visitor<'de> for Visitor {
-            type Value = UniqueJson;
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("bounded JSON without duplicate object fields")
-            }
-            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
-                Ok(UniqueJson(Value::Null))
-            }
-            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
-                Ok(UniqueJson(value.into()))
-            }
-            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
-                Ok(UniqueJson(value.into()))
-            }
-            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
-                Ok(UniqueJson(value.into()))
-            }
-            fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self::Value, E> {
-                serde_json::Number::from_f64(value)
-                    .map(|value| UniqueJson(Value::Number(value)))
-                    .ok_or_else(|| E::custom("nonfinite JSON number"))
-            }
-            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
-                Ok(UniqueJson(value.into()))
-            }
-            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
-                Ok(UniqueJson(value.into()))
-            }
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(
-                self,
-                mut sequence: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut values = Vec::new();
-                while let Some(UniqueJson(value)) = sequence.next_element()? {
-                    values.push(value);
-                }
-                Ok(UniqueJson(Value::Array(values)))
-            }
-            fn visit_map<A: serde::de::MapAccess<'de>>(
-                self,
-                mut fields: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut values = serde_json::Map::new();
-                while let Some(key) = fields.next_key::<String>()? {
-                    if values.contains_key(&key) {
-                        return Err(serde::de::Error::custom("duplicate JSON field"));
+impl UniqueJson {
+    fn whitespace(input: &mut &str) {
+        *input = input.trim_start_matches([' ', '\n', '\r', '\t']);
+    }
+
+    fn scalar<'a>(input: &mut &'a str) -> Result<&'a str, SemanticTransitionError> {
+        let text = *input;
+        if matches!(text.as_bytes().first(), Some(b'{' | b'[')) {
+            return Err(invalid_program());
+        }
+        let mut decoder =
+            serde_json::Deserializer::from_str(text).into_iter::<&serde_json::value::RawValue>();
+        let raw = decoder
+            .next()
+            .ok_or_else(invalid_program)?
+            .map_err(|_| invalid_program())?;
+        *input = &text[decoder.byte_offset()..];
+        Ok(raw.get())
+    }
+
+    fn read(&self, input: &mut &str) -> Result<Value, SemanticTransitionError> {
+        Self::whitespace(input);
+        if !matches!(input.as_bytes().first(), Some(b'{' | b'[')) {
+            // Only original scalar tokens reach Value's deserializer. Its
+            // optional synthetic number/raw-value maps cannot reinterpret a
+            // literal object, and integers never pass through f64.
+            return serde_json::from_str(Self::scalar(input)?).map_err(|_| invalid_program());
+        }
+        // Match serde's original finite recursion limit, shared across every
+        // container. Never scan a whole RawValue container: that scanner has no
+        // recursion check and would repeatedly scan nested subtrees.
+        let remaining_depth = self
+            .remaining_depth
+            .checked_sub(1)
+            .filter(|depth| *depth != 0)
+            .ok_or_else(invalid_program)?;
+        let child = Self { remaining_depth };
+        let object = input.starts_with('{');
+        let end = if object { '}' } else { ']' };
+        *input = &input[1..];
+        Self::whitespace(input);
+        let mut fields = serde_json::Map::new();
+        let mut values = Vec::new();
+        if let Some(rest) = input.strip_prefix(end) {
+            *input = rest;
+        } else {
+            loop {
+                if object {
+                    if !input.starts_with('"') {
+                        return Err(invalid_program());
                     }
-                    let UniqueJson(value) = fields.next_value()?;
-                    values.insert(key, value);
+                    let key: String = serde_json::from_str(Self::scalar(input)?)
+                        .map_err(|_| invalid_program())?;
+                    if fields.contains_key(&key) {
+                        return Err(invalid_program());
+                    }
+                    Self::whitespace(input);
+                    *input = input.strip_prefix(':').ok_or_else(invalid_program)?;
+                    fields.insert(key, child.read(input)?);
+                } else {
+                    values.push(child.read(input)?);
                 }
-                Ok(UniqueJson(Value::Object(values)))
+                Self::whitespace(input);
+                if let Some(rest) = input.strip_prefix(end) {
+                    *input = rest;
+                    break;
+                }
+                *input = input.strip_prefix(',').ok_or_else(invalid_program)?;
+                Self::whitespace(input);
             }
         }
-        deserializer.deserialize_any(Visitor)
+        Ok(if object {
+            Value::Object(fields)
+        } else {
+            Value::Array(values)
+        })
     }
 }
 
@@ -72,12 +93,17 @@ fn json_value(bytes: &[u8]) -> Result<Value, SemanticTransitionError> {
     if bytes.is_empty() || bytes.len() > PROGRAM_BYTES {
         return Err(invalid_program());
     }
-    // Keep serde's original finite recursion limit, in addition to the ingress
-    // byte bound. Exact original bytes, not this comparison encoding, identify
-    // the admitted program.
-    let mut decoder = serde_json::Deserializer::from_slice(bytes);
-    let UniqueJson(value) = UniqueJson::deserialize(&mut decoder).map_err(|_| invalid_program())?;
-    decoder.end().map_err(|_| invalid_program())?;
+    // Exact original bytes, not this comparison encoding, identify the admitted
+    // program. One finite depth budget covers the complete original input.
+    let mut input = std::str::from_utf8(bytes).map_err(|_| invalid_program())?;
+    let value = UniqueJson {
+        remaining_depth: PROGRAM_JSON_DEPTH,
+    }
+    .read(&mut input)?;
+    UniqueJson::whitespace(&mut input);
+    if !input.is_empty() {
+        return Err(invalid_program());
+    }
     Ok(value)
 }
 
