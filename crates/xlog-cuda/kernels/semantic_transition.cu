@@ -446,6 +446,9 @@ struct TextRow { uint64_t source_slot,logical_position; };
 struct TextBinding { uint64_t rows,count,selected; };
 // slots name the immutable source and this Update's exact pending generation.
 struct ModelUpdateBinding { uint64_t candidate,bytes,slots[2]; };
+struct SemanticCapacityRefusalRecord {
+    uint64_t abi,reason,allocation_ordinal,requested_bytes,used_bytes,capacity_bytes;
+};
 struct ContinuationInputs {
     TextBinding text;
     uint64_t active_rows,active_row_count,numerical_admissibility,transition_kind,authority_bytes;
@@ -453,6 +456,7 @@ struct ContinuationInputs {
     uint64_t model_update_refusal,model_update_canary_results,model_update_canaries;
     uint64_t numerical_blocks,physical_blocks,model_schema_digest[4],model_identity[4];
     uint64_t model_contract,model_contract_bytes;
+    uint64_t capacity_refusal_source,capacity_refusal,capacity_allocation_ordinal,capacity_bytes;
 };
 struct PublicationStorageEntry { uint64_t pointer,bytes,generation; };
 struct PublicationRange {
@@ -502,6 +506,7 @@ struct PendingContinuation {
     uint64_t numerical_admissibility,training_selection,model_update_bindings,model_update_binding_count;
     uint64_t model_update_admissibility,model_update_refusal,model_update_canary_results,model_update_canaries;
     uint64_t numerical_blocks,physical_blocks,model_schema_digest[4],model_identity[4];
+    uint64_t capacity_refusal;
 };
 struct PublicationCommand { uint64_t control,lease,operation,native_work; };
 struct PublicationDeliveryInput {
@@ -2305,12 +2310,22 @@ __device__ bool publication_model_spans_overlap(uint64_t left,uint64_t left_byte
         uint64_t right,uint64_t right_bytes) {
     return left_bytes && right_bytes && left<right+right_bytes && right<left+left_bytes;
 }
+__device__ bool publication_capacity_refusal_valid(const SemanticCapacityRefusalRecord& refusal,
+        semantic_graph::NativeWorkTally* work) {
+    semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::TableSlot,6);
+    if(refusal.abi!=1 || refusal.reason>1)return false;
+    if(!refusal.reason)return !refusal.allocation_ordinal && !refusal.requested_bytes &&
+        !refusal.used_bytes && !refusal.capacity_bytes;
+    return refusal.requested_bytes && refusal.used_bytes<=refusal.capacity_bytes &&
+        refusal.requested_bytes>refusal.capacity_bytes-refusal.used_bytes;
+}
+
 __device__ uint64_t publication_validate_model_update(const PublicationControl& control,
         const PublicationBank& base,const PendingContinuation& pending,semantic_graph::NativeWorkTally* work) {
     if(pending.transition_kind!=4)
         return pending.model_update_bindings || pending.model_update_binding_count ||
             pending.model_update_admissibility || pending.model_update_refusal ||
-            pending.model_update_canary_results || pending.model_update_canaries;
+            pending.model_update_canary_results || pending.model_update_canaries || pending.capacity_refusal;
     if(!pending.model_update_bindings ||
        pending.model_update_bindings%alignof(ModelUpdateBinding) ||
        !pending.model_update_binding_count ||
@@ -2327,6 +2342,8 @@ __device__ uint64_t publication_validate_model_update(const PublicationControl& 
        pending.model_update_canary_results>UINT64_MAX-5*sizeof(SemanticTrainingCanaryResultRecord))return 1;
     if(!publication_pointer_span(pending.model_update_canaries,5*sizeof(SemanticTrainingCanaryRecord),
         alignof(SemanticTrainingCanaryRecord)))return 1;
+    if(pending.capacity_refusal && !publication_pointer_span(pending.capacity_refusal,
+        sizeof(SemanticCapacityRefusalRecord),alignof(SemanticCapacityRefusalRecord)))return 1;
     if(base.header.neural_bank>1)return 1;
     const auto* bindings=reinterpret_cast<const ModelUpdateBinding*>(pending.model_update_bindings);
     const auto* old=reinterpret_cast<const PublicationRange*>(control.directories[base.header.publication_word&1]);
@@ -2496,6 +2513,13 @@ __device__ uint64_t publication_prepare_continuation(PublicationControl& control
         const PublicationLease& lease,ContinuationInputs inputs,semantic_graph::NativeWorkTally* work) {
     const uint64_t requested_kind=inputs.transition_kind;
     if((requested_kind==4)!=(inputs.training_selection!=0) ||
+       (inputs.capacity_refusal_source==0)!=(inputs.capacity_refusal==0) ||
+       (!inputs.capacity_refusal_source && (inputs.capacity_allocation_ordinal || inputs.capacity_bytes)) ||
+       (inputs.capacity_refusal_source && (requested_kind!=4 ||
+        !publication_pointer_span(inputs.capacity_refusal_source,sizeof(SemanticCapacityRefusalRecord),
+            alignof(SemanticCapacityRefusalRecord)) ||
+        !publication_pointer_span(inputs.capacity_refusal,sizeof(SemanticCapacityRefusalRecord),
+            alignof(SemanticCapacityRefusalRecord)))) ||
        (inputs.training_selection && (inputs.training_selection%alignof(uint64_t) ||
         inputs.training_selection>UINT64_MAX-sizeof(uint64_t))) ||
        (inputs.model_update_bindings==0)!=(inputs.model_update_binding_count==0) ||
@@ -2509,6 +2533,7 @@ __device__ uint64_t publication_prepare_continuation(PublicationControl& control
          inputs.model_update_binding_count>
              (UINT64_MAX-inputs.model_update_bindings)/sizeof(ModelUpdateBinding))))return 1;
     if(lease.transition_kind)inputs.transition_kind=lease.transition_kind;
+    if(inputs.capacity_refusal_source && inputs.transition_kind!=4)return 1;
     if(!publication_acquired_bank(control,lease,work) ||
        !control.directories[lease.bank] || !control.contract || !control.continuation ||
        control.contract%alignof(PublicationContract) || control.continuation%alignof(PendingContinuation) ||
@@ -2534,6 +2559,16 @@ __device__ uint64_t publication_prepare_continuation(PublicationControl& control
        !validate_text_binding(base.source,inputs.text,work) ||
        (inputs.transition_kind!=1 && text_any_selected(inputs.text,work)) ||
        publication_validate_source(base,contract,&end,work))return 1;
+    if(inputs.capacity_refusal_source) {
+        const auto& refusal=*reinterpret_cast<const SemanticCapacityRefusalRecord*>(inputs.capacity_refusal_source);
+        if(!publication_capacity_refusal_valid(refusal,work) ||
+           (refusal.reason && (refusal.allocation_ordinal!=inputs.capacity_allocation_ordinal ||
+            refusal.capacity_bytes!=inputs.capacity_bytes ||
+            *reinterpret_cast<const uint8_t*>(inputs.numerical_admissibility)!=0)))return 1;
+        *reinterpret_cast<SemanticCapacityRefusalRecord*>(inputs.capacity_refusal)=refusal;
+        semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::CanonicalByte,
+            sizeof(SemanticCapacityRefusalRecord));
+    }
     const uint64_t active_count=*reinterpret_cast<const uint64_t*>(inputs.active_row_count);
     if(active_count>capacity)return 1;
     auto* ranges=reinterpret_cast<PublicationRange*>(pending.ranges);
@@ -2641,6 +2676,7 @@ __device__ uint64_t publication_prepare_continuation(PublicationControl& control
     pending.model_update_refusal=inputs.transition_kind==4 ? inputs.model_update_refusal : 0;
     pending.model_update_canary_results=inputs.transition_kind==4 ? inputs.model_update_canary_results : 0;
     pending.model_update_canaries=inputs.transition_kind==4 ? inputs.model_update_canaries : 0;
+    pending.capacity_refusal=inputs.transition_kind==4 ? inputs.capacity_refusal : 0;
     semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::CanonicalByte,sizeof(PendingContinuation)-3*sizeof(uint64_t));
     for(uint64_t i=0;i<pending.range_count;++i) {
         semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::TableSlot,1);
@@ -3093,6 +3129,7 @@ extern "C" __global__ void semantic_publication_prepare_drain(uint64_t control_p
     pending.model_update_refusal=0;
     pending.model_update_canary_results=0;
     pending.model_update_canaries=0;
+    pending.capacity_refusal=0;
     semantic_graph::copy_identity(pending.instance,base->header.instance);
     semantic_graph::copy_identity(pending.topology_identity,contract.topology_identity);
     semantic_graph::copy_identity(pending.table_identity,contract.table_identity);
@@ -8400,7 +8437,7 @@ extern "C" __global__ void semantic_transition_execute(Descriptor descriptor) {
                 if(pending.numerical_admissibility || pending.training_selection ||
                     pending.model_update_bindings || pending.model_update_binding_count ||
                     pending.model_update_admissibility || pending.model_update_refusal ||
-                    pending.model_update_canary_results || pending.model_update_canaries) {
+                    pending.model_update_canary_results || pending.model_update_canaries || pending.capacity_refusal) {
                     semantic_content_integrity_trap();return;
                 }
             } else {
@@ -8411,6 +8448,7 @@ extern "C" __global__ void semantic_transition_execute(Descriptor descriptor) {
                 if(numerical>1) { semantic_content_integrity_trap();return; }
                 consume_model_work(descriptor.model_work,state->execution_work);
             }
+            const uint8_t late_numerical=numerical;
             if(transition_kind==4) {
                 numerical &= publication_merge_actor_refresh_work(descriptor,state->execution_work);
             } else if(descriptor.publication.native_work) {
@@ -8459,6 +8497,7 @@ extern "C" __global__ void semantic_transition_execute(Descriptor descriptor) {
                 semantic_content_integrity_trap();return;
             }
             const SemanticTrainingCanaryRefusalRecord* update_refusal=nullptr;
+            bool capacity_refused=false;
             if(pending.transition_kind==4) {
                 if(!pending.training_selection || pending.training_selection%alignof(uint64_t) ||
                     pending.training_selection>UINT64_MAX-sizeof(uint64_t) ||
@@ -8474,6 +8513,18 @@ extern "C" __global__ void semantic_transition_execute(Descriptor descriptor) {
                 }
                 training_status=*reinterpret_cast<const uint64_t*>(pending.training_selection);
                 if(training_status>3) { semantic_content_integrity_trap();return; }
+                if(pending.capacity_refusal) {
+                    if(!publication_pointer_span(pending.capacity_refusal,sizeof(SemanticCapacityRefusalRecord),
+                            alignof(SemanticCapacityRefusalRecord))) {
+                        semantic_content_integrity_trap();return;
+                    }
+                    const auto& refusal=*reinterpret_cast<const SemanticCapacityRefusalRecord*>(pending.capacity_refusal);
+                    if(!publication_capacity_refusal_valid(refusal,&admission_work.actual) ||
+                       (refusal.reason && late_numerical!=0)) {
+                        semantic_content_integrity_trap();return;
+                    }
+                    capacity_refused=refusal.reason==1;
+                }
                 const uint8_t update_admissibility=
                     *reinterpret_cast<const uint8_t*>(pending.model_update_admissibility);
                 if(update_admissibility>1) { semantic_content_integrity_trap();return; }
@@ -8488,7 +8539,8 @@ extern "C" __global__ void semantic_transition_execute(Descriptor descriptor) {
                 numerical &= update_admissibility;
             } else if(pending.training_selection || pending.model_update_bindings ||
                       pending.model_update_binding_count || pending.model_update_admissibility ||
-                      pending.model_update_refusal || pending.model_update_canary_results || pending.model_update_canaries) {
+                      pending.model_update_refusal || pending.model_update_canary_results || pending.model_update_canaries ||
+                      pending.capacity_refusal) {
                 semantic_content_integrity_trap();return;
             }
             admission_work.flush();
@@ -8525,6 +8577,7 @@ extern "C" __global__ void semantic_transition_execute(Descriptor descriptor) {
                 numerical_refused=true;failed=1;
                 state->status=state->execution_work.overflow ? 11 :
                     training_status ? 11+training_status :
+                    capacity_refused ? 16 :
                     !original_numerical ? 5 :
                     (update_refusal && update_refusal->reason) ? 15 : 5;
             }

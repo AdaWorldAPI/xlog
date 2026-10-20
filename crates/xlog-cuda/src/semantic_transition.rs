@@ -4171,12 +4171,74 @@ pub struct SemanticContinuationInput<D = Vec<u8>> {
     pub active_row_count: DlpackManagedTensor,
     /// Original Bool8[1] ordinary numerical admission predicate.
     pub numerical_admissibility: DlpackManagedTensor,
+    /// Optional sealed U64[6] first capacity-denial record for a prepared Update.
+    /// Its payload owner is bound separately; only its first-word anchor is hashed.
+    pub capacity_refusal: Option<SemanticCapacityRefusalInput>,
     /// Original pre-draw FP64[N,2,3] block bounds. Only proposals draw.
     pub numerical_blocks: Option<DlpackManagedTensor>,
     /// Original sealed model-contract schema digest for this block roster.
     pub model_schema_digest: Option<Identity256>,
     /// Original sealed model-contract identity for this generation.
     pub model_identity: Option<Identity256>,
+}
+
+/// Original device cause and retained payload allocation of one prepared Update.
+/// After the last reservation writer joins, the first continuation witness seals
+/// cause at role zero/index N+6 and anchor at N+7, following N ordinary tensors
+/// and six services. The anchor is the payload's initialized first U64 word.
+/// Its frozen descriptor must name allocation_ordinal, byte offset zero and the
+/// complete payload extent. All owners survive original graph retirement.
+pub struct SemanticCapacityRefusalInput {
+    pub cause: DlpackManagedTensor,
+    pub anchor: DlpackManagedTensor,
+    pub payload: DlpackManagedTensor,
+    pub allocation_ordinal: u64,
+}
+
+/// First denied reservation, in bytes, not application-wide live memory usage.
+/// ABI 1 uses reason 0 with all following fields zero, or reason 1 with the
+/// original frozen allocation ordinal and requested > capacity - used. The
+/// producer records one coherent first failure and never advances its denied
+/// cursor. Failure requires the same witness's late numerical predicate false.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SemanticCapacityRefusalRecord {
+    pub abi: u64,
+    pub reason: u64,
+    pub allocation_ordinal: u64,
+    pub requested_bytes: u64,
+    pub used_bytes: u64,
+    pub capacity_bytes: u64,
+}
+
+// SAFETY: the device ABI is exactly six initialized, padding-free U64 fields.
+unsafe impl DeviceRepr for SemanticCapacityRefusalRecord {}
+
+#[cfg(feature = "semantic-policy")]
+fn decode_capacity_refusal(
+    record: SemanticCapacityRefusalRecord,
+    expected: (u64, u64),
+) -> Result<Option<SemanticCapacityRefusalRecord>, SemanticTransitionError> {
+    if record.abi != 1 {
+        return Err(SemanticTransitionError::ObservationMismatch);
+    }
+    match record.reason {
+        0 if record.allocation_ordinal == 0
+            && record.requested_bytes == 0
+            && record.used_bytes == 0
+            && record.capacity_bytes == 0 =>
+        {
+            Ok(None)
+        }
+        1 if (record.allocation_ordinal, record.capacity_bytes) == expected
+            && record.requested_bytes > 0
+            && record.used_bytes <= record.capacity_bytes
+            && record.requested_bytes > record.capacity_bytes - record.used_bytes =>
+        {
+            Ok(Some(record))
+        }
+        _ => Err(SemanticTransitionError::ObservationMismatch),
+    }
 }
 
 fn continuation_service_layouts(
@@ -4422,6 +4484,7 @@ struct TextBinding {
 
 struct TextBindingStorage {
     inputs: Vec<PreparedSemanticTensor>,
+    capacity_refusal: Option<BoundCapacityRefusal>,
     numerical_block_snapshot: Option<Arc<TrackedCudaSlice<f64>>>,
     model_contract: Option<DeviceMemoryView<u8>>,
     physical_blocks: u64,
@@ -4431,6 +4494,13 @@ struct TextBindingStorage {
     _model_content_witness: Option<SemanticTensorContentWitness>,
     consumer_stream: u64,
     parent: TextBindingParent,
+}
+
+struct BoundCapacityRefusal {
+    snapshot: Arc<TrackedCudaSlice<SemanticCapacityRefusalRecord>>,
+    payload: PreparedSemanticTensor,
+    allocation_ordinal: u64,
+    capacity_bytes: u64,
 }
 
 #[expect(
@@ -4470,6 +4540,12 @@ impl TextBindingStorage {
         }
         if let Some(snapshot) = &self.numerical_block_snapshot {
             recorder.read(snapshot.as_ref());
+        }
+        if let Some(cause) = &self.capacity_refusal {
+            recorder.read_write(cause.snapshot.as_ref());
+            if let Some(payload) = &cause.payload.source {
+                recorder.read(payload);
+            }
         }
         if let Some(contract) = &self.model_contract {
             recorder.read(contract);
@@ -4512,6 +4588,23 @@ impl TextBindingStorage {
             model_update_refusal: model_update.refusal,
             model_update_canary_results: model_update.canary_results,
             model_update_canaries: model_update.canaries,
+            capacity_refusal_source: if self.capacity_refusal.is_some() {
+                self.inputs[6].data
+            } else {
+                0
+            },
+            capacity_refusal: self
+                .capacity_refusal
+                .as_ref()
+                .map_or(0, |cause| cause.snapshot.device_ptr_value()),
+            capacity_allocation_ordinal: self
+                .capacity_refusal
+                .as_ref()
+                .map_or(0, |cause| cause.allocation_ordinal),
+            capacity_bytes: self
+                .capacity_refusal
+                .as_ref()
+                .map_or(0, |cause| cause.capacity_bytes),
         }
     }
 }
@@ -5712,6 +5805,7 @@ struct PendingContinuation {
     physical_blocks: u64,
     model_schema_digest: Identity256,
     model_identity: Identity256,
+    capacity_refusal: u64,
 }
 
 #[repr(C)]
@@ -5736,6 +5830,10 @@ struct ContinuationInputs {
     model_identity: Identity256,
     model_contract: u64,
     model_contract_bytes: u64,
+    capacity_refusal_source: u64,
+    capacity_refusal: u64,
+    capacity_allocation_ordinal: u64,
+    capacity_bytes: u64,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -5893,6 +5991,7 @@ pub struct SemanticUpdateMeasurements {
     pub canaries: Vec<SemanticUpdateCanaryMeasurement>,
     pub forward_receipts: [SemanticUpdateForwardReceipt; 2],
     pub canary_refusal: Option<SemanticTrainingCanaryRefusalRecord>,
+    pub capacity_refusal: Option<SemanticCapacityRefusalRecord>,
 }
 
 #[repr(C)]
@@ -14976,6 +15075,7 @@ struct PreparedStepCompletionObservations {
     components: Option<Arc<Mutex<PublicationRead<SemanticTransitionReceipt>>>>,
     canary_results: Option<Arc<Mutex<PublicationRead<SemanticTrainingCanaryResultRecord>>>>,
     canary_refusal: Option<Arc<Mutex<PublicationRead<SemanticTrainingCanaryRefusalRecord>>>>,
+    capacity_refusal: Option<Arc<Mutex<PublicationRead<SemanticCapacityRefusalRecord>>>>,
     task_ground: Option<Arc<Mutex<PublicationRead<u8>>>>,
     base_directory: Option<Arc<Mutex<PublicationRead<PublicationRange>>>>,
     base_task_ground: Option<Arc<Mutex<PublicationRead<u8>>>>,
@@ -15505,6 +15605,14 @@ struct PreparedModelUpdate {
     admissibility: TrackedCudaSlice<u8>,
     canary_results: TrackedCudaSlice<SemanticTrainingCanaryResultRecord>,
     refusal: TrackedCudaSlice<SemanticTrainingCanaryRefusalRecord>,
+    #[cfg_attr(
+        not(feature = "semantic-policy"),
+        expect(
+            dead_code,
+            reason = "capacity custody is bound by the semantic-policy graph"
+        )
+    )]
+    capacity_refusal: Arc<TrackedCudaSlice<SemanticCapacityRefusalRecord>>,
     output: Option<BoundModelUpdate>,
     #[cfg_attr(
         not(feature = "semantic-policy"),
@@ -16253,6 +16361,7 @@ struct PreparedStepResult {
 struct PreparedTransitionEvidence {
     transition: SemanticTransitionKind,
     canary_refusal: Option<SemanticTrainingCanaryRefusalRecord>,
+    capacity_refusal: Option<SemanticCapacityRefusalRecord>,
 }
 
 // SAFETY: the C ABI contains initialized padding-free U64 fields and the
@@ -20512,8 +20621,9 @@ content_kernel_parameter!(learning_phase::FoldDeviceAssignment);
 #[cfg(feature = "semantic-policy")]
 content_kernel_parameter!(PolicyUniformDescriptor);
 
-const _: () = assert!(size_of::<PendingContinuation>() == 352);
-const _: () = assert!(size_of::<ContinuationInputs>() == 216);
+const _: () = assert!(size_of::<PendingContinuation>() == 360);
+const _: () = assert!(size_of::<ContinuationInputs>() == 248);
+const _: () = assert!(size_of::<SemanticCapacityRefusalRecord>() == 48);
 const _: () = assert!(size_of::<SemanticTransitionReceipt>() == 296);
 const _: () = assert!(size_of::<DeviceTaskFacts>() == 40);
 const _: () = assert!(size_of::<DeviceTaskEvaluation>() == 160);
@@ -20600,7 +20710,7 @@ mod task_state_contract {
             ..DeviceState::default()
         };
         assert_eq!(
-            refused_terminal(&original, rng, binding, binding.digest, None).unwrap(),
+            refused_terminal(&original, rng, binding, binding.digest, None, None).unwrap(),
             SemanticTransitionRefusal::NonFinitePolicyInput { completed_draws: 0 }
         );
         for mutation in 0..8 {
@@ -20615,33 +20725,33 @@ mod task_state_contract {
                 6 => state.cleanup_receipts[0][0] = 1,
                 _ => state.retired_roots_mask = 4,
             }
-            assert!(refused_terminal(&state, rng, binding, binding.digest, None).is_err());
+            assert!(refused_terminal(&state, rng, binding, binding.digest, None, None).is_err());
         }
         for status in [0, 1, 3, 4, 6, 7, 8, 9, 10] {
             let mut state = original;
             state.status = status;
-            assert!(refused_terminal(&state, rng, binding, binding.digest, None).is_err());
+            assert!(refused_terminal(&state, rng, binding, binding.digest, None, None).is_err());
         }
         let mut state = original;
         state.status = 2;
         state.blocks = 50;
         assert_eq!(
-            refused_terminal(&state, rng, binding, binding.digest, None).unwrap(),
+            refused_terminal(&state, rng, binding, binding.digest, None, None).unwrap(),
             SemanticTransitionRefusal::InvalidFinalSupport {
                 completed_draws: 50
             }
         );
         state.status = 11;
-        assert!(refused_terminal(&state, rng, binding, binding.digest, None).is_err());
+        assert!(refused_terminal(&state, rng, binding, binding.digest, None, None).is_err());
         state.execution_work.overflow = 1;
         assert_eq!(
-            refused_terminal(&state, rng, binding, binding.digest, None).unwrap(),
+            refused_terminal(&state, rng, binding, binding.digest, None, None).unwrap(),
             SemanticTransitionRefusal::WorkCounterOverflow {
                 completed_draws: 50
             }
         );
         state.next_proposal += 1;
-        assert!(refused_terminal(&state, rng, binding, binding.digest, None).is_err());
+        assert!(refused_terminal(&state, rng, binding, binding.digest, None, None).is_err());
     }
 
     #[test]
@@ -20725,6 +20835,9 @@ pub enum SemanticTransitionRefusal {
     RejectedModelUpdate {
         evidence: SemanticTrainingCanaryRefusalRecord,
     },
+    CapacityExceeded {
+        evidence: SemanticCapacityRefusalRecord,
+    },
 }
 
 impl SemanticTransitionRefusal {
@@ -20746,6 +20859,9 @@ impl SemanticTransitionRefusal {
                 SemanticTransitionError::RejectedModelUpdate {
                     evidence: Box::new(evidence),
                 }
+            }
+            Self::CapacityExceeded { evidence } => {
+                SemanticTransitionError::CapacityExceeded { evidence }
             }
         }
     }
@@ -20833,6 +20949,7 @@ fn refused_terminal(
     catalogue: SemanticCatalogueBinding,
     binding_digest: Identity256,
     canary_refusal: Option<SemanticTrainingCanaryRefusalRecord>,
+    capacity_refusal: Option<SemanticCapacityRefusalRecord>,
 ) -> Result<SemanticTransitionRefusal, SemanticTransitionError> {
     if state.model_generation != rng.model_generation
         || state.family_id != u32::from(rng.family_id)
@@ -20869,6 +20986,11 @@ fn refused_terminal(
         15 if state.execution_work.overflow == 0 && state.blocks == 0 => {
             Ok(SemanticTransitionRefusal::RejectedModelUpdate {
                 evidence: canary_refusal.ok_or(SemanticTransitionError::ObservationMismatch)?,
+            })
+        }
+        16 if state.execution_work.overflow == 0 && state.blocks == 0 => {
+            Ok(SemanticTransitionRefusal::CapacityExceeded {
+                evidence: capacity_refusal.ok_or(SemanticTransitionError::ObservationMismatch)?,
             })
         }
         _ => Err(SemanticTransitionError::ObservationMismatch),
@@ -21096,6 +21218,9 @@ pub enum SemanticTransitionError {
     },
     RejectedModelUpdate {
         evidence: Box<SemanticTrainingCanaryRefusalRecord>,
+    },
+    CapacityExceeded {
+        evidence: SemanticCapacityRefusalRecord,
     },
     InvalidTaskBank,
     InvalidTaskBase,
@@ -22855,30 +22980,44 @@ impl SemanticTransitionSession {
             };
             let bank = u8::try_from(lease.bank)
                 .map_err(|_| SemanticTransitionError::ObservationMismatch)?;
-            let (state_view, receipts, update_refusal_view) = {
-                let prepared = self.steps[&step.token]
-                    .prepared
-                    .as_ref()
-                    .expect("original prepared owner");
-                let branch = prepared
-                    .branches
-                    .get(usize::from(bank))
-                    .ok_or(SemanticTransitionError::ObservationMismatch)?;
-                (
-                    branch.state.view(),
-                    branch
-                        .receipts
+            let (state_view, receipts, update_refusal_view) =
+                {
+                    let prepared = self.steps[&step.token]
+                        .prepared
                         .as_ref()
-                        .ok_or(SemanticTransitionError::ObservationMismatch)?
-                        .view(),
-                    branch
-                        .model_update
-                        .as_ref()
-                        .map(|update| (update.refusal.view(), update.canary_results.view())),
-                )
-            };
-            let canary_refusal = match (transition, update_refusal_view) {
-                (SemanticTransitionKind::Update, Some((view, results))) => {
+                        .expect("original prepared owner");
+                    let branch = prepared
+                        .branches
+                        .get(usize::from(bank))
+                        .ok_or(SemanticTransitionError::ObservationMismatch)?;
+                    (
+                        branch.state.view(),
+                        branch
+                            .receipts
+                            .as_ref()
+                            .ok_or(SemanticTransitionError::ObservationMismatch)?
+                            .view(),
+                        branch.model_update.as_ref().map(|update| {
+                            (
+                                update.refusal.view(),
+                                update.canary_results.view(),
+                                branch.continuation.as_ref().and_then(|continuation| {
+                                    continuation.text_binding.capacity_refusal.as_ref().map(
+                                        |cause| {
+                                            (
+                                                cause.snapshot.view(),
+                                                cause.allocation_ordinal,
+                                                cause.capacity_bytes,
+                                            )
+                                        },
+                                    )
+                                }),
+                            )
+                        }),
+                    )
+                };
+            let (canary_refusal, capacity_refusal) = match (transition, update_refusal_view) {
+                (SemanticTransitionKind::Update, Some((view, results, capacity))) => {
                     let results = self.prepared_completion_read(results, |observations| {
                         &mut observations
                             .steps
@@ -22893,12 +23032,24 @@ impl SemanticTransitionSession {
                             .or_default()
                             .canary_refusal
                     })?[0];
-                    decode_canary_refusal(refusal, &results)?
+                    let capacity = if let Some((view, ordinal, bytes)) = capacity {
+                        let record = self.prepared_completion_read(view, |observations| {
+                            &mut observations
+                                .steps
+                                .entry(step.token)
+                                .or_default()
+                                .capacity_refusal
+                        })?[0];
+                        decode_capacity_refusal(record, (ordinal, bytes))?
+                    } else {
+                        None
+                    };
+                    (decode_canary_refusal(refusal, &results)?, capacity)
                 }
                 (SemanticTransitionKind::Update, None) | (_, Some(_)) => {
                     return Err(SemanticTransitionError::ObservationMismatch);
                 }
-                (_, None) => None,
+                (_, None) => (None, None),
             };
             let state = self.prepared_completion_read(state_view, |observations| {
                 &mut observations.steps.entry(step.token).or_default().state
@@ -23034,6 +23185,7 @@ impl SemanticTransitionSession {
                         PreparedTransitionEvidence {
                             transition,
                             canary_refusal,
+                            capacity_refusal,
                         },
                     )?;
                     self.prepared_segment
@@ -23331,13 +23483,20 @@ impl SemanticTransitionSession {
         let PreparedTransitionEvidence {
             transition,
             canary_refusal,
+            capacity_refusal,
         } = evidence;
         if result.refusal != 0 || state.status == 10 {
             return Err(SemanticTransitionError::PublicationRefused {
                 status: result.refusal,
             });
         }
-        if matches!(state.status, 2 | 5 | 11 | 12..=15) {
+        if (state.status == 16
+            && (transition != SemanticTransitionKind::Update || capacity_refusal.is_none()))
+            || (capacity_refusal.is_some() && !matches!(state.status, 11..=14 | 16))
+        {
+            return Err(SemanticTransitionError::ObservationMismatch);
+        }
+        if matches!(state.status, 2 | 5 | 11 | 12..=16) {
             let canary_refusal = if state.status == 15 {
                 Some(canary_refusal.ok_or(SemanticTransitionError::ObservationMismatch)?)
             } else {
@@ -23349,6 +23508,7 @@ impl SemanticTransitionSession {
                 SemanticActionCatalogue::current().binding(),
                 self.binding().digest,
                 canary_refusal,
+                capacity_refusal,
             )?;
             if result.word != parent.publication_word || result.header != *parent {
                 return Err(SemanticTransitionError::ObservationMismatch);
@@ -25776,6 +25936,7 @@ impl SemanticTransitionSession {
                 bytes.checked_add(
                     1 + 5 * size_of::<SemanticTrainingCanaryResultRecord>()
                         + size_of::<SemanticTrainingCanaryRefusalRecord>()
+                        + size_of::<SemanticCapacityRefusalRecord>()
                         + 2 * size_of::<ModelForwardReceipt>(),
                 )
             })
@@ -26111,6 +26272,15 @@ impl SemanticTransitionSession {
                         refusal.view(),
                         false,
                     )?);
+                    let capacity_refusal = reservation
+                        .alloc::<SemanticCapacityRefusalRecord>(1)
+                        .map_err(|error| runtime_error("capacity refusal allocation", error))?;
+                    writes.push(state_restoration::OriginalDeviceWrite::new(
+                        &self.stream,
+                        &[SemanticCapacityRefusalRecord::default()],
+                        capacity_refusal.view(),
+                        false,
+                    )?);
                     Ok(Some(PreparedModelUpdate {
                         canaries: None,
                         pending_slots: pending_generations[update_ordinal].clone(),
@@ -26142,6 +26312,7 @@ impl SemanticTransitionSession {
                         admissibility,
                         canary_results,
                         refusal,
+                        capacity_refusal: Arc::new(capacity_refusal),
                         output: None,
                         admissibility_copy: model_update_admissibility_copy.clone(),
                     }))
@@ -28017,6 +28188,7 @@ impl SemanticTransitionSession {
                 results,
                 receipts,
                 refusal,
+                capacity_refusal,
                 state,
                 forward_streams,
                 work_count,
@@ -28063,6 +28235,19 @@ impl SemanticTransitionSession {
                     update.canary_results.view(),
                     update.forward_receipts.view(),
                     update.refusal.view(),
+                    branch.continuation.as_ref().and_then(|continuation| {
+                        continuation
+                            .text_binding
+                            .capacity_refusal
+                            .as_ref()
+                            .map(|cause| {
+                                (
+                                    cause.snapshot.view(),
+                                    cause.allocation_ordinal,
+                                    cause.capacity_bytes,
+                                )
+                            })
+                    }),
                     branch.state.view(),
                     forwards,
                     work.recording.events().len() as u64,
@@ -28075,12 +28260,20 @@ impl SemanticTransitionSession {
             let results = self.publication_read(results)?;
             let receipts = self.publication_read(receipts)?;
             let refusal = decode_canary_refusal(self.publication_read(refusal)?[0], &results)?;
+            let capacity_refusal = if let Some((view, ordinal, bytes)) = capacity_refusal {
+                let record = self.publication_read(view)?[0];
+                decode_capacity_refusal(record, (ordinal, bytes))?
+            } else {
+                None
+            };
             let state = self.publication_read(state)?[0];
             if canaries.len() != 5
                 || results.len() != 5
                 || receipts.len() != 2
                 || selection.status > 4
                 || selection.row_count > rows.len() as u64
+                || (state.status == 16 && capacity_refusal.is_none())
+                || (capacity_refusal.is_some() && !matches!(state.status, 11..=14 | 16))
             {
                 return Err(SemanticTransitionError::ObservationMismatch);
             }
@@ -28201,6 +28394,7 @@ impl SemanticTransitionSession {
                 || (result.advanced == 1
                     && (state.status != 0
                         || refusal.is_some()
+                        || capacity_refusal.is_some()
                         || observations.iter().any(|check| check.availability != 2)))
             {
                 return Err(SemanticTransitionError::ObservationMismatch);
@@ -28299,6 +28493,7 @@ impl SemanticTransitionSession {
                     .try_into()
                     .map_err(|_| SemanticTransitionError::ObservationMismatch)?,
                 canary_refusal: refusal,
+                capacity_refusal,
             }))
         })();
         if observation.is_err() {
@@ -31520,11 +31715,22 @@ impl SemanticTransitionSession {
         &mut self,
         step: &SemanticPreparedStep,
         bank: usize,
-        continuation: SemanticContinuationInput<D>,
+        mut continuation: SemanticContinuationInput<D>,
         witness: &SemanticTensorContentWitness,
         model_content_witness: Option<&SemanticTensorContentWitness>,
         consumer_stream: u64,
     ) -> Result<(), SemanticTransitionError> {
+        // The new managed producers must already have completion custody if
+        // any preceding bank/witness/geometry check fails or completion is unknown.
+        let mut capacity_admission = RetainedTensorAdmission {
+            inputs: continuation
+                .capacity_refusal
+                .take()
+                .map(|cause| vec![cause]),
+            stream: Arc::clone(&self.stream),
+            consumer_stream: Some(consumer_stream),
+            ready: false,
+        };
         self.check_prepared_content_stream(step, consumer_stream)?;
         self.checked_prepared_content_witness(step, witness)?;
         if bank > 1 {
@@ -31611,8 +31817,30 @@ impl SemanticTransitionSession {
                 ));
             }
         };
-        let service_layouts =
+        let mut service_layouts =
             continuation_service_layouts(tensor_count, capacity, physical_blocks)?;
+        if capacity_admission.inputs.is_some() {
+            if kind != SemanticTransitionKind::Update || physical_blocks.is_some() {
+                return Err(publication_input_error(
+                    "capacity refusal requires a prepared Update",
+                ));
+            }
+            for (offset, elements) in [(6u64, 6), (7u64, 1)] {
+                service_layouts.push(canonical_tensor_layout(SemanticTensorLayout {
+                    role: 0,
+                    index: u64::try_from(tensor_count)
+                        .ok()
+                        .and_then(|index| index.checked_add(offset))
+                        .ok_or(SemanticTransitionError::GenerationExhausted)?,
+                    scalar_type: 3,
+                    element_bytes: 8,
+                    rank: 1,
+                    dimensions: [elements, 0, 0, 0],
+                    logical_axis: u64::MAX,
+                    strides_bytes: [0; 4],
+                })?);
+            }
+        }
         let SemanticContinuationInput {
             mut tensors,
             authority_decisions,
@@ -31622,6 +31850,7 @@ impl SemanticTransitionSession {
             active_rows,
             active_row_count,
             numerical_admissibility,
+            capacity_refusal: _,
             numerical_blocks,
             model_schema_digest: _,
             model_identity: _,
@@ -31640,6 +31869,28 @@ impl SemanticTransitionSession {
             numerical_admissibility,
         ];
         services.extend(numerical_blocks);
+        #[cfg(feature = "semantic-policy")]
+        let content_work = self.prepared_policy_work_counter(
+            step,
+            bank,
+            policy_work::PolicyWorkKey::ModelScratch,
+            &self.publication_issuer,
+            step.token,
+        )?;
+        let capacity_payload = if let Some(mut causes) = capacity_admission.inputs.take() {
+            let cause = causes.pop().expect("one original capacity cause");
+            let payload = RetainedTensorAdmission {
+                inputs: Some(vec![cause.payload]),
+                stream: Arc::clone(&self.stream),
+                consumer_stream: Some(consumer_stream),
+                ready: false,
+            };
+            services.push(cause.cause);
+            services.push(cause.anchor);
+            Some((payload, cause.allocation_ordinal))
+        } else {
+            None
+        };
         tensors.extend(
             services
                 .into_iter()
@@ -31652,14 +31903,6 @@ impl SemanticTransitionSession {
                     native_allocation: None,
                 }),
         );
-        #[cfg(feature = "semantic-policy")]
-        let content_work = self.prepared_policy_work_counter(
-            step,
-            bank,
-            policy_work::PolicyWorkKey::ModelScratch,
-            &self.publication_issuer,
-            step.token,
-        )?;
         self.verify_prepared_tensor_content_with_work(
             step,
             witness,
@@ -31704,16 +31947,109 @@ impl SemanticTransitionSession {
         } else {
             None
         };
+        let mut capacity_payload_custody = None;
+        let capacity_refusal = if let Some((mut payload, allocation_ordinal)) = capacity_payload {
+            let pointer = payload.inputs.as_ref().expect("retained payload")[0].as_ptr();
+            if pointer.is_null() {
+                return Err(publication_input_error(
+                    "capacity payload has no managed producer",
+                ));
+            }
+            // SAFETY: the original managed producer owns its immutable DLPack
+            // metadata; the normal retained import below validates device and dtype.
+            let elements = unsafe { semantic_tensor_metadata(&(*pointer).dl_tensor) }?;
+            if elements.shape.len() != 1 || elements.shape[0] < 1 || elements.byte_offset != 0 {
+                return Err(publication_input_error(
+                    "capacity payload requires its full original U64 backing",
+                ));
+            }
+            let layout = canonical_tensor_layout(SemanticTensorLayout {
+                role: 0,
+                index: 0,
+                scalar_type: 3,
+                element_bytes: 8,
+                rank: 1,
+                dimensions: [elements.shape[0] as u64, 0, 0, 0],
+                logical_axis: u64::MAX,
+                strides_bytes: [0; 4],
+            })?;
+            let tensor = payload
+                .inputs
+                .take()
+                .expect("retained payload")
+                .pop()
+                .expect("one payload");
+            let payload = prepare_retained_semantic_tensors(
+                &self.provider,
+                RetainedTensorAdmission {
+                    inputs: Some(vec![SemanticTensorInput {
+                        tensor,
+                        layout,
+                        logical_begin: 0,
+                        logical_end: 0,
+                        native_allocation: None,
+                    }]),
+                    stream: Arc::clone(&self.stream),
+                    consumer_stream: Some(consumer_stream),
+                    ready: false,
+                },
+            )?
+            .pop()
+            .expect("one retained payload");
+            // Frozen matching may reject a genuine but unrelated imported
+            // payload. Retire that exact owner on its declared stream as well.
+            capacity_payload_custody = Some(RetainedTensorAdmission {
+                inputs: Some(vec![payload.clone()]),
+                stream: Arc::clone(&self.stream),
+                consumer_stream: Some(consumer_stream),
+                ready: false,
+            });
+            let owner = &self.steps[&step.token];
+            let prepared = owner.prepared.as_ref().expect("prepared owner");
+            let anchor = &owner.content[witness.index].tensors[tensor_count + 7];
+            #[cfg(feature = "semantic-policy")]
+            let capacity_bytes = prepared
+                .content_plan
+                .as_ref()
+                .ok_or(SemanticTransitionError::NotBound)?
+                .require_capacity_payload(bank, witness, anchor, &payload, allocation_ordinal)?;
+            #[cfg(not(feature = "semantic-policy"))]
+            {
+                let _ = (prepared, anchor, payload, allocation_ordinal);
+                return Err(publication_input_error(
+                    "capacity refusal requires original frozen content custody",
+                ));
+            }
+            #[cfg(feature = "semantic-policy")]
+            {
+                let update = prepared.branches[bank]
+                    .model_update
+                    .as_ref()
+                    .ok_or(SemanticTransitionError::NotBound)?;
+                Some(BoundCapacityRefusal {
+                    snapshot: Arc::clone(&update.capacity_refusal),
+                    payload,
+                    allocation_ordinal,
+                    capacity_bytes,
+                })
+            }
+        } else {
+            None
+        };
         let owner = &self.steps[&step.token];
         let original = &owner.content[witness.index].tensors;
         let services = original[tensor_count..].to_vec();
-        if services.len() != 6 + usize::from(physical_blocks.is_some()) {
+        if services.len()
+            != 6 + usize::from(physical_blocks.is_some())
+                + 2 * usize::from(capacity_refusal.is_some())
+        {
             return Err(publication_input_error(
                 "continuation witness has the wrong original service roster",
             ));
         }
         let binding = Arc::new(TextBindingStorage {
             inputs: services,
+            capacity_refusal,
             numerical_block_snapshot,
             model_contract,
             physical_blocks: physical_blocks.unwrap_or(0) as u64,
@@ -31821,6 +32157,11 @@ impl SemanticTransitionSession {
             .continuation = Some(continuation);
         #[cfg(feature = "semantic-policy")]
         self.attach_prepared_policy_continuation(step, bank)?;
+        if let Some(custody) = &mut capacity_payload_custody {
+            // The original branch now retains this same owner through graph
+            // completion/Unknown and its existing joined retirement boundary.
+            custody.ready = true;
+        }
         Ok(())
     }
 
@@ -42058,7 +42399,7 @@ impl SemanticTransitionSession {
         let mut handoff = RetainedTensorAdmission {
             inputs: Some(vec![continuation]),
             stream: Arc::clone(self.provider.device().inner().stream()),
-            consumer_stream: None,
+            consumer_stream: Some(consumer_stream),
             ready: false,
         };
         let _ordinary = crate::cuda_graph::reserve_uncaptured_stream(&self.stream)
@@ -42107,6 +42448,11 @@ impl SemanticTransitionSession {
             .ok_or_else(|| publication_input_error("continuation active capacity overflow"))?;
         let (physical_blocks, model_schema_digest, model_identity) =
             storage.continuation_block_contract(kind, continuation, false)?;
+        if continuation.capacity_refusal.is_some() {
+            return Err(publication_input_error(
+                "capacity refusal requires a prepared Update",
+            ));
+        }
         let service_layouts =
             continuation_service_layouts(tensor_count, active_capacity, physical_blocks)?;
         if continuation.authority_decisions.as_ref().is_empty() {
@@ -42129,6 +42475,7 @@ impl SemanticTransitionSession {
             active_rows,
             active_row_count,
             numerical_admissibility,
+            capacity_refusal: _,
             numerical_blocks,
             model_schema_digest: _,
             model_identity: _,
@@ -42198,6 +42545,7 @@ impl SemanticTransitionSession {
         }
         let text_binding = Arc::new(TextBindingStorage {
             inputs: services,
+            capacity_refusal: None,
             numerical_block_snapshot,
             model_contract: None,
             physical_blocks: physical_blocks.unwrap_or(0) as u64,
@@ -48513,6 +48861,7 @@ impl SemanticTransitionSession {
             SemanticActionCatalogue::current().binding(),
             self.binding().digest,
             None,
+            None,
         )?;
         let storage = Arc::clone(
             self.publication
@@ -51932,6 +52281,7 @@ mod text_parent_tests {
                 active_rows,
                 active_row_count,
                 numerical_admissibility,
+                capacity_refusal: None,
                 numerical_blocks: None,
                 model_schema_digest: None,
                 model_identity: None,

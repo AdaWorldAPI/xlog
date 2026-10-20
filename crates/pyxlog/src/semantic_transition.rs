@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use xlog_core::{RelId, ScalarType, Schema};
 use xlog_cuda::memory::DeviceAllocationProvenance;
 use xlog_cuda::provider::resident_schedule::ResidentExecutionDomain;
-use xlog_cuda::CudaKernelProvider;
+use xlog_cuda::{CudaKernelProvider, SemanticCapacityRefusalInput};
 use xlog_cuda::{
     DlpackManagedTensor, Identity256, SemanticAdmissionLimits, SemanticAdmissionRecords,
     SemanticArgument, SemanticContinuationInput, SemanticGradientDeliveryBinding,
@@ -4271,6 +4271,9 @@ fn transition_refusal(
             SemanticTransitionRefusal::InvalidTrainingView { status } => {
                 ("invalid_training_view", *status)
             }
+            SemanticTransitionRefusal::CapacityExceeded { evidence } => {
+                ("capacity_exceeded", evidence.allocation_ordinal)
+            }
             SemanticTransitionRefusal::RejectedModelUpdate { evidence } => {
                 let reason = match evidence.reason() {
                     Some(xlog_cuda::SemanticTrainingCanaryRefusalReason::NonFiniteMeasurement) => {
@@ -4309,6 +4312,25 @@ fn transition_refusal(
 }
 
 #[cfg(feature = "semantic-policy")]
+fn capacity_refusal_report(
+    py: Python<'_>,
+    evidence: &xlog_cuda::SemanticCapacityRefusalRecord,
+) -> PyResult<Py<PyDict>> {
+    let report = PyDict::new(py);
+    for (name, value) in [
+        ("abi", evidence.abi),
+        ("reason", evidence.reason),
+        ("allocation_ordinal", evidence.allocation_ordinal),
+        ("requested_bytes", evidence.requested_bytes),
+        ("used_bytes", evidence.used_bytes),
+        ("capacity_bytes", evidence.capacity_bytes),
+    ] {
+        report.set_item(name, value)?;
+    }
+    Ok(report.unbind())
+}
+
+#[cfg(feature = "semantic-policy")]
 fn transition_refusal_report(
     py: Python<'_>,
     outcome: &xlog_cuda::SemanticTransitionOutcome,
@@ -4329,6 +4351,9 @@ fn transition_refusal_report(
         }
         SemanticTransitionRefusal::InvalidTrainingView { .. } => {
             report.set_item("training_view_status", detail)?;
+        }
+        SemanticTransitionRefusal::CapacityExceeded { evidence } => {
+            report.set_item("capacity_refusal", capacity_refusal_report(py, evidence)?)?;
         }
         SemanticTransitionRefusal::RejectedModelUpdate { evidence } => {
             report.set_item("canary_kind", evidence.kind)?;
@@ -4381,6 +4406,14 @@ fn update_measurements_report(
         PyBytes::new(py, observation.model_numerical_digest.as_bytes()),
     )?;
     report.set_item("transition_status", observation.transition_status)?;
+    report.set_item(
+        "capacity_refusal",
+        observation
+            .capacity_refusal
+            .as_ref()
+            .map(|evidence| capacity_refusal_report(py, evidence))
+            .transpose()?,
+    )?;
     let selected = &observation.selection;
     let selection = PyDict::new(py);
     for (name, value) in [
@@ -25268,8 +25301,10 @@ impl PySemanticTransitionController {
     /// Native validation checks the acquired source, prefix, services and
     /// generations before pending ranges enter the sole publication CAS. A
     /// prepared parent requires ``bank`` and retains a distinct continuation for
-    /// each recorded branch; published parents reject it.
-    #[pyo3(signature = (task_use, *, parent, text_rows, text_row_count, selected_text, active_rows, active_row_count, numerical_admissibility, tensors, producer_witness, consumer_stream, bank=None, numerical_blocks=None, model_schema_digest=None, model_identity=None, model_content_witness=None))]
+    /// each recorded branch; published parents reject it. Update capacity
+    /// evidence requires the original cause, full payload, explicit payload
+    /// anchor and allocation ordinal together.
+    #[pyo3(signature = (task_use, *, parent, text_rows, text_row_count, selected_text, active_rows, active_row_count, numerical_admissibility, tensors, producer_witness, consumer_stream, bank=None, numerical_blocks=None, model_schema_digest=None, model_identity=None, model_content_witness=None, capacity_refusal=None, capacity_payload=None, capacity_payload_anchor=None, capacity_allocation_ordinal=None))]
     #[expect(
         clippy::too_many_arguments,
         reason = "continuation binding retains each typed producer and its witness"
@@ -25293,6 +25328,10 @@ impl PySemanticTransitionController {
         model_schema_digest: Option<&Bound<'_, PyAny>>,
         model_identity: Option<&Bound<'_, PyAny>>,
         model_content_witness: Option<&PySemanticTensorContentWitness>,
+        capacity_refusal: Option<&Bound<'_, PyAny>>,
+        capacity_payload: Option<&Bound<'_, PyAny>>,
+        capacity_payload_anchor: Option<&Bound<'_, PyAny>>,
+        capacity_allocation_ordinal: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         self.session.borrow(py).require_creator()?;
         self.require_read_issued(task_use)?;
@@ -25323,6 +25362,10 @@ impl PySemanticTransitionController {
                     model_schema_digest,
                     model_identity,
                     model_content_witness,
+                    capacity_refusal,
+                    capacity_payload,
+                    capacity_payload_anchor,
+                    capacity_allocation_ordinal,
                 )
             }
             ContentStepOwner::Prepared(step) => {
@@ -25347,6 +25390,10 @@ impl PySemanticTransitionController {
                     model_schema_digest,
                     model_identity,
                     model_content_witness,
+                    capacity_refusal,
+                    capacity_payload,
+                    capacity_payload_anchor,
+                    capacity_allocation_ordinal,
                 )
             }
         }
@@ -28758,6 +28805,10 @@ impl PySemanticTransitionController {
                     schema,
                     identity,
                     None,
+                    None,
+                    None,
+                    None,
+                    None,
                 )
             };
             if kind == SemanticTransitionKind::Proposal {
@@ -29342,7 +29393,19 @@ impl PySemanticTransitionController {
         model_schema_digest: Option<&Bound<'_, PyAny>>,
         model_identity: Option<&Bound<'_, PyAny>>,
         model_content_witness: Option<&PySemanticTensorContentWitness>,
+        capacity_refusal: Option<&Bound<'_, PyAny>>,
+        capacity_payload: Option<&Bound<'_, PyAny>>,
+        capacity_payload_anchor: Option<&Bound<'_, PyAny>>,
+        capacity_allocation_ordinal: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
+        if capacity_refusal.is_some() != capacity_payload.is_some()
+            || capacity_refusal.is_some() != capacity_payload_anchor.is_some()
+            || capacity_refusal.is_some() != capacity_allocation_ordinal.is_some()
+        {
+            return Err(invalid(
+                "capacity refusal requires its original cause, payload, payload anchor and allocation ordinal together",
+            ));
+        }
         match parent {
             ContentStepRef::Published(_) if prepared_bank.is_some() => {
                 return Err(invalid(
@@ -29375,6 +29438,9 @@ impl PySemanticTransitionController {
             self.continuation_binding(&state, parent, import.is_some())?
         };
         let mut budget = 16 * 1024 * 1024;
+        let capacity_allocation_ordinal = capacity_allocation_ordinal
+            .map(|value| ColdValue::read(value, &mut budget, 0)?.unsigned())
+            .transpose()?;
         let consumer_stream = parse_witness_consumer_stream(consumer_stream, &mut budget)?;
         if let ContentStepRef::Prepared(step) = parent {
             let session = self.session.borrow(py);
@@ -29403,6 +29469,9 @@ impl PySemanticTransitionController {
             numerical_admissibility,
         ];
         services.extend(numerical_blocks);
+        services.extend(capacity_refusal);
+        services.extend(capacity_payload);
+        services.extend(capacity_payload_anchor);
         // Retain the original Python producers independently of mutable input
         // rows. Native code retains the captured witness without a Python cycle.
         // Any failed callback leaves these original autograd owners quarantined.
@@ -29486,7 +29555,24 @@ impl PySemanticTransitionController {
             }
         };
         let mut service_tensors = service_handoff.into_native();
-        let numerical_blocks = if services.len() == 7 {
+        let capacity_refusal = capacity_allocation_ordinal.map(|allocation_ordinal| {
+            let anchor = service_tensors
+                .pop()
+                .expect("original capacity payload anchor producer");
+            let payload = service_tensors
+                .pop()
+                .expect("original capacity payload producer");
+            let cause = service_tensors
+                .pop()
+                .expect("original capacity refusal producer");
+            SemanticCapacityRefusalInput {
+                cause,
+                payload,
+                anchor,
+                allocation_ordinal,
+            }
+        });
+        let numerical_blocks = if numerical_blocks.is_some() {
             service_tensors.pop()
         } else {
             None
@@ -29503,6 +29589,7 @@ impl PySemanticTransitionController {
             active_row_count,
             numerical_admissibility,
             numerical_blocks,
+            capacity_refusal,
             model_schema_digest,
             model_identity,
             tensors: tensors.into_native(),
