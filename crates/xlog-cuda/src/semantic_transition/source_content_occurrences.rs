@@ -642,12 +642,12 @@ impl PreparedTensorContentPlan {
                 "prepared capture belongs to another original recorder",
             ));
         }
-        if let Some(original) = &plan.receivers[state.cursor] {
-            original.authenticate(witness, content)?;
-        }
         if state.pending
             || verify != (event.kind == SemanticSourceContentKind::Verify)
             || !same_source_tensor_geometry(&event.tensors, &content.tensors)
+            || verification_inputs.as_ref().is_some_and(|inputs| {
+                plan.receivers[state.cursor].is_none() || inputs.len() != event.tensors.len()
+            })
             || content.native_work_ceiling(verify)? != plan.ceilings[state.cursor]
             || matches!(&content.seals, TensorContentSeals::Model(model)
                 if model.prepared.as_ref().is_some_and(|original| original.bank ==
@@ -661,6 +661,19 @@ impl PreparedTensorContentPlan {
             return Err(publication_input_error(
                 "prepared content changed its next original typed occurrence or native producer",
             ));
+        }
+        // A claim has no rollback after its first retained owner or custody
+        // mutation. A failed authentication must keep this original occurrence
+        // pending, rather than admit another owner against the same reservation.
+        state.pending = true;
+        if let Some(original) = &plan.receivers[state.cursor] {
+            state.retained.push(PreparedContentRetainedOwner {
+                _tensors: content.tensors.clone(),
+                _verification_inputs: verification_inputs.unwrap_or_default(),
+                _seals: content.seals.clone(),
+                _witness: witness.clone(),
+            });
+            original.authenticate(witness, content)?;
         }
         if verify {
             if let Some(original) = state.witnesses.get(&event.receiver_slot) {
@@ -705,14 +718,6 @@ impl PreparedTensorContentPlan {
                 ));
             }
             state.receiver = Some((event.receiver_slot, step.clone()));
-        }
-        if plan.receivers[state.cursor].is_some() {
-            state.retained.push(PreparedContentRetainedOwner {
-                _tensors: content.tensors.clone(),
-                _verification_inputs: verification_inputs.unwrap_or_default(),
-                _seals: content.seals.clone(),
-                _witness: witness.clone(),
-            });
         }
         for (descriptor, tensor) in event.tensors.iter().zip(&content.tensors) {
             let allocation = event
@@ -772,7 +777,6 @@ impl PreparedTensorContentPlan {
                 ));
             }
         }
-        state.pending = true;
         Ok(())
     }
 
@@ -1066,6 +1070,10 @@ impl SemanticTransitionSession {
             Some(SemanticSourceContentAllocation::Geometry(original)) => {
                 let owner = self.prepared_content_geometry_owner(original)?;
                 owner.require_allocation(original, allocation.span_bytes)?;
+                owner.require_content_overlay_stream(
+                    (self.prepared_transition_kind(step)?, bank),
+                    self.stream.cu_stream() as u64,
+                )?;
                 owner.require_prepared_allocation(
                     self,
                     step,
@@ -2104,6 +2112,7 @@ impl FrozenSourceContentOccurrences {
             .upgrade()
             .ok_or(SemanticTransitionError::ObservationMismatch)?;
         geometry.require_current_section(session, step, section)?;
+        geometry.require_content_overlay_stream(section, session.stream.cu_stream() as u64)?;
         for (descriptor, tensor) in occurrence.geometry().tensors.iter().zip(tensors) {
             if let Some(declared) = self.declared_allocations[occurrence.geometry().section]
                 .get(&descriptor.allocation_slot)

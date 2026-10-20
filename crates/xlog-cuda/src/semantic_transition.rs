@@ -16279,13 +16279,13 @@ enum TensorContentSeals {
 }
 
 struct ModelContentSeals {
-    _owner_reservation: Option<SemanticReplayMaterialReservation>,
     ranges: TrackedCudaSlice<PublicationRange>,
     contract: TrackedCudaSlice<u8>,
     guard: CudaFunction,
     prepared: Option<PreparedModelContentSeals>,
     #[cfg(feature = "semantic-policy")]
     original_snapshot: Mutex<Option<native_work_bound::OriginalModelSnapshot>>,
+    _owner_reservation: Option<SemanticReplayMaterialReservation>,
 }
 
 struct PreparedModelContentSeals {
@@ -16443,13 +16443,13 @@ impl ModelContentSeals {
                 runtime_error("kernel lookup", "retained model contract guard unavailable")
             })?;
         Ok(Self {
-            _owner_reservation: None,
             ranges,
             contract,
             guard,
             prepared: None,
             #[cfg(feature = "semantic-policy")]
             original_snapshot: Mutex::new(None),
+            _owner_reservation: None,
         })
     }
 
