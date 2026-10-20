@@ -210,6 +210,9 @@ pub struct SemanticTrainingViewRow<B = Vec<u8>> {
     /// equal the native task content executed during this cold binding.
     pub task_content: Option<SemanticTaskContentIdentity>,
     pub origin: Option<SemanticTrainingViewOrigin>,
+    /// Byte hashes of the admitted original action, codebook, solving witness,
+    /// and task ground. These travel with the same immutable replay row.
+    pub edit_demonstration_material_roots: Option<[Identity256; 4]>,
     pub bytes: B,
 }
 
@@ -730,6 +733,7 @@ pub(crate) struct FrozenPolicyGroupMember {
     pub bytes_identity: Identity256,
     pub content_identity: [u64; 4],
     pub origin: SemanticTrainingViewOriginRecord,
+    pub edit_demonstration_material_roots: Option<[Identity256; 4]>,
 }
 
 /// Fixed device port of the native-selected complete training roster.
@@ -855,6 +859,8 @@ impl SemanticSelectedTrainingView {
                     && member.bytes_identity == row.bytes_identity
                     && member.content_identity == descriptor.content_identity
                     && member.origin == descriptor.origin
+                    && member.edit_demonstration_material_roots
+                        == row.edit_demonstration_material_roots
             })
             .ok_or_else(|| input_error("original replay is not an exact frozen actor group member"))
     }
@@ -879,6 +885,8 @@ impl SemanticSelectedTrainingView {
                 && member.bytes_identity == row.bytes_identity
                 && member.content_identity == descriptor.content_identity
                 && member.origin == descriptor.origin
+                && member.edit_demonstration_material_roots
+                    == row.edit_demonstration_material_roots
         }))
     }
 
@@ -2038,7 +2046,7 @@ impl SemanticTrainingViewArena {
         for (ordinal, row) in rows.into_iter().enumerate() {
             let descriptor = validate_row(ordinal, &row, raw.len(), training_domain)?;
             #[cfg(feature = "semantic-policy")]
-            row_bytes_identities.push(row.bytes_identity);
+            row_bytes_identities.push((row.bytes_identity, row.edit_demonstration_material_roots));
             raw.extend_from_slice(row.bytes.as_ref());
             descriptors.push(descriptor);
         }
@@ -2103,7 +2111,8 @@ impl SemanticTrainingViewArena {
                         ordinal,
                         identity: row.identity,
                         source_identity: row.source_identity,
-                        bytes_identity: row_bytes_identities[ordinal as usize],
+                        bytes_identity: row_bytes_identities[ordinal as usize].0,
+                        edit_demonstration_material_roots: row_bytes_identities[ordinal as usize].1,
                         content_identity: row.content_identity,
                         origin: row.origin,
                     }
@@ -2123,6 +2132,11 @@ impl SemanticTrainingViewArena {
                 .map_err(|_| SemanticTransitionError::GenerationExhausted)?;
             let count = usize::try_from(group.member_count)
                 .map_err(|_| SemanticTransitionError::GenerationExhausted)?;
+            if group_members[start..start + count].iter().any(|&ordinal| {
+                row_bytes_identities[ordinal as usize].1.is_none()
+            }) {
+                return Err(input_error("every supervised-edit row requires its admitted original witness byte roots"));
+            }
             group_members[start..start + count]
                 .iter()
                 .map(|&ordinal| {
@@ -2131,7 +2145,8 @@ impl SemanticTrainingViewArena {
                         ordinal,
                         identity: row.identity,
                         source_identity: row.source_identity,
-                        bytes_identity: row_bytes_identities[ordinal as usize],
+                        bytes_identity: row_bytes_identities[ordinal as usize].0,
+                        edit_demonstration_material_roots: row_bytes_identities[ordinal as usize].1,
                         content_identity: row.content_identity,
                         origin: row.origin,
                     }

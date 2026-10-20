@@ -2959,7 +2959,7 @@ pub(super) fn model_context_activation_native_work_ceiling(
     Ok(ceiling)
 }
 
-fn repeat_native_ceiling(
+pub(super) fn repeat_native_ceiling(
     total: &mut [u64; 9],
     occurrence: [u64; 9],
     count: u64,
@@ -3079,6 +3079,10 @@ pub(super) fn policy_vjp_native_work_ceiling(
         component_count,                      // Original importance-weight receipt scan.
         ceiling_product(2, component_count)?, // Critic receipts and baselines.
         1,                                    // Critic term, including reached-refusal clearing.
+        if source.actor_refresh.as_ref().is_some_and(|staged| staged.proof.is_demonstration()) {
+            // Original choice, current choice, draw, and all retained key/counter/random words.
+            ceiling_product(13, component_count)?
+        } else { 0 },
     ])?;
     // Reached refusal clears four component coordinates; the normal actor path
     // visits at most eleven. Neither path can exceed this one output clear.
@@ -3208,7 +3212,7 @@ pub(super) fn update_canary_native_work_ceiling(
     Ok(ceiling)
 }
 
-fn publication_hash_ceiling(bytes: u64) -> Result<[u64; 9], SemanticTransitionError> {
+pub(super) fn publication_hash_ceiling(bytes: u64) -> Result<[u64; 9], SemanticTransitionError> {
     if bytes > u64::MAX / 8 {
         return Err(native_work_ceiling_overflow());
     }

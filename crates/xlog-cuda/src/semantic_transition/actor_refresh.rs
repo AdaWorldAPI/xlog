@@ -1,6 +1,6 @@
 use super::*;
 
-/// Native custody of an original actor row and one Update's actual input owners.
+/// Native custody of an original policy row and one Update's actual input owners.
 /// This proof does not claim that a pending model generation has executed.
 #[derive(Clone)]
 pub struct SemanticPreparedActorRefresh {
@@ -10,6 +10,24 @@ pub struct SemanticPreparedActorRefresh {
 impl SemanticPreparedActorRefresh {
     pub fn is_demonstration(&self) -> bool {
         self.inner.kind == SemanticSourceContentGeometryKind::CurrentDemonstration
+    }
+
+    pub(super) fn contribution_kind(&self) -> ImportedPolicyContributionKind {
+        if self.is_demonstration() { ImportedPolicyContributionKind::CurrentDemonstration }
+        else { ImportedPolicyContributionKind::CurrentActor }
+    }
+
+    pub(super) fn require_frozen_member<B: AsRef<[u8]>>(
+        &self, training: &SemanticSelectedTrainingView, row: &SemanticTrainingViewRow<B>,
+    ) -> Result<Option<usize>, SemanticTransitionError> {
+        if self.is_demonstration() {
+            if training.edit_group_member_index(self.inner.member.ordinal, row)?.is_none() {
+                return Err(SemanticTransitionError::ObservationMismatch);
+            }
+            Ok(None)
+        } else {
+            training.actor_group_member_index(self.inner.member.ordinal, row).map(Some)
+        }
     }
 }
 
@@ -446,6 +464,10 @@ impl ActorRefreshWork {
         budget: &SemanticReplayMaterialBudget,
     ) -> Result<Self, SemanticTransitionError> {
         let rows = members.len();
+        let observation_node = OwnedPublicationMaterial::tree_node_bound(
+            size_of::<(u64, SemanticSourceContentGeometryKind, u64)>(),
+            size_of::<PreparedActorRefreshCompletionObservations>(),
+        )?;
         let write_metadata = state_restoration::OriginalDeviceWrite::metadata_allocation_bytes::<
             ActorRefreshWorkEntry,
         >()
@@ -460,7 +482,8 @@ impl ActorRefreshWork {
                 size_of::<(SemanticSourceContentGeometryKind, u64)>()
                     + 2 * size_of::<Option<ActorRefreshObservedComponent>>()
                     + 2 * size_of::<bool>()
-                    + 4 * size_of::<ActorRefreshWorkEntry>(),
+                    + 4 * size_of::<ActorRefreshWorkEntry>()
+                    + observation_node,
             )
             .and_then(|bytes| bytes.checked_add(4 * size_of::<ActorRefreshWorkInput>()))
             .and_then(|bytes| bytes.checked_add(4 * write_metadata))
@@ -1091,6 +1114,10 @@ impl SemanticTransitionSession {
                 .as_ref()
                 .ok_or(SemanticTransitionError::NotBound)?,
         );
+        let preparation_node = OwnedPublicationMaterial::tree_node_bound(
+            size_of::<(u64, SemanticSourceContentGeometryKind, u64)>(),
+            size_of::<std::sync::Weak<PreparedActorRefreshOwner>>(),
+        )?;
         let metadata_bytes = training.actor_group_members().len()
             .checked_add(training.edit_group_members().len())
             .and_then(|count| count.checked_mul(size_of::<(SemanticSourceContentGeometryKind, u64)>()))
@@ -1103,7 +1130,7 @@ impl SemanticTransitionSession {
                 )
             })
             .and_then(|bytes| {
-                bytes.checked_add(size_of::<PreparedActorRefreshOwner>() + 8 * size_of::<usize>())
+                bytes.checked_add(size_of::<PreparedActorRefreshOwner>() + 8 * size_of::<usize>() + preparation_node)
             })
             .ok_or(SemanticTransitionError::GenerationExhausted)?;
         let material_reservation = content_geometry[0].material_budget().reserve_auxiliary(
@@ -3044,7 +3071,7 @@ impl SemanticTransitionSession {
         Ok(self.checked_actor_refresh_initializer_refusal()?.cloned())
     }
 
-    /// Retire the genuine fresh Proposal's final-use tape after the same outer
+    /// Retire the current actor or demonstration's final-use tape after the same outer
     /// execution and embedded observation. The backward pass was already
     /// recorded in that execution; this invokes only its canonical finisher.
     pub(super) fn finish_actor_refresh_policy_invocations(
