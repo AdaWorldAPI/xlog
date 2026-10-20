@@ -163,7 +163,8 @@ __device__ bool decode_plane(uint64_t address,uint64_t bytes,const Task& task,Pl
         const auto* words=reinterpret_cast<const uint64_t*>(&observation);
         if(observation.present>2 || observation.truth>3)return false;
         if(observation.present==2) {
-            if(observation.truth!=1 && observation.truth!=2)return false;
+            // The plane unions real verifier truths; each signed support is
+            // authenticated separately with one truth bit before publication.
             for(uint32_t word=0;word<4;++word)
                 if(observation.action[word]!=observation.intent[word])return false;
         }

@@ -540,10 +540,11 @@ impl TaskGroundLayout {
         for observation in bytes[64..self.query_offset].chunks_exact(144) {
             let present = u64::from_le_bytes(observation[..8].try_into().expect("presence word"));
             let truth = u64::from_le_bytes(observation[8..16].try_into().expect("truth word"));
-            if present > 1
+            if present > 2
                 || (present == 0 && observation.iter().any(|byte| *byte != 0))
-                || (present == 1
+                || (present != 0
                     && (truth > 3
+                        || (present == 2 && observation[48..80] != observation[80..112])
                         || observation[16..]
                             .chunks_exact(32)
                             .any(|identity| identity.iter().all(|byte| *byte == 0))))
