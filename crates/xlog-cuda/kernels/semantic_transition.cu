@@ -3600,6 +3600,19 @@ __device__ bool publication_pointer_span(uint64_t pointer,uint64_t bytes,uint64_
 __device__ bool publication_spans_overlap(uint64_t a,uint64_t a_bytes,uint64_t b,uint64_t b_bytes) {
     return a<b+b_bytes && b<a+a_bytes;
 }
+extern "C" __global__ void semantic_numerical_block_snapshot(uint64_t source_ptr,
+        uint64_t destination_ptr,uint64_t bytes,uint64_t native_work_ptr) {
+    if(blockIdx.x || threadIdx.x)return;
+    auto* work=reinterpret_cast<semantic_graph::NativeWorkTally*>(native_work_ptr);
+    semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::Command,1);
+    if(!publication_pointer_span(source_ptr,bytes,alignof(double)) ||
+       !publication_pointer_span(destination_ptr,bytes,alignof(double)) ||
+       publication_spans_overlap(source_ptr,bytes,destination_ptr,bytes)) {
+        semantic_content_integrity_trap();return;
+    }
+    publication_copy_bytes(reinterpret_cast<uint8_t*>(destination_ptr),
+        reinterpret_cast<const uint8_t*>(source_ptr),bytes,work);
+}
 __device__ bool publication_step_output_span(const PublicationControl& control,uint64_t lease,
         uint64_t bindings,uint64_t binding_bytes,uint64_t pointer,uint64_t bytes,
         semantic_graph::NativeWorkTally* work=nullptr) {
