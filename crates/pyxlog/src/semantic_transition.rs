@@ -63,6 +63,10 @@ mod model_context_checkpoint;
 pub(crate) mod model_context_continuation;
 #[cfg(feature = "semantic-policy")]
 pub(crate) mod model_evaluation;
+#[cfg(feature = "semantic-policy")]
+pub(crate) mod model_forward_stream;
+#[cfg(feature = "semantic-policy")]
+use model_forward_stream::PySemanticModelCanaryWitness;
 pub(crate) mod model_work_port;
 #[cfg(feature = "semantic-policy")]
 pub(crate) mod prepared_import;
@@ -4488,12 +4492,19 @@ fn update_measurements_report(
             .material
             .map(|receipt| -> PyResult<_> {
                 let payload = PyDict::new(py);
+                payload.set_item("abi", receipt.abi)?;
+                payload.set_item("availability", receipt.availability)?;
                 payload.set_item("role", receipt.role)?;
                 payload.set_item("generation", receipt.generation)?;
                 payload.set_item("work_sequence", receipt.work_sequence)?;
                 payload.set_item("scalar_type", receipt.scalar_type)?;
-                payload.set_item("dimensions", PyTuple::new(py, receipt.dimensions)?)?;
-                payload.set_item("strides_bytes", PyTuple::new(py, receipt.strides_bytes)?)?;
+                payload.set_item("stream_state", receipt.stream_state)?;
+                payload.set_item("row_count", receipt.row_count)?;
+                payload.set_item("capacity", receipt.capacity)?;
+                payload.set_item("vocabulary", receipt.vocabulary)?;
+                payload.set_item("block_positions", receipt.block_positions)?;
+                payload.set_item("row_seals", receipt.row_seals)?;
+                payload.set_item("finite", receipt.finite)?;
                 payload.set_item(
                     "model_geometry_digest",
                     PyBytes::new(py, receipt.model_geometry_digest.as_bytes()),
@@ -18305,7 +18316,6 @@ pub(crate) struct PySemanticTensorContentWitness {
 )]
 pub(crate) struct PySemanticModelForwardWitness {
     inner: SemanticModelForwardWitness,
-    _logits: Py<PyAny>,
     _session: Py<PySemanticTransitionSession>,
 }
 
@@ -24964,89 +24974,6 @@ impl PySemanticTransitionController {
     /// Native feedback outputs already carry their producer's original seal.
     /// Capturing those aliases verifies that seal and requires their original
     /// type, shape, interval and roster coordinate; it never reseals changed bytes.
-    /// Issue an opaque native receipt for one exact model-forward logits
-    /// occurrence while the producer's prepared bank capture is active.
-    #[pyo3(signature = (task_use, *, step, bank, role, logits, logits_layout, consumer_stream))]
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the forward receipt binds task authority, producer bank, role, logits geometry and stream"
-    )]
-    fn record_model_forward(
-        &self,
-        py: Python<'_>,
-        task_use: &PySemanticTransitionTaskUse,
-        step: &PySemanticPreparedStep,
-        bank: usize,
-        role: &str,
-        logits: &Bound<'_, PyAny>,
-        logits_layout: &Bound<'_, PyAny>,
-        consumer_stream: &Bound<'_, PyAny>,
-    ) -> PyResult<PySemanticModelForwardWitness> {
-        self.session.borrow(py).require_creator()?;
-        self.require_read_issued(task_use)?;
-        let role = match role {
-            "baseline" => 0,
-            "candidate" => 1,
-            _ => return Err(invalid("model forward role must be baseline or candidate")),
-        };
-        let mut budget = 16 * 1024 * 1024;
-        let stream = parse_witness_consumer_stream(consumer_stream, &mut budget)?;
-        let mut layout = parse_tensor_layout(&ColdValue::read(logits_layout, &mut budget, 0)?)?;
-        let parent = ContentStepRef::Prepared(step);
-        let expected = {
-            let session = self.session.borrow(py);
-            let owner = session.owner()?;
-            let state = self.continuation_state(py, task_use, parent, &owner, None)?;
-            step.require_recording_stream(&owner, stream)?;
-            self.continuation_binding(&state, parent, false)?
-        };
-        let check = || -> PyResult<()> {
-            let session = self.session.borrow(py);
-            let owner = session.owner()?;
-            let state = self.continuation_state(py, task_use, parent, &owner, None)?;
-            step.require_recording_stream(&owner, stream)?;
-            if self.continuation_binding(&state, parent, false)? != expected {
-                return Err(invalid(
-                    "prepared model-forward authority changed during producer handoff",
-                ));
-            }
-            Ok(())
-        };
-        let device = self.session.borrow(py).device_ordinal;
-        validate_producer_device_guarded(logits, device, &check)?;
-        layout.role = 0;
-        layout.index = role as u64;
-        let tensor = SemanticTensorInput {
-            tensor: crate::dlpack_from_py_for_stream_guarded(
-                logits,
-                i64::try_from(stream)
-                    .map_err(|_| invalid("consumer stream exceeds DLPack address space"))?,
-                &check,
-            )?,
-            layout,
-            logical_begin: 0,
-            logical_end: 0,
-            native_allocation: None,
-        };
-        let session = self.session.borrow(py);
-        let mut owner = session.owner()?;
-        let state = self.continuation_state(py, task_use, parent, &owner, None)?;
-        step.require_recording_stream(&owner, stream)?;
-        if self.continuation_binding(&state, parent, false)? != expected {
-            return Err(invalid(
-                "prepared model-forward authority changed before native receipt recording",
-            ));
-        }
-        let inner = owner
-            .record_prepared_model_forward(&step.inner, bank, role, tensor, stream)
-            .map_err(xlog_err)?;
-        drop(state);
-        Ok(PySemanticModelForwardWitness {
-            inner,
-            _logits: logits.clone().unbind(),
-            _session: self.session.clone_ref(py),
-        })
-    }
 
     #[pyo3(signature = (task_use, *, parent, tensors, consumer_stream, occurrence=None))]
     fn capture_tensor_content(
@@ -25239,14 +25166,15 @@ impl PySemanticTransitionController {
     /// update. The transient witness covers allocations, typed model views,
     /// Bool8[1] numerical admissibility. ``baseline_forward`` and
     /// ``candidate_forward`` are opaque witnesses issued only by
-    /// ``record_model_forward`` at the two actual producer sites. They retain
-    /// contiguous F16, BF16 or F32 ``[rows, capacity, vocabulary]`` logits and
-    /// native receipts that join the exact work occurrence, generation, model
-    /// seal and logits digest; this final handoff cannot assign roles by argument
-    /// position or substitute new tensors.
+    /// each stream's ``finish`` at the two actual producer sites. They retain
+    /// the bounded original scratch and complete native coverage receipts, not
+    /// dense logits. ``canary_comparison`` binds the original five paired
+    /// re-forwards to those exact full-forward row seals; this final handoff
+    /// cannot assign roles by argument position or substitute new tensors.
     /// XLOG computes every canary measurement, resource tally and refusal on device.
     /// ``bank`` identifies the recorded branch that owns these original outputs.
-    #[pyo3(signature = (task_use, *, step, bank, tensors, model_allocations, model_storages, model_views, numerical_admissibility, slab_backing, slab_bytes, baseline_forward, candidate_forward, allocation_witness, consumer_stream))]
+    #[cfg(feature = "semantic-policy")]
+    #[pyo3(signature = (task_use, *, step, bank, tensors, model_allocations, model_storages, model_views, numerical_admissibility, slab_backing, slab_bytes, baseline_forward, candidate_forward, canary_comparison, allocation_witness, consumer_stream))]
     #[expect(
         clippy::too_many_arguments,
         reason = "prepared update binding retains model geometry and numerical admissibility"
@@ -25266,6 +25194,7 @@ impl PySemanticTransitionController {
         slab_bytes: &Bound<'_, PyAny>,
         baseline_forward: &PySemanticModelForwardWitness,
         candidate_forward: &PySemanticModelForwardWitness,
+        canary_comparison: &PySemanticModelCanaryWitness,
         allocation_witness: &PySemanticTensorContentWitness,
         consumer_stream: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
@@ -25410,6 +25339,7 @@ impl PySemanticTransitionController {
                 slab_backing,
                 &baseline_forward.inner,
                 &candidate_forward.inner,
+                &canary_comparison.inner,
                 &allocation_witness.inner,
                 stream,
             )

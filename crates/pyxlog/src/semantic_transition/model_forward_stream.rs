@@ -5,7 +5,7 @@ use xlog_cuda::{
     SemanticModelCanaryStream, SemanticModelCanaryWitness, SemanticModelForwardStream,
 };
 
-#[pyclass(name = "SemanticModelForwardStream", module = "pyxlog", frozen)]
+#[pyclass(name = "SemanticModelForwardStream", module = "pyxlog._native", frozen)]
 pub(crate) struct PySemanticModelForwardStream {
     pub(super) inner: SemanticModelForwardStream,
     source: ModelForwardSource,
@@ -16,7 +16,7 @@ enum ModelForwardSource {
     Evaluation(Py<model_evaluation::PySemanticModelEvaluation>),
 }
 
-#[pyclass(name = "SemanticModelCanaryStream", module = "pyxlog", frozen)]
+#[pyclass(name = "SemanticModelCanaryStream", module = "pyxlog._native", frozen)]
 pub(crate) struct PySemanticModelCanaryStream {
     inner: SemanticModelCanaryStream,
     step: Py<PySemanticPreparedStep>,
@@ -24,7 +24,7 @@ pub(crate) struct PySemanticModelCanaryStream {
     candidate: Py<PySemanticModelForwardStream>,
 }
 
-#[pyclass(name = "SemanticModelCanaryWitness", module = "pyxlog", frozen)]
+#[pyclass(name = "SemanticModelCanaryWitness", module = "pyxlog._native", frozen)]
 pub(crate) struct PySemanticModelCanaryWitness {
     pub(super) inner: SemanticModelCanaryWitness,
     _session: Py<PySemanticTransitionSession>,

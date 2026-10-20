@@ -1880,6 +1880,7 @@ impl SemanticTransitionSession {
         consumer_stream: u64,
     ) -> Result<(), SemanticTransitionError> {
         self.require_model_forward_stream(step, &stream.owner.forwards[0], consumer_stream)?;
+        self.require_model_forward_stream(step, &stream.owner.forwards[1], consumer_stream)?;
         if !Arc::ptr_eq(&stream.issuer, &self.publication_issuer)
             || stream.reader_token != step.token
         {
@@ -1898,6 +1899,18 @@ impl SemanticTransitionSession {
         if original.is_none_or(|original| !Arc::ptr_eq(&original.owner, &stream.owner)) {
             return Err(publication_input_error(
                 "paired canary stream is not the original native bank owner",
+            ));
+        }
+        if self.steps[&step.token]
+            .prepared
+            .as_ref()
+            .expect("checked step")
+            .training_view
+            .as_ref()
+            .is_none_or(|view| view.canary_rows() != stream.owner.canary_rows)
+        {
+            return Err(publication_input_error(
+                "paired canary rows changed from their original native roster",
             ));
         }
         Ok(())
