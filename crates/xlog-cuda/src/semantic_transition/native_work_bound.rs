@@ -3488,7 +3488,7 @@ pub(super) fn continuation_preparation_geometry_native_work_ceiling(
             ceiling_sum([
                 64,
                 2 * size_of::<PublicationRange>() as u64 + 5 * 8,
-                ceiling_product(rows, size_of::<ActiveRow>() as u64)?,
+                ceiling_product(rows, size_of::<SemanticActiveRow>() as u64)?,
                 size_of::<PendingContinuation>() as u64 - 3 * 8,
                 ceiling_product(p, 2 * 8)?,
                 size_of::<PublicationRange>() as u64 + 2 * 8,
