@@ -227,7 +227,7 @@ fn full_forward_native_work_ceiling(
         size_of::<ModelForwardReceipt>() as u64 - 32,
         1,
     )?;
-    if role == 0 {
+    if role != 1 {
         stream_work_events(&mut ceiling, 0, 0, 0, 32, 1)?;
     } else {
         let ranges = &storage.bank_templates[0];
@@ -255,6 +255,41 @@ fn full_forward_native_work_ceiling(
             1,
         )?;
     }
+    native_work_bound::native_work_ceiling_units(ceiling)?;
+    Ok(ceiling)
+}
+
+pub(super) fn evaluation_forward_native_work_ceiling(
+    storage: &PublicationStorage,
+    geometry: StreamGeometry,
+) -> Result<[u64; 9], SemanticTransitionError> {
+    full_forward_native_work_ceiling(storage, geometry, 2)
+}
+
+/// Authenticate the same completed forward and the three original output seals.
+/// These bounds follow the fixed identity/merge loops in the shared GPU owner;
+/// hashing uses the canonical padding and tariff helpers above.
+pub(super) fn evaluation_forward_binding_native_work_ceiling(
+    verify: bool,
+) -> Result<[u64; 9], SemanticTransitionError> {
+    let mut ceiling = [0; 9];
+    stream_work_events(
+        &mut ceiling,
+        1,
+        if verify { 66 } else { 64 },
+        0,
+        size_of::<ModelForwardStreamState>() as u64
+            + size_of::<ModelForwardReceipt>() as u64
+            + 168
+            + if verify { 9 } else { 128 },
+        1,
+    )?;
+    stream_work_hash(
+        &mut ceiling,
+        size_of::<ModelForwardReceipt>() as u64 - 32,
+        1,
+    )?;
+    stream_work_hash(&mut ceiling, 136, 1)?;
     native_work_bound::native_work_ceiling_units(ceiling)?;
     Ok(ceiling)
 }
@@ -494,29 +529,29 @@ pub(super) struct ModelCanaryStreamReceipt {
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct ModelForwardStreamInputs {
-    control: u64,
-    lease: u64,
-    selection: u64,
-    state: u64,
-    row_seals: u64,
-    receipt: u64,
-    row_count: u64,
-    capacity: u64,
-    vocabulary: u64,
-    scalar_type: u64,
-    block_positions: u64,
-    role: u64,
-    row: u64,
-    position_begin: u64,
-    count: u64,
-    logits: u64,
-    position_stride_bytes: u64,
-    candidate_seals: u64,
-    candidate_seal_count: u64,
-    work_sequence: u64,
-    leaf_scratch: u64,
-    leaf_capacity: u64,
+pub(super) struct ModelForwardStreamInputs {
+    pub(super) control: u64,
+    pub(super) lease: u64,
+    pub(super) selection: u64,
+    pub(super) state: u64,
+    pub(super) row_seals: u64,
+    pub(super) receipt: u64,
+    pub(super) row_count: u64,
+    pub(super) capacity: u64,
+    pub(super) vocabulary: u64,
+    pub(super) scalar_type: u64,
+    pub(super) block_positions: u64,
+    pub(super) role: u64,
+    pub(super) row: u64,
+    pub(super) position_begin: u64,
+    pub(super) count: u64,
+    pub(super) logits: u64,
+    pub(super) position_stride_bytes: u64,
+    pub(super) candidate_seals: u64,
+    pub(super) candidate_seal_count: u64,
+    pub(super) work_sequence: u64,
+    pub(super) leaf_scratch: u64,
+    pub(super) leaf_capacity: u64,
 }
 
 #[repr(C)]
@@ -590,16 +625,16 @@ const _: () = assert!(size_of::<ModelCanaryStreamReceipt>() == 200);
 const _: () = assert!(size_of::<ModelCanaryStreamInputs>() == 232);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct StreamGeometry {
-    rows: u64,
-    capacity: u64,
-    vocabulary: u64,
-    scalar_type: u64,
-    block_positions: u64,
+pub(super) struct StreamGeometry {
+    pub(super) rows: u64,
+    pub(super) capacity: u64,
+    pub(super) vocabulary: u64,
+    pub(super) scalar_type: u64,
+    pub(super) block_positions: u64,
 }
 
 impl StreamGeometry {
-    fn new(
+    pub(super) fn new(
         rows: usize,
         capacity: usize,
         vocabulary: u64,
@@ -712,15 +747,24 @@ struct StreamRecording {
 pub struct SemanticModelForwardStream {
     issuer: Arc<()>,
     reader_token: u64,
-    bank: usize,
+    origin: ModelForwardStreamOrigin,
     role: usize,
     owner: Arc<ModelForwardStreamStorage>,
+}
+
+#[derive(Clone)]
+pub(super) enum ModelForwardStreamOrigin {
+    Update { bank: usize },
+    Evaluation(model_evaluation::SemanticModelEvaluation),
 }
 
 pub(super) struct ModelForwardStreamStorage {
     state: TrackedCudaSlice<ModelForwardStreamState>,
     row_seals: TrackedCudaSlice<u64>,
     leaves: TrackedCudaSlice<ModelStreamLeaf>,
+    // Evaluation has no prepared Update receipt bank. It owns one genuine
+    // receipt in the same stream storage, retained through original retirement.
+    evaluation_receipt: Option<TrackedCudaSlice<ModelForwardReceipt>>,
     geometry: StreamGeometry,
     native_work_ceiling: [u64; 9],
     kernels: [CudaFunction; 4],
@@ -732,6 +776,73 @@ pub(super) struct ModelForwardStreamStorage {
 impl SemanticModelForwardStream {
     pub fn role(&self) -> usize {
         self.role
+    }
+
+    pub fn bank(&self) -> Option<usize> {
+        match &self.origin {
+            ModelForwardStreamOrigin::Update { bank } => Some(*bank),
+            ModelForwardStreamOrigin::Evaluation(_) => None,
+        }
+    }
+
+    pub fn geometry(&self) -> (u64, u64, u64, u64, u64) {
+        let geometry = self.owner.geometry;
+        (
+            geometry.rows,
+            geometry.capacity,
+            geometry.vocabulary,
+            geometry.scalar_type,
+            geometry.block_positions,
+        )
+    }
+
+    fn update_bank(&self) -> Result<usize, SemanticTransitionError> {
+        self.bank().ok_or_else(|| {
+            publication_input_error("evaluation forward has no prepared Update bank")
+        })
+    }
+
+    pub(super) fn belongs_to_evaluation(
+        &self,
+        handle: &model_evaluation::SemanticModelEvaluation,
+    ) -> bool {
+        matches!(&self.origin, ModelForwardStreamOrigin::Evaluation(original)
+            if original.same_invocation(handle))
+    }
+
+    pub(super) fn same_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.issuer, &other.issuer)
+            && self.reader_token == other.reader_token
+            && Arc::ptr_eq(&self.owner, &other.owner)
+    }
+
+    pub(super) fn evaluation_receipt_pointer(&self) -> Result<u64, SemanticTransitionError> {
+        self.owner
+            .evaluation_receipt
+            .as_ref()
+            .map(TrackedCudaSlice::device_ptr_value)
+            .ok_or(SemanticTransitionError::ObservationMismatch)
+    }
+
+    pub(super) fn require_finished_scratch(
+        &self,
+    ) -> Result<PreparedSemanticTensor, SemanticTransitionError> {
+        let recording = self
+            .owner
+            .recording
+            .lock()
+            .map_err(|_| SemanticTransitionError::ObservationMismatch)?;
+        if recording.phase != 2
+            || recording.row != self.owner.geometry.rows
+            || recording.position != 0
+        {
+            return Err(publication_input_error(
+                "model forward requires its complete original producer finish",
+            ));
+        }
+        recording.scratch[0]
+            .clone()
+            .ok_or(SemanticTransitionError::ObservationMismatch)
     }
 
     pub(super) fn state_pointer(&self) -> u64 {
@@ -748,6 +859,33 @@ impl SemanticModelForwardStream {
 
     pub(super) fn native_work_ceiling(&self) -> [u64; 9] {
         self.owner.native_work_ceiling
+    }
+
+    pub(super) fn inputs(
+        &self,
+        control: u64,
+        lease: u64,
+        selection: u64,
+        receipt: u64,
+    ) -> ModelForwardStreamInputs {
+        let geometry = self.owner.geometry;
+        ModelForwardStreamInputs {
+            control,
+            lease,
+            selection,
+            receipt,
+            state: self.state_pointer(),
+            row_seals: self.row_seals_pointer(),
+            row_count: geometry.rows,
+            capacity: geometry.capacity,
+            vocabulary: geometry.vocabulary,
+            scalar_type: geometry.scalar_type,
+            block_positions: geometry.block_positions,
+            role: self.role as u64,
+            leaf_scratch: self.owner.leaves.device_ptr_value(),
+            leaf_capacity: self.owner.leaves.len() as u64,
+            ..Default::default()
+        }
     }
 
     pub(super) fn record(
@@ -842,6 +980,9 @@ impl ModelForwardStreamStorage {
         recorder.read_write(&self.state);
         recorder.read_write(&self.row_seals);
         recorder.read_write(&self.leaves);
+        if let Some(receipt) = &self.evaluation_receipt {
+            recorder.read_write(receipt);
+        }
         for tensor in self
             .recording
             .lock()
@@ -904,7 +1045,7 @@ impl SemanticTransitionSession {
         let forwards = [&baseline.stream, &candidate.stream];
         for (role, forward) in forwards.iter().enumerate() {
             self.require_model_forward_stream(step, forward, consumer_stream)?;
-            if forward.bank != bank || forward.role != role {
+            if forward.bank() != Some(bank) || forward.role != role {
                 return Err(publication_input_error(
                     "model update changed an original full-forward bank or role",
                 ));
@@ -1021,6 +1162,35 @@ impl SemanticTransitionSession {
         let native_work_ceiling =
             full_forward_native_work_ceiling(self.prepared_publication()?, geometry, role)?;
         self.require_model_stream_cold_allowance(step)?;
+        let stream = self.allocate_model_forward_stream(
+            step.token,
+            ModelForwardStreamOrigin::Update { bank },
+            role,
+            geometry,
+            native_work_ceiling,
+        )?;
+        self.steps
+            .get_mut(&step.token)
+            .expect("checked step")
+            .prepared
+            .as_mut()
+            .expect("checked prepared owner")
+            .branches[bank]
+            .model_update
+            .as_mut()
+            .expect("checked original update")
+            .forward_streams[role] = Some(stream.clone());
+        Ok(stream)
+    }
+
+    pub(super) fn allocate_model_forward_stream(
+        &mut self,
+        reader_token: u64,
+        origin: ModelForwardStreamOrigin,
+        role: usize,
+        geometry: StreamGeometry,
+        native_work_ceiling: [u64; 9],
+    ) -> Result<SemanticModelForwardStream, SemanticTransitionError> {
         let kernel_names = [
             "semantic_model_forward_stream_begin",
             "semantic_model_forward_stream_block_leaves",
@@ -1030,7 +1200,7 @@ impl SemanticTransitionSession {
         let [begin, leaves, fold, finish] = kernel_names.map(|name| self.model_stream_kernel(name));
         let kernels = [begin?, leaves?, fold?, finish?];
         let host_bytes = size_of::<ModelForwardStreamStorage>()
-            .checked_add(4 * size_of::<usize>())
+            .checked_add(size_of::<SemanticModelForwardStream>())
             .and_then(|bytes| bytes.checked_add(2 * size_of::<PreparedSemanticTensor>()))
             .ok_or(SemanticTransitionError::GenerationExhausted)?;
         let host = self
@@ -1038,6 +1208,7 @@ impl SemanticTransitionSession {
             .as_ref()
             .map(|budget| budget.reserve(host_bytes as u64))
             .transpose()?;
+        let evaluation = matches!(&origin, ModelForwardStreamOrigin::Evaluation(_));
         let row_cells = usize::try_from(geometry.rows)
             .ok()
             .and_then(|rows| rows.checked_mul(4))
@@ -1051,6 +1222,13 @@ impl SemanticTransitionSession {
                     .ok()
                     .and_then(|leaves| leaves.checked_mul(size_of::<ModelStreamLeaf>()))
                     .and_then(|leaves| bytes.checked_add(leaves))
+            })
+            .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        let bytes = bytes
+            .checked_add(if evaluation {
+                size_of::<ModelForwardReceipt>()
+            } else {
+                0
             })
             .ok_or(SemanticTransitionError::GenerationExhausted)?;
         let mut reservation = self
@@ -1068,31 +1246,26 @@ impl SemanticTransitionSession {
             leaves: reservation
                 .alloc(geometry.leaf_capacity()?)
                 .map_err(|error| runtime_error("model forward leaf allocation", error))?,
+            evaluation_receipt: if evaluation {
+                Some(reservation.alloc(1).map_err(|error| {
+                    runtime_error("evaluation forward receipt allocation", error)
+                })?)
+            } else {
+                None
+            },
             geometry,
             native_work_ceiling,
             kernels,
             recording: Mutex::new(StreamRecording::default()),
             _host_reservation: host,
         });
-        let stream = SemanticModelForwardStream {
+        Ok(SemanticModelForwardStream {
             issuer: Arc::clone(&self.publication_issuer),
-            reader_token: step.token,
-            bank,
+            reader_token,
+            origin,
             role,
             owner,
-        };
-        self.steps
-            .get_mut(&step.token)
-            .expect("checked step")
-            .prepared
-            .as_mut()
-            .expect("checked prepared owner")
-            .branches[bank]
-            .model_update
-            .as_mut()
-            .expect("checked original update")
-            .forward_streams[role] = Some(stream.clone());
-        Ok(stream)
+        })
     }
 
     pub fn begin_model_forward_stream(
@@ -1106,15 +1279,24 @@ impl SemanticTransitionSession {
             .prepared
             .as_ref()
             .expect("checked step")
-            .branches[stream.bank]
-            .model_update
-            .as_ref()
-            .expect("checked update");
+            .branches[stream.update_bank()?]
+        .model_update
+        .as_ref()
+        .expect("checked update");
         if update.forward_recorded != stream.role as u8 {
             return Err(publication_input_error(
                 "full forwards begin in original baseline then candidate order",
             ));
         }
+        let inputs = self.model_forward_stream_inputs(step, stream)?;
+        self.begin_model_forward_stream_inner(stream, inputs)
+    }
+
+    pub(super) fn begin_model_forward_stream_inner(
+        &mut self,
+        stream: &SemanticModelForwardStream,
+        inputs: ModelForwardStreamInputs,
+    ) -> Result<(), SemanticTransitionError> {
         {
             let mut recording = stream
                 .owner
@@ -1128,7 +1310,6 @@ impl SemanticTransitionSession {
             }
             recording.phase = 1;
         }
-        let inputs = self.model_forward_stream_inputs(step, stream)?;
         self.enqueue_model_forward_stream(stream, 0, inputs)
     }
 
@@ -1147,6 +1328,26 @@ impl SemanticTransitionSession {
         consumer_stream: u64,
     ) -> Result<(), SemanticTransitionError> {
         self.require_model_forward_stream(step, stream, consumer_stream)?;
+        let inputs = self.model_forward_stream_inputs(step, stream)?;
+        self.record_model_forward_stream_block_inner(
+            stream,
+            row,
+            position_begin,
+            count,
+            logits,
+            inputs,
+        )
+    }
+
+    pub(super) fn record_model_forward_stream_block_inner(
+        &mut self,
+        stream: &SemanticModelForwardStream,
+        row: u64,
+        position_begin: u64,
+        count: u64,
+        logits: SemanticTensorInput,
+        mut inputs: ModelForwardStreamInputs,
+    ) -> Result<(), SemanticTransitionError> {
         let mut tensors = prepare_semantic_tensors(&self.provider, vec![logits])?;
         let tensor = tensors
             .pop()
@@ -1183,7 +1384,7 @@ impl SemanticTransitionSession {
                 ));
             }
             geometry.require_block(&tensor, stream.role, count)?;
-            self.require_stream_scratch_disjoint(&tensor)?;
+            self.require_stream_scratch_disjoint(stream, &tensor)?;
             recording.position += count;
             if recording.position == geometry.capacity {
                 recording.position = 0;
@@ -1195,7 +1396,6 @@ impl SemanticTransitionSession {
             self.poisoned = true;
         }
         result?;
-        let mut inputs = self.model_forward_stream_inputs(step, stream)?;
         inputs.row = row;
         inputs.position_begin = position_begin;
         inputs.count = count;
@@ -1226,6 +1426,48 @@ impl SemanticTransitionSession {
                 ));
             }
         }
+        let mut inputs = self.model_forward_stream_inputs(step, stream)?;
+        let prepared = self.steps[&step.token]
+            .prepared
+            .as_ref()
+            .expect("checked step");
+        inputs.work_sequence = prepared
+            .model_work
+            .as_ref()
+            .expect("checked active model work")
+            .next_slot()
+            .map_err(publication_input_error)? as u64;
+        if inputs.work_sequence == 0 {
+            return Err(publication_input_error(
+                "full forward finish requires its actual producer model work",
+            ));
+        }
+        let witness = self.finish_model_forward_stream_inner(stream, allocation_witness, inputs)?;
+        self.steps
+            .get_mut(&step.token)
+            .expect("checked step")
+            .prepared
+            .as_mut()
+            .expect("checked prepared owner")
+            .branches[stream.update_bank()?]
+        .model_update
+        .as_mut()
+        .expect("checked original update")
+        .forward_recorded += 1;
+        Ok(witness)
+    }
+
+    pub(super) fn finish_model_forward_stream_inner(
+        &mut self,
+        stream: &SemanticModelForwardStream,
+        allocation_witness: Option<&SemanticTensorContentWitness>,
+        inputs: ModelForwardStreamInputs,
+    ) -> Result<SemanticModelForwardWitness, SemanticTransitionError> {
+        if inputs.work_sequence == 0 {
+            return Err(publication_input_error(
+                "full forward finish requires its actual producer model work",
+            ));
+        }
         {
             let mut recording = stream
                 .owner
@@ -1243,41 +1485,8 @@ impl SemanticTransitionSession {
             recording.candidate_content = allocation_witness.cloned();
             recording.phase = 2;
         }
-        let mut inputs = self.model_forward_stream_inputs(step, stream)?;
-        let prepared = self.steps[&step.token]
-            .prepared
-            .as_ref()
-            .expect("checked step");
-        inputs.work_sequence = prepared
-            .model_work
-            .as_ref()
-            .expect("checked active model work")
-            .next_slot()
-            .map_err(publication_input_error)? as u64;
-        if inputs.work_sequence == 0 {
-            return Err(publication_input_error(
-                "full forward finish requires its actual producer model work",
-            ));
-        }
         self.enqueue_model_forward_stream(stream, 2, inputs)?;
-        self.steps
-            .get_mut(&step.token)
-            .expect("checked step")
-            .prepared
-            .as_mut()
-            .expect("checked prepared owner")
-            .branches[stream.bank]
-            .model_update
-            .as_mut()
-            .expect("checked original update")
-            .forward_recorded += 1;
-        Ok(SemanticModelForwardWitness {
-            issuer: Arc::clone(&self.publication_issuer),
-            reader_token: step.token,
-            bank: stream.bank,
-            role: stream.role,
-            stream: stream.clone(),
-        })
+        Ok(SemanticModelForwardWitness::from_stream(stream.clone()))
     }
 
     pub fn prepare_model_canary_stream(
@@ -1291,7 +1500,7 @@ impl SemanticTransitionSession {
         self.require_prepared_structure_mutable()?;
         for (role, forward) in [(0, baseline), (1, candidate)] {
             self.require_model_forward_stream_identity(step, forward)?;
-            if forward.bank != bank || forward.role != role {
+            if forward.bank() != Some(bank) || forward.role != role {
                 return Err(publication_input_error("paired canaries require the original baseline and candidate streams of this bank"));
             }
         }
@@ -1508,7 +1717,7 @@ impl SemanticTransitionSession {
             }
             for (role, tensor) in tensors.iter().enumerate() {
                 geometry.require_block(tensor, role, count)?;
-                self.require_stream_scratch_disjoint(tensor)?;
+                self.require_stream_scratch_disjoint(&stream.owner.forwards[role], tensor)?;
                 if let Some(original) = &recording.scratch[role] {
                     if original.data != tensor.data {
                         return Err(publication_input_error(
@@ -1594,10 +1803,15 @@ impl SemanticTransitionSession {
         &self,
         step: &SemanticPreparedStep,
     ) -> Result<(), SemanticTransitionError> {
-        let allowance = self.cold_native_allowance(step.token)?.ok_or_else(|| {
-            publication_input_error(
-                "model stream allocation requires its original Update cold allowance",
-            )
+        self.require_model_stream_cold_allowance_token(step.token)
+    }
+
+    pub(super) fn require_model_stream_cold_allowance_token(
+        &self,
+        token: u64,
+    ) -> Result<(), SemanticTransitionError> {
+        let allowance = self.cold_native_allowance(token)?.ok_or_else(|| {
+            publication_input_error("model stream allocation requires its original cold allowance")
         })?;
         let allowance = allowance
             .lock()
@@ -1613,7 +1827,7 @@ impl SemanticTransitionSession {
         self.checked_prepared_step(step, false)?;
         if !Arc::ptr_eq(&stream.issuer, &self.publication_issuer)
             || stream.reader_token != step.token
-            || stream.bank > 1
+            || stream.bank().is_none_or(|bank| bank > 1)
             || stream.role > 1
         {
             return Err(publication_input_error(
@@ -1624,10 +1838,10 @@ impl SemanticTransitionSession {
             .prepared
             .as_ref()
             .expect("checked step")
-            .branches[stream.bank]
-            .model_update
-            .as_ref()
-            .and_then(|update| update.forward_streams[stream.role].as_ref());
+            .branches[stream.update_bank()?]
+        .model_update
+        .as_ref()
+        .and_then(|update| update.forward_streams[stream.role].as_ref());
         if original.is_none_or(|original| !Arc::ptr_eq(&original.owner, &stream.owner)) {
             return Err(publication_input_error(
                 "model forward stream is not the original native bank owner",
@@ -1650,7 +1864,7 @@ impl SemanticTransitionSession {
             .expect("checked step")
             .model_work
             .as_ref()
-            .is_none_or(|work| work.capture_bank != Some(stream.bank))
+            .is_none_or(|work| work.capture_bank != stream.bank())
         {
             return Err(publication_input_error(
                 "model stream requires its original active producer bank capture",
@@ -1689,12 +1903,13 @@ impl SemanticTransitionSession {
         Ok(())
     }
 
-    fn require_stream_scratch_disjoint(
+    pub(super) fn require_stream_scratch_disjoint(
         &self,
+        stream: &SemanticModelForwardStream,
         tensor: &PreparedSemanticTensor,
     ) -> Result<(), SemanticTransitionError> {
         let bytes = tensor_layout_bytes(&tensor.layout)?;
-        for owned in &self.prepared_publication()?.allocations {
+        for owned in &self.model_forward_stream_publication(stream)?.allocations {
             if step_input_overlap(
                 tensor.data,
                 bytes,
@@ -1719,7 +1934,7 @@ impl SemanticTransitionSession {
             .prepared
             .as_ref()
             .expect("checked step");
-        let update = prepared.branches[stream.bank]
+        let update = prepared.branches[stream.update_bank()?]
             .model_update
             .as_ref()
             .expect("checked update");
@@ -1800,6 +2015,19 @@ impl SemanticTransitionSession {
         })
     }
 
+    fn model_forward_stream_publication(
+        &self,
+        stream: &SemanticModelForwardStream,
+    ) -> Result<&Arc<PublicationStorage>, SemanticTransitionError> {
+        match &stream.origin {
+            ModelForwardStreamOrigin::Update { .. } => self.prepared_publication(),
+            ModelForwardStreamOrigin::Evaluation(_) => self
+                .publication
+                .as_ref()
+                .ok_or(SemanticTransitionError::NotBound),
+        }
+    }
+
     fn enqueue_model_forward_stream(
         &mut self,
         stream: &SemanticModelForwardStream,
@@ -1807,46 +2035,54 @@ impl SemanticTransitionSession {
         inputs: ModelForwardStreamInputs,
     ) -> Result<(), SemanticTransitionError> {
         let mut recorder = self.domain.new_strict_recorder();
-        self.prepared_publication()?.record(&mut recorder);
+        self.model_forward_stream_publication(stream)?
+            .record(&mut recorder);
         stream.owner.record(&mut recorder)?;
-        let prepared = self.steps[&stream.reader_token]
-            .prepared
-            .as_ref()
-            .expect("checked step");
-        recorder.read(&prepared.reader);
-        recorder.read(
-            &prepared
-                .training_view
-                .as_ref()
-                .expect("checked training view")
-                .selection(),
-        );
-        let update = prepared.branches[stream.bank]
-            .model_update
-            .as_ref()
-            .expect("checked update");
-        recorder.read(&update.forward_seals);
-        recorder.read_write(&update.forward_receipts);
-        if operation == 2 && stream.role == 1 {
-            let recording = stream
-                .owner
-                .recording
-                .lock()
-                .map_err(|_| SemanticTransitionError::ObservationMismatch)?;
-            let witness = recording
-                .candidate_content
-                .as_ref()
-                .ok_or(SemanticTransitionError::ObservationMismatch)?;
-            let TensorContentSeals::Captured(digests) =
-                &self.steps[&stream.reader_token].content[witness.index].seals
-            else {
-                return Err(SemanticTransitionError::ObservationMismatch);
-            };
-            // The metadata array contains device addresses, not ownership.
-            // Record every genuine original output digest allocation as a read.
-            for index in 0..digests.len() {
-                let (_, cells) = captured_tensor_digest_pointer(digests, index)?;
-                recorder.read(cells.as_ref());
+        match &stream.origin {
+            ModelForwardStreamOrigin::Update { .. } => {
+                let prepared = self.steps[&stream.reader_token]
+                    .prepared
+                    .as_ref()
+                    .expect("checked step");
+                recorder.read(&prepared.reader);
+                recorder.read(
+                    &prepared
+                        .training_view
+                        .as_ref()
+                        .expect("checked training view")
+                        .selection(),
+                );
+                let update = prepared.branches[stream.update_bank()?]
+                    .model_update
+                    .as_ref()
+                    .expect("checked update");
+                recorder.read(&update.forward_seals);
+                recorder.read_write(&update.forward_receipts);
+                if operation == 2 && stream.role == 1 {
+                    let recording = stream
+                        .owner
+                        .recording
+                        .lock()
+                        .map_err(|_| SemanticTransitionError::ObservationMismatch)?;
+                    let witness = recording
+                        .candidate_content
+                        .as_ref()
+                        .ok_or(SemanticTransitionError::ObservationMismatch)?;
+                    let TensorContentSeals::Captured(digests) =
+                        &self.steps[&stream.reader_token].content[witness.index].seals
+                    else {
+                        return Err(SemanticTransitionError::ObservationMismatch);
+                    };
+                    // The metadata array contains device addresses, not ownership.
+                    // Record every genuine original output digest allocation as a read.
+                    for index in 0..digests.len() {
+                        let (_, cells) = captured_tensor_digest_pointer(digests, index)?;
+                        recorder.read(cells.as_ref());
+                    }
+                }
+            }
+            ModelForwardStreamOrigin::Evaluation(handle) => {
+                self.record_evaluation_model_stream_dependencies(handle, stream, &mut recorder)?;
             }
         }
         let leaf_grid = if operation == 1 {
@@ -1862,7 +2098,7 @@ impl SemanticTransitionSession {
         };
         let result = enqueue_recorded(&self.domain, &mut self.poisoned, recorder, |enqueue| {
             // SAFETY: all native buffers and the single genuine producer scratch
-            // are retained by the original prepared bank through its known wait.
+            // are retained by the original invocation through its known wait.
             if operation == 1 {
                 unsafe {
                     stream.owner.kernels[1].clone().launch_in(

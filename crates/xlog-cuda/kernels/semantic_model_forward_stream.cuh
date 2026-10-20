@@ -171,7 +171,7 @@ __device__ void semantic_stream_copy_identity(uint64_t* destination,const uint64
 extern "C" __global__ void semantic_model_forward_stream_begin(ModelForwardStreamInputs inputs) {
     if(blockIdx.x || threadIdx.x)return;
     if(!inputs.control || !inputs.lease || !inputs.selection || !inputs.state ||
-       !inputs.row_seals || !inputs.receipt || inputs.role>1 || !inputs.row_count ||
+       !inputs.row_seals || !inputs.receipt || inputs.role>2 || !inputs.row_count ||
        !inputs.capacity || !inputs.vocabulary || !inputs.block_positions ||
        (inputs.scalar_type!=4 && inputs.scalar_type!=5 && inputs.scalar_type!=6)) {
         semantic_content_integrity_trap();return;
@@ -186,13 +186,13 @@ extern "C" __global__ void semantic_model_forward_stream_begin(ModelForwardStrea
     const auto* base=publication_acquired_bank(control,lease,&state.work);
     const auto& selection=*reinterpret_cast<const SemanticTrainingViewSelection*>(inputs.selection);
     if(!base || publication_validate_selected_model(control,*base,&state.work) ||
-       base->header.model_generation>=UINT32_MAX || selection.status ||
+       (inputs.role!=2 && base->header.model_generation>=UINT32_MAX) || selection.status ||
        !selection.row_count || selection.row_count>inputs.row_count ||
        selection.capacity!=inputs.capacity) { semantic_content_integrity_trap();return; }
     state.abi=1;state.phase=1;state.finite=1;state.row_count=inputs.row_count;
     state.capacity=inputs.capacity;state.vocabulary=inputs.vocabulary;
     state.scalar_type=inputs.scalar_type;state.block_positions=inputs.block_positions;
-    state.role=inputs.role;state.generation=base->header.model_generation+inputs.role;
+    state.role=inputs.role;state.generation=base->header.model_generation+(inputs.role==1 ? 1 : 0);
     state.publication_word=base->header.publication_word;
     semantic_stream_copy_identity(state.selection_identity,selection.identity,&state.work);
     semantic_stream_seed(0,inputs.role,inputs.row_count,inputs.capacity,
@@ -264,7 +264,7 @@ extern "C" __global__ void semantic_model_forward_stream_block(ModelForwardStrea
 __device__ bool semantic_stream_model_numerical(const PublicationControl& control,
         const PublicationBank& base,const ModelForwardStreamInputs& inputs,
         uint64_t* numerical,semantic_graph::NativeWorkTally* work) {
-    if(!inputs.role) {
+    if(inputs.role!=1) {
         semantic_stream_copy_identity(numerical,base.header.model_numerical_digest,work);return true;
     }
     if(!inputs.candidate_seals || !inputs.candidate_seal_count)return false;
@@ -303,7 +303,7 @@ extern "C" __global__ void semantic_model_forward_stream_finish(ModelForwardStre
     const auto* base=publication_acquired_bank(control,lease,work);
     if(!base || state.abi!=1 || state.phase!=1 || state.row!=state.row_count ||
        state.position || state.publication_word!=base->header.publication_word ||
-       state.generation!=base->header.model_generation+state.role || !inputs.work_sequence ||
+       state.generation!=base->header.model_generation+(state.role==1 ? 1 : 0) || !inputs.work_sequence ||
        inputs.role!=state.role) { semantic_content_integrity_trap();return; }
     ModelForwardReceipt receipt{};
     receipt.abi=2;receipt.availability=2;receipt.role=state.role;
@@ -333,7 +333,7 @@ __device__ bool semantic_stream_forward_valid(const ModelForwardStreamState& sta
         sizeof(state)+sizeof(receipt));
     if(state.abi!=1 || state.phase!=2 || state.row!=state.row_count || state.position ||
        state.role!=role || state.publication_word!=baseline.publication_word ||
-       state.generation!=baseline.model_generation+role || receipt.abi!=2 ||
+       state.generation!=baseline.model_generation+(role==1 ? 1 : 0) || receipt.abi!=2 ||
        receipt.availability!=2 || receipt.role!=role || receipt.stream_state!=pointer ||
        receipt.generation!=state.generation || !receipt.work_sequence ||
        receipt.scalar_type!=state.scalar_type || receipt.row_count!=state.row_count ||
@@ -342,12 +342,84 @@ __device__ bool semantic_stream_forward_valid(const ModelForwardStreamState& sta
        receipt.finite!=state.finite ||
        !publication_identity_equal(receipt.logits_digest,state.logits_digest,work) ||
        !publication_identity_equal(receipt.model_geometry_digest,baseline.model_geometry_digest,work) ||
-       (!role && !publication_identity_equal(receipt.model_numerical_digest,
+       (role!=1 && !publication_identity_equal(receipt.model_numerical_digest,
            baseline.model_numerical_digest,work)))return false;
     uint64_t identity[4];
     semantic_graph::sha256(reinterpret_cast<const uint8_t*>(&receipt),
         sizeof(receipt)-sizeof(receipt.identity),identity,work);
     return publication_identity_equal(identity,receipt.identity,work);
+}
+
+// Evaluation's original wrapper hashes losses/admissibility/slab AFTER its
+// enqueue callback. Bind those existing device seals here, never a duplicate
+// output hash or an unavailable future candidate-style numerical seal.
+struct ModelEvaluationStreamBinding {
+    uint64_t abi,forward_identity[4],output_digests[3][4],identity[4];
+};
+struct ModelEvaluationStreamInputs {
+    uint64_t control,lease,selection,state,row_seals,receipt,binding;
+    uint64_t output_digests[3],admissible,gate,native_work;
+};
+static_assert(sizeof(ModelEvaluationStreamBinding)==168,"evaluation stream binding ABI");
+static_assert(sizeof(ModelEvaluationStreamInputs)==104,"evaluation stream input ABI");
+
+extern "C" __global__ void semantic_model_evaluation_stream_binding(
+        ModelEvaluationStreamInputs inputs,uint64_t verify) {
+    if(blockIdx.x || threadIdx.x)return;
+    if(!inputs.native_work) { semantic_content_integrity_trap();return; }
+    auto* target=reinterpret_cast<semantic_graph::NativeWorkTally*>(inputs.native_work);
+    semantic_graph::NativeWorkTally work{};
+    semantic_graph::charge_native(&work,semantic_graph::NativeWorkEvent::Command,1);
+    const auto& state=*reinterpret_cast<const ModelForwardStreamState*>(inputs.state);
+    const auto& receipt=*reinterpret_cast<const ModelForwardReceipt*>(inputs.receipt);
+    const bool valid=[&]() {
+        const auto& control=*reinterpret_cast<const PublicationControl*>(inputs.control);
+        const auto& lease=*reinterpret_cast<const PublicationLease*>(inputs.lease);
+        const auto* base=publication_acquired_bank(control,lease,&work);
+        const auto& selection=*reinterpret_cast<const SemanticTrainingViewSelection*>(inputs.selection);
+        if(!base || verify>1 || selection.status || state.finite>1 ||
+           !semantic_stream_forward_valid(state,receipt,inputs.state,inputs.row_seals,
+               2,base->header,&work) ||
+           !publication_identity_equal(state.selection_identity,selection.identity,&work))return false;
+        for(uint32_t output=0;output<3;++output)
+            if(!inputs.output_digests[output] || inputs.output_digests[output]%alignof(uint64_t))return false;
+        auto& stored=*reinterpret_cast<ModelEvaluationStreamBinding*>(inputs.binding);
+        if(!verify) {
+            ModelEvaluationStreamBinding binding{};binding.abi=1;
+            semantic_stream_copy_identity(binding.forward_identity,receipt.identity,&work);
+            for(uint32_t output=0;output<3;++output)
+                semantic_stream_copy_identity(binding.output_digests[output],
+                    reinterpret_cast<const uint64_t*>(inputs.output_digests[output]),&work);
+            semantic_graph::sha256(reinterpret_cast<const uint8_t*>(&binding),
+                sizeof(binding)-sizeof(binding.identity),binding.identity,&work);
+            stored=binding;
+            semantic_graph::charge_native(&work,semantic_graph::NativeWorkEvent::CanonicalByte,sizeof(binding));
+        } else {
+            semantic_graph::charge_native(&work,semantic_graph::NativeWorkEvent::CanonicalByte,sizeof(stored));
+            if(stored.abi!=1 || !inputs.admissible || !inputs.gate ||
+               !publication_identity_equal(stored.forward_identity,receipt.identity,&work))return false;
+            for(uint32_t output=0;output<3;++output)
+                if(!publication_identity_equal(stored.output_digests[output],
+                    reinterpret_cast<const uint64_t*>(inputs.output_digests[output]),&work))return false;
+            uint64_t identity[4];
+            semantic_graph::sha256(reinterpret_cast<const uint8_t*>(&stored),
+                sizeof(stored)-sizeof(stored.identity),identity,&work);
+            if(!publication_identity_equal(identity,stored.identity,&work))return false;
+            const uint8_t admissible=*reinterpret_cast<const uint8_t*>(inputs.admissible);
+            semantic_graph::charge_native(&work,semantic_graph::NativeWorkEvent::CanonicalByte,1);
+            if(admissible>1)return false;
+            *reinterpret_cast<uint64_t*>(inputs.gate)=semantic_graph::written_word(
+                admissible && state.finite,&work);
+        }
+        return true;
+    }();
+    // The full producer's independent tally enters its original cold attempt
+    // exactly once per actual replay, never again at result verification.
+    if(!verify)semantic_stream_merge_native(&work,state.work);
+    semantic_stream_merge_native(target,work);
+    if(!valid || work.overflow || target->overflow) {
+        target->overflow=1;semantic_content_integrity_trap();
+    }
 }
 
 extern "C" __global__ void semantic_model_canary_stream_begin(ModelCanaryStreamInputs inputs) {

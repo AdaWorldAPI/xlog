@@ -7,14 +7,21 @@ use xlog_cuda::{
 
 #[pyclass(name = "SemanticModelForwardStream", module = "pyxlog", frozen)]
 pub(crate) struct PySemanticModelForwardStream {
-    inner: SemanticModelForwardStream,
-    step: Py<PySemanticPreparedStep>,
+    pub(super) inner: SemanticModelForwardStream,
+    source: ModelForwardSource,
+}
+
+enum ModelForwardSource {
+    Update(Py<PySemanticPreparedStep>),
+    Evaluation(Py<model_evaluation::PySemanticModelEvaluation>),
 }
 
 #[pyclass(name = "SemanticModelCanaryStream", module = "pyxlog", frozen)]
 pub(crate) struct PySemanticModelCanaryStream {
     inner: SemanticModelCanaryStream,
     step: Py<PySemanticPreparedStep>,
+    baseline: Py<PySemanticModelForwardStream>,
+    candidate: Py<PySemanticModelForwardStream>,
 }
 
 #[pyclass(name = "SemanticModelCanaryWitness", module = "pyxlog", frozen)]
@@ -61,7 +68,7 @@ fn original_tensor(
     py: Python<'_>,
     step: &PySemanticPreparedStep,
     logits: &Bound<'_, PyAny>,
-    mut layout: SemanticTensorLayout,
+    layout: SemanticTensorLayout,
     role: usize,
     stream: u64,
     expected: &(Option<String>, Vec<u8>),
@@ -75,14 +82,25 @@ fn original_tensor(
         Ok(())
     };
     let device = step.session.borrow(py).device_ordinal;
-    validate_producer_device_guarded(logits, device, &check)?;
+    original_tensor_guarded(logits, layout, role, stream, device, &check)
+}
+
+fn original_tensor_guarded(
+    logits: &Bound<'_, PyAny>,
+    mut layout: SemanticTensorLayout,
+    role: usize,
+    stream: u64,
+    device: usize,
+    check: &impl Fn() -> PyResult<()>,
+) -> PyResult<SemanticTensorInput> {
+    validate_producer_device_guarded(logits, device, check)?;
     layout.role = 0;
     layout.index = role as u64;
     let tensor = crate::dlpack_from_py_for_stream_guarded(
         logits,
         i64::try_from(stream)
             .map_err(|_| invalid("consumer stream exceeds DLPack address space"))?,
-        &check,
+        check,
     )?;
     check()?;
     Ok(SemanticTensorInput {
@@ -126,7 +144,7 @@ impl PySemanticPreparedStep {
             .map_err(xlog_err)?;
         Ok(PySemanticModelForwardStream {
             inner,
-            step: slf.clone_ref(py),
+            source: ModelForwardSource::Update(slf.clone_ref(py)),
         })
     }
 
@@ -135,12 +153,14 @@ impl PySemanticPreparedStep {
         slf: Py<Self>,
         py: Python<'_>,
         bank: &Bound<'_, PyAny>,
-        baseline_stream: &PySemanticModelForwardStream,
-        candidate_stream: &PySemanticModelForwardStream,
+        baseline_stream: Py<PySemanticModelForwardStream>,
+        candidate_stream: Py<PySemanticModelForwardStream>,
     ) -> PyResult<PySemanticModelCanaryStream> {
         let bank = self::bank(bank)?;
-        if baseline_stream.step.as_ptr() != slf.as_ptr()
-            || candidate_stream.step.as_ptr() != slf.as_ptr()
+        let baseline = baseline_stream.borrow(py);
+        let candidate = candidate_stream.borrow(py);
+        if !matches!(&baseline.source, ModelForwardSource::Update(original) if original.as_ptr() == slf.as_ptr())
+            || !matches!(&candidate.source, ModelForwardSource::Update(original) if original.as_ptr() == slf.as_ptr())
         {
             return Err(invalid(
                 "paired canaries require both original forwards of this exact prepared step",
@@ -152,32 +172,125 @@ impl PySemanticPreparedStep {
         let mut owner = session.owner()?;
         step.content_binding_with_owner(py, &owner)?;
         let inner = owner
-            .prepare_model_canary_stream(
-                &step.inner,
-                bank,
-                &baseline_stream.inner,
-                &candidate_stream.inner,
-            )
+            .prepare_model_canary_stream(&step.inner, bank, &baseline.inner, &candidate.inner)
             .map_err(xlog_err)?;
         Ok(PySemanticModelCanaryStream {
             inner,
             step: slf.clone_ref(py),
+            baseline: baseline_stream.clone_ref(py),
+            candidate: candidate_stream.clone_ref(py),
         })
+    }
+}
+
+impl ModelForwardSource {
+    fn session(&self, py: Python<'_>) -> Py<PySemanticTransitionSession> {
+        match self {
+            Self::Update(step) => step.borrow(py).session.clone_ref(py),
+            Self::Evaluation(evaluation) => evaluation
+                .borrow(py)
+                .parent
+                .borrow(py)
+                .session
+                .clone_ref(py),
+        }
+    }
+
+    fn recording_binding(
+        &self,
+        py: Python<'_>,
+        inner: &SemanticModelForwardStream,
+        stream: u64,
+    ) -> PyResult<(Option<String>, Vec<u8>)> {
+        match self {
+            Self::Update(step) => original_recording_binding(py, &step.borrow(py), stream),
+            Self::Evaluation(evaluation) => {
+                let evaluation = evaluation.borrow(py);
+                let parent = evaluation.parent.borrow(py);
+                let session = parent.session.borrow(py);
+                session.require_creator()?;
+                let owner = session.owner()?;
+                evaluation.check(py, &owner)?;
+                owner
+                    .check_evaluation_model_forward_stream(
+                        &*parent.lease()?,
+                        &evaluation.inner,
+                        inner,
+                        stream,
+                    )
+                    .map_err(xlog_err)?;
+                Ok(evaluation.binding.clone())
+            }
+        }
+    }
+}
+
+impl PySemanticModelForwardStream {
+    pub(super) fn from_evaluation(
+        inner: SemanticModelForwardStream,
+        evaluation: Py<model_evaluation::PySemanticModelEvaluation>,
+    ) -> Self {
+        Self {
+            inner,
+            source: ModelForwardSource::Evaluation(evaluation),
+        }
     }
 }
 
 #[pymethods]
 impl PySemanticModelForwardStream {
+    /// Original issued source owner, not a reconstructed Python handle.
+    #[getter]
+    fn source_owner(&self, py: Python<'_>) -> Py<PyAny> {
+        match &self.source {
+            ModelForwardSource::Update(step) => step.clone_ref(py).into_any(),
+            ModelForwardSource::Evaluation(evaluation) => evaluation.clone_ref(py).into_any(),
+        }
+    }
+
+    #[getter]
+    fn geometry(&self) -> (u64, u64, u64, u64, u64) {
+        self.inner.geometry()
+    }
+
+    #[getter]
+    fn role(&self) -> &'static str {
+        match self.inner.role() {
+            0 => "baseline",
+            1 => "candidate",
+            2 => "evaluation",
+            _ => unreachable!("native model forward role"),
+        }
+    }
+
+    #[getter]
+    fn bank(&self) -> Option<usize> {
+        self.inner.bank()
+    }
+
     #[pyo3(signature = (*, consumer_stream))]
     fn begin(&self, py: Python<'_>, consumer_stream: &Bound<'_, PyAny>) -> PyResult<()> {
         let stream = parse_witness_consumer_stream(consumer_stream, &mut 128)?;
-        let step = self.step.borrow(py);
-        original_recording_binding(py, &step, stream)?;
-        let session = step.session.borrow(py);
-        session
-            .owner()?
-            .begin_model_forward_stream(&step.inner, &self.inner, stream)
-            .map_err(xlog_err)
+        self.source.recording_binding(py, &self.inner, stream)?;
+        let session_ref = self.source.session(py);
+        let session = session_ref.borrow(py);
+        let mut owner = session.owner()?;
+        match &self.source {
+            ModelForwardSource::Update(step) => {
+                owner.begin_model_forward_stream(&step.borrow(py).inner, &self.inner, stream)
+            }
+            ModelForwardSource::Evaluation(evaluation) => {
+                let evaluation = evaluation.borrow(py);
+                let parent = evaluation.parent.borrow(py);
+                owner.begin_evaluation_model_forward_stream(
+                    &*parent.lease()?,
+                    &evaluation.inner,
+                    &self.inner,
+                    stream,
+                )
+            }
+        }
+        .map_err(xlog_err)
     }
 
     #[pyo3(signature = (*, row, position_begin, count, logits, logits_layout, consumer_stream))]
@@ -197,28 +310,48 @@ impl PySemanticModelForwardStream {
         let mut budget = 16 * 1024;
         let stream = parse_witness_consumer_stream(consumer_stream, &mut budget)?;
         let layout = parse_tensor_layout(&ColdValue::read(logits_layout, &mut budget, 0)?)?;
-        let step = self.step.borrow(py);
-        let expected = original_recording_binding(py, &step, stream)?;
-        let role = self.inner.role();
-        let tensor = original_tensor(py, &step, logits, layout, role, stream, &expected)?;
-        if original_recording_binding(py, &step, stream)? != expected {
-            return Err(invalid(
-                "model forward authority changed before native block recording",
-            ));
-        }
-        let session = step.session.borrow(py);
-        session
-            .owner()?
-            .record_model_forward_stream_block(
-                &step.inner,
+        let expected = self.source.recording_binding(py, &self.inner, stream)?;
+        let check = || -> PyResult<()> {
+            if self.source.recording_binding(py, &self.inner, stream)? != expected {
+                return Err(invalid(
+                    "model forward authority changed during native block handoff",
+                ));
+            }
+            Ok(())
+        };
+        let session_ref = self.source.session(py);
+        let device = session_ref.borrow(py).device_ordinal;
+        let tensor =
+            original_tensor_guarded(logits, layout, self.inner.role(), stream, device, &check)?;
+        check()?;
+        let session = session_ref.borrow(py);
+        let mut owner = session.owner()?;
+        match &self.source {
+            ModelForwardSource::Update(step) => owner.record_model_forward_stream_block(
+                &step.borrow(py).inner,
                 &self.inner,
                 row,
                 position_begin,
                 count,
                 tensor,
                 stream,
-            )
-            .map_err(xlog_err)
+            ),
+            ModelForwardSource::Evaluation(evaluation) => {
+                let evaluation = evaluation.borrow(py);
+                let parent = evaluation.parent.borrow(py);
+                owner.record_evaluation_model_forward_stream_block(
+                    &*parent.lease()?,
+                    &evaluation.inner,
+                    &self.inner,
+                    row,
+                    position_begin,
+                    count,
+                    tensor,
+                    stream,
+                )
+            }
+        }
+        .map_err(xlog_err)
     }
 
     #[pyo3(signature = (*, allocation_witness=None, consumer_stream))]
@@ -229,27 +362,61 @@ impl PySemanticModelForwardStream {
         consumer_stream: &Bound<'_, PyAny>,
     ) -> PyResult<PySemanticModelForwardWitness> {
         let stream = parse_witness_consumer_stream(consumer_stream, &mut 128)?;
-        let step = self.step.borrow(py);
-        original_recording_binding(py, &step, stream)?;
-        let session = step.session.borrow(py);
-        let inner = session
-            .owner()?
-            .finish_model_forward_stream(
-                &step.inner,
-                &self.inner,
-                allocation_witness.map(|witness| &witness.inner),
-                stream,
-            )
-            .map_err(xlog_err)?;
+        self.source.recording_binding(py, &self.inner, stream)?;
+        let session_ref = self.source.session(py);
+        let session = session_ref.borrow(py);
+        let mut owner = session.owner()?;
+        let inner = match &self.source {
+            ModelForwardSource::Update(step) => owner
+                .finish_model_forward_stream(
+                    &step.borrow(py).inner,
+                    &self.inner,
+                    allocation_witness.map(|witness| &witness.inner),
+                    stream,
+                )
+                .map_err(xlog_err)?,
+            ModelForwardSource::Evaluation(evaluation) => {
+                if allocation_witness.is_some() {
+                    return Err(invalid(
+                        "evaluation forward finish does not read an output-content witness",
+                    ));
+                }
+                let evaluation = evaluation.borrow(py);
+                let parent = evaluation.parent.borrow(py);
+                owner
+                    .finish_evaluation_model_forward_stream(
+                        &*parent.lease()?,
+                        &evaluation.inner,
+                        &self.inner,
+                        stream,
+                    )
+                    .map_err(xlog_err)?
+            }
+        };
         Ok(PySemanticModelForwardWitness {
             inner,
-            _session: step.session.clone_ref(py),
+            _session: session_ref.clone_ref(py),
         })
     }
 }
 
 #[pymethods]
 impl PySemanticModelCanaryStream {
+    #[getter]
+    fn source_owner(&self, py: Python<'_>) -> Py<PySemanticPreparedStep> {
+        self.step.clone_ref(py)
+    }
+
+    #[getter]
+    fn baseline_stream(&self, py: Python<'_>) -> Py<PySemanticModelForwardStream> {
+        self.baseline.clone_ref(py)
+    }
+
+    #[getter]
+    fn candidate_stream(&self, py: Python<'_>) -> Py<PySemanticModelForwardStream> {
+        self.candidate.clone_ref(py)
+    }
+
     #[getter]
     fn canary_rows(&self) -> (u64, u64, u64, u64, u64) {
         let [a, b, c, d, e] = self.inner.canary_rows();
