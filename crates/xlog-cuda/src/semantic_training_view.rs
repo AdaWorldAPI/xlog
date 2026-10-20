@@ -885,8 +885,7 @@ impl SemanticSelectedTrainingView {
                 && member.bytes_identity == row.bytes_identity
                 && member.content_identity == descriptor.content_identity
                 && member.origin == descriptor.origin
-                && member.edit_demonstration_material_roots
-                    == row.edit_demonstration_material_roots
+                && member.edit_demonstration_material_roots == row.edit_demonstration_material_roots
         }))
     }
 
@@ -2139,10 +2138,13 @@ impl SemanticTrainingViewArena {
                 .map_err(|_| SemanticTransitionError::GenerationExhausted)?;
             let count = usize::try_from(group.member_count)
                 .map_err(|_| SemanticTransitionError::GenerationExhausted)?;
-            if group_members[start..start + count].iter().any(|&ordinal| {
-                row_bytes_identities[ordinal as usize].1.is_none()
-            }) {
-                return Err(input_error("every supervised-edit row requires its admitted original witness byte roots"));
+            if group_members[start..start + count]
+                .iter()
+                .any(|&ordinal| row_bytes_identities[ordinal as usize].1.is_none())
+            {
+                return Err(input_error(
+                    "every supervised-edit row requires its admitted original witness byte roots",
+                ));
             }
             group_members[start..start + count]
                 .iter()

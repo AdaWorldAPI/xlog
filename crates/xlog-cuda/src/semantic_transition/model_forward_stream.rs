@@ -374,12 +374,14 @@ fn paired_canary_native_work_ceiling(
 
 fn stream_comparison_native_work_ceiling() -> Result<[u64; 9], SemanticTransitionError> {
     // Comparison authenticates its five rows (49 slots); two full receipt checks
-    // use 28; finite flags use two; three nine-counter validation/merge pairs use54.
+    // use 28; finite flags use two; three nine-counter validation/merge pairs use 54.
+    // Two selection identities use eight, distinct receipt identities use four,
+    // and the five paired row-seal checks use 45 more slots.
     let mut ceiling = [0; 9];
     stream_work_events(
         &mut ceiling,
         0,
-        49 + 28 + 2 + 54,
+        49 + 28 + 2 + 54 + 8 + 4 + 45,
         0,
         stream_work_sum(&[
             size_of::<ModelCanaryStreamState>() as u64,

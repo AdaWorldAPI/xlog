@@ -8510,8 +8510,7 @@ fn encode_publication_identity(bytes: &mut Vec<u8>, identity: SemanticPublishedI
 }
 
 #[cfg(feature = "semantic-policy")]
-const COMPLETED_COMPONENT_RECEIPT_BYTES: usize =
-    (2 + 9 + 2 + 4 + 4 + 4 + 4 * 3 + 2) * 8 + 2 * 32;
+const COMPLETED_COMPONENT_RECEIPT_BYTES: usize = (2 + 9 + 2 + 4 + 4 + 4 + 4 * 3 + 2) * 8 + 2 * 32;
 
 #[cfg(feature = "semantic-policy")]
 fn completed_action_child_identity(owner: Identity256, kind: &[u8], ordinal: u64) -> Identity256 {
@@ -8533,8 +8532,11 @@ fn completed_action_child_material(
 ) -> SemanticCompletedStepWitnessMaterial {
     let identity = completed_action_child_identity(owner, kind, ordinal);
     let mut bytes = Vec::with_capacity(
-        b"XLOG-COMPLETED-ACTION-CHILD\0".len() + 4 * size_of::<u64>() + 32
-            + kind.len() + payload.len(),
+        b"XLOG-COMPLETED-ACTION-CHILD\0".len()
+            + 4 * size_of::<u64>()
+            + 32
+            + kind.len()
+            + payload.len(),
     );
     bytes.extend_from_slice(b"XLOG-COMPLETED-ACTION-CHILD\0");
     material_u64(&mut bytes, 1);
