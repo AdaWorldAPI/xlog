@@ -22913,6 +22913,19 @@ impl PySemanticTransitionController {
                 .ok_or_else(|| invalid("original segment was removed during producer retirement"))?
                 .producers_retired = true;
         }
+        // The original graph and final consumers are joined, and the producer
+        // callback has retired. Return private receiver aliases before their
+        // child steps, outside native custody and prepared-step borrow guards.
+        for step in &steps {
+            let receivers = {
+                let step = step.borrow(py);
+                let mut owner = session.owner()?;
+                owner
+                    .take_prepared_tensor_content_receivers_for_retirement(&step.inner)
+                    .map_err(xlog_err)?
+            };
+            drop(receivers);
+        }
         actor_refresh::retire_actor_refresh_children(py, &actor_refreshes, &streams)?;
         for step in &steps {
             let step = step.borrow(py);

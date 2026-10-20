@@ -1105,6 +1105,20 @@ impl ActorRefreshCustody {
                     step.borrow(py).release_recorded_producer_aliases(py)?;
                 }
                 drain_export_owners();
+                // Discharge all private receiver owners after the original
+                // child graph joins, before releasing any source step. Managed
+                // producer deleters must not run under the Session mutex.
+                for step in &native_steps {
+                    let receivers = {
+                        let source = session.borrow(py);
+                        let mut owner = source.owner()?;
+                        owner
+                            .take_prepared_tensor_content_receivers_for_retirement(step)
+                            .map_err(xlog_err)?
+                    };
+                    drop(receivers);
+                }
+                drain_export_owners();
                 for step in &native_steps {
                     {
                         let source = session.borrow(py);
