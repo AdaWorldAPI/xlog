@@ -73,6 +73,81 @@ pub(super) struct OriginalContentBatch {
         Option<super::source_content_occurrences::SourceNativeContentClaim>,
 }
 
+pub(super) fn policy_uniform_native_work_ceiling(
+    components: &[SemanticComponent],
+    parameter_cells: u64,
+) -> Result<[u64; 9], SemanticTransitionError> {
+    let cells = ceiling_sum(
+        components
+            .iter()
+            .map(|component| u64::from(component.cardinality)),
+    )?;
+    let edits = ceiling_sum(
+        components
+            .iter()
+            .filter(|component| !component.is_text())
+            .map(|component| u64::from(component.cardinality)),
+    )?;
+    Ok([
+        0,
+        0,
+        0,
+        ceiling_sum([
+            ceiling_product(2, parameter_cells)?,
+            2 * 37 * 128,
+            ceiling_product(3, COMPONENT_COUNT as u64)?,
+            cells,
+            ceiling_product(257, edits)?,
+            ceiling_product(128, TEXT_CARDINALITY as u64)?,
+        ])?,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ])
+}
+
+pub(super) fn policy_binding_native_work_ceiling(
+    components: &[SemanticComponent],
+    layouts: &[SemanticTensorLayout; 9],
+) -> Result<[u64; 9], SemanticTransitionError> {
+    let mut ceiling = policy_uniform_native_work_ceiling(components, layouts[2].dimensions[0])?;
+    ceiling[0] = 9;
+    for layout in layouts {
+        let bytes = tensor_layout_bytes(layout)?;
+        ceiling[8] = ceiling[8]
+            .checked_add(bytes as u64)
+            .ok_or_else(native_work_ceiling_overflow)?;
+        add_native_work_ceiling(
+            &mut ceiling,
+            tensor_layout_native_work_ceiling(layout, 0, 0, bytes, true)?,
+        )?;
+    }
+    Ok(ceiling)
+}
+
+pub(super) fn update_binding_native_work_ceiling(
+    storage: &PublicationStorage,
+) -> Result<[u64; 9], SemanticTransitionError> {
+    let mut ceiling = [0; 9];
+    for &bytes in &storage.model_memory.allocation_bytes {
+        add_native_work_ceiling(&mut ceiling, content_digest_ceiling(bytes, 26, false)?)?;
+    }
+    for layout in storage
+        .layouts
+        .values()
+        .filter(|layout| matches!(layout.role, 18..=25))
+    {
+        add_native_work_ceiling(
+            &mut ceiling,
+            tensor_layout_native_work_ceiling(layout, 0, 0, tensor_layout_bytes(layout)?, true)?,
+        )?;
+    }
+    add_native_work_ceiling(&mut ceiling, content_digest_ceiling(1, 26, false)?)?;
+    Ok(ceiling)
+}
+
 impl OriginalContentBatch {
     pub(super) fn new(
         domain: &ResidentExecutionDomain,
@@ -3170,56 +3245,6 @@ pub(super) fn group_critic_native_work_ceiling(
     Ok(ceiling)
 }
 
-/// Enclose the existing five canaries from their original forward geometry.
-/// Each canary names one row, with at most `capacity` target positions.
-pub(super) fn update_canary_native_work_ceiling(
-    storage: &PublicationStorage,
-    capacity: u64,
-    vocabulary: u64,
-    seal_count: u64,
-    task_queries: u64,
-) -> Result<[u64; 9], SemanticTransitionError> {
-    let scans = ceiling_sum([
-        ceiling_product(14, ceiling_product(capacity, vocabulary)?)?,
-        // Normalizer constants, obligation metadata, protected-member checks,
-        // retained/drift position scans (including skipped labels/kinds).
-        ceiling_product(7, capacity)?,
-        task_queries,
-        2 * (4 * 4 + 3) + (4 + 6) + 5 + (5 + 4),
-        5,
-        2 * 8 + 8 + 4 + 5 * 12 + 24,
-        storage.bank_templates[0].len() as u64,
-    ])?;
-    let writes = ceiling_sum([
-        2 * (2 * size_of::<ModelForwardReceipt>() as u64 + 13 * 8 + 3 * 32 + 8),
-        5 * 3 * size_of::<SemanticTrainingCanaryResultRecord>() as u64,
-        10 * (size_of::<SemanticTrainingCanaryRefusalRecord>() as u64 - 8),
-        2 * size_of::<SemanticTrainingCanaryRefusalRecord>() as u64 + 8 + 1 + 5 * 8 + 8 + 5 * 8 + 8,
-    ])?;
-    let mut ceiling = [3, scans, 0, 0, 0, 0, 0, 0, writes];
-    let mut guard = model_contract_guard_native_work_ceiling(storage, &storage.bank_templates[0])?;
-    guard[0] = 0;
-    repeat_native_ceiling(&mut ceiling, guard, 2)?;
-    repeat_native_ceiling(
-        &mut ceiling,
-        publication_hash_ceiling(size_of::<ModelForwardReceipt>() as u64 - 32)?,
-        4,
-    )?;
-    repeat_native_ceiling(
-        &mut ceiling,
-        publication_hash_ceiling(b"xlog.semantic.model-numerics.v1\0".len() as u64)?,
-        2,
-    )?;
-    let folds = ceiling_sum([2, ceiling_product(2, seal_count)?])?;
-    repeat_native_ceiling(&mut ceiling, publication_hash_ceiling(80)?, folds)?;
-    add_native_work_ceiling(
-        &mut ceiling,
-        [0, 0, 0, 0, 0, 0, 0, 0, ceiling_product(80, folds)?],
-    )?;
-    native_work_ceiling_units(ceiling)?;
-    Ok(ceiling)
-}
-
 pub(super) fn publication_hash_ceiling(bytes: u64) -> Result<[u64; 9], SemanticTransitionError> {
     if bytes > u64::MAX / 8 {
         return Err(native_work_ceiling_overflow());
@@ -4172,14 +4197,26 @@ pub(super) fn actor_refresh_transition_native_work_ceilings(
         // support scan, 128 alternatives in each forward and reverse edit,
         // two-lane text alternatives and public text-domain export. The hot
         // alias check and primal/critic admission then visit their own cells.
-        let uniform = ceiling_sum([
-            ceiling_product(2, parameter_cells)?,
-            2 * 37 * 128,
-            ceiling_product(3, COMPONENT_COUNT as u64)?,
-            cells,
-            ceiling_product(257, edit_cells)?,
-            ceiling_product(128, TEXT_CARDINALITY as u64)?,
-        ])?;
+        let binding = policy
+            .buffers
+            .binding_work
+            .lock()
+            .map_err(|_| SemanticTransitionError::Poisoned)?;
+        let transferred = binding
+            .as_ref()
+            .is_some_and(|binding| binding.work.is_some());
+        let uniform = if transferred {
+            0
+        } else {
+            policy_uniform_native_work_ceiling(components, parameter_cells)?[3]
+        };
+        if !transferred {
+            let bytes = binding.as_ref().map_or(0, |binding| binding.snapshot_bytes);
+            add_native_work_ceiling(
+                ceiling,
+                [if bytes == 0 { 0 } else { 9 }, 0, 0, 0, 0, 0, 0, 0, bytes],
+            )?;
+        }
         let alias = ceiling_sum([
             parameter_cells,
             32 * TEXT_CARDINALITY as u64,

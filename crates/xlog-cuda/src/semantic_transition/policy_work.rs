@@ -193,31 +193,6 @@ impl PolicyWorkBuffers {
         Ok(component.tally.clone())
     }
 
-    /// Finalize the original output geometry while capture is still recording.
-    /// Earlier component addresses and ceilings remain unchanged; the complete
-    /// metadata is staged only after both original bank recordings finish.
-    pub(super) fn register_update_canary(
-        &mut self,
-        bank: usize,
-        issuer: Arc<()>,
-        token: u64,
-        ceiling: [u64; 9],
-    ) -> Result<(), SemanticTransitionError> {
-        let original = self
-            .banks
-            .get_mut(bank)
-            .ok_or(SemanticTransitionError::ObservationMismatch)?;
-        if original.keys.contains_key(&PolicyWorkKey::UpdateCanary) {
-            return Err(publication_input_error(
-                "original Update canary geometry was already bound",
-            ));
-        }
-        Self::frozen(original)?;
-        original.frozen = None;
-        self.register(bank, PolicyWorkKey::UpdateCanary, issuer, token, ceiling)?;
-        self.freeze(bank)
-    }
-
     pub(super) fn freeze(&mut self, bank: usize) -> Result<(), SemanticTransitionError> {
         let bank = self
             .banks

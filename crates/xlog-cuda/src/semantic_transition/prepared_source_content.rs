@@ -2257,6 +2257,7 @@ pub(super) struct SourcePublicationGeometry {
     feedback_plan: FeedbackAllocationPlan,
     feedback_layouts: [SemanticTensorLayout; 6],
     pub(super) policy_layouts: [SemanticTensorLayout; 9],
+    pub(super) policy_producer_ceiling: [u64; 9],
     uniform_layouts: [SemanticTensorLayout; 3],
     policy_layout: SemanticPolicyLayout,
     support_layout: [std::ops::Range<usize>; COMPONENT_COUNT],
@@ -2431,6 +2432,11 @@ impl SourcePublicationGeometry {
         let (components, support_cells) =
             ActionCodebooks::component_geometry(&original.codebook_header, seed.program.is_some())?;
         let policy = SemanticPolicyLayout::from_components(&components)?;
+        let mut policy_producer_ceiling = native_work_bound::policy_uniform_native_work_ceiling(
+            &components,
+            policy.parameter_cells as u64,
+        )?;
+        policy_producer_ceiling[0] = 9;
         let mut support_layout = std::array::from_fn(|_| 0..0);
         for (component, span) in components.iter().zip(&mut support_layout) {
             let begin = usize::try_from(component.offset)
@@ -2444,6 +2450,11 @@ impl SourcePublicationGeometry {
         }
         let policy_layouts =
             policy_numerical_producer_layouts(support_cells, policy.parameter_cells)?;
+        for layout in &policy_layouts {
+            policy_producer_ceiling[8] = policy_producer_ceiling[8]
+                .checked_add(tensor_layout_bytes(layout)? as u64)
+                .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        }
         let uniform_layouts =
             policy_uniform_domain_tensor_layouts(support_cells, policy.parameter_cells)?;
         Ok(Self {
@@ -2455,6 +2466,7 @@ impl SourcePublicationGeometry {
             feedback_plan,
             feedback_layouts,
             policy_layouts,
+            policy_producer_ceiling,
             uniform_layouts,
             policy_layout: policy,
             support_layout,
@@ -2984,6 +2996,10 @@ impl native_work_bound::FrozenColdSourceContent {
             let resident_ceiling = resident.native_guard_ceiling()?;
             let mut dma = snapshot;
             native_work_bound::add_native_work_ceiling(&mut dma, input_dma)?;
+            native_work_bound::add_native_work_ceiling(
+                &mut dma,
+                frozen.policy_binding_dma_ceiling()?,
+            )?;
             for producer in [
                 snapshot,
                 guard,

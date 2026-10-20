@@ -7,8 +7,11 @@ struct PolicyUniformDescriptor {
     uint64_t recurrent,hidden,scores,recurrent_cotangents,score_cotangents,score_roots;
     uint64_t status,work,training_rows,return_bound;
     double loss_coefficients[4]; // edit, actor, critic, cost from the cold law
+    uint64_t transfer_target,transferred;
 };
-static_assert(sizeof(PolicyUniformDescriptor)==160,"uniform policy domain ABI");
+static_assert(sizeof(PolicyUniformDescriptor)==176,"uniform policy domain ABI");
+static_assert(offsetof(PolicyUniformDescriptor,transfer_target)==160,"uniform work owner ABI");
+static_assert(offsetof(PolicyUniformDescriptor,transferred)==168,"uniform work marker ABI");
 
 namespace policy_uniform {
 using model_policy::DomainValue;
@@ -153,7 +156,7 @@ __device__ void merge_work(uint64_t pointer,const semantic_graph::NativeWorkTall
 }
 
 extern "C" __global__ void semantic_policy_uniform_domains(PolicyDescriptor p,PolicyUniformDescriptor u,
-        uint64_t components_pointer,uint64_t support_pointer) {
+        uint64_t components_pointer,uint64_t support_pointer,uint64_t snapshot_bytes) {
     using namespace policy_uniform;
     const auto* components=reinterpret_cast<const Component*>(components_pointer);
     const auto* support=reinterpret_cast<const uint8_t*>(support_pointer);
@@ -174,9 +177,12 @@ extern "C" __global__ void semantic_policy_uniform_domains(PolicyDescriptor p,Po
     if(threadIdx.x==0) {
         // Initialize the retained private descriptor on-device; binding must
         // not upload its immutable pointer/law metadata from host memory.
+        u.transferred=0;
         *reinterpret_cast<PolicyUniformDescriptor*>(p.numerical.uniform)=u;
         *reinterpret_cast<uint64_t*>(u.status)=0;
         *reinterpret_cast<semantic_graph::NativeWorkTally*>(u.work)={};
+        semantic_graph::charge_native(&work,semantic_graph::NativeWorkEvent::CanonicalByte,snapshot_bytes);
+        if(snapshot_bytes)semantic_graph::charge_native(&work,semantic_graph::NativeWorkEvent::Command,9);
         weight=importance();
         charge(work,COMPONENT_COUNT);
         if(u.return_bound>uint64_t(INT64_MAX))invalid(u.status);
@@ -332,6 +338,11 @@ extern "C" __global__ void semantic_policy_uniform_domains(PolicyDescriptor p,Po
         }
     }
     merge_work(u.work,work);
+    __syncthreads();
+    if(threadIdx.x==0 && u.transfer_target) {
+        merge_work(u.transfer_target,*reinterpret_cast<const semantic_graph::NativeWorkTally*>(u.work));
+        reinterpret_cast<PolicyUniformDescriptor*>(p.numerical.uniform)->transferred=1;
+    }
 }
 
 // Export aliases never become authoritative. Compare their exact bits with
@@ -354,7 +365,7 @@ __device__ bool policy_uniform_admissible(const PolicyDescriptor& p,semantic_gra
                 }
         }
     }
-    if(threadIdx.x==0) {
+    if(threadIdx.x==0 && !u.transferred) {
         const auto& produced=*reinterpret_cast<const semantic_graph::NativeWorkTally*>(u.work);
         for(uint32_t event=0;event<9;++event)
             semantic_graph::charge_native(work,static_cast<semantic_graph::NativeWorkEvent>(event),produced.events[event]);

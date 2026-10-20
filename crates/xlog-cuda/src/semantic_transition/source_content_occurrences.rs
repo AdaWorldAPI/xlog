@@ -311,6 +311,22 @@ pub(super) struct FrozenSourceContentOccurrences {
 }
 
 impl FrozenSourceContentOccurrences {
+    pub(super) fn policy_binding_dma_ceiling(&self) -> Result<[u64; 9], SemanticTransitionError> {
+        if !self
+            .native_guards
+            .contains_key(&SourceNativeContentGuard::PolicyBinding)
+        {
+            return Ok([0; 9]);
+        }
+        let geometry = self
+            .geometry
+            .upgrade()
+            .ok_or(SemanticTransitionError::ObservationMismatch)?;
+        let mut ceiling = [0; 9];
+        ceiling[0] = 9;
+        ceiling[8] = geometry.publication.policy_producer_ceiling[8];
+        Ok(ceiling)
+    }
     pub(super) fn require_original_occurrence(
         self: &Arc<Self>,
         occurrence: &SemanticSourceContentOccurrence,
@@ -682,6 +698,10 @@ impl FrozenSourceContentOccurrences {
                     )?;
                 }
                 let kinds: &[SourceNativeContentGuard] = if policy {
+                    native_work_bound::add_native_work_ceiling(
+                        &mut ceiling,
+                        recipe.publication.policy_producer_ceiling,
+                    )?;
                     &[
                         SourceNativeContentGuard::PolicyBinding,
                         SourceNativeContentGuard::PolicyAttach,
