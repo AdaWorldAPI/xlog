@@ -2867,8 +2867,32 @@ retries the callback.
 The sole complete pre-effect plan derives all original capture-row counts and
 the maximum event count across the two banks of each step. Its original producer
 calls `controller.finalize_segment_layout(task_use, layouts=...)` with the exact
-ordered tuple `(original_step, capture_rows, bank_event_capacity)` for every step.
-Native seals these counts as a child of the same admission, without rewriting
+ordered tuple `(original_step, capture_rows, bank_event_capacity,
+(bank0_content, bank1_content), (bank0_bindings, bank1_bindings))` for every step.
+Each binding record is `(policy_witness_slot_or_None,
+continuation_witness_slot_or_None, model_witness_slot_or_None)`, taken from the
+original binder arguments and continuation tail in the same plan. An absent
+role is `None`, including a Drain without a continuation; slot zero is not an
+absence marker. Native checks that the actual binder uses that original witness
+and derives its additional intrinsic guards before freezing, rather than
+identifying a binding by equal tensor layouts. These intrinsic guards do not
+advance the public Capture/Verify cursor. Each bank contains the original
+ordered `(kind, receiver_slot, output_slot_or_None, tensors, allocations)` events;
+`kind` is `"capture"` or `"verify"`. Tensor and allocation descriptors use the same
+typed layout, logical interval, storage/version partitions, complete backing span,
+byte offset and native provenance described above. A Verify names its genuine
+witness receiver even when that witness was captured outside the current step.
+Preserve the original body/tail interleaving, rather than appending all tails
+after all bodies. The immutable plan retains the original native backing owners.
+Every Capture/Verify belongs to this common roster, including SOURCE and CURRENT
+events with an occurrence handle. Every actual native call consumes its next
+original typed descriptor; a SOURCE call additionally verifies its original
+handle. There are no independent cursors that could reorder ordinary and SOURCE
+events. The common roster supplies each work ceiling once; a SOURCE handle does
+not add that same ceiling again. Both paths debit each actual hash once to the
+original selected bank's ModelScratch; a host construction cursor is not a work
+counter. Native derives exact work ceilings before the same freeze and seals these
+counts and descriptors as a child of the same admission, without rewriting
 program bytes, and reserves the whole late native allocation claim before
 allocating digest/event buffers. The original initialization engine retains the
 reset commands; finalization itself does not submit them. A failed physical or

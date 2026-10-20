@@ -3555,13 +3555,13 @@ __device__ uint64_t publication_validate_selected_model(const PublicationControl
        header.model_generation>UINT32_MAX || header.range_count>contract.range_capacity ||
        !directory || directory%alignof(PublicationRange) ||
        header.range_count>(UINT64_MAX-directory)/sizeof(PublicationRange) ||
-       !publication_bank_matches(control,bank,header.publication_word))return 1;
+       !publication_bank_matches(control,bank,header.publication_word,work))return 1;
     const auto* ranges=reinterpret_cast<const PublicationRange*>(directory);
     uint64_t digest[4];publication_original_descriptor_digest(control,bank,digest,work);
-    if(!publication_identity_equal(digest,header.descriptor_digest))return 1;
+    if(!publication_identity_equal(digest,header.descriptor_digest,work))return 1;
     const auto* model=publication_find_range(ranges,header.range_count,44,0,work);
     if(!model || publication_range_digest(control,*model,nullptr,digest,nullptr,work) ||
-       !publication_identity_equal(digest,model->digest) ||
+       !publication_identity_equal(digest,model->digest,work) ||
        publication_finalize_model_contract(control,header,*model,true,work))return 1;
     // Fold the original typed and full-backing seals in their canonical order.
     // Individual consumers still verify actual payloads against those seals;
@@ -3576,7 +3576,7 @@ __device__ uint64_t publication_validate_selected_model(const PublicationControl
             publication_fold(digest,ranges[i].role,ranges[i].index,ranges[i].backing_digest,work);
         }
     }
-    return publication_identity_equal(digest,header.model_numerical_digest) ? 0 : 1;
+    return publication_identity_equal(digest,header.model_numerical_digest,work) ? 0 : 1;
 }
 __device__ uint64_t publication_descriptor_digest(const PublicationControl& control,PublicationBank& bank,
         semantic_graph::NativeWorkTally* work=nullptr) {
@@ -3943,8 +3943,10 @@ extern "C" __global__ void semantic_publication_step_release(uint64_t control_pt
 // output ranges preserve that order and append the original contract range.
 extern "C" __global__ void semantic_publication_model_seals(uint64_t control_ptr,uint64_t lease_ptr,
         uint64_t roster_ptr,uint64_t count,uint64_t output_ranges_ptr,uint64_t output_contract_ptr,
-        uint64_t contract_capacity) {
+        uint64_t contract_capacity,uint64_t native_work_ptr) {
     if(blockIdx.x || threadIdx.x)return;
+    auto* work=reinterpret_cast<semantic_graph::NativeWorkTally*>(native_work_ptr);
+    semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::Command,1);
     uint64_t roster_bytes=0,output_count=0,output_bytes=0;
     if(!publication_pointer_span(control_ptr,sizeof(PublicationControl),alignof(PublicationControl)) ||
        !publication_pointer_span(lease_ptr,sizeof(PublicationLease),alignof(PublicationLease)) ||
@@ -3975,41 +3977,43 @@ extern "C" __global__ void semantic_publication_model_seals(uint64_t control_ptr
            !publication_pointer_span(control.directories[bank],directory_bytes,alignof(PublicationRange))) {
             semantic_content_integrity_trap();return;
         }
-    const auto* bank=publication_acquired_bank(control,lease);
+    const auto* bank=publication_acquired_bank(control,lease,work);
     if(!bank || bank->header.range_count>contract.range_capacity || count>bank->header.range_count ||
-       publication_validate_storage(control) ||
-       !publication_step_output_span(control,lease_ptr,roster_ptr,roster_bytes,output_ranges_ptr,output_bytes) ||
-       !publication_step_output_span(control,lease_ptr,roster_ptr,roster_bytes,output_contract_ptr,contract_capacity) ||
+       publication_validate_storage(control,work) ||
+       !publication_step_output_span(control,lease_ptr,roster_ptr,roster_bytes,output_ranges_ptr,output_bytes,work) ||
+       !publication_step_output_span(control,lease_ptr,roster_ptr,roster_bytes,output_contract_ptr,contract_capacity,work) ||
        publication_spans_overlap(output_ranges_ptr,output_bytes,output_contract_ptr,contract_capacity)) {
         semantic_content_integrity_trap();return;
     }
     auto* ranges=reinterpret_cast<PublicationRange*>(control.directories[lease.bank]);
     uint64_t digest[4];
-    if(publication_validate_selected_model(control,*bank)) { semantic_content_integrity_trap();return; }
-    const auto* table=publication_find_range(ranges,bank->header.range_count,55);
-    const auto* original_contract=publication_find_range(ranges,bank->header.range_count,44);
-    if(!table || publication_range_digest(control,*table,nullptr,digest) ||
-       !publication_identity_equal(digest,table->digest) ||
-       publication_validate_directory(control,contract,ranges,bank->header.range_count,false) ||
+    if(publication_validate_selected_model(control,*bank,work)) { semantic_content_integrity_trap();return; }
+    const auto* table=publication_find_range(ranges,bank->header.range_count,55,0,work);
+    const auto* original_contract=publication_find_range(ranges,bank->header.range_count,44,0,work);
+    if(!table || publication_range_digest(control,*table,nullptr,digest,nullptr,work) ||
+       !publication_identity_equal(digest,table->digest,work) ||
+       publication_validate_directory(control,contract,ranges,bank->header.range_count,false,work) ||
        !original_contract || original_contract->length_bytes!=contract_capacity ||
-       publication_range_digest(control,*original_contract,nullptr,digest) ||
-       !publication_identity_equal(digest,original_contract->digest)) {
+       publication_range_digest(control,*original_contract,nullptr,digest,nullptr,work) ||
+       !publication_identity_equal(digest,original_contract->digest,work)) {
         semantic_content_integrity_trap();return;
     }
     const auto* roster=reinterpret_cast<const uint64_t*>(roster_ptr);
     for(uint64_t i=0;i<count;++i) {
         const uint64_t role=roster[2*i],index=roster[2*i+1];
         if(role<18 || role>20) { semantic_content_integrity_trap();return; }
-        const auto* range=publication_find_range(ranges,bank->header.range_count,role,index);
-        const auto* layout=publication_find_layout(control,ranges,bank->header.range_count,role,index);
-        if(!range || !layout || publication_range_digest(control,*range,layout,digest) ||
-           !publication_identity_equal(digest,range->digest)) { semantic_content_integrity_trap();return; }
+        const auto* range=publication_find_range(ranges,bank->header.range_count,role,index,work);
+        const auto* layout=publication_find_layout(control,ranges,bank->header.range_count,role,index,work);
+        if(!range || !layout || publication_range_digest(control,*range,layout,digest,nullptr,work) ||
+           !publication_identity_equal(digest,range->digest,work)) { semantic_content_integrity_trap();return; }
     }
     auto* output=reinterpret_cast<PublicationRange*>(output_ranges_ptr);
-    for(uint64_t i=0;i<count;++i)
-        output[i]=*publication_find_range(ranges,bank->header.range_count,roster[2*i],roster[2*i+1]);
-    output[count]=*original_contract;
-    publication_copy_bytes(reinterpret_cast<uint8_t*>(output_contract_ptr),publication_range_bytes(control,*original_contract),contract_capacity);
+    for(uint64_t i=0;i<count;++i) {
+        const auto* range=publication_find_range(ranges,bank->header.range_count,roster[2*i],roster[2*i+1],work);
+        publication_copy_bytes(reinterpret_cast<uint8_t*>(&output[i]),reinterpret_cast<const uint8_t*>(range),sizeof(PublicationRange),work);
+    }
+    publication_copy_bytes(reinterpret_cast<uint8_t*>(&output[count]),reinterpret_cast<const uint8_t*>(original_contract),sizeof(PublicationRange),work);
+    publication_copy_bytes(reinterpret_cast<uint8_t*>(output_contract_ptr),publication_range_bytes(control,*original_contract),contract_capacity,work);
 }
 
 // Capture binds both resident input banks once. Every execution resolves the

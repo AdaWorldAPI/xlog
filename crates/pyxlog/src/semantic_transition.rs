@@ -21107,9 +21107,9 @@ impl PySemanticTransitionController {
         )
     }
 
-    /// Seal all original step counts from the one complete pre-effect plan.
-    /// Counts are a child of the original admission, never replacement program
-    /// bytes or an independently extensible allocation capacity.
+    /// Seal counts and ordered tensor-content descriptors from the one complete
+    /// pre-effect plan. All Capture/Verify calls share one ordered roster;
+    /// SOURCE occurrences additionally retain their original frozen handles.
     #[cfg(feature = "semantic-policy")]
     #[pyo3(signature = (task_use, *, layouts))]
     fn finalize_segment_layout(
@@ -21147,6 +21147,39 @@ impl PySemanticTransitionController {
                 ));
             }
         }
+        let pool = session.material_sources.native_budget()?;
+        let row_bytes = std::mem::size_of::<(
+            SemanticPreparedStep,
+            usize,
+            usize,
+            [Vec<xlog_cuda::SemanticPreparedTensorContentEvent>; 2],
+            [xlog_cuda::SemanticPreparedTensorContentBindings; 2],
+        )>();
+        let reservation_bytes = std::mem::size_of::<xlog_cuda::SemanticReplayMaterialReservation>();
+        let metadata_bytes = row_bytes
+            .checked_add(
+                reservation_bytes
+                    .checked_mul(2)
+                    .ok_or_else(|| invalid("segment tensor-content reservation extent overflow"))?,
+            )
+            .and_then(|bytes| bytes.checked_mul(layouts.len()))
+            .ok_or_else(|| invalid("segment tensor-content input extent overflow"))?;
+        let _rows_metadata = pool
+            .reserve_auxiliary(
+                u64::try_from(metadata_bytes)
+                    .map_err(|_| invalid("segment tensor-content input extent exceeds u64"))?,
+            )
+            .map_err(xlog_err)?;
+        // Descriptors drop before the reservations that account for their backing.
+        let mut input_metadata = Vec::new();
+        input_metadata
+            .try_reserve_exact(
+                layouts
+                    .len()
+                    .checked_mul(2)
+                    .ok_or_else(|| invalid("segment tensor-content bank count overflow"))?,
+            )
+            .map_err(|_| invalid("segment tensor-content reservation roster allocation failed"))?;
         let mut rows = Vec::new();
         rows.try_reserve_exact(layouts.len())
             .map_err(|_| invalid("original segment layout roster reservation failed"))?;
@@ -21156,8 +21189,8 @@ impl PySemanticTransitionController {
                 return Err(invalid("segment layout rows must be exact original tuples"));
             }
             let row = row.cast::<PyTuple>()?;
-            if row.len() != 3 {
-                return Err(invalid("segment layout rows require (original step, capture rows, bank event capacity)"));
+            if row.len() != 5 {
+                return Err(invalid("segment layout rows require (original step, capture rows, bank event capacity, paired content rosters, paired witness bindings)"));
             }
             let step_value = row.get_item(0)?;
             let step = step_value.extract::<PyRef<'_, PySemanticPreparedStep>>()?;
@@ -21175,7 +21208,22 @@ impl PySemanticTransitionController {
             let events =
                 usize::try_from(ColdValue::read(&row.get_item(2)?, &mut 128, 0)?.unsigned()?)
                     .map_err(|_| invalid("bank event count exceeds native address space"))?;
-            rows.push((step.inner.clone(), tensors, events));
+            let mut transport = 16 * 1024 * 1024;
+            let banks = source_content_occurrences::exact_tuple(
+                &row.get_item(3)?,
+                Some(2),
+                &mut transport,
+            )?;
+            let mut content = [Vec::new(), Vec::new()];
+            for (bank, content) in content.iter_mut().enumerate() {
+                let descriptors = banks.get_item(bank)?;
+                input_metadata.push(source_content_occurrences::reserve_events::<
+                    xlog_cuda::SemanticPreparedTensorContentEvent,
+                >(&descriptors, &pool)?);
+                *content = source_content_occurrences::parse_prepared_events(&descriptors)?;
+            }
+            let bindings = source_content_occurrences::parse_prepared_bindings(&row.get_item(4)?)?;
+            rows.push((step.inner.clone(), tensors, events, content, bindings));
         }
         owner
             .finalize_prepared_segment_layout(&rows)
