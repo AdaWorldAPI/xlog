@@ -819,6 +819,43 @@ impl PreparedTensorContentPlan {
 }
 
 impl SemanticTransitionSession {
+    /// Return receiver pins only after every still-owned original step has
+    /// joined its final consumers and the original graph has retired. Drop the
+    /// returned owners outside the Session lock, before releasing producers.
+    pub fn take_prepared_tensor_content_receivers_for_retirement(
+        &mut self,
+        step: &SemanticPreparedStep,
+    ) -> Result<impl Send + 'static, SemanticTransitionError> {
+        self.ensure_quiescent()?;
+        let build = self
+            .prepared_segment
+            .as_ref()
+            .ok_or(SemanticTransitionError::NotCaptured)?;
+        build.check_retained(step, &self.publication_issuer)?;
+        for token in &build.tokens {
+            if self.steps.contains_key(token) {
+                self.retained_prepared_step_final_consumers(&SemanticPreparedStep {
+                    issuer: Arc::clone(&build.issuer),
+                    scope: Arc::clone(&build.scope),
+                    token: *token,
+                })?;
+            }
+        }
+        if build.cancelled.load(Ordering::Acquire) {
+            if build.completed || (build.submitted && !build.has_never_graph_called_proof()) {
+                return Err(SemanticTransitionError::ObservationMismatch);
+            }
+            self.require_original_prepared_graph_retirement()?;
+        } else {
+            self.require_completed_prepared_graph_retirement()?;
+        }
+        Ok(self
+            .steps
+            .get_mut(&step.token)
+            .and_then(|owner| owner.prepared.as_mut())
+            .and_then(|prepared| prepared.content_plan.take()))
+    }
+
     pub fn verify_prepared_tensor_content_in_recording_step(
         &mut self,
         recording_step: &SemanticPreparedStep,

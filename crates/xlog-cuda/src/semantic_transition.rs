@@ -31214,7 +31214,6 @@ impl SemanticTransitionSession {
             step,
             tensors,
             consumer_stream,
-            None,
             #[cfg(feature = "semantic-policy")]
             occurrence,
         )
@@ -31225,7 +31224,6 @@ impl SemanticTransitionSession {
         step: &SemanticPreparedStep,
         tensors: Vec<SemanticTensorInput>,
         consumer_stream: u64,
-        forward_role: Option<usize>,
         #[cfg(feature = "semantic-policy")] occurrence: Option<&SemanticSourceContentOccurrence>,
     ) -> Result<SemanticTensorContentWitness, SemanticTransitionError> {
         let pending = RetainedTensorAdmission {
@@ -31255,21 +31253,11 @@ impl SemanticTransitionSession {
         let result = (|| {
             let owner = &self.steps[&step.token];
             let original = &owner.content[index].tensors;
-            if let Some(role) = forward_role {
-                if !matches!(original.as_slice(), [tensor]
-                    if tensor.layout.role == 0 && tensor.layout.index == role as u64)
-                {
-                    return Err(publication_input_error(
-                        "model forward content requires its exact baseline or candidate logits occurrence",
-                    ));
-                }
-            } else {
-                validate_content_coordinates(
-                    original
-                        .iter()
-                        .map(|tensor| (tensor.layout.role, tensor.layout.index)),
-                )?;
-            }
+            validate_content_coordinates(
+                original
+                    .iter()
+                    .map(|tensor| (tensor.layout.role, tensor.layout.index)),
+            )?;
             let mut digests = Vec::with_capacity(original.len());
             let prepared = owner.prepared.as_ref().expect("prepared content owner");
             let mut next = prepared.next_digest;
