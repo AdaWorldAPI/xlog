@@ -175,6 +175,7 @@ extern "C" __global__ void semantic_policy_uniform_domains(PolicyDescriptor p,Po
     __shared__ uint32_t legal_count,has_null;
     semantic_graph::NativeWorkTally work{};
     if(threadIdx.x==0) {
+        semantic_graph::charge_native(&work,semantic_graph::NativeWorkEvent::Command,1);
         // Initialize the retained private descriptor on-device; binding must
         // not upload its immutable pointer/law metadata from host memory.
         u.transferred=0;
