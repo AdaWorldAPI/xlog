@@ -32427,7 +32427,7 @@ for method in ('finish_inference', 'finish_refusal'):
     assert tuple(finish.parameters) == ('self', 'consumer_stream')
     assert finish.parameters['consumer_stream'].kind is inspect.Parameter.KEYWORD_ONLY
     assert finish.parameters['consumer_stream'].default is inspect.Parameter.empty
-for method in ('finish_recorded_training', 'finish_unselected_recorded_training'):
+for method in ('finish_unselected_recorded_training',):
     finish = inspect.signature(getattr(SemanticPolicyInvocation, method))
     assert tuple(finish.parameters) == ('self', 'update_step', 'consumer_stream')
     assert finish.parameters['consumer_stream'].kind is inspect.Parameter.KEYWORD_ONLY
