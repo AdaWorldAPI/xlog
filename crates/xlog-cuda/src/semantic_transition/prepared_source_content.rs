@@ -516,7 +516,7 @@ pub(super) struct SourceContentGeometryOwner {
     pub(super) publication: Arc<SourcePublicationGeometry>,
     scope: Arc<()>,
     pub(super) recipe: Mutex<Option<std::sync::Weak<PreparedSourceContentOwner>>>,
-    current: Mutex<Option<std::sync::Weak<actor_refresh::PreparedActorRefreshOwner>>>,
+    current: Mutex<Option<actor_refresh::ActorRefreshPreparationEntry>>,
     reader: Mutex<Option<(Arc<()>, u64)>>,
     pub(super) occurrences:
         Mutex<Option<Arc<super::source_content_occurrences::FrozenSourceContentOccurrences>>>,
@@ -896,7 +896,7 @@ impl SourceContentGeometryOwner {
                     publication_input_error("original actor geometry custody is poisoned")
                 })?
                 .as_ref()
-                .and_then(std::sync::Weak::upgrade)
+                .and_then(|original| original.proof.upgrade())
                 .is_none_or(|original| !Arc::ptr_eq(&original, actor))
             || !Arc::ptr_eq(&build.actor_refresh_execution, &actor.execution)
             || !Arc::ptr_eq(&build.cancelled, &actor.cancelled)
@@ -1446,7 +1446,7 @@ impl SemanticPreparedSourceContentGeometry {
         if original.is_some() {
             return Err(SemanticTransitionError::ObservationMismatch);
         }
-        *original = Some(Arc::downgrade(proof));
+        *original = Some(actor_refresh::ActorRefreshPreparationEntry::new(proof));
         Ok(())
     }
 

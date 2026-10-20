@@ -17,6 +17,10 @@ impl SemanticPreparedActorRefresh {
         else { ImportedPolicyContributionKind::CurrentActor }
     }
 
+    pub(super) fn material_reservation(&self) -> Arc<SemanticReplayMaterialReservation> {
+        Arc::clone(&self.inner._material_reservation)
+    }
+
     pub(super) fn require_frozen_member<B: AsRef<[u8]>>(
         &self, training: &SemanticSelectedTrainingView, row: &SemanticTrainingViewRow<B>,
     ) -> Result<Option<usize>, SemanticTransitionError> {
@@ -196,12 +200,34 @@ struct ActorRefreshInitializerRefusalOwner {
     proof: Arc<PreparedActorRefreshOwner>,
     target_bank: usize,
     observation: ActorRefreshInitializerObservation,
+    _material_reservation: Arc<SemanticReplayMaterialReservation>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct ActorRefreshInitializerObservation {
     marker: PreparedActorRefreshDevice,
     native_work: [u64; 11],
+}
+
+type ActorRefreshInitializerObservationCustody = (
+    Mutex<Option<ActorRefreshInitializerObservation>>,
+    Arc<SemanticReplayMaterialReservation>,
+);
+
+/// The original parent map retains both its weak proof allocation and the
+/// same capacity receipt even when construction never obtains a child owner.
+pub(super) struct ActorRefreshPreparationEntry {
+    pub(super) proof: std::sync::Weak<PreparedActorRefreshOwner>,
+    _material_reservation: Arc<SemanticReplayMaterialReservation>,
+}
+
+impl ActorRefreshPreparationEntry {
+    pub(super) fn new(proof: &Arc<PreparedActorRefreshOwner>) -> Self {
+        Self {
+            proof: Arc::downgrade(proof),
+            _material_reservation: Arc::clone(&proof._material_reservation),
+        }
+    }
 }
 
 pub(super) struct PreparedActorRefreshOwner {
@@ -225,10 +251,10 @@ pub(super) struct PreparedActorRefreshOwner {
     pub(super) recording_ready: Arc<AtomicBool>,
     pub(super) target: Arc<PublicationStorage>,
     pub(super) content_geometry: [SemanticPreparedSourceContentGeometry; 2],
-    _material_reservation: SemanticReplayMaterialReservation,
     work: Arc<ActorRefreshWork>,
     children: Mutex<[Option<Arc<()>>; 2]>,
     construction_pending: [Arc<AtomicBool>; 2],
+    _material_reservation: Arc<SemanticReplayMaterialReservation>,
 }
 
 pub(super) struct ActorRefreshConstructionBinding {
@@ -300,7 +326,7 @@ pub(super) struct StagedActorRefresh {
     context_issuance: Arc<()>,
     context_pending: Arc<AtomicBool>,
     native_ceiling: [u64; 9],
-    initializer_observation: Arc<Mutex<Option<ActorRefreshInitializerObservation>>>,
+    initializer_observation: Arc<ActorRefreshInitializerObservationCustody>,
     initializer_refusal: Option<SemanticActorRefreshInitializerRefusal>,
     cancellation: Option<SemanticPreparedSegmentNonSubmission>,
 }
@@ -424,9 +450,11 @@ pub(super) struct ActorRefreshObservedComponent {
     pub(super) model_event_records: [Vec<ModelWorkEvent>; 2],
     pub(super) native_ceiling: [u64; 9],
     pub(super) transition_ceilings: [[u64; 9]; 2],
-    initializer_observation: Arc<Mutex<Option<ActorRefreshInitializerObservation>>>,
+    initializer_observation: Arc<ActorRefreshInitializerObservationCustody>,
     model_events: [DeviceMemoryView<ModelWorkEvent>; 2],
     model_inputs: [ModelWorkInput; 2],
+    pub(super) material_reservation: Arc<SemanticReplayMaterialReservation>,
+    pub(super) completion_reservation: Arc<SemanticReplayMaterialReservation>,
 }
 
 impl ActorRefreshObservedComponent {
@@ -445,7 +473,7 @@ impl ActorRefreshObservedComponent {
                 .try_into()
                 .map_err(|_| SemanticTransitionError::ObservationMismatch)?,
         };
-        let mut original = self.initializer_observation.lock().map_err(|_| {
+        let mut original = self.initializer_observation.as_ref().0.lock().map_err(|_| {
             publication_input_error("original actor refusal observation lock is poisoned")
         })?;
         if original.is_some_and(|original| original != observation) {
@@ -1116,8 +1144,21 @@ impl SemanticTransitionSession {
         );
         let preparation_node = OwnedPublicationMaterial::tree_node_bound(
             size_of::<(u64, SemanticSourceContentGeometryKind, u64)>(),
-            size_of::<std::sync::Weak<PreparedActorRefreshOwner>>(),
+            size_of::<ActorRefreshPreparationEntry>(),
         )?;
+        // One marker read belongs to the parent completion cache and one to
+        // each of the two child banks. A read owns at most two live payloads:
+        // pinned+projected before completion, or retained+caller afterwards.
+        let marker_read_bytes = size_of::<Mutex<PublicationRead<PreparedActorRefreshDevice>>>()
+            .checked_add(2 * size_of::<usize>())
+            .and_then(|bytes| bytes.checked_add(2 * size_of::<PreparedActorRefreshDevice>()))
+            .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        let observation_bytes = size_of::<ActorRefreshInitializerObservationCustody>()
+            .checked_add(size_of::<ActorRefreshInitializerRefusalOwner>())
+            .and_then(|bytes| bytes.checked_add(4 * size_of::<usize>()))
+            .and_then(|bytes| bytes.checked_mul(2))
+            .and_then(|bytes| bytes.checked_add(marker_read_bytes.checked_mul(3)?))
+            .ok_or(SemanticTransitionError::GenerationExhausted)?;
         let metadata_bytes = training.actor_group_members().len()
             .checked_add(training.edit_group_members().len())
             .and_then(|count| count.checked_mul(size_of::<(SemanticSourceContentGeometryKind, u64)>()))
@@ -1132,11 +1173,13 @@ impl SemanticTransitionSession {
             .and_then(|bytes| {
                 bytes.checked_add(size_of::<PreparedActorRefreshOwner>() + 8 * size_of::<usize>() + preparation_node)
             })
+            .and_then(|bytes| bytes.checked_add(observation_bytes))
+            .and_then(|bytes| bytes.checked_add(size_of::<SemanticReplayMaterialReservation>() + 2 * size_of::<usize>()))
             .ok_or(SemanticTransitionError::GenerationExhausted)?;
-        let material_reservation = content_geometry[0].material_budget().reserve_auxiliary(
+        let material_reservation = Arc::new(content_geometry[0].material_budget().reserve_auxiliary(
             u64::try_from(metadata_bytes)
                 .map_err(|_| SemanticTransitionError::GenerationExhausted)?,
-        )?;
+        )?);
         let policy_members = training
             .actor_group_members()
             .iter()
@@ -1300,7 +1343,7 @@ impl SemanticTransitionSession {
                 ),
                 target: Arc::clone(self.prepared_publication()?),
                 content_geometry,
-                _material_reservation: material_reservation,
+                _material_reservation: Arc::clone(&material_reservation),
                 work,
                 children: Mutex::new([None, None]),
                 construction_pending: std::array::from_fn(|_| Arc::new(AtomicBool::new(false))),
@@ -1325,7 +1368,7 @@ impl SemanticTransitionSession {
         }
         }
         self.actor_refresh_preparations
-            .insert((step.token, kind, member_ordinal), Arc::downgrade(&proof.inner));
+            .insert((step.token, kind, member_ordinal), ActorRefreshPreparationEntry::new(&proof.inner));
         Ok(proof)
     }
 
@@ -1542,7 +1585,7 @@ impl SemanticTransitionSession {
     ) -> bool {
         self.actor_refresh_preparations
             .values()
-            .filter_map(std::sync::Weak::upgrade)
+            .filter_map(|original| original.proof.upgrade())
             .any(|proof| {
                 proof
                     .construction_pending
@@ -1691,7 +1734,7 @@ impl SemanticTransitionSession {
             context_issuance: Arc::new(()),
             context_pending: Arc::new(AtomicBool::new(true)),
             native_ceiling: [0; 9],
-            initializer_observation: Arc::new(Mutex::new(None)),
+            initializer_observation: Arc::new((Mutex::new(None), proof.material_reservation())),
             initializer_refusal: None,
             cancellation: None,
         });
@@ -2408,6 +2451,8 @@ impl SemanticTransitionSession {
                     .ok_or(SemanticTransitionError::NotBound)?
                     .instance,
                 marker: staged.device.view(),
+                material_reservation: proof.material_reservation(),
+                completion_reservation: Arc::clone(&work.material_reservation),
                 native_work: staged.native_work.view(),
                 states: [
                     recompute.branches[0].state.view(),
@@ -2985,7 +3030,7 @@ impl SemanticTransitionSession {
         if children[staged.target_bank]
             .as_ref()
             .is_none_or(|issuer| !Arc::ptr_eq(issuer, &self.publication_issuer))
-            || *staged.initializer_observation.lock().map_err(|_| {
+            || *staged.initializer_observation.as_ref().0.lock().map_err(|_| {
                 publication_input_error("original actor refusal observation lock is poisoned")
             })? != Some(*observation)
         {
@@ -3004,6 +3049,7 @@ impl SemanticTransitionSession {
             .ok_or(SemanticTransitionError::NotBound)?;
         let observation = staged
             .initializer_observation
+            .as_ref().0
             .lock()
             .map_err(|_| {
                 publication_input_error("original actor refusal observation lock is poisoned")
@@ -3029,6 +3075,7 @@ impl SemanticTransitionSession {
                 proof: Arc::clone(&staged.proof.inner),
                 target_bank: staged.target_bank,
                 observation,
+                _material_reservation: staged.proof.material_reservation(),
             }),
         };
         self.actor_refresh

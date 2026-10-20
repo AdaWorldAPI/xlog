@@ -14989,6 +14989,7 @@ struct PreparedActorRefreshCompletionObservations {
     marker: Option<Arc<Mutex<PublicationRead<actor_refresh::PreparedActorRefreshDevice>>>>,
     native_work: Option<Arc<Mutex<PublicationRead<u64>>>>,
     steps: [PreparedStepCompletionObservations; 2],
+    _material_reservation: Option<Arc<SemanticReplayMaterialReservation>>,
 }
 
 #[derive(Default)]
@@ -20421,7 +20422,7 @@ mod task_state_contract {
     #[test]
     fn task_state_bank_includes_actual_query_receipts() {
         assert_eq!(size_of::<DeviceState>(), 7568);
-        assert_eq!(size_of::<Descriptor>(), 1368);
+        assert_eq!(size_of::<Descriptor>(), 1472);
     }
 
     #[test]
@@ -21236,7 +21237,7 @@ pub struct SemanticTransitionSession {
     actor_refresh_program: Option<actor_refresh_program::ActorRefreshProgram>,
     #[cfg(feature = "semantic-policy")]
     actor_refresh_preparations:
-        BTreeMap<(u64, SemanticSourceContentGeometryKind, u64), std::sync::Weak<actor_refresh::PreparedActorRefreshOwner>>,
+        BTreeMap<(u64, SemanticSourceContentGeometryKind, u64), actor_refresh::ActorRefreshPreparationEntry>,
     pending_replay_delivery: Option<PendingReplayDelivery>,
     pending_delivery_acknowledgement: Option<Arc<OriginalDeliveryAcknowledgement>>,
     completed_delivery_acknowledgement_dma: OriginalDeliveryAcknowledgementDma,
@@ -22392,7 +22393,16 @@ impl SemanticTransitionSession {
         let mut native = policy_native;
         for component in components {
             let key = (step.token, component.kind, component.member_ordinal);
-            let marker = self.prepared_completion_read(component.marker.clone(), |bundle| {
+            let cached = self.prepared_segment.as_mut().ok_or(SemanticTransitionError::NotCaptured)?
+                .completion_observations.actor_refresh.entry(key).or_default();
+            if let Some(original) = &cached._material_reservation {
+                if !Arc::ptr_eq(original, &component.completion_reservation) {
+                    return Err(SemanticTransitionError::ObservationMismatch);
+                }
+            } else {
+                cached._material_reservation = Some(Arc::clone(&component.completion_reservation));
+            }
+            let marker = self.prepared_completion_read_with_owner(component.marker.clone(), Some(Arc::clone(&component.material_reservation)), |bundle| {
                 &mut bundle.actor_refresh.entry(key).or_default().marker
             })?[0];
             // An entered target bank must have reached every original initializer.
@@ -22999,7 +23009,9 @@ impl SemanticTransitionSession {
             if self.poisoned || self.graph.ensure_not_poisoned().is_err() {
                 return Err(SemanticTransitionError::Poisoned);
             }
-            let original = Arc::new(Mutex::new(self.stage_publication_read(device.view())?));
+            let original = Arc::new(Mutex::new(self.stage_publication_read_with_owner(
+                device.view(), Some(staged.proof.material_reservation()),
+            )?));
             self.prepared_segment
                 .as_mut()
                 .expect("retained original actor")
@@ -23699,6 +23711,17 @@ impl SemanticTransitionSession {
     fn prepared_completion_read<T: DeviceRepr + Copy>(
         &mut self,
         source: DeviceMemoryView<T>,
+        field: impl FnMut(
+            &mut PreparedSegmentCompletionObservations,
+        ) -> &mut Option<Arc<Mutex<PublicationRead<T>>>>,
+    ) -> Result<Vec<T>, SemanticTransitionError> {
+        self.prepared_completion_read_with_owner(source, None, field)
+    }
+
+    fn prepared_completion_read_with_owner<T: DeviceRepr + Copy>(
+        &mut self,
+        source: DeviceMemoryView<T>,
+        material_reservation: Option<Arc<SemanticReplayMaterialReservation>>,
         mut field: impl FnMut(
             &mut PreparedSegmentCompletionObservations,
         ) -> &mut Option<Arc<Mutex<PublicationRead<T>>>>,
@@ -23717,7 +23740,7 @@ impl SemanticTransitionSession {
                 if self.poisoned || self.graph.ensure_not_poisoned().is_err() {
                     return Err(SemanticTransitionError::Poisoned);
                 }
-                let original = Arc::new(Mutex::new(self.stage_publication_read(source.clone())?));
+                let original = Arc::new(Mutex::new(self.stage_publication_read_with_owner(source.clone(), material_reservation.clone())?));
                 *field(
                     &mut self
                         .prepared_segment
@@ -23733,6 +23756,9 @@ impl SemanticTransitionSession {
         })?;
         if original.read.source().len() != source.len()
             || original.read.source().device_ptr() != source.device_ptr()
+            || material_reservation.as_ref().is_some_and(|expected| {
+                original._material_reservation.as_ref().is_none_or(|retained| !Arc::ptr_eq(expected, retained))
+            })
         {
             return Err(SemanticTransitionError::ObservationMismatch);
         }
@@ -31183,7 +31209,7 @@ impl SemanticTransitionSession {
         let proof = self
             .actor_refresh_preparations
             .get(&(step.token, SemanticSourceContentGeometryKind::Current, member_ordinal))
-            .and_then(std::sync::Weak::upgrade)
+            .and_then(|original| original.proof.upgrade())
             .ok_or_else(|| {
                 publication_input_error(
                     "overlapping historical Edit requires its original CURRENT actor owner",
