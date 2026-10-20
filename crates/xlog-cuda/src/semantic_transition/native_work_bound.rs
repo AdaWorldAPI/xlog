@@ -2493,7 +2493,7 @@ pub(super) fn model_snapshot_prepared_native_work_ceiling(
     let table_bytes = ceiling_sum([
         size_of::<TensorLayoutTableHeader>() as u64,
         ceiling_product(l, size_of::<SemanticTensorLayout>() as u64)?,
-        ceiling_product(active, size_of::<ActiveRow>() as u64)?,
+        ceiling_product(active, size_of::<SemanticActiveRow>() as u64)?,
     ])?;
     let mut ceiling = [0; 9];
     for directory in &storage.bank_templates {
