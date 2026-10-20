@@ -50,6 +50,10 @@ unsafe impl DeviceRepr for PublicationReplayDeliveryInput {}
 // SAFETY: each row is a padding-free collection of integer native ABI records.
 unsafe impl DeviceRepr for PublicationReplayDeliveryRow {}
 const _: () = assert!(size_of::<PublicationReplayDeliveryInput>() == 232);
+const _: () = assert!(std::mem::offset_of!(PublicationReplayDeliveryInput, receiver_outcome) == 88);
+const _: () = assert!(std::mem::offset_of!(PublicationReplayDeliveryInput, rows) == 144);
+const _: () = assert!(std::mem::offset_of!(PublicationReplayDeliveryInput, observations) == 192);
+const _: () = assert!(std::mem::offset_of!(PublicationReplayDeliveryInput, native_work) == 224);
 const _: () = assert!(size_of::<PublicationReplayDeliveryRow>() == 1128);
 
 type LoadedReplayDeliveryAcquisition<V> = (

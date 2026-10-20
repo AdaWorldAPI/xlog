@@ -112,6 +112,9 @@ pub(super) fn contributor_indices<B: PublicationByteStorage>(
         .ok_or(SemanticTransitionError::GenerationExhausted)?;
     if end > binding.candidate_prefix_end
         || end > header.prefix_extent
+        || (header.terminal == 2
+            && (end > header.terminal_position
+                || header.terminal_position.checked_add(1) != Some(header.prefix_extent)))
         || count.checked_mul(8).and_then(|n| n.checked_add(48)) != Some(intent.payload.len() as u64)
         || (end != binding.candidate_prefix_end
             && (header.terminal != 2 || end != header.terminal_position))

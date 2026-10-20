@@ -1384,7 +1384,8 @@ impl SemanticPreparedSourceContentGeometry {
             || self.owner.member.bytes_identity != member.bytes_identity
             || self.owner.member.content_identity != member.content_identity
             || self.owner.member.origin != member.origin
-            || self.owner.member.edit_demonstration_material_roots != member.edit_demonstration_material_roots
+            || self.owner.member.edit_demonstration_material_roots
+                != member.edit_demonstration_material_roots
             || !Arc::ptr_eq(&self.owner.instruction, instruction)
             || !Arc::ptr_eq(&self.owner.seed.material.owner, &material.owner)
             || target
@@ -1589,18 +1590,28 @@ impl SemanticPreparedSourceContentGeometry {
         material: &SemanticCompletedStepWitnessMaterial,
     ) -> Result<(), SemanticTransitionError> {
         let original = &self.owner.seed.proof.owner;
-        let range = original.directory.iter().find(|range| range.role == 48 && range.index == 0)
+        let range = original
+            .directory
+            .iter()
+            .find(|range| range.role == 48 && range.index == 0)
             .ok_or(SemanticTransitionError::ObservationMismatch)?;
-        let header_bytes = model_catalogue::HEADER_WORDS.checked_mul(size_of::<u64>())
+        let header_bytes = model_catalogue::HEADER_WORDS
+            .checked_mul(size_of::<u64>())
             .ok_or(SemanticTransitionError::GenerationExhausted)?;
         if material.identity != self.codebook_identity(21)
             || material.bytes.len() as u64 != range.length_bytes
             || material.bytes.len() < header_bytes
             || !material.bytes.len().is_multiple_of(size_of::<u64>())
-            || material.bytes[..header_bytes].as_chunks::<8>().0.iter()
-                .zip(original.codebook_header).any(|(bytes, word)| u64::from_le_bytes(*bytes) != word)
+            || material.bytes[..header_bytes]
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .zip(original.codebook_header)
+                .any(|(bytes, word)| u64::from_le_bytes(*bytes) != word)
         {
-            return Err(publication_input_error("demonstration codebook differs from its authenticated original source geometry"));
+            return Err(publication_input_error(
+                "demonstration codebook differs from its authenticated original source geometry",
+            ));
         }
         Ok(())
     }
@@ -1642,15 +1653,14 @@ impl SemanticPreparedSourceContentGeometry {
                 SemanticSourceContentGeometryKind::Current
                 | SemanticSourceContentGeometryKind::CurrentDemonstration,
                 Some((operation, bank)),
-            )
-                if bank < 2
-                    && matches!(
-                        operation,
-                        SemanticTransitionKind::Recompute | SemanticTransitionKind::Proposal
-                    )
-                    && kind != SemanticSourceContentKind::BindModel
-                    && !(operation == SemanticTransitionKind::Recompute
-                        && phase == SemanticSourceContentPhase::PackPolicy) =>
+            ) if bank < 2
+                && matches!(
+                    operation,
+                    SemanticTransitionKind::Recompute | SemanticTransitionKind::Proposal
+                )
+                && kind != SemanticSourceContentKind::BindModel
+                && !(operation == SemanticTransitionKind::Recompute
+                    && phase == SemanticSourceContentPhase::PackPolicy) =>
             {
                 Ok(SemanticSourceContentFamily::for_prepared_section(
                     &self.owner,
@@ -2170,19 +2180,21 @@ impl SemanticTransitionSession {
             for (kind, members) in [
                 (SemanticSourceContentGeometryKind::Historical, edits),
                 (SemanticSourceContentGeometryKind::Current, actors),
-                (SemanticSourceContentGeometryKind::CurrentDemonstration, edits),
+                (
+                    SemanticSourceContentGeometryKind::CurrentDemonstration,
+                    edits,
+                ),
             ] {
                 for member in members {
                     let index = original_seeds
                         .iter()
                         .position(|(ordinal, _)| *ordinal == member.ordinal)
                         .ok_or(SemanticTransitionError::ObservationMismatch)?;
-                    let banks: &[Option<usize>] =
-                        if kind.is_current() {
-                            &[Some(0), Some(1)]
-                        } else {
-                            &[None]
-                        };
+                    let banks: &[Option<usize>] = if kind.is_current() {
+                        &[Some(0), Some(1)]
+                    } else {
+                        &[None]
+                    };
                     for &bank in banks {
                         handles.push(SemanticPreparedSourceContentGeometry {
                             owner: Arc::new(SourceContentGeometryOwner {
@@ -2547,10 +2559,10 @@ pub(super) struct PreparedSourceContentOwner {
     pub(super) consumer_stream: u64,
     ports_issued: std::sync::atomic::AtomicBool,
     ports: Mutex<Option<SourceContentPortsState>>,
-    _metadata: Arc<SemanticReplayMaterialReservation>,
     destinations: Mutex<SourceDestinations>,
     pub(super) occurrences:
         Mutex<Option<Arc<super::source_content_occurrences::FrozenSourceContentOccurrences>>>,
+    _metadata: Arc<SemanticReplayMaterialReservation>,
 }
 
 struct SourceContentActivation {
@@ -2744,14 +2756,11 @@ pub(super) struct PendingSourceContent {
 }
 
 struct SourceDestinations {
-    banks: [Option<SourceDestination>; 2],
+    target: SourceDestination,
     sealed: bool,
 }
 
 pub(super) struct SourceDestination {
-    pub(super) preparation: std::sync::Weak<PreparedImportedEditDelivery>,
-    pub(super) issuer: Arc<()>,
-    pub(super) scope: Arc<()>,
     pub(super) step: u64,
     pub(super) instruction: Arc<[u8]>,
     pub(super) updates: Vec<u64>,
@@ -2867,19 +2876,12 @@ impl native_work_bound::FrozenColdSourceContent {
             let destinations = owner.destinations.lock().map_err(|_| {
                 publication_input_error("original SOURCE destinations are poisoned")
             })?;
-            if !destinations.sealed
-                || destinations.banks.iter().any(|bank| {
-                    bank.as_ref()
-                        .is_none_or(|bank| bank.preparation.upgrade().is_none())
-                })
-            {
+            if !destinations.sealed {
                 return Err(publication_input_error(
-                    "SOURCE union requires both original sealed TARGET preparation receipts",
+                    "SOURCE union requires its original sealed target roster",
                 ));
             }
-            let target = destinations.banks[0]
-                .as_ref()
-                .expect("sealed original destination");
+            let target = &destinations.target;
             if !Arc::ptr_eq(&target.instruction, instruction) {
                 return Err(publication_input_error(
                     "SOURCE union belongs to another original native instruction",
@@ -3011,9 +3013,7 @@ impl native_work_bound::FrozenColdSourceContent {
             let destinations = owners[0].destinations.lock().map_err(|_| {
                 publication_input_error("original SOURCE destinations are poisoned")
             })?;
-            let target = destinations.banks[0]
-                .as_ref()
-                .expect("sealed original destination");
+            let target = &destinations.target;
             if target.members.len() != owners.len()
                 || target.members.iter().zip(owners).any(|(member, owner)| {
                     member.ordinal != owner.ordinal || member.origin != owner.origin
@@ -3780,6 +3780,35 @@ impl SemanticTransitionSession {
             .iter()
             .position(|&token| token == target_step.token)
             .ok_or(SemanticTransitionError::ObservationMismatch)?;
+        let target_build = target
+            .prepared_segment
+            .as_ref()
+            .ok_or(SemanticTransitionError::NotBound)?;
+        let target_updates = target_build
+            .tokens
+            .iter()
+            .zip(&target_build.transitions)
+            .filter(|(_, kind)| **kind == SemanticTransitionKind::Update)
+            .map(|(&token, _)| token);
+        let target_training =
+            |token: u64| -> Result<&SemanticSelectedTrainingView, SemanticTransitionError> {
+                target
+                    .steps
+                    .get(&token)
+                    .and_then(|step| step.prepared.as_ref())
+                    .and_then(|step| step.training_view.as_ref())
+                    .ok_or_else(|| {
+                        publication_input_error(
+                            "SOURCE requires every original target Update training view",
+                        )
+                    })
+            };
+        let target_members = target_training(target_step.token)?.edit_group_members();
+        let target_member_count = target_updates.clone().try_fold(0usize, |count, token| {
+            count
+                .checked_add(target_training(token)?.edit_group_members().len())
+                .ok_or(SemanticTransitionError::GenerationExhausted)
+        })?;
         let declared = &geometry.owner;
         if declared.kind != SemanticSourceContentGeometryKind::Historical
             || declared.bank.is_some()
@@ -3835,6 +3864,18 @@ impl SemanticTransitionSession {
         if declared.member.origin != origin {
             return Err(publication_input_error(
                 "SOURCE recipe changed its native frozen member origin",
+            ));
+        }
+        if !target_members.iter().any(|member| {
+            member.ordinal == ordinal
+                && member.origin == origin
+                && member.identity == declared.member.identity
+                && member.source_identity == declared.member.source_identity
+                && member.bytes_identity == declared.member.bytes_identity
+                && member.content_identity == declared.member.content_identity
+        }) {
+            return Err(publication_input_error(
+                "SOURCE changed its original frozen target Edit member",
             ));
         }
         let (material_identity, _) = self.verify_replay_source_material(lease, material)?;
@@ -3949,6 +3990,29 @@ impl SemanticTransitionSession {
                     size_of::<SemanticReplayMaterialReservation>() + 2 * size_of::<usize>(),
                 )
             })
+            .and_then(|bytes| {
+                target_updates
+                    .clone()
+                    .count()
+                    .checked_mul(
+                        size_of::<u64>()
+                            + size_of::<(
+                                u64,
+                                Vec<crate::semantic_training_view::FrozenPolicyGroupMember>,
+                            )>(),
+                    )
+                    .and_then(|roster| bytes.checked_add(roster))
+            })
+            .and_then(|bytes| {
+                target_member_count
+                    .checked_add(target_members.len())
+                    .and_then(|count| {
+                        count.checked_mul(size_of::<
+                            crate::semantic_training_view::FrozenPolicyGroupMember,
+                        >())
+                    })
+                    .and_then(|members| bytes.checked_add(members))
+            })
             .ok_or(SemanticTransitionError::GenerationExhausted)?;
         let owner_metadata = Arc::new(
             declared.seed.proof.owner.budget.reserve_auxiliary(
@@ -3957,6 +4021,19 @@ impl SemanticTransitionSession {
             )?,
         );
         let feedback_geometry = feedback.content.tensors.clone();
+        let mut updates = Vec::with_capacity(target_updates.clone().count());
+        let mut all_members = Vec::with_capacity(target_updates.clone().count());
+        for token in target_updates {
+            updates.push(token);
+            all_members.push((token, target_training(token)?.edit_group_members().to_vec()));
+        }
+        let destination = SourceDestination {
+            step: target_step.token,
+            instruction: Arc::clone(&target_instruction),
+            updates,
+            members: target_members.to_vec(),
+            all_members,
+        };
         step.feedback.push(feedback);
         let owner = Arc::new(PreparedSourceContentOwner {
             geometry: Arc::clone(declared),
@@ -3986,7 +4063,7 @@ impl SemanticTransitionSession {
             ports: Mutex::new(None),
             _metadata: owner_metadata,
             destinations: Mutex::new(SourceDestinations {
-                banks: std::array::from_fn(|_| None),
+                target: destination,
                 sealed: false,
             }),
             occurrences: Mutex::new(Some(occurrence_owner)),
@@ -4052,93 +4129,6 @@ impl SemanticTransitionSession {
         Ok(())
     }
 
-    pub(super) fn retain_source_content_destination(
-        &self,
-        lease: &SemanticPublishedLease,
-        preparation: Arc<PreparedImportedEditDelivery>,
-        instruction: Arc<[u8]>,
-        updates: Vec<u64>,
-        members: Vec<crate::semantic_training_view::FrozenPolicyGroupMember>,
-        all_members: Vec<(
-            u64,
-            Vec<crate::semantic_training_view::FrozenPolicyGroupMember>,
-        )>,
-    ) -> Result<(), SemanticTransitionError> {
-        let owner = self
-            .steps
-            .get(&lease.token)
-            .and_then(|step| step.source_content.as_ref())
-            .ok_or_else(|| {
-                publication_input_error("future Edit lost its original SOURCE recipe")
-            })?;
-        if preparation.bank > 1
-            || !Arc::ptr_eq(&owner.target.issuer, &preparation.issuer)
-            || !Arc::ptr_eq(&owner.target.scope, &preparation.scope)
-            || owner.target.token != preparation.step
-            || !Arc::ptr_eq(&owner.target_instruction, &instruction)
-            || !Arc::ptr_eq(&owner.issuer, &preparation.source_issuer)
-            || owner.token != preparation.source_token
-            || owner.identity != preparation.source_identity
-            || owner.ordinal != preparation.member_ordinal
-            || owner.material != preparation.material
-            || owner.origin != preparation.origin
-            || !updates.contains(&preparation.step)
-            || !members
-                .iter()
-                .any(|member| member.ordinal == owner.ordinal && member.origin == owner.origin)
-            || all_members
-                .iter()
-                .map(|(step, _)| *step)
-                .collect::<Vec<_>>()
-                != updates
-        {
-            return Err(publication_input_error(
-                "future Edit changed its original SOURCE recipe",
-            ));
-        }
-        let mut destinations = owner.destinations.lock().map_err(|_| {
-            publication_input_error("original SOURCE destination roster is poisoned")
-        })?;
-        let bank = preparation.bank;
-        if destinations.sealed || destinations.banks[bank].is_some() {
-            return Err(publication_input_error(
-                "original SOURCE destination was already retained",
-            ));
-        }
-        if let Some(other) = &destinations.banks[1 - bank] {
-            if !Arc::ptr_eq(&other.issuer, &preparation.issuer)
-                || !Arc::ptr_eq(&other.scope, &preparation.scope)
-                || other.step != preparation.step
-                || !Arc::ptr_eq(&other.instruction, &instruction)
-                || other.updates != updates
-                || other.members.len() != members.len()
-                || other.members.iter().zip(&members).any(|(left, right)| {
-                    left.ordinal != right.ordinal
-                        || left.origin != right.origin
-                        || left.identity != right.identity
-                        || left.source_identity != right.source_identity
-                        || left.bytes_identity != right.bytes_identity
-                        || left.content_identity != right.content_identity
-                })
-            {
-                return Err(publication_input_error(
-                    "SOURCE banks changed their original target or frozen roster",
-                ));
-            }
-        }
-        destinations.banks[bank] = Some(SourceDestination {
-            preparation: Arc::downgrade(&preparation),
-            issuer: Arc::clone(&preparation.issuer),
-            scope: Arc::clone(&preparation.scope),
-            step: preparation.step,
-            instruction,
-            updates,
-            members,
-            all_members,
-        });
-        Ok(())
-    }
-
     /// Seal only the complete structural roster; no numerical witness is issued.
     pub fn seal_prepared_source_content(
         &self,
@@ -4150,14 +4140,9 @@ impl SemanticTransitionSession {
         let mut destinations = owner.destinations.lock().map_err(|_| {
             publication_input_error("original SOURCE destination roster is poisoned")
         })?;
-        if !owner.ports_issued.load(Ordering::Acquire)
-            || destinations.banks.iter().any(|bank| {
-                bank.as_ref()
-                    .is_none_or(|bank| bank.preparation.upgrade().is_none())
-            })
-        {
+        if !owner.ports_issued.load(Ordering::Acquire) {
             return Err(publication_input_error(
-                "SOURCE preparation lacks its original ports and both TARGET banks",
+                "SOURCE preparation lacks its original ports",
             ));
         }
         destinations.sealed = true;

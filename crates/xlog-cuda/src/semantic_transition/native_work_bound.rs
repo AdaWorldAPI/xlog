@@ -2860,7 +2860,7 @@ pub(super) fn model_context_activation_native_work_ceiling(
                 ceiling_product(5, ns)?,
                 ceiling_product(2, nt)?,
                 ceiling_product(21, intents)?,
-                ceiling_product(13, acknowledgments)?,
+                ceiling_product(17, acknowledgments)?,
                 ceiling_product(5, ceiling_product(acknowledgments, intents)?)?,
                 ceiling_product(5, pairs(acknowledgments)?)?,
                 16,
@@ -2876,14 +2876,14 @@ pub(super) fn model_context_activation_native_work_ceiling(
                     ceiling_product(72, ceiling_sum([intents, 1])?)?,
                 ])? / 64,
                 ceiling_product(6, intents)?,
-                ceiling_sum([ack_payload, ceiling_product(72, acknowledgments)?])? / 64,
-                ceiling_product(4, acknowledgments)?,
+                ceiling_sum([ack_payload, ceiling_product(144, acknowledgments)?])? / 64,
+                ceiling_product(6, acknowledgments)?,
             ])?,
             ceiling_sum([
                 ceiling_product(32, ceiling_sum([intents, 1])?)?,
                 ceiling_product(344, intents)?,
-                ceiling_product(32, acknowledgments)?,
-                ceiling_product(224, acknowledgments)?,
+                ceiling_product(64, acknowledgments)?,
+                ceiling_product(336, acknowledgments)?,
             ])?,
         ],
     )?;
@@ -2943,7 +2943,7 @@ pub(super) fn model_context_activation_native_work_ceiling(
     )?;
     for item in target_directory
         .iter()
-        .filter(|item| matches!(item.role, 27 | 28 | 30 | 31 | 32 | 33))
+        .filter(|item| matches!(item.role, 2 | 27 | 28 | 30 | 31 | 32 | 33))
     {
         add_native_work_ceiling(&mut ceiling, digest(item.length_bytes)?)?;
         add_native_work_ceiling(&mut ceiling, fold)?;
@@ -3079,10 +3079,16 @@ pub(super) fn policy_vjp_native_work_ceiling(
         component_count,                      // Original importance-weight receipt scan.
         ceiling_product(2, component_count)?, // Critic receipts and baselines.
         1,                                    // Critic term, including reached-refusal clearing.
-        if source.actor_refresh.as_ref().is_some_and(|staged| staged.proof.is_demonstration()) {
+        if source
+            .actor_refresh
+            .as_ref()
+            .is_some_and(|staged| staged.proof.is_demonstration())
+        {
             // Original choice, current choice, draw, and all retained key/counter/random words.
             ceiling_product(13, component_count)?
-        } else { 0 },
+        } else {
+            0
+        },
     ])?;
     // Reached refusal clears four component coordinates; the normal actor path
     // visits at most eleven. Neither path can exceed this one output clear.
@@ -3640,7 +3646,8 @@ fn publication_finalization_native_work_ceiling(
         let intent = u64::from(matches!(role, 30 | 31));
         let attempt = u64::from(matches!(role, 14 | 27 | 30 | 32 | 33));
         let attempt_target = 2 * u64::from(role == 33);
-        let descriptor = u64::from(matches!(role, 27 | 28 | 30 | 31 | 32 | 33));
+        let descriptor = u64::from(matches!(role, 2 | 27 | 28 | 30 | 31 | 32 | 33));
+        let provenance_annotation = u64::from(role == 2);
         let preserve = u64::from(
             matches!(role, 32 | 44 | 56 | 57) || role == SemanticStateRole::TaskGround as u64,
         );
@@ -3652,6 +3659,7 @@ fn publication_finalization_native_work_ceiling(
             attempt,
             attempt_target,
             descriptor,
+            provenance_annotation,
             preserve,
         ])?;
         let mut digest = content_digest_ceiling(bytes, 29, false)?;
@@ -3662,7 +3670,14 @@ fn publication_finalization_native_work_ceiling(
         repeat_native_ceiling(&mut result, digest, occurrences)?;
         // The predictor constructs the same small content-view framing for
         // logical/attempt/descriptor hashes; SHA runs only in the actual suffix.
-        let predicted_views = ceiling_sum([logical, intent, attempt, attempt_target, descriptor])?;
+        let predicted_views = ceiling_sum([
+            logical,
+            intent,
+            attempt,
+            attempt_target,
+            descriptor,
+            provenance_annotation,
+        ])?;
         add_native_work_ceiling(
             &mut result,
             [
@@ -3679,7 +3694,12 @@ fn publication_finalization_native_work_ceiling(
         )?;
         // Logical/descriptor and directory folds, plus one coverage fold. A
         // model view has two numerical folds and the logical backing fold too.
-        let folds = ceiling_sum([2, coverage, if (18..=25).contains(&role) { 3 } else { 0 }])?;
+        let folds = ceiling_sum([
+            2,
+            coverage,
+            provenance_annotation,
+            if (18..=25).contains(&role) { 3 } else { 0 },
+        ])?;
         repeat_native_ceiling(&mut result, publication_hash_ceiling(80)?, folds)?;
         add_native_work_ceiling(
             &mut result,
@@ -3713,9 +3733,9 @@ fn publication_finalization_native_work_ceiling(
     let searches = ceiling_sum([
         ceiling_product(2, ceiling_product(n, ceiling_sum([n, t])?)?)?,
         ceiling_product(n, n.saturating_sub(1))? / 2,
-        ceiling_product(ceiling_sum([window, 25])?, n)?,
+        ceiling_product(ceiling_sum([window, 27])?, n)?,
         ceiling_product(3, n)?,
-        window,
+        ceiling_product(2, window)?,
     ])?;
     add_native_work_ceiling(
         &mut result,
@@ -3774,7 +3794,7 @@ fn publication_finalization_native_work_ceiling(
         size_of::<AttemptReceipt>() as u64,
         size_of::<IntentEntry>() as u64,
         12 * size_of::<PublicationRange>() as u64,
-        ceiling_product(window, 2 * size_of::<TokenProvenance>() as u64 + 16 * 8)?,
+        ceiling_product(window, 2 * size_of::<TokenProvenance>() as u64 + 24 * 8)?,
         // Fixed identity copies and scalar writes in action/coverage/attempt,
         // model-contract, intent, equality and publication closure.
         (16 + 4 + 13 + 9 + 25 + 19 + 8 + 5 + 4 + 4 * 5 + 10 + 11) * 8,

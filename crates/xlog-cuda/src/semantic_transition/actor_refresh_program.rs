@@ -3345,7 +3345,7 @@ impl SemanticTransitionSession {
             .ok_or_else(invalid_program)?;
         let intents = output_intents_from_ranges(entries, payload)?;
         let acknowledged =
-            acknowledgement_receipts(&acknowledgements.bytes, acknowledgements.capacity)?;
+            acknowledgement_records(&acknowledgements.bytes, acknowledgements.capacity)?;
         if admissions.is_empty() {
             if attachment_present
                 || !actor_assignments.is_empty()
@@ -3410,7 +3410,7 @@ impl SemanticTransitionSession {
             || intents.iter().any(|intent| {
                 !acknowledged
                     .iter()
-                    .any(|(identity, _)| *identity == intent.stable_identity)
+                    .any(|record| record.stable_identity == intent.stable_identity)
             })
         {
             return Err(invalid_program());

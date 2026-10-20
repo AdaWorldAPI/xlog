@@ -531,12 +531,16 @@ struct SemanticTrainingReplayAppendEntry {
     SemanticTrainingViewOriginRecord original_origin;
     uint64_t stable_intent[4],result_receipt_digest[4],payload_offset_bytes,payload_length_bytes,disposition;
 };
-struct PublicationReplayDeliveryInput {
-    PublicationDeliveryInput delivery;
+struct PublicationReplayDeliveryRow {
     SemanticTrainingReplayAppendEntry entry;
     uint64_t payload,payload_bytes;
     TrainingViewRowDescriptor row_descriptor;
-    uint64_t row_bytes,row_bytes_len,arena_descriptors,arena_descriptor_count,arena_raw,arena_raw_bytes;
+    uint64_t row_bytes,row_bytes_len;
+};
+struct PublicationReplayDeliveryInput {
+    PublicationDeliveryInput delivery;
+    uint64_t receiver_outcome,receiver_outcome_bytes,receiver_outcome_digest[4],receiver_disposition;
+    uint64_t rows,row_count,arena_descriptors,arena_descriptor_count,arena_raw,arena_raw_bytes;
     uint64_t observations,observation_count,statements,supports,native_work;
 };
 struct TrainingOriginalMaterializationInput {
@@ -544,8 +548,12 @@ struct TrainingOriginalMaterializationInput {
 };
 static_assert(sizeof(TrainingOriginalMaterializationInput)==176,"original training materialization ABI");
 static_assert(sizeof(SemanticTrainingReplayAppendHeader)==128 && sizeof(SemanticTrainingReplayAppendEntry)==480 &&
-    sizeof(PublicationReplayDeliveryInput)==1288,
+    sizeof(PublicationReplayDeliveryRow)==1128 && sizeof(PublicationReplayDeliveryInput)==232,
     "replay append queue ABI");
+static_assert(offsetof(PublicationReplayDeliveryInput,receiver_outcome)==88 &&
+    offsetof(PublicationReplayDeliveryInput,rows)==144 &&
+    offsetof(PublicationReplayDeliveryInput,observations)==192 &&
+    offsetof(PublicationReplayDeliveryInput,native_work)==224,"replay delivery field ABI");
 struct PublicationTensorLayout {
     uint64_t role,index,element_bytes,scalar_type,rank,logical_axis,dimensions[4],strides_bytes[4];
 };
@@ -580,6 +588,7 @@ struct PublicationStepResult {
 struct TokenProvenanceRecord {
     uint64_t source_slot,logical_position,token,base_word,proposal,ordinal,action_receipt_digest[4];
     uint64_t authority_generation,origin_logical_digest[4],authority_closure_digest[4],record_digest[4];
+    uint64_t successor_logical_digest[4];
 };
 struct IntentQueueHeader {
     uint64_t abi,count,capacity,payload_used_bytes,payload_capacity_bytes,effect_offset_bytes,effect_length_bytes,chain_head[4];
@@ -593,7 +602,8 @@ struct AcknowledgementQueueHeader {
     uint64_t abi,count,capacity,payload_used_bytes,payload_capacity_bytes,chain_head[4];
 };
 struct AcknowledgementEntry {
-    uint64_t stable_identity[4],receipt_digest[4],receipt_len,previous_chain[4],chain[4];
+    uint64_t stable_identity[4],receipt_digest[4],receipt_len,receiver_outcome_digest[4],receiver_outcome_len;
+    uint64_t previous_chain[4],chain[4];
 };
 struct PolicyField { uint64_t embeddings,biases; uint32_t cardinality; int32_t null_category; uint64_t retained_offset; };
 struct PolicyNumericalDescriptor {
@@ -1286,11 +1296,12 @@ static_assert(sizeof(PublicationTensorLayout)==112,"tensor layout ABI");
 static_assert(sizeof(RawFeedbackRecord)==384,"raw feedback ABI");
 static_assert(sizeof(CompletionCoverage)==360,"completion coverage ABI");
 static_assert(sizeof(AttemptReceipt)==352,"attempt receipt ABI");
-static_assert(sizeof(TokenProvenanceRecord)==184,"token provenance ABI");
+static_assert(sizeof(TokenProvenanceRecord)==216,"token provenance ABI");
+static_assert(offsetof(TokenProvenanceRecord,successor_logical_digest)==184,"token provenance successor ABI");
 static_assert(sizeof(IntentQueueHeader)==88,"intent queue ABI");
 static_assert(sizeof(IntentEntry)==344,"intent entry ABI");
 static_assert(sizeof(AcknowledgementQueueHeader)==72,"acknowledgement queue ABI");
-static_assert(sizeof(AcknowledgementEntry)==136,"acknowledgement entry ABI");
+static_assert(sizeof(AcknowledgementEntry)==176,"acknowledgement entry ABI");
 static_assert(sizeof(Descriptor)==1472,"launch ABI");
 static_assert((2*262144+4*65536)*sizeof(uint32_t)<=SCRATCH_BYTES,"serial scratch and completion witnesses");
 #ifdef XLOG_SEMANTIC_POLICY
@@ -3518,12 +3529,14 @@ __device__ uint64_t publication_action_digest(const PublicationControl& control,
 struct PublicationLogicalBytes {
     PublicationTensorBytes view;
     uint64_t role;
+    bool provenance_state=false;
     __device__ uint8_t operator[](uint64_t index) const {
         if(index<128)return view[index];
         const uint64_t byte=index-128,word=byte/8;
         // The stable record seal binds the normalized originating receipt;
         // retain it while excluding the separately preserved audit receipt hash.
-        if(role==2 && (word%23==3 || (word%23>=6 && word%23<=9)))return 0;
+        if(role==2 && (word%27==3 || (word%27>=6 && word%27<=9) ||
+            (!provenance_state && word%27>=23)))return 0;
         if(role==14 && ((word>=1 && word<=5) || word>=41))return 0;
         if(role==15 && word%48>=6 && publication_receipt_runtime_word(word%48-6))return 0;
         if(role==33 && ((word>=1 && word<=6) || word>=39))return 0;
@@ -3536,12 +3549,12 @@ struct PublicationLogicalBytes {
 };
 __device__ uint64_t publication_logical_range_digest(const PublicationControl& control,
         const PublicationRange& range,const PublicationTensorLayout* layout,uint64_t* digest,
-        semantic_graph::NativeWorkTally* work=nullptr) {
+        semantic_graph::NativeWorkTally* work=nullptr,bool provenance_state=false) {
     if(range.role==48) {
         if(range.length_bytes%8)return 1;
         return publication_logical_codebook_digest(reinterpret_cast<const uint64_t*>(publication_range_bytes(control,range)),range.length_bytes/8,digest,work);
     }
-    PublicationLogicalBytes input{};uint64_t bytes=0;input.role=range.role;
+    PublicationLogicalBytes input{};uint64_t bytes=0;input.role=range.role;input.provenance_state=provenance_state;
     if(publication_tensor_view(control,range,layout,&input.view,&bytes,nullptr,work) || bytes>UINT64_MAX/8-128)return 1;
     semantic_graph::sha256(input,128+bytes,digest,work);
     return 0;
@@ -3785,9 +3798,9 @@ __device__ uint64_t publication_descriptor_digest(const PublicationControl& cont
     uint64_t digest[4];
     for(uint64_t i=0;i<bank.header.range_count;++i) {
         semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::TableSlot,1);
-        if(ranges[i].role!=27 && ranges[i].role!=28 && ranges[i].role!=30 && ranges[i].role!=31 &&
+        if(ranges[i].role!=2 && ranges[i].role!=27 && ranges[i].role!=28 && ranges[i].role!=30 && ranges[i].role!=31 &&
            ranges[i].role!=32 && ranges[i].role!=33)continue;
-        if(publication_logical_range_digest(control,ranges[i],nullptr,digest,work))return 1;
+        if(publication_logical_range_digest(control,ranges[i],nullptr,digest,work,true))return 1;
         publication_fold(bank.header.state_digest,ranges[i].role,ranges[i].index,digest,work);
     }
     publication_original_descriptor_digest(control,bank,bank.header.descriptor_digest,work);
@@ -4590,8 +4603,15 @@ __device__ uint64_t publication_validate_intents(const PublicationControl& contr
     }
     if(cursor!=queue->payload_used_bytes || !publication_identity_equal(queue->chain_head,chain,work))return 1;
     if(terminal_position!=UINT64_MAX) {
-        if(queue->count==queue->capacity || terminal_position>(UINT64_MAX-16)/8)return 5;
-        const uint64_t needed=16+terminal_position*8;
+        const auto& contract=*reinterpret_cast<const PublicationContract*>(control.contract);
+        uint64_t tokens=terminal_position,header_bytes=16;
+        if(contract.nonterminal_intent_mode==1) {
+            if(terminal_position<contract.nonterminal_intent_prefix_begin)return 1;
+            const uint64_t end=terminal_position<contract.nonterminal_intent_prefix_end ? terminal_position : contract.nonterminal_intent_prefix_end;
+            tokens=end-contract.nonterminal_intent_prefix_begin;header_bytes=48;
+        }
+        if(queue->count==queue->capacity || tokens>(UINT64_MAX-header_bytes)/8)return 5;
+        const uint64_t needed=header_bytes+tokens*8;
         if(needed>queue->payload_capacity_bytes-queue->payload_used_bytes)return 5;
     }
     return 0;
@@ -5366,7 +5386,7 @@ __device__ void semantic_policy_backward(const Descriptor& descriptor,
                 slot();
                 if(!isfinite(coefficients[i]))*status=1;
             }
-        } else if(b.mode==1 || b.mode==2 || b.mode==3 || b.mode==4 || b.mode==5) {
+        } else if(b.mode==4 || b.mode==5) {
             if(!b.selection || b.selection%alignof(SemanticTrainingViewSelection) ||
                !b.objective || b.objective%alignof(SemanticTrainingObjectiveRecord) ||
                !b.objective_groups || b.objective_groups%alignof(SemanticTrainingObjectiveGroupRecord) ||
@@ -5408,7 +5428,6 @@ __device__ void semantic_policy_backward(const Descriptor& descriptor,
                 if(!isfinite(evaluator_min) || !isfinite(evaluator_max) || evaluator_min>evaluator_max)*status=1;
                 uint64_t actor_groups=0,edit_groups=0,matching_edit_rows=0;
                 bool selected_member=false,group_member=false;
-                const SemanticTrainingRosterRow* matching_edit_row=nullptr;
                 for(uint64_t i=0;i<objective.group_count && !*status;++i) {
                     slot();
                     const auto group=groups[i];
@@ -5426,7 +5445,7 @@ __device__ void semantic_policy_backward(const Descriptor& descriptor,
                             if(ordinal>=objective.row_count) {*status=1;break;}
                             if(roster[ordinal].origin_candidate==committed_append_origin) {*status=1;break;}
                             selected_member |= ordinal==selection.ordinal;
-                            group_member |= (b.mode==2 || b.mode==4) && ordinal==b.member_ordinal;
+                            group_member |= b.mode==4 && ordinal==b.member_ordinal;
                         }
                     } else if(group.kind==4) {
                         ++edit_groups;
@@ -5441,24 +5460,21 @@ __device__ void semantic_policy_backward(const Descriptor& descriptor,
                                 continue;
                             }
                             if(row.ordinal!=ordinal || row.basis!=1 || row.origin.present!=1 ||
-                               row.origin.transition!=1 ||
-                               (b.mode==1 && row.origin_candidate==UINT64_MAX)) {
+                               row.origin.transition!=1) {
                                 *status=1;break;
                             }
-                            if((b.mode==1 && row.origin_candidate==b.origin_candidate) ||
-                               ((b.mode==2 || b.mode==3 || b.mode==5) && ordinal==b.member_ordinal)) {
+                            if(b.mode==5 && ordinal==b.member_ordinal) {
                                 ++matching_edit_rows;
-                                matching_edit_row=&row;
                             }
                         }
                     }
                 }
                 if(actor_groups!=1 || edit_groups!=1 ||
                    (!selected_member && !committed_append) || (selected_member && committed_append) ||
-                   ((b.mode==2 || b.mode==4) && (!group_member || b.member_ordinal>=objective.row_count ||
+                   (b.mode==4 && (!group_member || b.member_ordinal>=objective.row_count ||
                     !b.critic_term || b.critic_term%alignof(float) ||
                     !publication_pointer_span(b.critic_term,sizeof(float),alignof(float)))) ||
-                   ((b.mode==3 || b.mode==5) && (b.member_ordinal>=objective.row_count ||
+                   (b.mode==5 && (b.member_ordinal>=objective.row_count ||
                     matching_edit_rows!=1)) ||
                    matching_edit_rows>1)*status=1;
                 const auto* origin_lease=reinterpret_cast<const PublicationLease*>(b.origin_lease);
@@ -5468,34 +5484,16 @@ __device__ void semantic_policy_backward(const Descriptor& descriptor,
                     *status=1;
                 const auto* state=reinterpret_cast<const State*>(descriptor.state);
                 const bool owned=origin_lease && origin_lease->bank==b.origin_bank;
-                apply_actor=owned && (b.mode==1
-                    ? !committed_append && b.origin_candidate==selection.origin_candidate
-                    : ((b.mode==2 || b.mode==4) && group_member));
-                apply_edit=b.mode!=4 && owned && matching_edit_rows==1;
+                apply_actor=owned && b.mode==4 && group_member;
+                apply_edit=b.mode==5 && owned && matching_edit_rows==1;
                 apply_selected=apply_actor || apply_edit;
                 if(apply_selected && !*status) {
                     const auto* target=reinterpret_cast<const PublicationHeader*>(b.target_header);
-                    const auto& origin=b.mode==1 ? selection.origin : roster[b.member_ordinal].origin;
+                    const auto& origin=roster[b.member_ordinal].origin;
                     if(!publication_pointer_span(b.target_header,sizeof(PublicationHeader),alignof(PublicationHeader)) ||
                        target->abi!=1 || origin.present!=1)*status=1;
-                    else if(b.mode!=4 && b.mode!=5 &&
-                       (!publication_identity_equal(origin.model_geometry_digest,target->model_geometry_digest) ||
-                        !publication_identity_equal(origin.model_numerical_digest,target->model_numerical_digest))) *status=1;
                 }
                 if((apply_actor || apply_edit) && (!state || state->status))*status=1;
-                if((b.mode==2 || b.mode==3) && (!owned || !state || state->status))*status=1;
-                if((b.mode==2 || b.mode==3) && !*status) {
-                    const auto& row=roster[b.member_ordinal];
-                    const auto& origin=row.origin;
-                    if(row.ordinal!=b.member_ordinal || row.basis!=1 ||
-                       row.origin_candidate==committed_append_origin ||
-                       origin.present!=1 || origin.transition!=1 ||
-                       row.origin_candidate!=b.origin_candidate ||
-                       state->model_generation!=origin.model_generation ||
-                       state->stream_serial!=origin.stream_serial ||
-                       state->family_id!=origin.family_id ||
-                        state->proposal!=origin.proposal)*status=1;
-                }
                 if((b.mode==4 || b.mode==5) && !*status) {
                     const auto* proof=reinterpret_cast<const PreparedActorRefreshDevice*>(b.derived_origin);
                     if(!owned || !state || state->status || (b.mode==4 ? !apply_actor : !apply_edit) ||
@@ -5565,54 +5563,15 @@ __device__ void semantic_policy_backward(const Descriptor& descriptor,
                     }
                 }
                 if(apply_edit && !*status) {
-                    const auto& origin=matching_edit_row->origin;
-                    if(b.mode==5) {
-                        const auto& proof=*reinterpret_cast<const PreparedActorRefreshDevice*>(b.derived_origin);
-                        edit_lane=uint32_t(proof.demonstrated_lane-1);
-                    } else if(state->model_generation!=origin.model_generation ||
-                       state->stream_serial!=origin.stream_serial ||
-                        state->family_id!=origin.family_id || state->proposal!=origin.proposal) {
-                        *status=1;
-                    } else {
-                        const auto* task=reinterpret_cast<const uint64_t*>(descriptor.task);
-                        if(!task || task[0]!=9) {
-                            *status=1;
-                        } else {
-                            const auto* goal=backward_program_bank.task.goal_witness;
-                            bool complete_goal=true;
-                            for(uint32_t root=0;root<4;++root) {
-                                bool present=false;
-                                for(uint32_t word=0;word<4;++word) { slot();present|=goal[root*4+word]!=0; }
-                                complete_goal&=present;
-                            }
-                            complete_goal&=goal[16]!=0 && goal[17]!=0;
-                            const auto& base=state->task_evaluation.facts[0];
-                            const bool base_solves=base.eligible==1 && base.p==1;
-                            for(uint32_t lane=0;lane<2 && edit_lane==UINT32_MAX;++lane) {
-                                slot();
-                                const auto& facts=state->task_evaluation.facts[lane+1];
-                                const auto& admission=state->semantic_receipts[3+lane*3];
-                                if(complete_goal && !base_solves &&
-                                   state->task_evaluation.lane_refusal[lane]==0 &&
-                                   admission.words[0]==semantic_graph::kOk &&
-                                   state->work[lane].added_supports>0 &&
-                                   facts.eligible==1 && facts.p==1)edit_lane=lane;
-                            }
-                            if(edit_lane==UINT32_MAX)*status=1;
-                        }
-                    }
+                    const auto& proof=*reinterpret_cast<const PreparedActorRefreshDevice*>(b.derived_origin);
+                    edit_lane=uint32_t(proof.demonstrated_lane-1);
                     bounded_edit_scale=policy_scalar_divide(policy_exact_scalar(double(objective_coefficients[3])),
                         policy_uint64_bound(edit_denominator));
                     edit_scale=bounded_edit_scale.value;
                     if(!isfinite(edit_scale))*status=1;
                 }
                 if(apply_actor && !*status) {
-                    const auto& origin=b.mode==1 ? selection.origin : roster[b.member_ordinal].origin;
-                    if(!state || state->status || (b.mode!=4 &&
-                       (state->model_generation!=origin.model_generation ||
-                        state->stream_serial!=origin.stream_serial ||
-                        state->family_id!=origin.family_id ||
-                        state->proposal!=origin.proposal)) ||
+                    if(!state || state->status ||
                        !isfinite(state->importance_weight) || state->importance_weight<=0.0 ||
                        !selected_task_cost_matches(state,objective.cost_cap)) {
                         *status=1;
@@ -5651,7 +5610,7 @@ __device__ void semantic_policy_backward(const Descriptor& descriptor,
         } else {
             *status=1;
         }
-        if((b.mode==2 || b.mode==4) && b.critic_term && b.critic_term%alignof(float)==0 && !*status) {
+        if(b.mode==4 && b.critic_term && b.critic_term%alignof(float)==0 && !*status) {
             float raw=0.0f;
             const auto* baseline=reinterpret_cast<const float*>(p.component_baselines);
             for(uint32_t i=0;i<COMPONENT_COUNT;++i) {
@@ -5972,7 +5931,10 @@ __device__ uint64_t publication_source_records(const PublicationControl& control
         if(s.kind!=1)continue;
         if(s.provenance_record>=provenance->length_bytes/sizeof(TokenProvenanceRecord))return 1;
         const auto& record=records[s.provenance_record];
+        const uint64_t successor=record.successor_logical_digest[0]|record.successor_logical_digest[1]|
+            record.successor_logical_digest[2]|record.successor_logical_digest[3];
         if(record.logical_position!=s.logical_position || record.token!=s.token ||
+           (s.provenance!=1 && s.provenance!=2) || (s.provenance==1 && successor) || (s.provenance==2 && !successor) ||
            !(record.origin_logical_digest[0]|record.origin_logical_digest[1]|record.origin_logical_digest[2]|record.origin_logical_digest[3]) ||
            !(record.authority_closure_digest[0]|record.authority_closure_digest[1]|record.authority_closure_digest[2]|record.authority_closure_digest[3]))return 1;
     }
@@ -6253,7 +6215,7 @@ __device__ uint64_t publication_initialize(const Descriptor& descriptor,Publicat
 __device__ uint64_t publication_append_replay(PublicationControl& control,const PublicationBank& base,
         const PublicationRange* old,PublicationRange* next_ranges,const PublicationRange& entries_template,
         const PublicationRange& payload_template,const PublicationReplayDeliveryInput& input,
-        const IntentEntry& intent,semantic_graph::NativeWorkTally* work=nullptr) {
+        const IntentEntry& intent,semantic_graph::NativeWorkTally* work=nullptr,bool commit=true) {
     const auto& contract=*reinterpret_cast<const PublicationContract*>(control.contract);
     const auto* prior_entries=publication_find_range(old,base.header.range_count,56,0,work);
     const auto* prior_payload=publication_find_range(old,base.header.range_count,57,0,work);
@@ -6268,46 +6230,18 @@ __device__ uint64_t publication_append_replay(PublicationControl& control,const 
     const auto* old_payload=publication_range_bytes(control,*prior_payload);
     if(!old_bytes || (prior_payload->length_bytes && !old_payload))return 1;
     const auto& header=*reinterpret_cast<const SemanticTrainingReplayAppendHeader*>(old_bytes);
-    const auto& added=input.entry;
-    const auto& row=input.row_descriptor;
-    const bool eligible=added.disposition==1;
-    if(header.abi!=1 || header.original_stage!=1 || header.original_count>contract.replay_original_slot_boundary ||
-       !(header.original_prefix_identity[0]|header.original_prefix_identity[1]|header.original_prefix_identity[2]|header.original_prefix_identity[3]) ||
-       header.eligible_count>header.count || header.count>=header.capacity ||
-       (added.disposition!=1 && added.disposition!=2) || contract.replay_original_slot_boundary>contract.replay_row_capacity ||
+    if(header.abi!=1 || header.original_stage>1 || header.original_count>contract.replay_original_slot_boundary ||
+       (input.row_count && (header.original_stage!=1 ||
+        !(header.original_prefix_identity[0]|header.original_prefix_identity[1]|header.original_prefix_identity[2]|header.original_prefix_identity[3]))) ||
+       header.eligible_count>header.count || header.count>header.capacity ||
+       input.row_count>header.capacity-header.count || contract.replay_original_slot_boundary>contract.replay_row_capacity ||
        header.capacity!=contract.replay_row_capacity-contract.replay_original_slot_boundary ||
        header.capacity>(UINT64_MAX-sizeof(header))/sizeof(SemanticTrainingReplayAppendEntry) ||
        prior_entries->length_bytes!=sizeof(header)+header.count*sizeof(SemanticTrainingReplayAppendEntry) ||
        prior_payload->length_bytes!=header.payload_used_bytes || header.payload_used_bytes>header.payload_capacity_bytes ||
        header.payload_capacity_bytes!=contract.replay_payload_capacity_bytes ||
-       added.row_ordinal!=(eligible ? header.original_count+header.eligible_count : UINT64_MAX) ||
-       input.arena_descriptor_count!=contract.replay_row_capacity || input.arena_raw_bytes!=contract.replay_raw_capacity_bytes ||
-       row.ordinal!=added.row_ordinal || row.basis!=1 || row.origin.present!=1 ||
-       row.raw_bytes!=input.row_bytes_len || !row.raw_bytes ||
-       (eligible && (contract.replay_original_slot_boundary+header.eligible_count>UINT64_MAX/row.raw_bytes ||
-                     row.raw_offset!=(contract.replay_original_slot_boundary+header.eligible_count)*row.raw_bytes ||
-                     row.raw_offset>input.arena_raw_bytes || row.raw_bytes>input.arena_raw_bytes-row.raw_offset)) ||
-       (!eligible && row.raw_offset!=0) ||
-       !publication_identity_equal(row.content_identity,added.content_identity,work) ||
-       !publication_identity_equal(added.stable_intent,intent.stable_identity,work) ||
-       !publication_identity_equal(row.origin.predecessor_logical,intent.base_logical,work) ||
-       !publication_identity_equal(row.origin.successor_logical,intent.result_logical,work) ||
-       !publication_identity_equal(added.original_origin.predecessor_logical,intent.base_logical,work) ||
-       !publication_identity_equal(added.original_origin.successor_logical,intent.result_logical,work) ||
-       !(added.result_receipt_digest[0]|added.result_receipt_digest[1]|added.result_receipt_digest[2]|added.result_receipt_digest[3]) ||
-       added.payload_offset_bytes!=header.payload_used_bytes || added.payload_length_bytes!=input.payload_bytes ||
-       input.payload_bytes>header.payload_capacity_bytes-header.payload_used_bytes ||
-       !publication_pointer_span(input.payload,input.payload_bytes,1) ||
-       !publication_pointer_span(input.row_bytes,input.row_bytes_len,1) ||
-       input.arena_descriptor_count>UINT64_MAX/sizeof(TrainingViewRowDescriptor) ||
-       !publication_pointer_span(input.arena_descriptors,input.arena_descriptor_count*sizeof(TrainingViewRowDescriptor),alignof(TrainingViewRowDescriptor)) ||
-       !publication_pointer_span(input.arena_raw,input.arena_raw_bytes,1))return 1;
-    const auto* origin_words=reinterpret_cast<const uint64_t*>(&row.origin);
-    const auto* entry_origin=reinterpret_cast<const uint64_t*>(&added.original_origin);
-    for(uint32_t i=0;i<sizeof(row.origin)/8;++i) {
-        semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::TableSlot,1);
-        if(origin_words[i]!=entry_origin[i])return 1;
-    }
+       input.row_count>UINT64_MAX/sizeof(PublicationReplayDeliveryRow) ||
+       (input.row_count && !publication_pointer_span(input.rows,input.row_count*sizeof(PublicationReplayDeliveryRow),alignof(PublicationReplayDeliveryRow))))return 1;
     const auto* items=reinterpret_cast<const SemanticTrainingReplayAppendEntry*>(old_bytes+sizeof(header));
     uint64_t chain[4]={},used=0,eligible_seen=0;
     for(uint64_t i=0;i<header.count;++i) {
@@ -6316,52 +6250,110 @@ __device__ uint64_t publication_append_replay(PublicationControl& control,const 
         const auto& item=items[i];
         if((item.disposition!=1 && item.disposition!=2) ||
            item.row_ordinal!=(item.disposition==1 ? header.original_count+eligible_seen : UINT64_MAX) ||
-           item.payload_offset_bytes!=used ||
+           item.payload_offset_bytes!=used || used>header.payload_used_bytes ||
            item.payload_length_bytes>header.payload_used_bytes-used ||
-           publication_identity_equal(item.stable_intent,added.stable_intent,work) ||
+           (input.row_count && publication_identity_equal(item.stable_intent,intent.stable_identity,work)) ||
            !(item.result_receipt_digest[0]|item.result_receipt_digest[1]|item.result_receipt_digest[2]|item.result_receipt_digest[3]))return 1;
         uint64_t digest[4];
         semantic_graph::sha256(reinterpret_cast<const uint8_t*>(&item),sizeof(item),digest,work);
         publication_fold(chain,56,i,digest,work);
         semantic_graph::sha256(old_payload+used,item.payload_length_bytes,digest,work);
         publication_fold(chain,57,i,digest,work);
-        used+=item.payload_length_bytes;
-        eligible_seen+=item.disposition==1;
+        used+=item.payload_length_bytes;eligible_seen+=item.disposition==1;
     }
     if(used!=header.payload_used_bytes || eligible_seen!=header.eligible_count ||
        !publication_identity_equal(chain,header.chain_head,work))return 1;
+    const auto* rows=reinterpret_cast<const PublicationReplayDeliveryRow*>(input.rows);
+    uint64_t eligible_added=0;
+    for(uint64_t index=0;index<input.row_count;++index) {
+        semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::TableSlot,1);
+        const auto& value=rows[index];const auto& added=value.entry;const auto& row=value.row_descriptor;
+        const bool eligible=added.disposition==1;
+        uint64_t physical=0;
+        if(!semantic_graph::checked_add(contract.replay_original_slot_boundary,header.eligible_count,&physical) ||
+           !semantic_graph::checked_add(physical,eligible_added,&physical))return 1;
+        if((added.disposition!=1 && added.disposition!=2) ||
+           added.row_ordinal!=(eligible ? header.original_count+header.eligible_count+eligible_added : UINT64_MAX) ||
+           input.arena_descriptor_count!=contract.replay_row_capacity || input.arena_raw_bytes!=contract.replay_raw_capacity_bytes ||
+           row.ordinal!=added.row_ordinal || row.basis!=1 || row.origin.present!=1 || row.origin.transition!=1 ||
+           row.raw_bytes!=value.row_bytes_len || !row.raw_bytes ||
+           (eligible && (physical>=input.arena_descriptor_count || physical>UINT64_MAX/row.raw_bytes ||
+             row.raw_offset!=physical*row.raw_bytes || row.raw_offset>input.arena_raw_bytes ||
+             row.raw_bytes>input.arena_raw_bytes-row.raw_offset)) || (!eligible && row.raw_offset!=0) ||
+           !publication_identity_equal(row.content_identity,added.content_identity,work) ||
+           !publication_identity_equal(added.stable_intent,intent.stable_identity,work) ||
+           !(row.origin.predecessor_logical[0]|row.origin.predecessor_logical[1]|row.origin.predecessor_logical[2]|row.origin.predecessor_logical[3]) ||
+           !(row.origin.successor_logical[0]|row.origin.successor_logical[1]|row.origin.successor_logical[2]|row.origin.successor_logical[3]) ||
+           !(added.result_receipt_digest[0]|added.result_receipt_digest[1]|added.result_receipt_digest[2]|added.result_receipt_digest[3]) ||
+           added.payload_offset_bytes!=used || added.payload_length_bytes!=value.payload_bytes ||
+           used>header.payload_capacity_bytes || value.payload_bytes>header.payload_capacity_bytes-used ||
+           !publication_pointer_span(value.payload,value.payload_bytes,1) ||
+           !publication_pointer_span(value.row_bytes,value.row_bytes_len,1) ||
+           value.payload_bytes<40+sizeof(TrainingViewRowDescriptor) ||
+           value.row_bytes!=value.payload+40+sizeof(TrainingViewRowDescriptor) ||
+           row.raw_bytes>value.payload_bytes-40-sizeof(TrainingViewRowDescriptor) ||
+           input.arena_descriptor_count>UINT64_MAX/sizeof(TrainingViewRowDescriptor) ||
+           !publication_pointer_span(input.arena_descriptors,input.arena_descriptor_count*sizeof(TrainingViewRowDescriptor),alignof(TrainingViewRowDescriptor)) ||
+           !publication_pointer_span(input.arena_raw,input.arena_raw_bytes,1))return 1;
+        const auto* origin_words=reinterpret_cast<const uint64_t*>(&row.origin);
+        const auto* entry_origin=reinterpret_cast<const uint64_t*>(&added.original_origin);
+        for(uint32_t word=0;word<sizeof(row.origin)/8;++word) {
+            semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::TableSlot,1);
+            if(origin_words[word]!=entry_origin[word])return 1;
+        }
+        for(uint64_t prior=0;prior<index;++prior) {
+            semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::TableSlot,1);
+            if(publication_identity_equal(rows[prior].entry.original_origin.predecessor_logical,row.origin.predecessor_logical,work) &&
+               publication_identity_equal(rows[prior].entry.original_origin.successor_logical,row.origin.successor_logical,work))return 1;
+        }
+        used+=value.payload_bytes;eligible_added+=eligible;
+    }
     const auto* storage=reinterpret_cast<const PublicationStorageEntry*>(control.storage);
-    const uint64_t entries_length=prior_entries->length_bytes+sizeof(added);
-    const uint64_t payload_length=header.payload_used_bytes+input.payload_bytes;
-    if(entries_length>storage[entries_template.storage_slot].bytes || payload_length>storage[payload_template.storage_slot].bytes)return 1;
+    const uint64_t entries_length=sizeof(header)+(header.count+input.row_count)*sizeof(SemanticTrainingReplayAppendEntry);
+    if(entries_template.offset_bytes>storage[entries_template.storage_slot].bytes ||
+       entries_length>storage[entries_template.storage_slot].bytes-entries_template.offset_bytes ||
+       payload_template.offset_bytes>storage[payload_template.storage_slot].bytes ||
+       used>storage[payload_template.storage_slot].bytes-payload_template.offset_bytes)return 1;
+    PublicationRange staged_entries=entries_template,staged_payload=payload_template;
+    staged_entries.length_bytes=entries_length;staged_payload.length_bytes=used;
+    semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::CanonicalByte,
+        2*sizeof(PublicationRange)+2*sizeof(uint64_t));
+    uint8_t* staged=nullptr;
+    if(!publication_resolve_range(control,staged_entries,&staged) ||
+       !publication_resolve_range(control,staged_payload,&staged))return 1;
+    if(!commit || !input.row_count)return 0;
     next_entries->storage_slot=entries_template.storage_slot;
-    next_entries->length_bytes=entries_length;next_entries->logical_begin=0;next_entries->logical_end=header.count+1;
+    next_entries->length_bytes=entries_length;next_entries->logical_begin=0;next_entries->logical_end=header.count+input.row_count;
     next_payload->storage_slot=payload_template.storage_slot;
-    next_payload->length_bytes=payload_length;next_payload->logical_begin=0;next_payload->logical_end=payload_length;
+    next_payload->length_bytes=used;next_payload->logical_begin=0;next_payload->logical_end=used;
     semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::CanonicalByte,8*sizeof(uint64_t));
     auto* target_entries=publication_range_bytes(control,*next_entries);
     auto* target_payload=publication_range_bytes(control,*next_payload);
     if(!target_entries || !target_payload)return 1;
     publication_copy_bytes(target_entries,old_bytes,prior_entries->length_bytes,work);
-    if(used)publication_copy_bytes(target_payload,old_payload,used,work);
-    publication_copy_bytes(target_payload+used,reinterpret_cast<const uint8_t*>(input.payload),input.payload_bytes,work);
-    *reinterpret_cast<SemanticTrainingReplayAppendEntry*>(target_entries+prior_entries->length_bytes)=added;
-    semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::CanonicalByte,sizeof(added));
-    auto* next_header=reinterpret_cast<SemanticTrainingReplayAppendHeader*>(target_entries);
-    ++next_header->count;next_header->payload_used_bytes=payload_length;
-    next_header->eligible_count+=eligible;
-    semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::CanonicalByte,3*sizeof(uint64_t));
-    uint64_t digest[4];semantic_graph::sha256(reinterpret_cast<const uint8_t*>(&added),sizeof(added),digest,work);
-    publication_fold(chain,56,header.count,digest,work);
-    semantic_graph::sha256(reinterpret_cast<const uint8_t*>(input.payload),input.payload_bytes,digest,work);
-    publication_fold(chain,57,header.count,digest,work);
-    semantic_graph::copy_identity(next_header->chain_head,chain,work);
-    if(eligible) {
-        publication_copy_bytes(reinterpret_cast<uint8_t*>(input.arena_raw+row.raw_offset),
-            reinterpret_cast<const uint8_t*>(input.row_bytes),row.raw_bytes,work);
-        reinterpret_cast<TrainingViewRowDescriptor*>(input.arena_descriptors)[contract.replay_original_slot_boundary+header.eligible_count]=row;
-        semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::CanonicalByte,sizeof(row));
+    if(header.payload_used_bytes)publication_copy_bytes(target_payload,old_payload,header.payload_used_bytes,work);
+    uint64_t physical=contract.replay_original_slot_boundary+header.eligible_count;
+    for(uint64_t index=0;index<input.row_count;++index) {
+        semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::TableSlot,1);
+        const auto& value=rows[index];const auto& added=value.entry;const auto& row=value.row_descriptor;
+        publication_copy_bytes(target_payload+added.payload_offset_bytes,reinterpret_cast<const uint8_t*>(value.payload),value.payload_bytes,work);
+        reinterpret_cast<SemanticTrainingReplayAppendEntry*>(target_entries+sizeof(header))[header.count+index]=added;
+        semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::CanonicalByte,sizeof(added));
+        uint64_t digest[4];semantic_graph::sha256(reinterpret_cast<const uint8_t*>(&added),sizeof(added),digest,work);
+        publication_fold(chain,56,header.count+index,digest,work);
+        semantic_graph::sha256(reinterpret_cast<const uint8_t*>(value.payload),value.payload_bytes,digest,work);
+        publication_fold(chain,57,header.count+index,digest,work);
+        if(added.disposition==1) {
+            publication_copy_bytes(reinterpret_cast<uint8_t*>(input.arena_raw+row.raw_offset),
+                reinterpret_cast<const uint8_t*>(value.row_bytes),row.raw_bytes,work);
+            reinterpret_cast<TrainingViewRowDescriptor*>(input.arena_descriptors)[physical++]=row;
+            semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::CanonicalByte,sizeof(row));
+        }
     }
+    auto* next_header=reinterpret_cast<SemanticTrainingReplayAppendHeader*>(target_entries);
+    next_header->count+=input.row_count;next_header->payload_used_bytes=used;next_header->eligible_count+=eligible_added;
+    semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::CanonicalByte,3*sizeof(uint64_t));
+    semantic_graph::copy_identity(next_header->chain_head,chain,work);
     if(publication_range_digest(control,*next_entries,nullptr,next_entries->digest,nullptr,work) ||
        publication_range_digest(control,*next_payload,nullptr,next_payload->digest,nullptr,work))return 1;
     return 0;
@@ -6406,7 +6398,7 @@ __device__ bool publication_charge_native_work(semantic_graph::NativeWorkTally* 
 __device__ uint64_t publication_acknowledgement_chain(const uint8_t* bytes,uint64_t length,
         const AcknowledgementQueueHeader& queue,const IntentEntry* selected,const uint64_t* selected_digest,
         const IntentQueueHeader* all_intents,uint64_t* receipt_used,uint64_t* chain,
-        semantic_graph::NativeWorkTally* work=nullptr) {
+        semantic_graph::NativeWorkTally* work=nullptr,const uint64_t* selected_outcome=nullptr) {
     if(!bytes || length<sizeof(AcknowledgementQueueHeader) || queue.abi!=1 || queue.count>queue.capacity ||
        queue.payload_used_bytes!=length-sizeof(AcknowledgementQueueHeader) ||
        queue.capacity>(UINT64_MAX-sizeof(AcknowledgementQueueHeader))/sizeof(AcknowledgementEntry) ||
@@ -6420,15 +6412,23 @@ __device__ uint64_t publication_acknowledgement_chain(const uint8_t* bytes,uint6
         if(cursor>length || length-cursor<sizeof(AcknowledgementEntry))return 1;
         const auto& item=*reinterpret_cast<const AcknowledgementEntry*>(bytes+cursor);
         if(item.receipt_len>length-cursor-sizeof(AcknowledgementEntry) ||
+           item.receiver_outcome_len>length-cursor-sizeof(AcknowledgementEntry)-item.receipt_len ||
            !publication_identity_equal(item.previous_chain,chain,work))return 1;
         uint64_t digest[4];
         semantic_graph::sha256(bytes+cursor+sizeof(AcknowledgementEntry),item.receipt_len,digest,work);
         if(!publication_identity_equal(digest,item.receipt_digest,work))return 1;
+        uint64_t outcome[4]={};
+        if(item.receiver_outcome_len)
+            semantic_graph::sha256(bytes+cursor+sizeof(AcknowledgementEntry)+item.receipt_len,item.receiver_outcome_len,outcome,work);
+        if(!publication_identity_equal(outcome,item.receiver_outcome_digest,work))return 1;
         publication_fold(chain,32,ordinal,item.stable_identity,work);
         publication_fold(chain,32,ordinal,item.receipt_digest,work);
+        publication_fold(chain,32,ordinal,item.receiver_outcome_digest,work);
         if(!publication_identity_equal(chain,item.chain,work))return 1;
         if(selected && publication_identity_equal(item.stable_identity,selected->stable_identity,work))
-            return publication_identity_equal(item.receipt_digest,selected_digest,work) ? 7 : 1;
+            return publication_identity_equal(item.receipt_digest,selected_digest,work) &&
+                (selected_outcome ? publication_identity_equal(item.receiver_outcome_digest,selected_outcome,work) :
+                 !(outcome[0]|outcome[1]|outcome[2]|outcome[3])) ? 7 : 1;
         if(all_intents) {
             const auto* entries=reinterpret_cast<const IntentEntry*>(all_intents+1);
             uint64_t matches=0;
@@ -6442,12 +6442,14 @@ __device__ uint64_t publication_acknowledgement_chain(const uint8_t* bytes,uint6
                 semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::TableSlot,1);
                 const auto& previous=*reinterpret_cast<const AcknowledgementEntry*>(bytes+prior_cursor);
                 if(publication_identity_equal(previous.stable_identity,item.stable_identity,work))return 1;
-                prior_cursor+=sizeof(AcknowledgementEntry)+previous.receipt_len;
+                prior_cursor+=sizeof(AcknowledgementEntry)+previous.receipt_len+previous.receiver_outcome_len;
             }
         }
         if(*receipt_used>queue.payload_capacity_bytes || item.receipt_len>queue.payload_capacity_bytes-*receipt_used)return 1;
         *receipt_used+=item.receipt_len;
-        cursor+=sizeof(AcknowledgementEntry)+item.receipt_len;
+        if(item.receiver_outcome_len>queue.payload_capacity_bytes-*receipt_used)return 1;
+        *receipt_used+=item.receiver_outcome_len;
+        cursor+=sizeof(AcknowledgementEntry)+item.receipt_len+item.receiver_outcome_len;
     }
     return cursor==length && publication_identity_equal(chain,queue.chain_head,work) ? 0 : 1;
 }
@@ -6471,7 +6473,8 @@ __device__ uint64_t publication_acknowledge(const Descriptor& descriptor,Publica
         const auto& lease=*reinterpret_cast<const PublicationLease*>(input.lease);
         const uint64_t word=publication_load(control.word);
         const auto* base=publication_acquired_bank(control,lease);
-        if(!base || lease.word!=word || base->header.terminal!=(replay ? 0 : 2) || !base->header.fuel ||
+        if(!replay && reinterpret_cast<const PublicationContract*>(control.contract)->nonterminal_intent_mode==1)break;
+        if(!base || lease.word!=word || (replay ? (base->header.terminal!=0 && base->header.terminal!=2) : base->header.terminal!=2) || !base->header.fuel ||
            control.reader_counts[(word&1)^1] || (word>>1)==(UINT64_MAX>>1) ||
            publication_validate_selected_model(control,*base,cold_work)) { status=3;break; }
         protected_root={base->header.semantic_owner,semantic_graph::kRootKind,
@@ -6499,7 +6502,7 @@ __device__ uint64_t publication_acknowledge(const Descriptor& descriptor,Publica
         const auto* payload=publication_range_bytes(control,*payload_range);
         const auto* old_queue=reinterpret_cast<const AcknowledgementQueueHeader*>(publication_range_bytes(control,*prior_ack));
         if(!intents || !payload || !old_queue || old_queue->abi!=1 ||
-           old_queue->count>old_queue->capacity || old_queue->count>=old_queue->capacity ||
+           old_queue->count>old_queue->capacity ||
            old_queue->payload_used_bytes!=prior_ack->length_bytes-sizeof(AcknowledgementQueueHeader) ||
            old_queue->capacity>(UINT64_MAX-sizeof(AcknowledgementQueueHeader))/sizeof(AcknowledgementEntry) ||
            old_queue->payload_capacity_bytes>UINT64_MAX-sizeof(AcknowledgementQueueHeader)-
@@ -6549,21 +6552,76 @@ __device__ uint64_t publication_acknowledge(const Descriptor& descriptor,Publica
             if(receipt[payload_length_offset+8+i]!=payload[selected->payload_offset+i]){exact=false;break;}
         }
         if(!exact)break;
+        const uint64_t outcome_bytes=replay ? replay->receiver_outcome_bytes : 0;
+        uint64_t joint_bytes=0,retained_bytes=0;
+        if(old_queue->count>old_queue->payload_used_bytes/sizeof(AcknowledgementEntry) ||
+           !semantic_graph::checked_add(input.receipt_len,outcome_bytes,&joint_bytes))break;
+        retained_bytes=old_queue->payload_used_bytes-old_queue->count*sizeof(AcknowledgementEntry);
+        if(retained_bytes>old_queue->payload_capacity_bytes ||
+           joint_bytes>old_queue->payload_capacity_bytes)break;
         semantic_task_ground::Task result_task{};
         if(replay) {
             if(!semantic_task_ground::decode(reinterpret_cast<const uint64_t*>(descriptor.task),
                     descriptor.task_words,&result_task) || !result_task.coding ||
-               replay->observation_count!=result_task.bindings || !replay->observations ||
-               !replay->statements || !replay->supports)break;
+               !result_task.bindings || (replay->receiver_disposition!=1 && replay->receiver_disposition!=2) ||
+               replay->receiver_outcome_bytes<265 ||
+               !publication_pointer_span(replay->receiver_outcome,replay->receiver_outcome_bytes,1))break;
+            const bool completed=replay->receiver_disposition==1;
+            uint64_t expected_observations=0,batches=0;
+            if((!completed && replay->row_count) ||
+               !semantic_graph::checked_add(replay->row_count,1,&batches) ||
+               (completed && !semantic_graph::checked_mul(batches,result_task.bindings,&expected_observations)) ||
+               replay->observation_count!=expected_observations ||
+               replay->observation_count>UINT64_MAX/sizeof(semantic_task_ground::Observation) ||
+               replay->observation_count>UINT64_MAX/sizeof(semantic_graph::DecodedStatement) ||
+               replay->observation_count>UINT64_MAX/sizeof(semantic_graph::DecodedSupport) ||
+               (replay->observation_count && (
+                !publication_pointer_span(replay->observations,replay->observation_count*sizeof(semantic_task_ground::Observation),alignof(semantic_task_ground::Observation)) ||
+                !publication_pointer_span(replay->statements,replay->observation_count*sizeof(semantic_graph::DecodedStatement),alignof(semantic_graph::DecodedStatement)) ||
+                !publication_pointer_span(replay->supports,replay->observation_count*sizeof(semantic_graph::DecodedSupport),alignof(semantic_graph::DecodedSupport)))))break;
+            const auto* terminal=reinterpret_cast<const uint8_t*>(replay->receiver_outcome);
+            const char outcome_domain[]="xlog.receiver.outcome.v1";
+            for(uint32_t index=0;index<sizeof(outcome_domain);++index) {
+                semantic_graph::charge_native(cold_work,semantic_graph::NativeWorkEvent::TableSlot,1);
+                if(terminal[index]!=uint8_t(outcome_domain[index]))exact=false;
+            }
+            uint64_t terminal_status=0,content_bytes=0;
+            for(uint32_t index=0;index<8;++index) {
+                semantic_graph::charge_native(cold_work,semantic_graph::NativeWorkEvent::TableSlot,2);
+                terminal_status|=uint64_t(terminal[217+index])<<(8*index);
+                content_bytes|=uint64_t(terminal[225+index])<<(8*index);
+            }
+            if(!exact || terminal_status!=replay->receiver_disposition ||
+               content_bytes!=replay->receiver_outcome_bytes-265 || !content_bytes ||
+               (!completed && content_bytes>4096))break;
+            const uint64_t* expected_ids[]={selected->stable_identity,input.recipient_id,selected->effect_digest,
+                selected->payload_digest,input.receipt_digest};
+            for(uint32_t identity=0;identity<5;++identity)for(uint32_t byte=0;byte<32;++byte) {
+                semantic_graph::charge_native(cold_work,semantic_graph::NativeWorkEvent::TableSlot,1);
+                if(terminal[25+identity*32+byte]!=reinterpret_cast<const uint8_t*>(expected_ids[identity])[byte])exact=false;
+            }
+            uint8_t checkpoint=0;
+            for(uint32_t byte=0;byte<32;++byte) {
+                semantic_graph::charge_native(cold_work,semantic_graph::NativeWorkEvent::TableSlot,1);
+                checkpoint|=terminal[185+byte];
+            }
+            uint64_t terminal_digest[4];semantic_graph::sha256(terminal,replay->receiver_outcome_bytes,terminal_digest,cold_work);
+            if(!exact || !checkpoint || !publication_identity_equal(terminal_digest,replay->receiver_outcome_digest,cold_work))break;
             const auto* observations=reinterpret_cast<const semantic_task_ground::Observation*>(replay->observations);
             const auto* statements=reinterpret_cast<const semantic_graph::DecodedStatement*>(replay->statements);
             const auto* supports=reinterpret_cast<const semantic_graph::DecodedSupport*>(replay->supports);
-            for(uint32_t ordinal=0;ordinal<result_task.bindings && exact;++ordinal) {
+            for(uint64_t ordinal=0;ordinal<replay->observation_count && exact;++ordinal) {
                 semantic_graph::charge_native(cold_work,semantic_graph::NativeWorkEvent::TableSlot,1);
                 const auto& observation=observations[ordinal];
                 const auto& statement=statements[ordinal];const auto& support=supports[ordinal];
-                if(observation.present!=1 || (observation.truth!=1 && observation.truth!=2) ||
-                   statement.record!=result_task.binding(ordinal)[1] || support.record!=UINT32_MAX ||
+                const uint32_t binding=uint32_t(ordinal%result_task.bindings);
+                const auto& common=observations[binding];
+                if(observation.present!=(ordinal<result_task.bindings ? 2 : 1) ||
+                   (observation.truth!=1 && observation.truth!=2) ||
+                   (ordinal<result_task.bindings && !publication_identity_equal(observation.action,observation.intent,cold_work)) ||
+                   (ordinal>=result_task.bindings && (observation.truth!=common.truth ||
+                    !publication_identity_equal(observation.receipt,common.receipt,cold_work))) ||
+                   statement.record!=result_task.binding(binding)[1] || support.record!=UINT32_MAX ||
                    support.polarity!=observation.truth ||
                    !publication_identity_equal(observation.intent,selected->stable_identity,cold_work)) { exact=false;break; }
                 for(uint32_t field=0;field<10;++field) {
@@ -6580,7 +6638,7 @@ __device__ uint64_t publication_acknowledge(const Descriptor& descriptor,Publica
                             (uint64_t(decoded[identity][word*2+1])<<32)))exact=false;
                     }
                 }
-                const auto* original=result_task.observation(ordinal);
+                const auto* original=result_task.observation(binding);
                 for(uint32_t word=0;word<4;++word) {
                     semantic_graph::charge_native(cold_work,semantic_graph::NativeWorkEvent::TableSlot,1);
                     if(original[word]!=(uint64_t(statement.identity_words[word*2])|
@@ -6594,17 +6652,20 @@ __device__ uint64_t publication_acknowledge(const Descriptor& descriptor,Publica
         const uint8_t* old_bytes=publication_range_bytes(control,*prior_ack);
         uint64_t chain[4]={},receipt_used=0;
         const uint64_t acknowledged=publication_acknowledgement_chain(old_bytes,prior_ack->length_bytes,
-            *old_queue,selected,digest,nullptr,&receipt_used,chain,cold_work);
+            *old_queue,selected,digest,nullptr,&receipt_used,chain,cold_work,replay ? replay->receiver_outcome_digest : nullptr);
         if(acknowledged) { status=acknowledged;break; }
         const uint64_t cursor=prior_ack->length_bytes;
-        if(input.receipt_len>old_queue->payload_capacity_bytes-receipt_used)break;
+        if(old_queue->count==old_queue->capacity ||
+           joint_bytes>old_queue->payload_capacity_bytes-receipt_used)break;
         const auto* storage=reinterpret_cast<const PublicationStorageEntry*>(control.storage);
         if(ack_template.storage_slot>=control.storage_count || attempt_template.storage_slot>=control.storage_count ||
            ack_template.storage_slot==prior_ack->storage_slot ||
            ack_template.storage_slot==attempt_template.storage_slot ||
-           input.receipt_len>UINT64_MAX-sizeof(AcknowledgementEntry) ||
+           joint_bytes>UINT64_MAX-sizeof(AcknowledgementEntry) ||
            cursor>storage[ack_template.storage_slot].bytes ||
-           sizeof(AcknowledgementEntry)+input.receipt_len>storage[ack_template.storage_slot].bytes-cursor)break;
+           sizeof(AcknowledgementEntry)+joint_bytes>storage[ack_template.storage_slot].bytes-cursor)break;
+        if(replay && publication_append_replay(control,*base,old,next_ranges,
+            append_entries_template,append_payload_template,*replay,*selected,cold_work,false))break;
         for(uint64_t i=0;i<base->header.range_count;++i) {
             semantic_graph::charge_native(cold_work,semantic_graph::NativeWorkEvent::TableSlot,1);
             PublicationRange target=next_ranges[i];
@@ -6617,7 +6678,7 @@ __device__ uint64_t publication_acknowledge(const Descriptor& descriptor,Publica
             // ordinary continuation or overwrite its still-read-leased source.
             if(publication_mutable_role(role) && role!=1 && role!=2 && role!=31 &&
                !(role>=18 && role<=25) && role!=32 && role!=33 &&
-               !(replay && (role==56 || role==57))) {
+               !(replay && replay->row_count && (role==56 || role==57))) {
                 if(publication_preserve_range(control,old,base->header.range_count,old[i],target,cold_work)) { exact=false;break; }
                 next_ranges[i]=target;
                 semantic_graph::charge_native(cold_work,semantic_graph::NativeWorkEvent::CanonicalByte,sizeof(PublicationRange));
@@ -6628,7 +6689,7 @@ __device__ uint64_t publication_acknowledge(const Descriptor& descriptor,Publica
         auto* next_attempt=const_cast<PublicationRange*>(publication_find_range(next_ranges,base->header.range_count,33,0,cold_work));
         next_ack->storage_slot=ack_template.storage_slot;
         next_attempt->storage_slot=attempt_template.storage_slot;
-        next_ack->length_bytes=cursor+sizeof(AcknowledgementEntry)+input.receipt_len;
+        next_ack->length_bytes=cursor+sizeof(AcknowledgementEntry)+joint_bytes;
         next_ack->logical_begin=0;next_ack->logical_end=old_queue->count+1;
         semantic_graph::charge_native(cold_work,semantic_graph::NativeWorkEvent::CanonicalByte,5*sizeof(uint64_t));
         auto* next_bytes=publication_range_bytes(control,*next_ack);
@@ -6640,14 +6701,19 @@ __device__ uint64_t publication_acknowledge(const Descriptor& descriptor,Publica
         semantic_graph::charge_native(cold_work,semantic_graph::NativeWorkEvent::CanonicalByte,sizeof(*added));
         semantic_graph::copy_identity(added->stable_identity,selected->stable_identity,cold_work);
         semantic_graph::copy_identity(added->receipt_digest,digest,cold_work);
-        added->receipt_len=input.receipt_len;
+        added->receipt_len=input.receipt_len;added->receiver_outcome_len=outcome_bytes;
+        semantic_graph::charge_native(cold_work,semantic_graph::NativeWorkEvent::CanonicalByte,sizeof(added->receiver_outcome_len));
+        if(replay)semantic_graph::copy_identity(added->receiver_outcome_digest,replay->receiver_outcome_digest,cold_work);
         semantic_graph::charge_native(cold_work,semantic_graph::NativeWorkEvent::CanonicalByte,sizeof(added->receipt_len));
         semantic_graph::copy_identity(added->previous_chain,chain,cold_work);
         publication_fold(chain,32,old_queue->count,added->stable_identity,cold_work);
         publication_fold(chain,32,old_queue->count,added->receipt_digest,cold_work);
+        publication_fold(chain,32,old_queue->count,added->receiver_outcome_digest,cold_work);
         semantic_graph::copy_identity(added->chain,chain,cold_work);
         publication_copy_bytes(next_bytes+cursor+sizeof(AcknowledgementEntry),receipt,input.receipt_len,cold_work);
-        ++queue->count;queue->payload_used_bytes+=sizeof(AcknowledgementEntry)+input.receipt_len;
+        if(replay)publication_copy_bytes(next_bytes+cursor+sizeof(AcknowledgementEntry)+input.receipt_len,
+            reinterpret_cast<const uint8_t*>(replay->receiver_outcome),outcome_bytes,cold_work);
+        ++queue->count;queue->payload_used_bytes+=sizeof(AcknowledgementEntry)+joint_bytes;
         semantic_graph::charge_native(cold_work,semantic_graph::NativeWorkEvent::CanonicalByte,2*sizeof(uint64_t));
         semantic_graph::copy_identity(queue->chain_head,chain,cold_work);
         if(publication_range_digest(control,*next_ack,nullptr,next_ack->digest,nullptr,cold_work))break;
@@ -6665,7 +6731,7 @@ __device__ uint64_t publication_acknowledge(const Descriptor& descriptor,Publica
         }
         next=*base;
         semantic_graph::charge_native(cold_work,semantic_graph::NativeWorkEvent::CanonicalByte,sizeof(next));
-        if(replay) {
+        if(replay && replay->receiver_disposition==1) {
             staged_bank=&next;
             auto* ground_range=const_cast<PublicationRange*>(publication_find_range(next_ranges,
                 base->header.range_count,semantic_task_ground::kPublicationRole,0,cold_work));
@@ -6687,7 +6753,7 @@ __device__ uint64_t publication_acknowledge(const Descriptor& descriptor,Publica
             if(candidate.words[0]!=semantic_graph::kOk)break;
             const auto* statements=reinterpret_cast<const semantic_graph::DecodedStatement*>(replay->statements);
             const auto* supports=reinterpret_cast<const semantic_graph::DecodedSupport*>(replay->supports);
-            for(uint32_t ordinal=0;ordinal<result_task.bindings;++ordinal) {
+            for(uint64_t ordinal=0;ordinal<replay->observation_count;++ordinal) {
                 semantic_call(descriptor,semantic_graph::kResidentInsertSupportAdmission,nullptr,&candidate,&candidate,
                     statements+ordinal,supports+ordinal,&work);
                 if(candidate.words[0]!=semantic_graph::kOk)break;
@@ -7463,6 +7529,8 @@ __device__ uint64_t publication_append_provenance(const PublicationControl& cont
         semantic_graph::copy_identity(record.origin_logical_digest,base.header.logical_digest,work);
         semantic_graph::copy_identity(record.authority_closure_digest,closure->digest,work);
         TokenProvenanceRecord logical=record;logical.base_word=0;
+        for(uint32_t w=0;w<4;++w)logical.successor_logical_digest[w]=0;
+        semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::CanonicalByte,32);
         semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::CanonicalByte,sizeof(logical)+sizeof(uint64_t));
         if(publication_action_digest(control,next,receipts+record.ordinal,1,logical.action_receipt_digest,work))return 1;
         semantic_graph::sha256(reinterpret_cast<const uint8_t*>(&logical),sizeof(logical),record.record_digest,work);
@@ -7471,6 +7539,26 @@ __device__ uint64_t publication_append_provenance(const PublicationControl& cont
       }
     }
     return 0;
+}
+__device__ uint64_t publication_annotate_provenance(const PublicationControl& control,const PublicationBank& base,
+        PublicationBank& next,semantic_graph::NativeWorkTally* work=nullptr) {
+    auto* ranges=reinterpret_cast<PublicationRange*>(control.directories[next.header.publication_word&1]);
+    const auto* previous=reinterpret_cast<const PublicationRange*>(control.directories[base.header.publication_word&1]);
+    auto* range=const_cast<PublicationRange*>(publication_find_range(ranges,next.header.range_count,2,0,work));
+    const auto* old=publication_find_range(previous,base.header.range_count,2,0,work);
+    if(!range || !old || old->length_bytes>range->length_bytes ||
+       range->length_bytes%sizeof(TokenProvenanceRecord) || old->length_bytes%sizeof(TokenProvenanceRecord))return 1;
+    if(range->length_bytes==old->length_bytes)return 0;
+    auto* records=reinterpret_cast<TokenProvenanceRecord*>(publication_range_bytes(control,*range));
+    if(!records)return 1;
+    for(uint64_t index=old->length_bytes/sizeof(TokenProvenanceRecord);index<range->length_bytes/sizeof(TokenProvenanceRecord);++index) {
+        semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::TableSlot,1);
+        auto& record=records[index];
+        if(record.successor_logical_digest[0]|record.successor_logical_digest[1]|
+           record.successor_logical_digest[2]|record.successor_logical_digest[3])return 1;
+        semantic_graph::copy_identity(record.successor_logical_digest,next.header.logical_digest,work);
+    }
+    return publication_range_digest(control,*range,nullptr,range->digest,nullptr,work);
 }
 __device__ uint64_t publication_append_prefix_intent(const PublicationControl& control,const PublicationBank& base,
         PublicationBank& next,uint64_t begin,uint64_t end,const uint64_t* plan_digest=nullptr,
@@ -7537,6 +7625,13 @@ __device__ uint64_t publication_append_prefix_intent(const PublicationControl& c
 __device__ uint64_t publication_append_final_intent(const PublicationControl& control,const PublicationBank& base,
         PublicationBank& next,semantic_graph::NativeWorkTally* work=nullptr) {
     if(next.header.terminal!=2 || next.header.prefix_extent!=next.header.terminal_position+1)return 1;
+    const auto& contract=*reinterpret_cast<const PublicationContract*>(control.contract);
+    if(contract.nonterminal_intent_mode==1) {
+        if(next.header.terminal_position<contract.nonterminal_intent_prefix_begin ||
+           next.header.terminal_position>contract.nonterminal_intent_prefix_end)return 1;
+        return publication_append_prefix_intent(control,base,next,contract.nonterminal_intent_prefix_begin,
+            next.header.terminal_position,contract.nonterminal_intent_plan_digest,work);
+    }
     return publication_append_prefix_intent(control,base,next,0,next.header.prefix_extent,nullptr,work);
 }
 __device__ uint64_t publication_append_nonterminal_intent(const PublicationControl& control,const PublicationBank& base,
@@ -7800,6 +7895,19 @@ __device__ void publication_finish_refused_update(const PendingContinuation& pen
     execution_work_merge_native(execution,actual);
 }
 
+__device__ bool publication_predict_provenance_annotation(const PublicationControl& control,const PublicationBank& base,
+        const PublicationBank& bank,PublicationSealPrediction& cost) {
+    const auto* ranges=reinterpret_cast<const PublicationRange*>(control.directories[bank.header.publication_word&1]);
+    const auto* previous=reinterpret_cast<const PublicationRange*>(control.directories[base.header.publication_word&1]);
+    const auto* range=cost.find(ranges,bank.header.range_count,2);
+    const auto* old=cost.find(previous,base.header.range_count,2);
+    if(!range || !old || old->length_bytes>range->length_bytes ||
+       range->length_bytes%sizeof(TokenProvenanceRecord) || old->length_bytes%sizeof(TokenProvenanceRecord))return false;
+    const uint64_t count=(range->length_bytes-old->length_bytes)/sizeof(TokenProvenanceRecord);
+    if(!count)return true;
+    cost.slots(count);cost.bytes(count*32);
+    return cost.range(control,*range,false);
+}
 struct PublicationIntentPrediction {
     bool append=false,planned=false;
     uint64_t begin=0,end=0,payload_bytes=0;
@@ -7811,14 +7919,16 @@ struct PublicationIntentPrediction {
 };
 
 __device__ bool publication_predict_intent(const PublicationControl& control,const PublicationBank& base,
-        const PublicationBank& bank,bool drain,PublicationSealPrediction& cost,PublicationIntentPrediction& result) {
+        const PublicationBank& bank,bool drain,bool no_draw,PublicationSealPrediction& cost,PublicationIntentPrediction& result) {
     const auto& contract=*reinterpret_cast<const PublicationContract*>(control.contract);
-    result.append=drain || (contract.nonterminal_intent_mode==1 && bank.header.terminal==0 &&
+    result.append=drain || (!no_draw && contract.nonterminal_intent_mode==1 && bank.header.terminal==0 &&
         base.header.prefix_extent<contract.nonterminal_intent_prefix_end &&
         bank.header.prefix_extent>=contract.nonterminal_intent_prefix_end);
     if(!result.append)return true;
-    result.planned=!drain;result.begin=drain ? 0 : contract.nonterminal_intent_prefix_begin;
-    result.end=drain ? bank.header.prefix_extent : contract.nonterminal_intent_prefix_end;
+    result.planned=contract.nonterminal_intent_mode==1;
+    result.begin=result.planned ? contract.nonterminal_intent_prefix_begin : 0;
+    result.end=drain ? (result.planned ? bank.header.terminal_position : bank.header.prefix_extent) : contract.nonterminal_intent_prefix_end;
+    if(result.planned && result.end>contract.nonterminal_intent_prefix_end)return false;
     const auto* ranges=reinterpret_cast<const PublicationRange*>(control.directories[bank.header.publication_word&1]);
     const auto* entries=cost.find(ranges,bank.header.range_count,30);
     const auto* payload=cost.find(ranges,bank.header.range_count,31);
@@ -7872,7 +7982,7 @@ __device__ bool publication_predict_descriptor(const PublicationControl& control
     cost.bytes(32);
     for(uint64_t i=0;i<bank.header.range_count;++i) {
         cost.inspect();const auto& range=ranges[i];
-        if(range.role!=27 && range.role!=28 && range.role!=30 && range.role!=31 && range.role!=32 && range.role!=33)continue;
+        if(range.role!=2 && range.role!=27 && range.role!=28 && range.role!=30 && range.role!=31 && range.role!=32 && range.role!=33)continue;
         if(!cost.range(control,intent.after(range,&cost.overhead)) || !cost.fold())return false;
     }
     if(!cost.sha(sizeof(PublicationBank)))return false;
@@ -7974,7 +8084,8 @@ __device__ uint64_t publication_publish(const Descriptor& descriptor,Publication
     const uint64_t replay_bytes=descriptor.replay.successor.rows ?
         replay_copy_extent(control,next,descriptor.replay.successor,&prediction.overhead) : 0;
     if(!prediction.logical(control,next,!no_draw) ||
-       !publication_predict_intent(control,base,next,drain,prediction,intent_prediction) ||
+       !publication_predict_provenance_annotation(control,base,next,prediction) ||
+       !publication_predict_intent(control,base,next,drain,no_draw,prediction,intent_prediction) ||
        !publication_predict_attempt(control,base,next,pending.transition_kind,intent_prediction,prediction))return 1;
     const auto* predicted_attempt=prediction.find(ranges,next.header.range_count,33);
     if(!predicted_attempt || !prediction.range(control,*predicted_attempt,false) ||
@@ -8002,8 +8113,9 @@ __device__ uint64_t publication_publish(const Descriptor& descriptor,Publication
         semantic_graph::copy_identity(next.state.action_batch_root,state->action_batch_root,work);
     }
     if(publication_logical_digest(control,next,work))return 1;
+    if(publication_annotate_provenance(control,base,next,work))return 1;
     if(drain && publication_append_final_intent(control,base,next,work))return 1;
-    if(!drain && publication_append_nonterminal_intent(control,base,next,work))return 1;
+    if(!drain && !no_draw && publication_append_nonterminal_intent(control,base,next,work))return 1;
     if(publication_write_attempt(control,next,base,pending.transition_kind,work))return 1;
     auto* attempt_range=const_cast<PublicationRange*>(publication_find_range(ranges,next.header.range_count,33,0,work));
     if(!attempt_range || publication_range_digest(control,*attempt_range,nullptr,attempt_range->digest,nullptr,work) ||
