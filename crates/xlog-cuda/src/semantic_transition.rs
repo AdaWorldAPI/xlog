@@ -16406,7 +16406,7 @@ fn model_content_copy_plan(
             !seen.insert(index)
                 || directory
                     .get(index)
-                    .is_none_or(|range| !matches!(range.role, 18..=20))
+                    .is_none_or(|range| !matches!(range.role, 18..=25))
         })
     {
         return Err(SemanticTransitionError::ObservationMismatch);
@@ -17443,7 +17443,7 @@ fn model_content_ranges(
     }
     let expected: BTreeSet<_> = directory
         .iter()
-        .filter(|range| matches!(range.role, 18..=20))
+        .filter(|range| matches!(range.role, 18..=25))
         .map(|range| (range.role, range.index))
         .collect();
     let mut seen = BTreeSet::new();
@@ -25851,7 +25851,7 @@ impl SemanticTransitionSession {
                 let ranges = directory
                     .iter()
                     .enumerate()
-                    .filter_map(|(index, range)| matches!(range.role, 18..=20).then_some(index))
+                    .filter_map(|(index, range)| matches!(range.role, 18..=25).then_some(index))
                     .collect::<Vec<_>>();
                 let plan =
                     model_content_copy_plan(directory, &ranges, &publication_allocation_bytes)?;
@@ -30768,8 +30768,10 @@ impl SemanticTransitionSession {
         Ok(())
     }
 
-    /// Bind the original live model roster cold. Each execution later copies
-    /// its expected seals from the actual device-acquired publication.
+    /// Bind the complete original typed model and learning-state roster cold.
+    /// Every view in roles 18 through 25 is required, including non-floating
+    /// state. Each execution copies its expected seals from the actual
+    /// device-acquired publication, never from a new output capture.
     pub fn bind_prepared_model_content(
         &mut self,
         step: &SemanticPreparedStep,
@@ -37002,10 +37004,12 @@ impl SemanticTransitionSession {
         self.bind_tensor_content(lease, tensors, consumer_stream, false, Some(occurrence))
     }
 
-    /// Bind the complete live model roster to this parent's originally sealed
-    /// model content and generation. A new reader receives a new witness, not a
-    /// new baseline. Initial physical layout/address may differ; later verify
-    /// retains this invocation's exact producer storage and layout. Enqueue-only.
+    /// Bind every original typed model and learning-state view in roles 18
+    /// through 25 to this parent's sealed model content and generation. Integer
+    /// and boolean state is authenticated alongside floating inputs. A new
+    /// reader receives a new witness, not a new baseline. Initial physical
+    /// layout/address may differ; later verify retains this invocation's exact
+    /// producer storage and layout. Enqueue-only.
     pub fn bind_model_content(
         &mut self,
         lease: &SemanticPublishedLease,

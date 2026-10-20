@@ -4014,7 +4014,7 @@ extern "C" __global__ void semantic_publication_model_seals(uint64_t control_ptr
     const auto* roster=reinterpret_cast<const uint64_t*>(roster_ptr);
     for(uint64_t i=0;i<count;++i) {
         const uint64_t role=roster[2*i],index=roster[2*i+1];
-        if(role<18 || role>20) { semantic_content_integrity_trap();return; }
+        if(role<18 || role>25) { semantic_content_integrity_trap();return; }
         const auto* range=publication_find_range(ranges,bank->header.range_count,role,index,work);
         const auto* layout=publication_find_layout(control,ranges,bank->header.range_count,role,index,work);
         if(!range || !layout || publication_range_digest(control,*range,layout,digest,nullptr,work) ||
