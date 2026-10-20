@@ -241,11 +241,13 @@ pub(super) fn contributor_indices<B: PublicationByteStorage>(
         }
         used[index] = true;
     }
-    Ok(used
-        .iter()
-        .enumerate()
-        .filter_map(|(index, &used)| used.then_some(index))
-        .collect())
+    let mut indices = Vec::with_capacity(proposals.len());
+    for (index, used) in used.into_iter().enumerate() {
+        if used {
+            indices.push(index);
+        }
+    }
+    Ok(indices)
 }
 
 impl SemanticTransitionSession {

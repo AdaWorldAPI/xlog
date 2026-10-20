@@ -7872,6 +7872,89 @@ fn read_replay_material_pair(
     Ok(ColdValue::Sequence(vec![reference, payload]))
 }
 
+type LoadedCodingProposal = (
+    xlog_cuda::SemanticReplayMaterial,
+    xlog_cuda::SemanticResolvedReplayMaterial,
+    xlog_cuda::SemanticReplayLoadedMaterial,
+);
+
+fn read_coding_proposals(
+    proposals: &Bound<'_, PyAny>,
+    budget: &mut usize,
+    max_material_bytes: usize,
+    total_material_bytes: &mut usize,
+    max_evidence_bytes: usize,
+    unique_materials: &mut BTreeMap<String, ColdValue>,
+    material_sources: &Arc<material_source::MaterialSourceRegistry>,
+) -> PyResult<Vec<LoadedCodingProposal>> {
+    if !proposals.is_exact_instance_of::<PyTuple>() {
+        return Err(invalid(
+            "coding Proposal custody requires its original tuple",
+        ));
+    }
+    let candidates = object_sequence(proposals, budget)?;
+    let mut originals = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let fields = object_sequence(&candidate, budget)?;
+        if fields.len() != 5 {
+            return Err(invalid("coding Proposal requires original B/S, base material, action material and evidence"));
+        }
+        let before = ColdValue::read(&fields[0], budget, 0)?;
+        let after = ColdValue::read(&fields[1], budget, 0)?;
+        let predecessor = read_replay_material_pair(
+            &fields[2],
+            budget,
+            max_material_bytes,
+            total_material_bytes,
+            unique_materials,
+            material_sources,
+        )?;
+        let action = read_replay_material_pair(
+            &fields[3],
+            budget,
+            max_material_bytes,
+            total_material_bytes,
+            unique_materials,
+            material_sources,
+        )?;
+        let predecessor = ReplayMaterial::parse(&predecessor, &BTreeSet::new())?;
+        let action = ReplayMaterial::parse(&action, &BTreeSet::new())?;
+        if predecessor.kind != "logical-state"
+            || predecessor.identity != before.text()?
+            || action.kind != "action"
+            || predecessor.reconstruction.is_some()
+            || action.reconstruction.is_some()
+        {
+            return Err(invalid(
+                "coding Proposal must retain its actual native base and original action witness",
+            ));
+        }
+        let evidence = exact_replay_bytes(&fields[4])?;
+        if evidence.len() > max_evidence_bytes {
+            return Err(invalid(
+                "coding Proposal evidence exceeds its original native limit",
+            ));
+        }
+        let evidence = ColdValue::ReplayBytes(material_source::ReplayPayload::new(
+            material_sources,
+            evidence,
+        )?)
+        .load_payload()?;
+        let replay = xlog_cuda::SemanticReplayMaterial::decode_owned(
+            predecessor.load_original()?,
+            evidence,
+            replay_digest_identity(before.text()?)?,
+            replay_digest_identity(after.text()?)?,
+        )
+        .map_err(xlog_err)?;
+        let original = replay
+            .resolve_predecessor(predecessor.load_original()?)
+            .map_err(xlog_err)?;
+        originals.push((replay, original, action.load_original()?));
+    }
+    Ok(originals)
+}
+
 fn read_replay_rows(
     value: &Bound<'_, PyAny>,
     budget: &mut usize,
@@ -7880,11 +7963,33 @@ fn read_replay_rows(
     max_evidence_bytes: usize,
     material_sources: &Arc<material_source::MaterialSourceRegistry>,
 ) -> PyResult<ColdValue> {
-    if max_material_bytes == 0 || total_material_bytes == 0 || max_evidence_bytes == 0 {
+    if total_material_bytes == 0 {
+        return Err(invalid("replay kit byte caps must be positive integers"));
+    }
+    read_replay_rows_with_materials(
+        value,
+        budget,
+        max_material_bytes,
+        &mut total_material_bytes,
+        max_evidence_bytes,
+        &mut BTreeMap::new(),
+        material_sources,
+    )
+}
+
+fn read_replay_rows_with_materials(
+    value: &Bound<'_, PyAny>,
+    budget: &mut usize,
+    max_material_bytes: usize,
+    total_material_bytes: &mut usize,
+    max_evidence_bytes: usize,
+    unique_materials: &mut BTreeMap<String, ColdValue>,
+    material_sources: &Arc<material_source::MaterialSourceRegistry>,
+) -> PyResult<ColdValue> {
+    if max_material_bytes == 0 || max_evidence_bytes == 0 {
         return Err(invalid("replay kit byte caps must be positive integers"));
     }
     let mut rows = Vec::new();
-    let mut unique_materials = BTreeMap::<String, ColdValue>::new();
     for row in object_sequence(value, budget)? {
         let fields = object_sequence(&row, budget)?;
         if fields.len() != 5 {
@@ -7898,8 +8003,8 @@ fn read_replay_rows(
                 &material,
                 budget,
                 max_material_bytes,
-                &mut total_material_bytes,
-                &mut unique_materials,
+                total_material_bytes,
+                unique_materials,
                 material_sources,
             )?);
         }
@@ -8833,6 +8938,7 @@ impl ReplayRow {
                 training_seed,
                 task_content,
                 origin,
+                actor_refresh::original_edit_demonstration_material_roots(self)?,
             )
             .map_err(xlog_err)
     }
@@ -11219,7 +11325,8 @@ impl TaskAuthority {
                             )
                         })?;
                     if binding.observation_record != statement
-                        || observation[0] != 1
+                        || !matches!(observation[0], 1 | 2)
+                        || (observation[0] == 2 && observation[6..10] != observation[10..14])
                         || !matches!(observation[1], 1 | 2)
                         || observation[2..]
                             .chunks_exact(4)
@@ -22919,6 +23026,11 @@ impl PySemanticTransitionController {
                 let row = row.cast::<PyTuple>()?;
                 let observed = row.get_item(3)?;
                 let original = match outcome {
+                    xlog_cuda::SemanticPreparedStepOutcome::PolicyScore { .. } => {
+                        return Err(invalid(
+                            "a private demonstration score is not a public action outcome",
+                        ));
+                    }
                     xlog_cuda::SemanticPreparedStepOutcome::Skipped { .. } => None,
                     xlog_cuda::SemanticPreparedStepOutcome::Completed { outcome, .. } => {
                         transition_refusal_report(py, outcome)?
@@ -27105,7 +27217,9 @@ impl PySemanticTransitionController {
             ));
         }
         if !proposals.is_exact_instance_of::<PyTuple>() {
-            return Err(invalid("coding Proposal custody requires its original tuple"));
+            return Err(invalid(
+                "coding Proposal custody requires its original tuple",
+            ));
         }
         let stable = exact_replay_bytes(stable_intent)?;
         let stable = Identity256::from_bytes(
@@ -27137,64 +27251,16 @@ impl PySemanticTransitionController {
         )?;
         let pool = task_use.checkpoint.material_sources.native_budget()?;
         let _metadata = pool.reserve_auxiliary(budget as u64).map_err(xlog_err)?;
-        let mut originals = Vec::new();
         let mut unique_materials = BTreeMap::new();
-        for candidate in object_sequence(proposals, &mut budget)? {
-            let fields = object_sequence(&candidate, &mut budget)?;
-            if fields.len() != 5 {
-                return Err(invalid("coding Proposal requires original B/S, base material, action material and evidence"));
-            }
-            let before = ColdValue::read(&fields[0], &mut budget, 0)?;
-            let after = ColdValue::read(&fields[1], &mut budget, 0)?;
-            let predecessor = read_replay_material_pair(
-                &fields[2],
-                &mut budget,
-                material_limit,
-                &mut total_limit,
-                &mut unique_materials,
-                &task_use.checkpoint.material_sources,
-            )?;
-            let action = read_replay_material_pair(
-                &fields[3],
-                &mut budget,
-                material_limit,
-                &mut total_limit,
-                &mut unique_materials,
-                &task_use.checkpoint.material_sources,
-            )?;
-            let predecessor = ReplayMaterial::parse(&predecessor, &BTreeSet::new())?;
-            let action = ReplayMaterial::parse(&action, &BTreeSet::new())?;
-            if predecessor.kind != "logical-state"
-                || predecessor.identity != before.text()?
-                || action.kind != "action"
-                || predecessor.reconstruction.is_some()
-                || action.reconstruction.is_some()
-            {
-                return Err(invalid("coding Proposal must retain its actual native base and original action witness"));
-            }
-            let evidence = exact_replay_bytes(&fields[4])?;
-            if evidence.len() > evidence_limit {
-                return Err(invalid(
-                    "coding Proposal evidence exceeds its original native limit",
-                ));
-            }
-            let evidence = ColdValue::ReplayBytes(material_source::ReplayPayload::new(
-                &task_use.checkpoint.material_sources,
-                evidence,
-            )?)
-            .load_payload()?;
-            let replay = xlog_cuda::SemanticReplayMaterial::decode_owned(
-                predecessor.load_original()?,
-                evidence,
-                replay_digest_identity(before.text()?)?,
-                replay_digest_identity(after.text()?)?,
-            )
-            .map_err(xlog_err)?;
-            let original = replay
-                .resolve_predecessor(predecessor.load_original()?)
-                .map_err(xlog_err)?;
-            originals.push((replay, original, action.load_original()?));
-        }
+        let originals = read_coding_proposals(
+            proposals,
+            &mut budget,
+            material_limit,
+            &mut total_limit,
+            evidence_limit,
+            &mut unique_materials,
+            &task_use.checkpoint.material_sources,
+        )?;
         let proposals = originals
             .iter()
             .map(|(replay, original, action)| (replay, original, action))
@@ -27212,7 +27278,7 @@ impl PySemanticTransitionController {
 
     /// Publish the authenticated acquired replay batch and its delivery receipt
     /// through the same native acknowledgement operation.
-    #[pyo3(signature = (task_use, *, parent, snapshot, delivery_receipt, result_receipts, replay_rows, material_source))]
+    #[pyo3(signature = (task_use, *, parent, snapshot, delivery_receipt, receiver_outcome, proposals, result_receipts, replay_rows, material_source))]
     #[expect(
         clippy::too_many_arguments,
         reason = "replay acknowledgement retains its original authority, receipts and complete row"
@@ -27226,6 +27292,8 @@ impl PySemanticTransitionController {
         parent: &Bound<'_, PySemanticPublishedParent>,
         snapshot: &Bound<'_, PyAny>,
         delivery_receipt: &Bound<'_, PyAny>,
+        receiver_outcome: &Bound<'_, PyAny>,
+        proposals: &Bound<'_, PyAny>,
         result_receipts: &Bound<'_, PyAny>,
         replay_rows: &Bound<'_, PyAny>,
         material_source: &Bound<'_, PyAny>,
@@ -27241,9 +27309,12 @@ impl PySemanticTransitionController {
         if !result_receipts.is_exact_instance_of::<PyTuple>()
             || !replay_rows.is_exact_instance_of::<PyTuple>()
         {
-            return Err(invalid("replay delivery requires the complete original receipt and row tuples"));
+            return Err(invalid(
+                "replay delivery requires the complete original receipt and row tuples",
+            ));
         }
         let delivery = exact_replay_bytes(delivery_receipt)?;
+        let outcome = exact_replay_bytes(receiver_outcome)?;
         let binding = task_use.delivery_binding()?;
         let limits = {
             let session = controller.session.borrow(py);
@@ -27263,6 +27334,10 @@ impl PySemanticTransitionController {
             });
         let metadata_limit = metadata_limit?;
         let mut budget = metadata_limit;
+        let pool = task_use.checkpoint.material_sources.native_budget()?;
+        let _input_metadata = pool
+            .reserve_auxiliary(metadata_limit as u64)
+            .map_err(xlog_err)?;
         let snapshot = AuthoritySnapshot::parse(&ColdValue::read(snapshot, &mut budget, 0)?)?;
         bind_inherited_material_source(
             py,
@@ -27270,19 +27345,33 @@ impl PySemanticTransitionController {
             &task_use.checkpoint.material_sources,
             material_source,
         )?;
-        let values = read_replay_rows(
+        let material_limit = material_limit?;
+        let mut total_material_limit = total_material_limit?;
+        let evidence_limit = evidence_limit?;
+        let mut unique_materials = BTreeMap::new();
+        let proposal_materials = read_coding_proposals(
+            proposals,
+            &mut budget,
+            material_limit,
+            &mut total_material_limit,
+            evidence_limit,
+            &mut unique_materials,
+            &task_use.checkpoint.material_sources,
+        )?;
+        let values = read_replay_rows_with_materials(
             replay_rows,
             &mut budget,
-            material_limit?,
-            total_material_limit?,
-            evidence_limit?,
+            material_limit,
+            &mut total_material_limit,
+            evidence_limit,
+            &mut unique_materials,
             &task_use.checkpoint.material_sources,
         )?;
         let result_values = object_sequence(result_receipts, &mut budget)?;
         let ColdValue::Sequence(originals) = &values else {
             return Err(invalid("replay batch lost its original row roster"));
         };
-        if originals.is_empty() || originals.len() != result_values.len() {
+        if originals.len() != result_values.len() {
             return Err(invalid(
                 "replay acknowledgement requires one result signature per contributing Proposal",
             ));
@@ -27291,7 +27380,13 @@ impl PySemanticTransitionController {
         let _metadata = pool
             .reserve_auxiliary(
                 (metadata_limit as u64)
-                    .checked_mul(originals.len() as u64)
+                    .checked_mul(
+                        originals
+                            .len()
+                            .checked_add(1)
+                            .ok_or_else(|| invalid("replay batch metadata extent overflow"))?
+                            as u64,
+                    )
                     .ok_or_else(|| invalid("replay batch metadata extent overflow"))?,
             )
             .map_err(xlog_err)?;
@@ -27353,6 +27448,13 @@ impl PySemanticTransitionController {
             .value(py)
             .setattr("result_receipts", result_receipts)?;
         pending.value(py).setattr("replay_rows", replay_rows)?;
+        pending
+            .value(py)
+            .setattr("receiver_outcome", receiver_outcome)?;
+        pending.value(py).setattr("proposals", proposals)?;
+        pending
+            .value(py)
+            .setattr("material_source", material_source)?;
         let session = controller.session.borrow(py);
         let mut owner = session.owner()?;
         task_use.require_current(&owner)?;
@@ -27372,10 +27474,12 @@ impl PySemanticTransitionController {
         let result = owner.acknowledge_loaded_replay_delivery(
             &*acquired.lease()?,
             delivery,
+            outcome,
             &results,
             binding.recipient_id,
             &binding.verification_key,
             &binding.expected_effect,
+            proposal_materials,
             acquisitions,
         );
         let entered = owner.replay_delivery_pending();
@@ -28674,6 +28778,11 @@ impl PySemanticTransitionController {
             let step = &steps[index];
             let completed = &outcomes[index];
             let native_step = match completed {
+                xlog_cuda::SemanticPreparedStepOutcome::PolicyScore { .. } => {
+                    return Err(invalid(
+                        "a private demonstration score has no published action observation",
+                    ));
+                }
                 xlog_cuda::SemanticPreparedStepOutcome::Skipped { step, .. }
                 | xlog_cuda::SemanticPreparedStepOutcome::Completed { step, .. } => step,
             };
@@ -28683,6 +28792,11 @@ impl PySemanticTransitionController {
                 ));
             }
             let (transition, status, refusal, invocation, bank) = match completed {
+                xlog_cuda::SemanticPreparedStepOutcome::PolicyScore { .. } => {
+                    return Err(invalid(
+                        "a private demonstration score has no published action observation",
+                    ));
+                }
                 xlog_cuda::SemanticPreparedStepOutcome::Skipped { status, .. } => {
                     (None, *status, None, py.None(), None)
                 }

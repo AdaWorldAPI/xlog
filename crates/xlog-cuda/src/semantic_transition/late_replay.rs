@@ -1,5 +1,7 @@
 //! Cold acquisition of an external result, committed with its native acknowledgement.
 
+use super::acknowledgement_archive::{self, acknowledgement_records};
+use super::verification_receipts::OriginalObservationOrigin;
 use super::*;
 #[path = "intent_lineage.rs"]
 mod intent_lineage;
@@ -26,6 +28,10 @@ struct PublicationReplayDeliveryRow {
 #[derive(Clone, Copy, Default)]
 struct PublicationReplayDeliveryInput {
     delivery: PublicationDeliveryInput,
+    receiver_outcome: u64,
+    receiver_outcome_bytes: u64,
+    receiver_outcome_digest: Identity256,
+    receiver_disposition: u64,
     rows: u64,
     row_count: u64,
     arena_descriptors: u64,
@@ -43,7 +49,7 @@ struct PublicationReplayDeliveryInput {
 unsafe impl DeviceRepr for PublicationReplayDeliveryInput {}
 // SAFETY: each row is a padding-free collection of integer native ABI records.
 unsafe impl DeviceRepr for PublicationReplayDeliveryRow {}
-const _: () = assert!(size_of::<PublicationReplayDeliveryInput>() == 176);
+const _: () = assert!(size_of::<PublicationReplayDeliveryInput>() == 232);
 const _: () = assert!(size_of::<PublicationReplayDeliveryRow>() == 1128);
 
 type LoadedReplayDeliveryAcquisition<V> = (
@@ -54,6 +60,12 @@ type LoadedReplayDeliveryAcquisition<V> = (
     Identity256,
     Identity256,
     V,
+    SemanticResolvedReplayMaterial,
+    SemanticReplayLoadedMaterial,
+);
+
+type LoadedCodingProposal = (
+    SemanticReplayMaterial,
     SemanticResolvedReplayMaterial,
     SemanticReplayLoadedMaterial,
 );
@@ -149,6 +161,7 @@ pub(super) struct PendingReplayDelivery {
         Arc<std::sync::Mutex<model_context_continuation::OriginalModelContextAcknowledgement>>,
     >,
     receipt: ReplayUpload<u8>,
+    receiver_outcome: ReplayUpload<u8>,
     payload: ReplayUpload<u8>,
     rows: ReplayUpload<PublicationReplayDeliveryRow>,
     observations: ReplayUpload<u64>,
@@ -473,13 +486,14 @@ fn append_rows_from_ranges<'a, B: PublicationByteStorage>(
 }
 
 impl SemanticTransitionSession {
-    fn replay_delivery_allocation_bound<B: AsRef<[u8]>>(
+    fn replay_delivery_allocation_bound(
         &self,
         lease: &SemanticPublishedLease,
-        replay: &SemanticReplayMaterial,
-        row: &SemanticTrainingViewRow<B>,
+        replay: Option<&SemanticReplayMaterial>,
+        row_bytes: usize,
         canonical_row: &[u8],
         delivery_receipt: &[u8],
+        receiver_outcome: &[u8],
         result_receipt: &[u8],
     ) -> Result<u64, SemanticTransitionError> {
         let mut bytes = 0u64;
@@ -519,7 +533,11 @@ impl SemanticTransitionSession {
             .checked_sub(size_of::<AcknowledgementQueueHeader>() as u64)
             .ok_or(SemanticTransitionError::ObservationMismatch)?
             / size_of::<AcknowledgementEntry>() as u64;
-        add(acknowledgements, size_of::<(Identity256, Vec<u8>)>() as u64)?;
+        add(
+            acknowledgements,
+            size_of::<acknowledgement_archive::ArchivedAcknowledgement>() as u64
+                + OwnedPublicationMaterial::tree_node_bound(size_of::<[u8; 32]>(), 0)? as u64,
+        )?;
         add(length(32)?, 1)?;
         let appends = length(56)?
             .checked_sub(size_of::<SemanticTrainingReplayAppendHeader>() as u64)
@@ -537,12 +555,13 @@ impl SemanticTransitionSession {
         )?;
         let packed = 40u64
             .checked_add(size_of::<TrainingViewRowDescriptor>() as u64)
-            .and_then(|n| n.checked_add(row.bytes.as_ref().len() as u64))
+            .and_then(|n| n.checked_add(row_bytes as u64))
             .and_then(|n| n.checked_add(canonical_row.len() as u64))
             .and_then(|n| n.checked_add(result_receipt.len() as u64))
             .ok_or(SemanticTransitionError::GenerationExhausted)?;
         add(packed.max(1), 2)?;
         add(delivery_receipt.len().max(1) as u64, 1)?;
+        add(receiver_outcome.len().max(1) as u64, 1)?;
         // The loaded row already owns its row-sized Arc metadata reservation.
         // Charge the additional receipt field and the receipt's real Arc here.
         add(
@@ -582,7 +601,10 @@ impl SemanticTransitionSession {
                 + 4 * size_of::<usize>()) as u64,
         )?;
         let mut evidence = (REPLAY_EVIDENCE_MAGIC.len() + 4 + 32 + 80 + 4) as u64;
-        for range in &replay.evidence.ranges {
+        for range in replay
+            .into_iter()
+            .flat_map(|replay| &replay.evidence.ranges)
+        {
             evidence = evidence
                 .checked_add((24 + size_of::<PublicationRange>()) as u64)
                 .and_then(|n| n.checked_add(range.bytes.len() as u64))
@@ -680,7 +702,7 @@ impl SemanticTransitionSession {
             || acknowledgements.bytes.len() != size_of::<AcknowledgementQueueHeader>()
             || appends.bytes.len() != size_of::<SemanticTrainingReplayAppendHeader>()
             || !output_intents_from_ranges(intents, intent_payload)?.is_empty()
-            || !acknowledgement_receipts(&acknowledgements.bytes, acknowledgements.capacity)?
+            || !acknowledgement_records(&acknowledgements.bytes, acknowledgements.capacity)?
                 .is_empty()
             || !append_rows_from_ranges(appends, append_payload)?.is_empty()
             || self
@@ -1262,6 +1284,44 @@ impl SemanticTransitionSession {
             .layout;
         let entries = self.read_replay_authentication_range(56)?;
         let payload = self.read_replay_authentication_range(57)?;
+        let row_count = entries
+            .bytes
+            .len()
+            .checked_sub(size_of::<SemanticTrainingReplayAppendHeader>())
+            .ok_or(SemanticTransitionError::ObservationMismatch)?
+            / size_of::<SemanticTrainingReplayAppendEntry>();
+        let row_parse_width = size_of::<AppendPayload<'_>>()
+            .checked_add(OwnedPublicationMaterial::tree_node_bound(
+                size_of::<([u64; 4], [u64; 4], [u64; 4])>(),
+                0,
+            )?)
+            .and_then(|width| {
+                width.checked_add(
+                    OwnedPublicationMaterial::tree_node_bound(size_of::<[u64; 4]>(), 0).ok()?,
+                )
+            })
+            .and_then(|width| {
+                width.checked_add(
+                    size_of::<(
+                        &SemanticReplayMaterial,
+                        &SemanticResolvedReplayMaterial,
+                        &SemanticReplayLoadedMaterial,
+                    )>() + size_of::<usize>()
+                        + size_of::<bool>(),
+                )
+            })
+            .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        let _row_parse_owner = self
+            .replay_material_budget
+            .as_ref()
+            .map(|budget| {
+                budget.reserve_auxiliary(
+                    (row_count as u64)
+                        .checked_mul(row_parse_width as u64)
+                        .ok_or(SemanticTransitionError::GenerationExhausted)?,
+                )
+            })
+            .transpose()?;
         let rows = append_rows_from_ranges(&entries, &payload)?;
         if rows.len() != acquisitions.len() {
             return Err(publication_input_error(
@@ -1277,10 +1337,37 @@ impl SemanticTransitionSession {
         }
         let intent_entries = self.read_replay_authentication_range(30)?;
         let intent_payload = self.read_replay_authentication_range(31)?;
+        let intent_count = intent_entries
+            .bytes
+            .len()
+            .checked_sub(size_of::<IntentQueueHeader>())
+            .ok_or(SemanticTransitionError::ObservationMismatch)?
+            / size_of::<IntentEntry>();
+        let intent_parse_bytes = intent_count
+            .checked_mul(
+                size_of::<SemanticOutputIntent>()
+                    .checked_add(intent_payload.bytes.len())
+                    .ok_or(SemanticTransitionError::GenerationExhausted)?,
+            )
+            .and_then(|bytes| bytes.checked_add(intent_payload.bytes.len()))
+            .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        let _intent_parse_owner = self
+            .replay_material_budget
+            .as_ref()
+            .map(|budget| budget.reserve_auxiliary(intent_parse_bytes as u64))
+            .transpose()?;
         let intents = output_intents_from_ranges(&intent_entries, &intent_payload)?;
         let acknowledgements = self.read_replay_authentication_range(32)?;
-        let receipts =
-            acknowledgement_receipts(&acknowledgements.bytes, acknowledgements.capacity)?;
+        let archive_bound = acknowledgement_archive::allocation_bound(
+            &acknowledgements.bytes,
+            acknowledgements.capacity,
+        )?;
+        let _archive_owner = self
+            .replay_material_budget
+            .as_ref()
+            .map(|budget| budget.reserve_auxiliary(archive_bound))
+            .transpose()?;
+        let receipts = acknowledgement_records(&acknowledgements.bytes, acknowledgements.capacity)?;
         let prefix = self.read_replay_authentication_range(1)?;
         let provenance = self.read_replay_authentication_range(2)?;
         let contract = self
@@ -1320,9 +1407,144 @@ impl SemanticTransitionSession {
             }
             begin = end;
         }
+        let source_count = rows
+            .len()
+            .checked_add(receipts.len())
+            .and_then(|count| count.checked_mul(ground.bindings().len()))
+            .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        let metadata_bytes = receipts
+            .len()
+            .checked_mul(size_of::<(
+                Identity256,
+                Option<super::verification_receipts::AuthenticatedTaskResults>,
+            )>())
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    source_count.checked_mul(size_of::<(u32, crate::SemanticRootSupport)>())?,
+                )
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    ground
+                        .bindings()
+                        .len()
+                        .checked_mul(size_of::<[u64; 18]>())?,
+                )
+            })
+            .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        let _metadata_owner = self
+            .replay_material_budget
+            .as_ref()
+            .map(|budget| budget.reserve_auxiliary(metadata_bytes as u64))
+            .transpose()?;
         let mut eligible_count = 0;
         let mut observations = vec![[0u64; 18]; ground.bindings().len()];
-        let mut sources = Vec::new();
+        let mut sources = Vec::with_capacity(source_count);
+        let mut receiver_results = Vec::with_capacity(receipts.len());
+        for record in &receipts {
+            let intent = intents
+                .iter()
+                .find(|intent| intent.stable_identity == record.stable_identity)
+                .ok_or_else(|| {
+                    publication_input_error(
+                        "restored acknowledgement has no original native intent",
+                    )
+                })?;
+            if effect.is_empty() || intent.effect != effect {
+                return Err(publication_input_error(
+                    "restored receiver outcome changed its original effect",
+                ));
+            }
+            let outcome_capacity = acknowledgement_archive::admit_payload(
+                &acknowledgements.bytes,
+                acknowledgements.capacity,
+                record.stable_identity,
+                record.delivery_receipt.len(),
+                record.receiver_outcome.len(),
+            )?;
+            verify_delivery_receipt(&record.delivery_receipt, intent, recipient, key)?;
+            if matches!(&ground, SemanticTaskGround::Logical) {
+                if !record.receiver_outcome.is_empty()
+                    || rows.iter().any(|row| {
+                        words_identity(row.entry.stable_intent) == record.stable_identity
+                    })
+                {
+                    return Err(publication_input_error(
+                        "logical delivery acknowledgement cannot contain coding results",
+                    ));
+                }
+                receiver_results.push((record.stable_identity, None));
+                continue;
+            }
+            let outcome = super::receiver_outcome::verify_receiver_outcome(
+                &record.receiver_outcome,
+                record.stable_identity,
+                recipient,
+                &intent.effect,
+                &intent.payload,
+                &record.delivery_receipt,
+                key,
+                outcome_capacity,
+            )?;
+            let batch_rows = rows
+                .iter()
+                .filter(|row| words_identity(row.entry.stable_intent) == record.stable_identity)
+                .count();
+            let common =
+                if outcome.disposition == super::receiver_outcome::ReceiverDisposition::Completed {
+                    if batch_rows == 0
+                        && !intent_lineage::contributor_indices(
+                            contract,
+                            lease.header,
+                            intent,
+                            &prefix,
+                            &provenance,
+                            &[],
+                        )?
+                        .is_empty()
+                    {
+                        return Err(publication_input_error(
+                            "restored empty result omitted native contributors",
+                        ));
+                    }
+                    let common = super::verification_receipts::verify_completed_tool_result(
+                        &ground,
+                        outcome.content,
+                        record.stable_identity,
+                        recipient,
+                        &intent.effect,
+                        &intent.payload,
+                        key,
+                        self.replay_material_budget.as_ref(),
+                    )?;
+                    for (ordinal, (binding, &incoming)) in ground
+                        .bindings()
+                        .iter()
+                        .zip(&common.observations)
+                        .enumerate()
+                    {
+                        sources.push((
+                            binding.observation_record,
+                            crate::SemanticRootSupport::Authenticated {
+                                binding_ordinal: ordinal as u64,
+                                observation: incoming,
+                            },
+                        ));
+                        let accumulated = observations[ordinal][1] | incoming[1];
+                        observations[ordinal] = incoming;
+                        observations[ordinal][1] = accumulated;
+                    }
+                    Some(common)
+                } else {
+                    if batch_rows != 0 {
+                        return Err(publication_input_error(
+                            "refused receiver outcome acquired action rows",
+                        ));
+                    }
+                    None
+                };
+            receiver_results.push((record.stable_identity, common));
+        }
         for (
             archived,
             (
@@ -1348,14 +1570,41 @@ impl SemanticTransitionSession {
             let intent = &intents[index];
             let authenticated = super::verification_receipts::verify_acquired_receipts(
                 &ground,
-                materials.as_ref(),
+                materials
+                    .as_ref()
+                    .iter()
+                    .map(|(identity, material, metadata)| {
+                        (*identity, material.as_ref(), Some(metadata.as_ref()))
+                    }),
                 stable,
                 &intent.effect,
                 &intent.payload,
-                *action_identity,
+                OriginalObservationOrigin::Action(*action_identity),
                 key,
                 self.replay_material_budget.as_ref(),
             )?;
+            let common = receiver_results
+                .iter()
+                .find(|(identity, _)| *identity == stable)
+                .and_then(|(_, result)| result.as_ref())
+                .ok_or_else(|| {
+                    publication_input_error(
+                        "restored action row lacks a completed receiver outcome",
+                    )
+                })?;
+            if authenticated
+                .receipts
+                .iter()
+                .map(|receipt| (receipt.identity, receipt.outcome))
+                .ne(common
+                    .receipts
+                    .iter()
+                    .map(|receipt| (receipt.identity, receipt.outcome)))
+            {
+                return Err(publication_input_error(
+                    "restored action row changed its actual completed receipt roster",
+                ));
+            }
             let disposition = authenticated.disposition;
             if disposition != archived.entry.disposition {
                 return Err(publication_input_error(
@@ -1386,9 +1635,6 @@ impl SemanticTransitionSession {
                         observation: incoming,
                     },
                 ));
-                let accumulated = observations[ordinal][1] | incoming[1];
-                observations[ordinal] = incoming;
-                observations[ordinal][1] = accumulated;
             }
             if effect.is_empty()
                 || intent.effect != effect
@@ -1422,13 +1668,13 @@ impl SemanticTransitionSession {
             }
             let receipt = &receipts
                 .iter()
-                .find(|(identity, _)| *identity == stable)
+                .find(|record| record.stable_identity == stable)
                 .ok_or_else(|| {
                     publication_input_error(
                         "restored append has no original delivery acknowledgement",
                     )
                 })?
-                .1;
+                .delivery_receipt;
             let delivery_digest = verify_delivery_receipt(receipt, intent, recipient, key)?;
             if verify_result_receipt(
                 archived.result_receipt,
@@ -1532,10 +1778,17 @@ impl SemanticTransitionSession {
                 "restored replay queue differs from its original cold arena",
             ));
         }
-        let row_metadata_bytes =
-            OwnedPublicationMaterial::tree_node_bound(size_of::<Identity256>(), 0)?
-                .checked_add(size_of::<AppendPayload<'_>>())
-                .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        let row_metadata_bytes = OwnedPublicationMaterial::tree_node_bound(
+            size_of::<([u64; 4], [u64; 4], [u64; 4])>(),
+            0,
+        )?
+        .checked_add(OwnedPublicationMaterial::tree_node_bound(
+            size_of::<[u64; 4]>(),
+            0,
+        )?)
+        .ok_or(SemanticTransitionError::GenerationExhausted)?
+        .checked_add(size_of::<AppendPayload<'_>>())
+        .ok_or(SemanticTransitionError::GenerationExhausted)?;
         let parse_bytes = usize::try_from(header.count)
             .ok()
             .and_then(|count| count.checked_mul(row_metadata_bytes))
@@ -1666,10 +1919,12 @@ impl SemanticTransitionSession {
         &mut self,
         lease: &SemanticPublishedLease,
         delivery_receipt: &[u8],
+        receiver_outcome: &[u8],
         result_receipts: &[Vec<u8>],
         recipient_id: Identity256,
         verification_key: &[u8; 32],
         expected_effect: &[u8],
+        proposals: Vec<LoadedCodingProposal>,
         acquisitions: Vec<LoadedReplayDeliveryAcquisition<V>>,
     ) -> Result<SemanticPublishedIdentity, SemanticTransitionError>
     where
@@ -1691,8 +1946,7 @@ impl SemanticTransitionSession {
         arena
             .replay_capacity()
             .ok_or(SemanticTransitionError::NotBound)?;
-        if acquisitions.is_empty()
-            || acquisitions.len() != result_receipts.len()
+        if acquisitions.len() != result_receipts.len()
             || acquisitions.len() > arena.row_capacity() - arena.original_slot_boundary()
         {
             return Err(publication_input_error(
@@ -1702,8 +1956,59 @@ impl SemanticTransitionSession {
         let budget = self.replay_material_budget.as_ref().ok_or_else(|| {
             publication_input_error("loaded replay delivery requires its original material pool")
         })?;
-        let mut bytes =
-            (size_of::<Vec<LoadedReplayDeliveryAcquisition<V>>>() + 4 * size_of::<usize>()) as u64;
+        let mut bytes = (size_of::<(
+            Vec<LoadedCodingProposal>,
+            Vec<LoadedReplayDeliveryAcquisition<V>>,
+        )>() + 2 * size_of::<usize>()) as u64;
+        bytes = bytes
+            .checked_add(self.replay_delivery_allocation_bound(
+                lease,
+                None,
+                0,
+                &[],
+                delivery_receipt,
+                receiver_outcome,
+                &[],
+            )?)
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    (proposals.capacity() as u64)
+                        .checked_mul(size_of::<LoadedCodingProposal>() as u64)?,
+                )
+            })
+            .and_then(|bytes| {
+                bytes.checked_add((proposals.len() as u64).checked_mul(
+                    (size_of::<(
+                        &SemanticReplayMaterial,
+                        &SemanticResolvedReplayMaterial,
+                        &SemanticReplayLoadedMaterial,
+                    )>() + size_of::<usize>()
+                        + size_of::<bool>()) as u64,
+                )?)
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    (acquisitions.capacity() as u64)
+                        .checked_mul(size_of::<LoadedReplayDeliveryAcquisition<V>>() as u64)?,
+                )
+            })
+            .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        for (replay, original, action) in &proposals {
+            if replay
+                .budget
+                .as_ref()
+                .is_none_or(|original| !budget.same_pool(original))
+                || !Arc::ptr_eq(&replay.proof_owner, &original.proof_owner)
+                || action
+                    .bytes
+                    .budget()
+                    .is_none_or(|original| !budget.same_pool(original))
+            {
+                return Err(publication_input_error(
+                    "coding Proposal custody changed its original material pool",
+                ));
+            }
+        }
         for ((replay, row, canonical, _, _, _, materials, original, action), result) in
             acquisitions.iter().zip(result_receipts)
         {
@@ -1733,32 +2038,35 @@ impl SemanticTransitionSession {
             bytes = bytes
                 .checked_add(self.replay_delivery_allocation_bound(
                     lease,
-                    replay,
-                    row,
+                    Some(replay),
+                    row.bytes.as_ref().len(),
                     canonical,
                     delivery_receipt,
+                    receiver_outcome,
                     result,
                 )?)
                 .and_then(|n| {
                     n.checked_add(
-                        (size_of::<LoadedReplayDeliveryAcquisition<V>>()
-                            + size_of::<PublicationReplayDeliveryRow>())
-                            as u64,
+                        (size_of::<PublicationReplayDeliveryRow>()
+                            + size_of::<super::verification_receipts::AuthenticatedTaskResults>()
+                            + size_of::<Identity256>()) as u64,
                     )
                 })
                 .ok_or(SemanticTransitionError::GenerationExhausted)?;
         }
         let reservation = Arc::new(budget.reserve_auxiliary(bytes)?);
-        let rows = Arc::new(acquisitions);
+        let custody = Arc::new((proposals, acquisitions));
         self.acknowledge_replay_delivery_inner(
             lease,
             delivery_receipt,
+            receiver_outcome,
             result_receipts,
             recipient_id,
             verification_key,
             expected_effect,
-            rows.as_ref(),
-            Some(Arc::clone(&rows) as Arc<dyn Send + Sync>),
+            &custody.0,
+            &custody.1,
+            Some(Arc::clone(&custody) as Arc<dyn Send + Sync>),
             Some(reservation),
         )
     }
@@ -1767,10 +2075,12 @@ impl SemanticTransitionSession {
         &mut self,
         lease: &SemanticPublishedLease,
         delivery_receipt: &[u8],
+        receiver_outcome: &[u8],
         result_receipts: &[Vec<u8>],
         recipient_id: Identity256,
         verification_key: &[u8; 32],
         expected_effect: &[u8],
+        original_proposals: &[LoadedCodingProposal],
         acquisitions: &[LoadedReplayDeliveryAcquisition<V>],
         row_custody: Option<Arc<dyn Send + Sync>>,
         material_reservation: Option<Arc<SemanticReplayMaterialReservation>>,
@@ -1808,7 +2118,7 @@ impl SemanticTransitionSession {
         let capacity = arena
             .replay_capacity()
             .ok_or_else(|| publication_input_error("replay append was not reserved cold"))?;
-        if !arena.is_materialized() {
+        if !acquisitions.is_empty() && !arena.is_materialized() {
             return Err(publication_input_error("acquired results remain in durable custody until original training materialization"));
         }
         let entries = self.read_published_control_record_with_custody(
@@ -1842,11 +2152,34 @@ impl SemanticTransitionSession {
                 "external result effect differs from the currently bound receiver",
             ));
         }
+        let acknowledgements = self.read_published_control_record_with_custody(
+            lease,
+            32,
+            material_reservation.clone(),
+            row_custody.clone(),
+        )?;
+        let outcome_capacity = acknowledgement_archive::admit_payload(
+            &acknowledgements.bytes,
+            acknowledgements.capacity,
+            stable,
+            delivery_receipt.len(),
+            receiver_outcome.len(),
+        )?;
         let delivery_digest =
             verify_delivery_receipt(delivery_receipt, intent, recipient_id, verification_key)?;
-        let proposals = acquisitions
+        let outcome = super::receiver_outcome::verify_receiver_outcome(
+            receiver_outcome,
+            stable,
+            recipient_id,
+            &intent.effect,
+            &intent.payload,
+            delivery_receipt,
+            verification_key,
+            outcome_capacity,
+        )?;
+        let proposals = original_proposals
             .iter()
-            .map(|(replay, _, _, _, _, _, _, original, action)| (replay, original, action))
+            .map(|(replay, original, action)| (replay, original, action))
             .collect::<Vec<_>>();
         let prefix = self.read_published_control_record_with_custody(
             lease,
@@ -1873,8 +2206,10 @@ impl SemanticTransitionSession {
             &provenance,
             &proposals,
         )?;
-        if contributing.len() != acquisitions.len()
-            || contributing.iter().copied().ne(0..acquisitions.len())
+        let completed =
+            outcome.disposition == super::receiver_outcome::ReceiverDisposition::Completed;
+        if (completed && contributing.len() != acquisitions.len())
+            || (!completed && (!acquisitions.is_empty() || !result_receipts.is_empty()))
         {
             return Err(publication_input_error(
                 "replay acknowledgement must cover exactly the complete native contributor set",
@@ -1887,17 +2222,56 @@ impl SemanticTransitionSession {
             .0
             .spec
             .task_ground;
+        let common = if completed {
+            Some(super::verification_receipts::verify_completed_tool_result(
+                ground,
+                outcome.content,
+                stable,
+                recipient_id,
+                &intent.effect,
+                &intent.payload,
+                verification_key,
+                self.replay_material_budget.as_ref(),
+            )?)
+        } else {
+            None
+        };
         let mut authenticated = Vec::with_capacity(acquisitions.len());
         let mut result_digests = Vec::with_capacity(acquisitions.len());
         let source_count = acquisitions
             .len()
+            .checked_add(usize::from(completed))
+            .ok_or(SemanticTransitionError::GenerationExhausted)?
             .checked_mul(ground.bindings().len())
             .ok_or(SemanticTransitionError::GenerationExhausted)?;
         let mut sources = Vec::with_capacity(source_count);
-        for ((replay, row, canonical, action, record, evidence, materials, _, _), result) in
-            acquisitions.iter().zip(result_receipts)
+        if let Some(common) = &common {
+            for (ordinal, (binding, &observation)) in ground
+                .bindings()
+                .iter()
+                .zip(&common.observations)
+                .enumerate()
+            {
+                sources.push((
+                    binding.observation_record,
+                    crate::SemanticRootSupport::Authenticated {
+                        binding_ordinal: ordinal as u64,
+                        observation,
+                    },
+                ));
+            }
+        }
+        for (
+            ((replay, row, canonical, action, record, evidence, materials, _, _), result),
+            &contributor,
+        ) in acquisitions.iter().zip(result_receipts).zip(&contributing)
         {
+            let proposal = &original_proposals[contributor].0;
             if row.basis != SemanticTrainingViewBasis::Episode
+                || replay.predecessor_identity().logical_digest
+                    != proposal.predecessor_identity().logical_digest
+                || replay.successor_identity().logical_digest
+                    != proposal.successor_identity().logical_digest
                 || row.origin != Some(replay.training_view_origin()?)
                 || canonical.is_empty()
                 || canonical.len() > capacity.payload_capacity_bytes
@@ -1910,14 +2284,37 @@ impl SemanticTransitionSession {
             }
             let verification = super::verification_receipts::verify_acquired_receipts(
                 ground,
-                materials.as_ref(),
+                materials
+                    .as_ref()
+                    .iter()
+                    .map(|(identity, material, metadata)| {
+                        (*identity, material.as_ref(), Some(metadata.as_ref()))
+                    }),
                 stable,
                 &intent.effect,
                 &intent.payload,
-                *action,
+                OriginalObservationOrigin::Action(*action),
                 verification_key,
                 self.replay_material_budget.as_ref(),
             )?;
+            let common = common
+                .as_ref()
+                .ok_or(SemanticTransitionError::ObservationMismatch)?;
+            if verification
+                .receipts
+                .iter()
+                .map(|receipt| (receipt.identity, receipt.outcome))
+                .ne(common
+                    .receipts
+                    .iter()
+                    .map(|receipt| (receipt.identity, receipt.outcome)))
+                || verification.canonical_payload_identity != common.canonical_payload_identity
+                || verification.file_roster_identity != common.file_roster_identity
+            {
+                return Err(publication_input_error(
+                    "contributor row differs from the receiver's actual completed receipt roster",
+                ));
+            }
             result_digests.push(verify_result_receipt(
                 result,
                 stable,
@@ -1964,12 +2361,6 @@ impl SemanticTransitionSession {
                 "external result acknowledgement requires the current acquired parent",
             ));
         }
-        let acknowledgements = self.read_published_control_record_with_custody(
-            lease,
-            32,
-            material_reservation.clone(),
-            row_custody.clone(),
-        )?;
         let queue = self.read_published_control_record_with_custody(
             lease,
             56,
@@ -1983,16 +2374,19 @@ impl SemanticTransitionSession {
             row_custody.clone(),
         )?;
         let archived = append_rows_from_ranges(&queue, &queue_payload)?;
-        if let Some((_, previous)) =
-            acknowledgement_receipts(&acknowledgements.bytes, acknowledgements.capacity)?
+        if let Some(previous) =
+            acknowledgement_records(&acknowledgements.bytes, acknowledgements.capacity)?
                 .iter()
-                .find(|(identity, _)| *identity == stable)
+                .find(|record| record.stable_identity == stable)
         {
             let matching = archived
                 .iter()
                 .filter(|item| words_identity(item.entry.stable_intent) == stable)
                 .collect::<Vec<_>>();
-            if previous.as_slice() != delivery_receipt || matching.len() != acquisitions.len() {
+            if previous.delivery_receipt.as_slice() != delivery_receipt
+                || previous.receiver_outcome.as_slice() != receiver_outcome
+                || matching.len() != acquisitions.len()
+            {
                 return Err(publication_input_error(
                     "native intent was acknowledged with another complete contributor batch",
                 ));
@@ -2043,7 +2437,18 @@ impl SemanticTransitionSession {
         }
         let mut eligible_count = usize::try_from(queue_header.eligible_count)
             .map_err(|_| SemanticTransitionError::GenerationExhausted)?;
-        let mut packed = Vec::new();
+        let packed_capacity = acquisitions.iter().zip(result_receipts).try_fold(
+            0usize,
+            |bytes, ((_, row, canonical, _, _, _, _, _, _), result)| {
+                bytes
+                    .checked_add(40 + size_of::<TrainingViewRowDescriptor>())
+                    .and_then(|bytes| bytes.checked_add(row.bytes.as_ref().len()))
+                    .and_then(|bytes| bytes.checked_add(canonical.len()))
+                    .and_then(|bytes| bytes.checked_add(result.len()))
+                    .ok_or(SemanticTransitionError::GenerationExhausted)
+            },
+        )?;
+        let mut packed = Vec::with_capacity(packed_capacity);
         let mut rows = Vec::with_capacity(acquisitions.len());
         for ((((_, row, canonical, _, _, _, _, _, _), result), verification), digest) in
             acquisitions
@@ -2105,6 +2510,12 @@ impl SemanticTransitionSession {
             delivery_receipt,
             material_reservation.as_ref(),
         )?;
+        let receiver_upload = ReplayUpload::new_with_owner(
+            &self.provider,
+            &self.stream,
+            receiver_outcome,
+            material_reservation.as_ref(),
+        )?;
         let payload = ReplayUpload::new_with_owner(
             &self.provider,
             &self.stream,
@@ -2121,12 +2532,21 @@ impl SemanticTransitionSession {
             &rows,
             material_reservation.as_ref(),
         )?;
-        let observation_words = authenticated
-            .iter()
-            .flat_map(|result| &result.observations)
-            .flatten()
-            .copied()
-            .collect::<Vec<_>>();
+        let mut observation_words = Vec::with_capacity(
+            source_count
+                .checked_mul(18)
+                .ok_or(SemanticTransitionError::GenerationExhausted)?,
+        );
+        if let Some(common) = &common {
+            for observation in &common.observations {
+                observation_words.extend_from_slice(observation);
+            }
+        }
+        for result in &authenticated {
+            for observation in &result.observations {
+                observation_words.extend_from_slice(observation);
+            }
+        }
         let observations = ReplayUpload::new_with_owner(
             &self.provider,
             &self.stream,
@@ -2158,6 +2578,10 @@ impl SemanticTransitionSession {
                 recipient_id,
                 receipt_digest: delivery_digest,
             },
+            receiver_outcome: receiver_upload.device.device_ptr_value(),
+            receiver_outcome_bytes: receiver_outcome.len() as u64,
+            receiver_outcome_digest: outcome.identity,
+            receiver_disposition: if completed { 1 } else { 2 },
             rows: rows.device.device_ptr_value(),
             row_count: acquisitions.len() as u64,
             arena_descriptors: *descriptors.device_ptr(),
@@ -2165,10 +2589,7 @@ impl SemanticTransitionSession {
             arena_raw: *raw.device_ptr(),
             arena_raw_bytes: raw.len() as u64,
             observations: observations.device.device_ptr_value(),
-            observation_count: authenticated
-                .iter()
-                .map(|value| value.observations.len() as u64)
-                .sum(),
+            observation_count: source_count as u64,
             statements: statements.device.device_ptr_value(),
             supports: supports.device.device_ptr_value(),
             native_work: native_work.as_ref().map_or(0, |work| *work.device_ptr()),
@@ -2211,8 +2632,20 @@ impl SemanticTransitionSession {
             delivery_receipt,
             delivery_digest,
             recipient_id,
-            Some(&packed),
+            Some((&packed, receiver_outcome)),
         )?;
+        let mut receipt_allocation_owners =
+            Vec::with_capacity(authenticated.len() + usize::from(completed));
+        if let Some(common) = common {
+            if let Some(owner) = common.allocation_owner {
+                receipt_allocation_owners.push(owner);
+            }
+        }
+        for result in authenticated.iter_mut() {
+            if let Some(owner) = result.allocation_owner.take() {
+                receipt_allocation_owners.push(owner);
+            }
+        }
         let eligible = authenticated.iter().any(|result| result.disposition == 1);
         self.pending_replay_delivery = Some(PendingReplayDelivery {
             base: lease.identity,
@@ -2223,6 +2656,7 @@ impl SemanticTransitionSession {
             #[cfg(feature = "semantic-policy")]
             context_acknowledgement,
             receipt,
+            receiver_outcome: receiver_upload,
             payload,
             rows,
             observations,
@@ -2239,10 +2673,7 @@ impl SemanticTransitionSession {
             _row_custody: row_custody,
             _material_reservation: material_reservation,
             _support_allocation_owner: prepared.allocation_owner,
-            _receipt_allocation_owners: authenticated
-                .into_iter()
-                .filter_map(|result| result.allocation_owner)
-                .collect(),
+            _receipt_allocation_owners: receipt_allocation_owners,
         });
         let result = self.resolve_replay_delivery(lease);
         if result.is_err()
@@ -2252,6 +2683,7 @@ impl SemanticTransitionSession {
                 .is_some_and(|pending| {
                     !pending.kernel_entered
                         && pending.receipt.completed
+                        && pending.receiver_outcome.completed
                         && pending.payload.completed
                         && pending.rows.completed
                         && pending.observations.completed
@@ -2284,6 +2716,9 @@ impl SemanticTransitionSession {
             .ok_or(SemanticTransitionError::NoPendingLaunch)?;
         let uploads = (|| {
             pending.receipt.complete(&self.provider, &self.stream)?;
+            pending
+                .receiver_outcome
+                .complete(&self.provider, &self.stream)?;
             pending.payload.complete(&self.provider, &self.stream)?;
             pending.rows.complete(&self.provider, &self.stream)?;
             pending
@@ -2323,6 +2758,7 @@ impl SemanticTransitionSession {
         };
         let mut recorder = self.kernel_recorder();
         recorder.read(&pending.receipt.device);
+        recorder.read(&pending.receiver_outcome.device);
         recorder.read(&pending.payload.device);
         recorder.read(&pending.rows.device);
         recorder.read(&pending.observations.device);
