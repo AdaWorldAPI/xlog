@@ -279,8 +279,9 @@ The target retains its complete frozen roster and original objective for the
 Update. Other retained rows keep their own authenticated task identities; they
 need not describe the selected source task.
 
-For a whole instruction, pass `prepare_invocation=` to the same retained
-`import_task(..., retain_policy=True)` call. Its callback receives the original
+Every retained SOURCE import requires `prepare_invocation=` in the same
+`import_task(..., retain_policy=True)` call. Direct unprepared imports do not
+retain policy or Update final-use rights. Its callback receives the original
 `(task_use, parent)` and returns `None`, retaining the source model and all
 exports in the original invocation lifetime without running its forward.
 The result is a `SemanticPreparedTaskImport`, not an imported task or a policy
@@ -517,11 +518,10 @@ before sole evaluation admission. The later witness getter retains its existing
 numerical admission and terminal-proof requirements; metadata cannot authorize
 bind, capture, numerical verification or a different private child.
 
-Bind future historical deliveries with
-`step.register_gradient_delivery(..., group_member=prepared_import, edit_only=True)`
-before the whole instruction freezes. This requires the original replay child,
-source parameter allocations and target gradient destinations; it grants no
-current-policy result. The single `build_segment` call takes
+Historical SOURCE preparation retains its authentic instruction-bound target
+Update, complete model ports and source-content witness before the whole
+instruction freezes. It does not register historical policy gradients or issue
+a CURRENT actor or demonstration result. The single `build_segment` call takes
 `execute_prepared_imports=`. After all outer and CURRENT resources and successors
 exist in the original allocation scope, it freezes the complete import roster
 and invokes this callback once. Freeze the single complete numerical plan there,
@@ -534,14 +534,12 @@ entry, or SOURCE execution before every initializer genuinely completes. Call
 Update/replay order. Each call performs its retained restore, pack and finalize
 once and returns `(same_task_use, genuine_retained_member)`; successful repeats
 return the cached pair. An unknown invocation cannot be rerun or skipped.
-Completion authenticates every original physical Parameter and restored SOURCE
-gradient slot against that same completed model witness, preserving its slot as
-the deferred delivery's restoration intent. It does not replace leaves or edges.
-The prepared owner's `group_update_vjp` delegates only to that genuine completed
-member. Its `group_update_vjp_layouts(update_step, bank, consumer_stream=...,
-edit_only=True)` is available earlier, after that same future physical delivery
-is registered. It does not execute or complete the SOURCE import. Retain the
-same owner, model, aliases and graph through actual final use.
+Completion retains the genuine SOURCE model witness without substituting leaves
+or edges. Historical SOURCE owners have no group-policy derivative or VJP port;
+CURRENT actors and edit demonstrations use their distinct native refresh owners.
+Retain the same SOURCE owner, model, aliases and graph through actual target
+completion and native final use. Removing historical gradient delivery does not
+infer completion of either target bank or authorize early source retirement.
 If the target is genuinely cancelled before this import executes, native retires
 the same prepared source and invokes its original cleanup once. The prepared
 owner's `finish_cancelled_private_segment()` only acknowledges that cached
@@ -2975,6 +2973,57 @@ and `segment_transfers` in `execution_measurements`. Native adoption validates
 the exact immutable tuple structure and compares every value with the original
 native observation; caller-authored measurements cannot replace it.
 
+### Streamed model forward producers
+
+Prepare each Update bank's full forwards with
+`step.prepare_model_forward_stream(bank, role, vocabulary=...,
+scalar_type=5, block_positions=64)`, where `role` is `"baseline"` or
+`"candidate"`. The returned `SemanticModelForwardStream` derives the complete
+row and position extents from that original native training view. No dense
+row-by-position-by-vocabulary tensor is required or accepted as a replacement
+for the stream.
+
+Inside the original recording, call `forward.begin(consumer_stream=...)`, then
+`forward.record_block(row=..., position_begin=..., count=..., logits=...,
+logits_layout=..., consumer_stream=...)` for every row and position in original
+row-major order. Each logits block contains all vocabulary columns, including
+reserved columns and positions outside an objective's active mask. Use one
+fixed contiguous block backing per forward, handing each actual block to native
+before overwriting it. A shorter final block uses the same backing. These
+producer copies and their model work remain actual recorded operations.
+
+`forward.finish(allocation_witness=..., consumer_stream=...)` returns the issued
+`SemanticModelForwardWitness`; it is not a host-authored receipt or a new model
+invocation. Baseline finish has no allocation witness. Candidate finish requires
+the exact original output-content witness, captured after the output writes and
+before finish. Native scans every value and authenticates complete coverage,
+generation and the original owners. Final completion incorporates full-finite
+status; unsupported or incomplete producers cannot authorize an Update.
+
+Prepare the original paired comparison cold with
+`step.prepare_model_canary_stream(bank, baseline_stream=...,
+candidate_stream=...)`. Its `canary_rows` is the five-row native roster, not a
+caller-selected sample. Inside the same recording, call `begin` only after both
+full forwards have finished, then
+`record_block(canary_index=..., position_begin=..., count=...,
+baseline_logits=..., candidate_logits=..., logits_layout=...,
+consumer_stream=...)` for every original canary row and position, and `finish`.
+The paired producer recomputes those original rows from the same immutable
+baseline and candidate generations, using separate fixed block backings. It
+does not reuse overwritten full-forward logits. Its issued
+`SemanticModelCanaryWitness` is required as `canary_comparison` when binding the
+original Update output.
+
+For cold compiler controls, a forward exposes readonly `source_owner`,
+`geometry=(rows, positions, vocabulary, scalar_type, block_positions)`, `role`
+and `bank`; a canary exposes its original `source_owner`, `baseline_stream`,
+`candidate_stream` and `canary_rows`. These getters issue no tensors, numerical
+work, device reads or execution authority. Native reset, hashing, coverage and
+comparison work uses the original native counters and admission ceilings; it
+must not be replaced by invented Python work records. All producer backings,
+private counters and witnesses remain retained through uncertain completion and
+the original final-use boundary.
+
 ### Original Update measurements
 
 Before retirement, read `step.update_measurements` on the original completed
@@ -3018,17 +3067,19 @@ availability; the existing segment-row format is unchanged.
 
 `forward_receipts` contains the original baseline and candidate records in that
 order. Each has `role` (0 or 1), the same availability vocabulary, and `material`
-(`None` if no complete receipt was obtained). Obtained material contains `role`,
-the **actual receipt's** `generation`, `work_sequence`, `scalar_type`, `dimensions`,
-`strides_bytes`, `model_geometry_digest`, `model_numerical_digest`, `logits_digest`,
-`identity`, and `canonical_bytes`. Native code validates the original logits
-owner/layout, receipt SHA-256, baseline binding, receipt order, and published
-candidate binding when present. The candidate generation is read from its receipt,
-not reconstructed as acquired generation plus one. Canonical bytes are the exact
-232-byte little-endian private receipt: ten scalar words, three stride words,
-then four 32-byte digests (geometry, numerics, logits, identity). The last digest
-seals the preceding 200 bytes. The original pointer word is inert evidence, not a
-CUDA alias or a replay capability. All returned dictionaries, tuples and bytes
+(`None` if no complete receipt was obtained). Obtained material contains `abi`,
+`availability`, `role`, the **actual receipt's** `generation`, `work_sequence`,
+`stream_state`, `scalar_type`, `row_count`, `capacity`, `vocabulary`,
+`block_positions`, `row_seals`, `finite`, `model_geometry_digest`,
+`model_numerical_digest`, `logits_digest`, `identity`, and `canonical_bytes`.
+Native code validates the original stream owner and geometry, receipt SHA-256,
+baseline binding, receipt order, and published candidate binding when present.
+The candidate generation is read from its receipt, not reconstructed as acquired
+generation plus one. Canonical bytes are the exact 232-byte little-endian ABI2
+private receipt: thirteen scalar words, then four 32-byte digests (geometry,
+numerics, logits, identity). The last digest seals the preceding 200 bytes.
+The original `stream_state` and `row_seals` pointer words are inert evidence,
+not CUDA aliases or replay capabilities. All returned dictionaries, tuples and bytes
 are host-owned and may outlive retirement; the getter itself may not.
 
 This port does not change the six native `execute_segment` row fields, objective
@@ -3461,14 +3512,14 @@ truths, catalogue, and device-forward component materials. Its half-open edit
 component interval is `32..68` for lane 1 or `100..136` for lane 2; policy winner
 and score do not determine membership.
 
-For an authenticated episode row in the supervised-edit objective,
-`temporal_update_vjp(...)` derives that same minimal decisive lane on device from
-the original completed Proposal state and bound goal closure. Its direct edit
+For an authenticated episode row in the supervised-edit objective, the native
+CURRENT edit-demonstration owner derives that same minimal decisive lane from
+the original solving witness and current source content. Its direct edit
 cotangent covers only the selected lane's 36 edit components. Text components
 and the other lane receive zero direct edit cotangent; the native backward still
 walks the complete original edit recurrence and original categorical choices,
 masks, catalogue, and decode-bound tape. It does not resample, consume a
-historical score array, or invoke the model a second time.
+historical score array, or publish another Proposal.
 
 The projection also contains the admitted slot-zero record, learned lane slots 1
 and 2 with their native admission or refusal, exact non-NULL text actions and
@@ -5201,6 +5252,21 @@ content witness before capture. Then call
 The callback uses the existing model content scope on the same parent and the
 existing numerical/work registrar on the evaluation's `consumer_stream`; it
 retains the original output tensors and returns `None`.
+Before preparing or admitting that evaluation's original cold report, prepare
+its complete forward with
+`evaluation.prepare_model_forward_stream(vocabulary=..., scalar_type=5,
+block_positions=64)`. It returns the same `SemanticModelForwardStream` type;
+its native role is `"evaluation"`, `source_owner` is that exact evaluation and
+`bank` is `None`, not a fabricated Update bank. The callback records `begin`, all
+original row-major blocks and `forward.finish(consumer_stream=...)` before
+returning. Evaluation forward finish requires `allocation_witness=None`
+(normally omitted): the existing capture wrapper then seals the original losses,
+admissibility and slab exactly once and binds that output to the retained
+completed stream. The
+ordinary evaluation `capture` and `finish(output_witness, consumer_streams=...)`
+signatures do not change. Native completion requires its original finished
+stream, full coverage and finite checks as well as that exact captured output;
+there is no dense or missing-stream fallback.
 Capture returns `(work_bound, operation_count, model_calls)` and freezes the
 original graph without launching it. A failed capture finalization cannot be
 launched, and ports or recording geometry cannot be rebound after capture.
