@@ -2476,6 +2476,99 @@ pub(super) fn model_snapshot_native_work_ceiling(
     ])
 }
 
+/// One prepared model-seal kernel validates the acquired publication and copies
+/// its original seals. This is distinct from the cold DMA snapshot above.
+pub(super) fn model_snapshot_prepared_native_work_ceiling(
+    storage: &PublicationStorage,
+    tensors: &[PreparedSemanticTensor],
+) -> Result<[u64; 9], SemanticTransitionError> {
+    let count = |value: usize| u64::try_from(value).map_err(|_| native_work_ceiling_overflow());
+    let pairs = |value: u64| ceiling_product(value, value.saturating_sub(1)).map(|n| n / 2);
+    let l = count(storage.layouts.len())?;
+    let s = count(storage.allocations.len())?;
+    let r = count(storage.role_counts.len())?;
+    let k = count(tensors.len())?;
+    let contract = &storage.contract_value;
+    let active = ceiling_sum([contract.window_capacity, contract.feedback_capacity])?;
+    let table_bytes = ceiling_sum([
+        size_of::<TensorLayoutTableHeader>() as u64,
+        ceiling_product(l, size_of::<SemanticTensorLayout>() as u64)?,
+        ceiling_product(active, size_of::<SemanticActiveRow>() as u64)?,
+    ])?;
+    let mut ceiling = [0; 9];
+    for directory in &storage.bank_templates {
+        let n = count(directory.len())?;
+        let record = directory
+            .iter()
+            .find(|range| range.role == 44 && range.index == 0)
+            .ok_or(SemanticTransitionError::ObservationMismatch)?;
+        let table = directory
+            .iter()
+            .find(|range| range.role == 55 && range.index == 0)
+            .ok_or(SemanticTransitionError::ObservationMismatch)?;
+        // The shared role44 bound covers selected-model authentication and
+        // the enclosing raw-contract hash, not another command launch.
+        let mut bank = model_contract_guard_geometry_native_work_ceiling(contract, directory)?;
+        bank[0] = 1;
+        let mut table_digest =
+            content_digest_ceiling(table_bytes.max(table.length_bytes), 21, false)?;
+        table_digest[0] = 0;
+        add_native_work_ceiling(&mut bank, table_digest)?;
+        let visits = ceiling_sum([
+            16, // Acquired lease/bank and the two outer digest comparisons.
+            s,
+            pairs(s)?, // Full storage validation, including prior entries.
+            ceiling_product(2, ceiling_sum([2, s])?)?, // Two output-span scans.
+            n,         // Layout-table search; the role44 search is in its guard bound.
+            r,
+            n,
+            active, // Directory role roster, table search and active-row map.
+            ceiling_product(l, ceiling_sum([1, n])?)?,
+            pairs(l)?, // Every layout's original range and prior layouts.
+            ceiling_product(n, ceiling_sum([1, n, l, active])?)?,
+            // Per roster row: range, table/layout, final copy lookup, seal.
+            ceiling_product(k, ceiling_sum([ceiling_product(3, n)?, l, 4])?)?,
+        ])?;
+        let copied_bytes = ceiling_sum([
+            ceiling_product(ceiling_sum([k, 1])?, size_of::<PublicationRange>() as u64)?,
+            record.length_bytes,
+        ])?;
+        add_native_work_ceiling(
+            &mut bank,
+            [
+                0,
+                visits,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                ceiling_sum([
+                    ceiling_product(n, 29 * size_of::<u64>() as u64)?,
+                    copied_bytes,
+                ])?,
+            ],
+        )?;
+        for tensor in tensors {
+            let mut digest = tensor_layout_native_work_ceiling(
+                &tensor.layout,
+                tensor.logical_begin,
+                tensor.logical_end,
+                tensor.source.as_ref().map_or(0, DeviceMemoryView::len),
+                true,
+            )?;
+            digest[0] = 0;
+            add_native_work_ceiling(&mut bank, digest)?;
+        }
+        for (ceiling, bank) in ceiling.iter_mut().zip(bank) {
+            *ceiling = (*ceiling).max(bank);
+        }
+    }
+    native_work_ceiling_units(ceiling)?;
+    Ok(ceiling)
+}
+
 /// The actual publication ModelContract guard authenticates its original bank,
 /// every directory seal, the schema/identity, and the selected model seal fold.
 /// Its outer guard hashes the raw contract a second time; private retained
@@ -2501,7 +2594,8 @@ pub(super) fn model_contract_guard_geometry_native_work_ceiling(
             .map(|bytes| bytes / 64)
             .ok_or_else(native_work_ceiling_overflow)
     };
-    let mut ceiling = [1, 0, 0, 0, 0, 0, 0, 0, 752];
+    // Selected-bank instance, descriptor, contract and numerical identities.
+    let mut ceiling = [1, 16, 0, 0, 0, 0, 0, 0, 752];
     ceiling[7] = blocks(size_of::<PublicationBank>() as u64)?
         .checked_add(
             blocks(
