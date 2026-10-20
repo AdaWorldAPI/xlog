@@ -1,6 +1,8 @@
 //! Cold acquisition of an external result, committed with its native acknowledgement.
 
 use super::*;
+#[path = "intent_lineage.rs"]
+mod intent_lineage;
 use crate::semantic_hypergraph::{
     SemanticResidentDecodedStatement, SemanticResidentDecodedSupport,
 };
@@ -11,14 +13,21 @@ use crate::semantic_training_view::{
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct PublicationReplayDeliveryInput {
-    delivery: PublicationDeliveryInput,
+struct PublicationReplayDeliveryRow {
     entry: SemanticTrainingReplayAppendEntry,
     payload: u64,
     payload_bytes: u64,
     row_descriptor: TrainingViewRowDescriptor,
     row_bytes: u64,
     row_bytes_len: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct PublicationReplayDeliveryInput {
+    delivery: PublicationDeliveryInput,
+    rows: u64,
+    row_count: u64,
     arena_descriptors: u64,
     arena_descriptor_count: u64,
     arena_raw: u64,
@@ -32,7 +41,22 @@ struct PublicationReplayDeliveryInput {
 
 // SAFETY: the device wire consists exclusively of integral scalar records.
 unsafe impl DeviceRepr for PublicationReplayDeliveryInput {}
-const _: () = assert!(size_of::<PublicationReplayDeliveryInput>() == 1288);
+// SAFETY: each row is a padding-free collection of integer native ABI records.
+unsafe impl DeviceRepr for PublicationReplayDeliveryRow {}
+const _: () = assert!(size_of::<PublicationReplayDeliveryInput>() == 176);
+const _: () = assert!(size_of::<PublicationReplayDeliveryRow>() == 1128);
+
+type LoadedReplayDeliveryAcquisition<V> = (
+    SemanticReplayMaterial,
+    SemanticReplayTrainingViewRow,
+    Vec<u8>,
+    Identity256,
+    Identity256,
+    Identity256,
+    V,
+    SemanticResolvedReplayMaterial,
+    SemanticReplayLoadedMaterial,
+);
 
 struct ReplayUpload<T: DeviceRepr> {
     device: TrackedCudaSlice<T>,
@@ -42,14 +66,6 @@ struct ReplayUpload<T: DeviceRepr> {
 }
 
 impl<T: DeviceRepr + 'static> ReplayUpload<T> {
-    fn new(
-        provider: &CudaKernelProvider,
-        stream: &Arc<CudaStream>,
-        source: &[T],
-    ) -> Result<Self, SemanticTransitionError> {
-        Self::new_with_owner(provider, stream, source, None)
-    }
-
     fn new_with_owner(
         provider: &CudaKernelProvider,
         stream: &Arc<CudaStream>,
@@ -122,15 +138,10 @@ pub(super) struct ReplayAuthentication {
     _effect_reservation: Option<SemanticReplayMaterialReservation>,
 }
 
-struct ReplayDeliveryRowCustody {
-    row: SemanticReplayTrainingViewRow,
-    _reservation: Arc<SemanticReplayMaterialReservation>,
-}
-
 pub(super) struct PendingReplayDelivery {
     base: SemanticPublishedIdentity,
     fuel: u64,
-    disposition: u64,
+    eligible: bool,
     lease_token: u64,
     completion: Option<SemanticPublishedIdentity>,
     #[cfg(feature = "semantic-policy")]
@@ -139,6 +150,7 @@ pub(super) struct PendingReplayDelivery {
     >,
     receipt: ReplayUpload<u8>,
     payload: ReplayUpload<u8>,
+    rows: ReplayUpload<PublicationReplayDeliveryRow>,
     observations: ReplayUpload<u64>,
     statements: ReplayUpload<SemanticResidentDecodedStatement>,
     supports: ReplayUpload<SemanticResidentDecodedSupport>,
@@ -153,7 +165,7 @@ pub(super) struct PendingReplayDelivery {
     _row_custody: Option<Arc<dyn Send + Sync>>,
     _material_reservation: Option<Arc<SemanticReplayMaterialReservation>>,
     _support_allocation_owner: Option<Arc<SemanticReplayMaterialReservation>>,
-    _receipt_allocation_owner: Option<Arc<SemanticReplayMaterialReservation>>,
+    _receipt_allocation_owners: Vec<Arc<SemanticReplayMaterialReservation>>,
 }
 
 pub(super) fn receiver_mac_matches(body: &[u8], mac: &[u8], key: &[u8; 32]) -> bool {
@@ -183,7 +195,9 @@ pub(super) fn receiver_mac_matches(body: &[u8], mac: &[u8], key: &[u8; 32]) -> b
 
 fn verify_result_receipt(
     receipt: &[u8],
-    intent: &IntentEntry,
+    stable_intent: Identity256,
+    predecessor_logical: Identity256,
+    successor_logical: Identity256,
     delivery_digest: Identity256,
     action_identity: Identity256,
     record_digest: Identity256,
@@ -204,10 +218,10 @@ fn verify_result_receipt(
         ));
     }
     for (ordinal, expected) in [
-        intent.stable_identity,
+        stable_intent,
         delivery_digest,
-        intent.base_logical,
-        intent.result_logical,
+        predecessor_logical,
+        successor_logical,
         action_identity,
         record_digest,
         evidence_digest,
@@ -330,7 +344,9 @@ fn append_rows_from_ranges<'a, B: PublicationByteStorage>(
     let mut cursor = 0usize;
     let mut chain = Identity256::default();
     let mut eligible_count = 0;
-    let mut stable_intents = BTreeSet::new();
+    let mut original_pairs = BTreeSet::new();
+    let mut closed_intents = BTreeSet::new();
+    let mut previous_intent = None;
     let mut rows = Vec::with_capacity(header.count as usize);
     for ordinal in 0..header.count as usize {
         let offset = size_of::<SemanticTrainingReplayAppendHeader>()
@@ -396,7 +412,11 @@ fn append_rows_from_ranges<'a, B: PublicationByteStorage>(
         if !matches!(entry.disposition, 1 | 2)
             || (entry.disposition == 2
                 && (entry.row_ordinal != u64::MAX || descriptor.raw_offset != 0))
-            || !stable_intents.insert(entry.stable_intent)
+            || !original_pairs.insert((
+                entry.stable_intent,
+                entry.original_origin.predecessor_logical,
+                entry.original_origin.successor_logical,
+            ))
             || descriptor.ordinal != entry.row_ordinal
             || descriptor.basis != 1
             || descriptor.origin.present != 1
@@ -410,6 +430,14 @@ fn append_rows_from_ranges<'a, B: PublicationByteStorage>(
             return Err(publication_input_error(
                 "append row differs from its committed origin or signed result",
             ));
+        }
+        if previous_intent != Some(entry.stable_intent) {
+            if !closed_intents.insert(entry.stable_intent) {
+                return Err(publication_input_error(
+                    "replay contributor batch is not contiguous",
+                ));
+            }
+            previous_intent = Some(entry.stable_intent);
         }
         chain = publication_fold_digest(
             chain,
@@ -473,7 +501,7 @@ impl SemanticTransitionSession {
                 .map(|range| range.length_bytes)
                 .ok_or(SemanticTransitionError::ObservationMismatch)
         };
-        for role in [30, 31, 32, 56, 57] {
+        for role in [1, 2, 30, 31, 32, 56, 57] {
             add(length(role)?.max(1), 2)?;
             add(
                 1,
@@ -500,7 +528,12 @@ impl SemanticTransitionSession {
         add(
             appends,
             size_of::<AppendPayload<'_>>() as u64
-                + OwnedPublicationMaterial::tree_node_bound(size_of::<Identity256>(), 0)? as u64,
+                + OwnedPublicationMaterial::tree_node_bound(
+                    size_of::<([u64; 4], [u64; 4], [u64; 4])>(),
+                    0,
+                )? as u64
+                + OwnedPublicationMaterial::tree_node_bound(size_of::<Identity256>(), 0)? as u64
+                + size_of::<&AppendPayload<'_>>() as u64,
         )?;
         let packed = 40u64
             .checked_add(size_of::<TrainingViewRowDescriptor>() as u64)
@@ -826,9 +859,9 @@ impl SemanticTransitionSession {
             );
             let mut read_bytes = (size_of::<ReplayAuthenticationReads>()
                 + 2 * size_of::<usize>()
-                + 6 * size_of::<ReplayAuthenticationRange>()
+                + 8 * size_of::<ReplayAuthenticationRange>()
                 + 2 * size_of::<PublicationControl>()) as u64;
-            for role in [30, 31, 32, 56, 57, 58] {
+            for role in [1, 2, 30, 31, 32, 56, 57, 58] {
                 let extent = lease
                     .directory
                     .iter()
@@ -848,8 +881,8 @@ impl SemanticTransitionSession {
                 .as_ref()
                 .map(|budget| budget.reserve_auxiliary(read_bytes).map(Arc::new))
                 .transpose()?;
-            let mut ranges = Vec::with_capacity(6);
-            for role in [30, 31, 32, 56, 57, 58] {
+            let mut ranges = Vec::with_capacity(8);
+            for role in [1, 2, 30, 31, 32, 56, 57, 58] {
                 let range = *lease
                     .directory
                     .iter()
@@ -917,7 +950,15 @@ impl SemanticTransitionSession {
             .checked_sub(size_of::<SemanticTrainingReplayAppendHeader>())
             .ok_or(SemanticTransitionError::ObservationMismatch)?
             / size_of::<SemanticTrainingReplayAppendEntry>();
-        let node = OwnedPublicationMaterial::tree_node_bound(size_of::<Identity256>(), 0)?;
+        let node = OwnedPublicationMaterial::tree_node_bound(
+            size_of::<([u64; 4], [u64; 4], [u64; 4])>(),
+            0,
+        )?
+        .checked_add(OwnedPublicationMaterial::tree_node_bound(
+            size_of::<Identity256>(),
+            0,
+        )?)
+        .ok_or(SemanticTransitionError::GenerationExhausted)?;
         let row_bytes = count
             .checked_mul(size_of::<AppendPayload<'_>>() + size_of::<Vec<u8>>() + node)
             .and_then(|n| n.checked_add(payload.bytes.len()))
@@ -1012,6 +1053,8 @@ impl SemanticTransitionSession {
             Identity256,
             Identity256,
             Vec<(Identity256, Vec<u8>, Vec<u8>)>,
+            SemanticResolvedReplayMaterial,
+            SemanticReplayLoadedMaterial,
         )],
     ) -> Result<(), SemanticTransitionError> {
         if self.replay_material_budget.is_some() {
@@ -1043,6 +1086,8 @@ impl SemanticTransitionSession {
             Identity256,
             Identity256,
             V,
+            SemanticResolvedReplayMaterial,
+            SemanticReplayLoadedMaterial,
         )],
     ) -> Result<(), SemanticTransitionError> {
         let budget = self.replay_material_budget.as_ref().ok_or_else(|| {
@@ -1052,8 +1097,13 @@ impl SemanticTransitionSession {
         })?;
         if acquisitions
             .iter()
-            .any(|(proof, row, _, _, _, _, materials)| {
+            .any(|(proof, row, _, _, _, _, materials, original, action)| {
                 row.bytes.require_budget(budget).is_err()
+                    || !Arc::ptr_eq(&proof.proof_owner, &original.proof_owner)
+                    || action
+                        .bytes
+                        .budget()
+                        .is_none_or(|original| !budget.same_pool(original))
                     || proof
                         .budget
                         .as_ref()
@@ -1088,6 +1138,8 @@ impl SemanticTransitionSession {
             Identity256,
             Identity256,
             V,
+            SemanticResolvedReplayMaterial,
+            SemanticReplayLoadedMaterial,
         )],
     ) -> Result<(), SemanticTransitionError>
     where
@@ -1182,6 +1234,8 @@ impl SemanticTransitionSession {
             Identity256,
             Identity256,
             V,
+            SemanticResolvedReplayMaterial,
+            SemanticReplayLoadedMaterial,
         )],
     ) -> Result<(), SemanticTransitionError>
     where
@@ -1227,12 +1281,61 @@ impl SemanticTransitionSession {
         let acknowledgements = self.read_replay_authentication_range(32)?;
         let receipts =
             acknowledgement_receipts(&acknowledgements.bytes, acknowledgements.capacity)?;
+        let prefix = self.read_replay_authentication_range(1)?;
+        let provenance = self.read_replay_authentication_range(2)?;
+        let contract = self
+            .publication
+            .as_ref()
+            .ok_or(SemanticTransitionError::NotBound)?
+            .contract_value;
+        let mut begin = 0;
+        while begin < rows.len() {
+            let stable = rows[begin].entry.stable_intent;
+            let end = rows[begin..]
+                .iter()
+                .position(|row| row.entry.stable_intent != stable)
+                .map_or(rows.len(), |offset| begin + offset);
+            let intent = intents
+                .iter()
+                .find(|intent| identity_words(*intent.stable_identity.as_bytes()) == stable)
+                .ok_or(SemanticTransitionError::ObservationMismatch)?;
+            let proposals = acquisitions[begin..end]
+                .iter()
+                .map(|(replay, _, _, _, _, _, _, original, action)| (replay, original, action))
+                .collect::<Vec<_>>();
+            let contributing = intent_lineage::contributor_indices(
+                contract,
+                lease.header,
+                intent,
+                &prefix,
+                &provenance,
+                &proposals,
+            )?;
+            if contributing.len() != proposals.len()
+                || contributing.iter().copied().ne(0..proposals.len())
+            {
+                return Err(publication_input_error(
+                    "restored batch changed the complete native contributor set",
+                ));
+            }
+            begin = end;
+        }
         let mut eligible_count = 0;
         let mut observations = vec![[0u64; 18]; ground.bindings().len()];
         let mut sources = Vec::new();
         for (
             archived,
-            (replay, row, canonical, action_identity, record_digest, evidence_digest, materials),
+            (
+                replay,
+                row,
+                canonical,
+                action_identity,
+                record_digest,
+                evidence_digest,
+                materials,
+                _,
+                _,
+            ),
         ) in rows.iter().zip(acquisitions)
         {
             let stable = words_identity(archived.entry.stable_intent);
@@ -1327,26 +1430,18 @@ impl SemanticTransitionSession {
                 })?
                 .1;
             let delivery_digest = verify_delivery_receipt(receipt, intent, recipient, key)?;
-            let offset = size_of::<IntentQueueHeader>() + index * size_of::<IntentEntry>();
-            // SAFETY: the canonical intent decoder checked this complete scalar entry.
-            let original = unsafe {
-                intent_entries.bytes[offset..]
-                    .as_ptr()
-                    .cast::<IntentEntry>()
-                    .read_unaligned()
-            };
-            if replay.predecessor_identity().logical_digest != original.base_logical
-                || replay.successor_identity().logical_digest != original.result_logical
-                || verify_result_receipt(
-                    archived.result_receipt,
-                    &original,
-                    delivery_digest,
-                    *action_identity,
-                    *record_digest,
-                    *evidence_digest,
-                    disposition,
-                    key,
-                )? != words_identity(archived.entry.result_receipt_digest)
+            if verify_result_receipt(
+                archived.result_receipt,
+                stable,
+                replay.predecessor_identity().logical_digest,
+                replay.successor_identity().logical_digest,
+                delivery_digest,
+                *action_identity,
+                *record_digest,
+                *evidence_digest,
+                disposition,
+                key,
+            )? != words_identity(archived.entry.result_receipt_digest)
             {
                 return Err(publication_input_error(
                     "restored result proof differs from its original action pair",
@@ -1505,156 +1600,140 @@ impl SemanticTransitionSession {
         ])
     }
 
-    /// Acquire one complete non-actor episode and acknowledge its nonterminal intent in one CAS.
+    /// Acquire the complete non-actor contributor batch and acknowledge its intent in one CAS.
     /// Neither the original action coordinates nor the ordinary training cursor are rewritten.
-    pub fn acknowledge_replay_delivery(
+
+    pub fn acknowledge_loaded_replay_delivery<V>(
         &mut self,
         lease: &SemanticPublishedLease,
         delivery_receipt: &[u8],
-        result_receipt: &[u8],
+        result_receipts: &[Vec<u8>],
         recipient_id: Identity256,
         verification_key: &[u8; 32],
         expected_effect: &[u8],
-        replay: &SemanticReplayMaterial,
-        row: SemanticTrainingViewRow,
-        canonical_row: &[u8],
-        action_identity: Identity256,
-        record_digest: Identity256,
-        evidence_digest: Identity256,
-        verification_materials: &[(Identity256, Vec<u8>, Vec<u8>)],
-    ) -> Result<SemanticPublishedIdentity, SemanticTransitionError> {
-        if self.replay_material_budget.is_some() {
+        acquisitions: Vec<LoadedReplayDeliveryAcquisition<V>>,
+    ) -> Result<SemanticPublishedIdentity, SemanticTransitionError>
+    where
+        V: AsRef<
+                [(
+                    Identity256,
+                    SemanticReplayLoadedMaterial,
+                    SemanticReplayLoadedMaterial,
+                )],
+            > + Send
+            + Sync
+            + 'static,
+    {
+        self.checked_reader(lease)?;
+        let arena = self
+            .training_views
+            .as_ref()
+            .ok_or(SemanticTransitionError::NotBound)?;
+        arena
+            .replay_capacity()
+            .ok_or(SemanticTransitionError::NotBound)?;
+        if acquisitions.is_empty()
+            || acquisitions.len() != result_receipts.len()
+            || acquisitions.len() > arena.row_capacity() - arena.original_slot_boundary()
+        {
             return Err(publication_input_error(
-                "bounded replay delivery requires its original loaded row",
+                "replay delivery requires one complete bounded contributor batch",
             ));
         }
-        self.acknowledge_replay_delivery_inner(
-            lease,
-            delivery_receipt,
-            result_receipt,
-            recipient_id,
-            verification_key,
-            expected_effect,
-            replay,
-            &row,
-            canonical_row,
-            action_identity,
-            record_digest,
-            evidence_digest,
-            verification_materials,
-            None,
-            None,
-        )
-    }
-
-    pub fn acknowledge_loaded_replay_delivery(
-        &mut self,
-        lease: &SemanticPublishedLease,
-        delivery_receipt: &[u8],
-        result_receipt: &[u8],
-        recipient_id: Identity256,
-        verification_key: &[u8; 32],
-        expected_effect: &[u8],
-        replay: &SemanticReplayMaterial,
-        row: SemanticReplayTrainingViewRow,
-        canonical_row: &[u8],
-        action_identity: Identity256,
-        record_digest: Identity256,
-        evidence_digest: Identity256,
-        verification_materials: &[(
-            Identity256,
-            SemanticReplayLoadedMaterial,
-            SemanticReplayLoadedMaterial,
-        )],
-    ) -> Result<SemanticPublishedIdentity, SemanticTransitionError> {
         let budget = self.replay_material_budget.as_ref().ok_or_else(|| {
             publication_input_error("loaded replay delivery requires its original material pool")
         })?;
-        if row.bytes.require_budget(budget).is_err()
-            || replay
-                .budget
-                .as_ref()
-                .is_none_or(|original| !budget.same_pool(original))
+        let mut bytes =
+            (size_of::<Vec<LoadedReplayDeliveryAcquisition<V>>>() + 4 * size_of::<usize>()) as u64;
+        for ((replay, row, canonical, _, _, _, materials, original, action), result) in
+            acquisitions.iter().zip(result_receipts)
         {
-            return Err(publication_input_error(
-                "delivery row changed its original material pool",
-            ));
-        }
-        self.checked_reader(lease)?;
-        if verification_materials
-            .iter()
-            .any(|(_, material, metadata)| {
-                [material, metadata].iter().any(|loaded| {
-                    loaded
-                        .bytes
-                        .budget()
-                        .is_none_or(|original| !budget.same_pool(original))
+            if row.bytes.require_budget(budget).is_err()
+                || replay
+                    .budget
+                    .as_ref()
+                    .is_none_or(|original| !budget.same_pool(original))
+                || !Arc::ptr_eq(&replay.proof_owner, &original.proof_owner)
+                || action
+                    .bytes
+                    .budget()
+                    .is_none_or(|original| !budget.same_pool(original))
+                || materials.as_ref().iter().any(|(_, material, metadata)| {
+                    [material, metadata].iter().any(|loaded| {
+                        loaded
+                            .bytes
+                            .budget()
+                            .is_none_or(|original| !budget.same_pool(original))
+                    })
                 })
-            })
-        {
-            return Err(publication_input_error(
-                "verification receipts changed their original material pool",
-            ));
+            {
+                return Err(publication_input_error(
+                    "delivery batch changed its original material pool",
+                ));
+            }
+            bytes = bytes
+                .checked_add(self.replay_delivery_allocation_bound(
+                    lease,
+                    replay,
+                    row,
+                    canonical,
+                    delivery_receipt,
+                    result,
+                )?)
+                .and_then(|n| {
+                    n.checked_add(
+                        (size_of::<LoadedReplayDeliveryAcquisition<V>>()
+                            + size_of::<PublicationReplayDeliveryRow>())
+                            as u64,
+                    )
+                })
+                .ok_or(SemanticTransitionError::GenerationExhausted)?;
         }
-        let bytes = self.replay_delivery_allocation_bound(
-            lease,
-            replay,
-            &row,
-            canonical_row,
-            delivery_receipt,
-            result_receipt,
-        )?;
-        let material_reservation = Arc::new(budget.reserve_auxiliary(bytes)?);
-        let row_custody = Arc::new(ReplayDeliveryRowCustody {
-            row,
-            _reservation: Arc::clone(&material_reservation),
-        });
+        let reservation = Arc::new(budget.reserve_auxiliary(bytes)?);
+        let rows = Arc::new(acquisitions);
         self.acknowledge_replay_delivery_inner(
             lease,
             delivery_receipt,
-            result_receipt,
+            result_receipts,
             recipient_id,
             verification_key,
             expected_effect,
-            replay,
-            &row_custody.row,
-            canonical_row,
-            action_identity,
-            record_digest,
-            evidence_digest,
-            verification_materials,
-            Some(Arc::clone(&row_custody) as Arc<dyn Send + Sync>),
-            Some(material_reservation),
+            rows.as_ref(),
+            Some(Arc::clone(&rows) as Arc<dyn Send + Sync>),
+            Some(reservation),
         )
     }
 
-    fn acknowledge_replay_delivery_inner<R: AsRef<[u8]>, B: AsRef<[u8]>>(
+    fn acknowledge_replay_delivery_inner<V>(
         &mut self,
         lease: &SemanticPublishedLease,
         delivery_receipt: &[u8],
-        result_receipt: &[u8],
+        result_receipts: &[Vec<u8>],
         recipient_id: Identity256,
         verification_key: &[u8; 32],
         expected_effect: &[u8],
-        replay: &SemanticReplayMaterial,
-        row: &SemanticTrainingViewRow<R>,
-        canonical_row: &[u8],
-        action_identity: Identity256,
-        record_digest: Identity256,
-        evidence_digest: Identity256,
-        verification_materials: &[(Identity256, B, B)],
+        acquisitions: &[LoadedReplayDeliveryAcquisition<V>],
         row_custody: Option<Arc<dyn Send + Sync>>,
         material_reservation: Option<Arc<SemanticReplayMaterialReservation>>,
-    ) -> Result<SemanticPublishedIdentity, SemanticTransitionError> {
+    ) -> Result<SemanticPublishedIdentity, SemanticTransitionError>
+    where
+        V: AsRef<
+            [(
+                Identity256,
+                SemanticReplayLoadedMaterial,
+                SemanticReplayLoadedMaterial,
+            )],
+        >,
+    {
         self.checked_reader(lease)?;
         if self.pending_replay_delivery.is_some()
             || self.pending
             || self.admitted_transition.is_some()
             || self.continuation_base.is_some()
-            || lease.header.terminal != 0
+            || !matches!(lease.header.terminal, 0 | 2)
         {
             return Err(publication_input_error(
-                "replay acknowledgement requires an idle acquired nonterminal parent",
+                "replay acknowledgement requires an idle acquired coding parent",
             ));
         }
         if !self.task_observations_authenticated {
@@ -1672,17 +1751,6 @@ impl SemanticTransitionSession {
             .ok_or_else(|| publication_input_error("replay append was not reserved cold"))?;
         if !arena.is_materialized() {
             return Err(publication_input_error("acquired results remain in durable custody until original training materialization"));
-        }
-        if row.basis != SemanticTrainingViewBasis::Episode
-            || row.origin != Some(replay.training_view_origin()?)
-            || canonical_row.is_empty()
-            || canonical_row.len() > capacity.payload_capacity_bytes
-            || Identity256::from_bytes(Sha256::digest(replay.evidence.encode()?).into())
-                != evidence_digest
-        {
-            return Err(publication_input_error(
-                "replay acknowledgement requires the complete original episode and evidence",
-            ));
         }
         let entries = self.read_published_control_record_with_custody(
             lease,
@@ -1704,13 +1772,12 @@ impl SemanticTransitionSession {
             .ok_or_else(|| {
                 publication_input_error("delivery receipt has no stable native intent")
             })?;
-        let ordinal = intents
+        let intent = intents
             .iter()
-            .position(|intent| intent.stable_identity == stable)
+            .find(|intent| intent.stable_identity == stable)
             .ok_or_else(|| {
                 publication_input_error("external result has no original native intent")
             })?;
-        let intent = &intents[ordinal];
         if expected_effect.is_empty() || intent.effect != expected_effect {
             return Err(publication_input_error(
                 "external result effect differs from the currently bound receiver",
@@ -1718,19 +1785,40 @@ impl SemanticTransitionSession {
         }
         let delivery_digest =
             verify_delivery_receipt(delivery_receipt, intent, recipient_id, verification_key)?;
-        let offset = size_of::<IntentQueueHeader>() + ordinal * size_of::<IntentEntry>();
-        // SAFETY: output_intents_from_ranges verified the complete fixed entry roster above.
-        let original = unsafe {
-            entries.bytes[offset..]
-                .as_ptr()
-                .cast::<IntentEntry>()
-                .read_unaligned()
-        };
-        if replay.predecessor_identity().logical_digest != original.base_logical
-            || replay.successor_identity().logical_digest != original.result_logical
+        let proposals = acquisitions
+            .iter()
+            .map(|(replay, _, _, _, _, _, _, original, action)| (replay, original, action))
+            .collect::<Vec<_>>();
+        let prefix = self.read_published_control_record_with_custody(
+            lease,
+            1,
+            material_reservation.clone(),
+            row_custody.clone(),
+        )?;
+        let provenance = self.read_published_control_record_with_custody(
+            lease,
+            2,
+            material_reservation.clone(),
+            row_custody.clone(),
+        )?;
+        let contract = self
+            .publication
+            .as_ref()
+            .ok_or(SemanticTransitionError::NotBound)?
+            .contract_value;
+        let contributing = intent_lineage::contributor_indices(
+            contract,
+            lease.header,
+            intent,
+            &prefix,
+            &provenance,
+            &proposals,
+        )?;
+        if contributing.len() != acquisitions.len()
+            || contributing.iter().copied().ne(0..acquisitions.len())
         {
             return Err(publication_input_error(
-                "replay original action pair differs from the native intent",
+                "replay acknowledgement must cover exactly the complete native contributor set",
             ));
         }
         let ground = &self
@@ -1740,42 +1828,65 @@ impl SemanticTransitionSession {
             .0
             .spec
             .task_ground;
-        let authenticated = super::verification_receipts::verify_acquired_receipts(
-            ground,
-            verification_materials,
-            stable,
-            &intent.effect,
-            &intent.payload,
-            action_identity,
-            verification_key,
-            self.replay_material_budget.as_ref(),
-        )?;
-        let disposition = authenticated.disposition;
-        let sources = ground
-            .bindings()
-            .iter()
-            .zip(&authenticated.observations)
-            .enumerate()
-            .map(|(ordinal, (binding, &observation))| {
-                (
+        let mut authenticated = Vec::with_capacity(acquisitions.len());
+        let mut result_digests = Vec::with_capacity(acquisitions.len());
+        let source_count = acquisitions
+            .len()
+            .checked_mul(ground.bindings().len())
+            .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        let mut sources = Vec::with_capacity(source_count);
+        for ((replay, row, canonical, action, record, evidence, materials, _, _), result) in
+            acquisitions.iter().zip(result_receipts)
+        {
+            if row.basis != SemanticTrainingViewBasis::Episode
+                || row.origin != Some(replay.training_view_origin()?)
+                || canonical.is_empty()
+                || canonical.len() > capacity.payload_capacity_bytes
+                || Identity256::from_bytes(Sha256::digest(replay.evidence.encode()?).into())
+                    != *evidence
+            {
+                return Err(publication_input_error(
+                    "replay acknowledgement requires each complete original episode and evidence",
+                ));
+            }
+            let verification = super::verification_receipts::verify_acquired_receipts(
+                ground,
+                materials.as_ref(),
+                stable,
+                &intent.effect,
+                &intent.payload,
+                *action,
+                verification_key,
+                self.replay_material_budget.as_ref(),
+            )?;
+            result_digests.push(verify_result_receipt(
+                result,
+                stable,
+                replay.predecessor_identity().logical_digest,
+                replay.successor_identity().logical_digest,
+                delivery_digest,
+                *action,
+                *record,
+                *evidence,
+                verification.disposition,
+                verification_key,
+            )?);
+            for (ordinal, (binding, &observation)) in ground
+                .bindings()
+                .iter()
+                .zip(&verification.observations)
+                .enumerate()
+            {
+                sources.push((
                     binding.observation_record,
                     crate::SemanticRootSupport::Authenticated {
                         binding_ordinal: ordinal as u64,
                         observation,
                     },
-                )
-            })
-            .collect::<Vec<_>>();
-        let result_digest = verify_result_receipt(
-            result_receipt,
-            &original,
-            delivery_digest,
-            action_identity,
-            record_digest,
-            evidence_digest,
-            disposition,
-            verification_key,
-        )?;
+                ));
+            }
+            authenticated.push(verification);
+        }
         let publication = Arc::clone(
             self.publication
                 .as_ref()
@@ -1800,96 +1911,130 @@ impl SemanticTransitionSession {
             material_reservation.clone(),
             row_custody.clone(),
         )?;
-        if let Some((_, previous)) =
-            acknowledgement_receipts(&acknowledgements.bytes, acknowledgements.capacity)?
-                .iter()
-                .find(|(identity, _)| *identity == stable)
-        {
-            let queue = self.read_published_control_record_with_custody(
-                lease,
-                56,
-                material_reservation.clone(),
-                row_custody.clone(),
-            )?;
-            let payload = self.read_published_control_record_with_custody(
-                lease,
-                57,
-                material_reservation.clone(),
-                row_custody.clone(),
-            )?;
-            let rows = append_rows_from_ranges(&queue, &payload)?;
-            let mut matching = rows
-                .iter()
-                .filter(|item| words_identity(item.entry.stable_intent) == stable);
-            let archived = matching.next().ok_or_else(|| {
-                publication_input_error("acknowledged result has no original committed append")
-            })?;
-            let descriptor = if disposition == 1 {
-                let row_ordinal = usize::try_from(archived.entry.row_ordinal)
-                    .map_err(|_| SemanticTransitionError::GenerationExhausted)?;
-                arena.prepare_append_row(row_ordinal, row)?
-            } else {
-                arena.prepare_rejected_row(row)?
-            };
-            if previous.as_slice() != delivery_receipt
-                || archived.entry.disposition != disposition
-                || matching.next().is_some()
-                || archived.result_receipt != result_receipt
-                || words_identity(archived.entry.result_receipt_digest) != result_digest
-                || archived.canonical != canonical_row
-                || archived.raw != row.bytes.as_ref()
-                || publication_abi_bytes(&[archived.descriptor])
-                    != publication_abi_bytes(&[descriptor])
-            {
-                return Err(publication_input_error(
-                    "native intent was acknowledged with a different complete replay result",
-                ));
-            }
-            return Ok(lease.identity);
-        }
-        if lease.header.fuel == 0 {
-            return Err(publication_input_error(
-                "nonterminal parent has no reserved replay acknowledgement fuel",
-            ));
-        }
         let queue = self.read_published_control_record_with_custody(
             lease,
             56,
             material_reservation.clone(),
             row_custody.clone(),
         )?;
+        let queue_payload = self.read_published_control_record_with_custody(
+            lease,
+            57,
+            material_reservation.clone(),
+            row_custody.clone(),
+        )?;
+        let archived = append_rows_from_ranges(&queue, &queue_payload)?;
+        if let Some((_, previous)) =
+            acknowledgement_receipts(&acknowledgements.bytes, acknowledgements.capacity)?
+                .iter()
+                .find(|(identity, _)| *identity == stable)
+        {
+            let matching = archived
+                .iter()
+                .filter(|item| words_identity(item.entry.stable_intent) == stable)
+                .collect::<Vec<_>>();
+            if previous.as_slice() != delivery_receipt || matching.len() != acquisitions.len() {
+                return Err(publication_input_error(
+                    "native intent was acknowledged with another complete contributor batch",
+                ));
+            }
+            for (((item, (_, row, canonical, _, _, _, _, _, _)), result), (verification, digest)) in
+                matching
+                    .iter()
+                    .zip(acquisitions)
+                    .zip(result_receipts)
+                    .zip(authenticated.iter().zip(&result_digests))
+            {
+                let descriptor = if verification.disposition == 1 {
+                    arena.prepare_append_row(
+                        usize::try_from(item.entry.row_ordinal)
+                            .map_err(|_| SemanticTransitionError::GenerationExhausted)?,
+                        row,
+                    )?
+                } else {
+                    arena.prepare_rejected_row(row)?
+                };
+                if item.entry.disposition != verification.disposition
+                    || item.result_receipt != result.as_slice()
+                    || words_identity(item.entry.result_receipt_digest) != *digest
+                    || item.canonical != canonical.as_slice()
+                    || item.raw != row.bytes.as_ref()
+                    || publication_abi_bytes(&[item.descriptor])
+                        != publication_abi_bytes(&[descriptor])
+                {
+                    return Err(publication_input_error(
+                        "native intent was acknowledged with a different original replay row",
+                    ));
+                }
+            }
+            return Ok(lease.identity);
+        }
         let queue_header = append_header(&queue.bytes)?;
-        if queue_header.count >= queue_header.capacity
+        if lease.header.fuel == 0
+            || queue_header
+                .count
+                .checked_add(acquisitions.len() as u64)
+                .is_none_or(|count| count > queue_header.capacity)
             || queue_header.capacity
                 != (arena.row_capacity() - arena.original_slot_boundary()) as u64
         {
             return Err(publication_input_error(
-                "replay append reservation is exhausted or differs from the original arena",
+                "complete replay batch exceeds the original append or acknowledgement reservation",
             ));
         }
-        let row_ordinal = arena
-            .original_count()
-            .checked_add(queue_header.eligible_count as usize)
-            .ok_or(SemanticTransitionError::GenerationExhausted)?;
-        let row_descriptor = if disposition == 1 {
-            arena.prepare_append_row(row_ordinal, row)?
-        } else {
-            arena.prepare_rejected_row(row)?
-        };
-        let packed = append_payload(
-            &row_descriptor,
-            row.bytes.as_ref(),
-            canonical_row,
-            result_receipt,
-        )?;
-        if queue_header
-            .payload_used_bytes
-            .checked_add(packed.len() as u64)
-            .is_none_or(|size| size > queue_header.payload_capacity_bytes)
+        let mut eligible_count = usize::try_from(queue_header.eligible_count)
+            .map_err(|_| SemanticTransitionError::GenerationExhausted)?;
+        let mut packed = Vec::new();
+        let mut rows = Vec::with_capacity(acquisitions.len());
+        for ((((_, row, canonical, _, _, _, _, _, _), result), verification), digest) in
+            acquisitions
+                .iter()
+                .zip(result_receipts)
+                .zip(&authenticated)
+                .zip(&result_digests)
         {
-            return Err(publication_input_error(
-                "complete replay append exceeds its original payload reservation",
-            ));
+            let descriptor = if verification.disposition == 1 {
+                let ordinal = arena
+                    .original_count()
+                    .checked_add(eligible_count)
+                    .ok_or(SemanticTransitionError::GenerationExhausted)?;
+                eligible_count = eligible_count
+                    .checked_add(1)
+                    .ok_or(SemanticTransitionError::GenerationExhausted)?;
+                arena.prepare_append_row(ordinal, row)?
+            } else {
+                arena.prepare_rejected_row(row)?
+            };
+            let payload_offset = packed.len() as u64;
+            let bytes = append_payload(&descriptor, row.bytes.as_ref(), canonical, result)?;
+            if queue_header
+                .payload_used_bytes
+                .checked_add(payload_offset)
+                .and_then(|used| used.checked_add(bytes.len() as u64))
+                .is_none_or(|used| used > queue_header.payload_capacity_bytes)
+            {
+                return Err(publication_input_error(
+                    "complete replay batch exceeds its original payload reservation",
+                ));
+            }
+            rows.push(PublicationReplayDeliveryRow {
+                entry: SemanticTrainingReplayAppendEntry {
+                    row_ordinal: descriptor.ordinal,
+                    content_identity: descriptor.content_identity,
+                    original_origin: descriptor.origin,
+                    stable_intent: identity_words(*stable.as_bytes()),
+                    result_receipt_digest: identity_words(*digest.as_bytes()),
+                    payload_offset_bytes: queue_header.payload_used_bytes + payload_offset,
+                    payload_length_bytes: bytes.len() as u64,
+                    disposition: verification.disposition,
+                },
+                payload: payload_offset,
+                payload_bytes: bytes.len() as u64,
+                row_descriptor: descriptor,
+                row_bytes: payload_offset + 40 + size_of::<TrainingViewRowDescriptor>() as u64,
+                row_bytes_len: row.bytes.as_ref().len() as u64,
+            });
+            packed.extend(bytes);
         }
         let prepared = self
             .graph
@@ -1907,9 +2052,19 @@ impl SemanticTransitionSession {
             &packed,
             material_reservation.as_ref(),
         )?;
+        for row in &mut rows {
+            row.payload += payload.device.device_ptr_value();
+            row.row_bytes += payload.device.device_ptr_value();
+        }
+        let rows = ReplayUpload::new_with_owner(
+            &self.provider,
+            &self.stream,
+            &rows,
+            material_reservation.as_ref(),
+        )?;
         let observation_words = authenticated
-            .observations
             .iter()
+            .flat_map(|result| &result.observations)
             .flatten()
             .copied()
             .collect::<Vec<_>>();
@@ -1944,41 +2099,17 @@ impl SemanticTransitionSession {
                 recipient_id,
                 receipt_digest: delivery_digest,
             },
-            entry: SemanticTrainingReplayAppendEntry {
-                row_ordinal: row_descriptor.ordinal,
-                content_identity: row_descriptor.content_identity,
-                original_origin: row_descriptor.origin,
-                stable_intent: std::array::from_fn(|index| {
-                    u64::from_ne_bytes(
-                        stable.as_bytes()[index * 8..index * 8 + 8]
-                            .try_into()
-                            .expect("identity word"),
-                    )
-                }),
-                result_receipt_digest: std::array::from_fn(|index| {
-                    u64::from_ne_bytes(
-                        result_digest.as_bytes()[index * 8..index * 8 + 8]
-                            .try_into()
-                            .expect("identity word"),
-                    )
-                }),
-                payload_offset_bytes: queue_header.payload_used_bytes,
-                payload_length_bytes: packed.len() as u64,
-                disposition,
-            },
-            payload: payload.device.device_ptr_value(),
-            payload_bytes: packed.len() as u64,
-            row_descriptor,
-            row_bytes: payload.device.device_ptr_value()
-                + 40
-                + size_of::<TrainingViewRowDescriptor>() as u64,
-            row_bytes_len: row.bytes.as_ref().len() as u64,
+            rows: rows.device.device_ptr_value(),
+            row_count: acquisitions.len() as u64,
             arena_descriptors: *descriptors.device_ptr(),
             arena_descriptor_count: descriptors.len() as u64,
             arena_raw: *raw.device_ptr(),
             arena_raw_bytes: raw.len() as u64,
             observations: observations.device.device_ptr_value(),
-            observation_count: authenticated.observations.len() as u64,
+            observation_count: authenticated
+                .iter()
+                .map(|value| value.observations.len() as u64)
+                .sum(),
             statements: statements.device.device_ptr_value(),
             supports: supports.device.device_ptr_value(),
             native_work: native_work.as_ref().map_or(0, |work| *work.device_ptr()),
@@ -1997,9 +2128,8 @@ impl SemanticTransitionSession {
                 row_custody.clone(),
             )?,
         ));
-        // Stage the exact successor header before any upload or CAS may enter.
-        // Resolution joins these same owners after an unknown read completion.
         let successor_bank = ((lease.identity.word & 1) ^ 1) as usize;
+        // SAFETY: the inactive publication bank's fixed header exists for this same retained submission.
         let header_view = unsafe {
             publication.banks[successor_bank]
                 .view()
@@ -2016,26 +2146,26 @@ impl SemanticTransitionSession {
                 row_custody.clone(),
             )?,
         ));
-        // All pinned sources, destinations and pre-reserved graph references
-        // precede the first transfer or numerical/publication entry boundary.
         #[cfg(feature = "semantic-policy")]
         let context_acknowledgement = self.stage_model_context_acknowledgement(
             lease,
             delivery_receipt,
             delivery_digest,
             recipient_id,
-            Some(result_receipt),
+            Some(&packed),
         )?;
+        let eligible = authenticated.iter().any(|result| result.disposition == 1);
         self.pending_replay_delivery = Some(PendingReplayDelivery {
             base: lease.identity,
             fuel: lease.header.fuel,
-            disposition,
+            eligible,
             lease_token: lease.token,
             completion: None,
             #[cfg(feature = "semantic-policy")]
             context_acknowledgement,
             receipt,
             payload,
+            rows,
             observations,
             statements,
             supports,
@@ -2050,7 +2180,10 @@ impl SemanticTransitionSession {
             _row_custody: row_custody,
             _material_reservation: material_reservation,
             _support_allocation_owner: prepared.allocation_owner,
-            _receipt_allocation_owner: authenticated.allocation_owner,
+            _receipt_allocation_owners: authenticated
+                .into_iter()
+                .filter_map(|result| result.allocation_owner)
+                .collect(),
         });
         let result = self.resolve_replay_delivery(lease);
         if result.is_err()
@@ -2061,14 +2194,13 @@ impl SemanticTransitionSession {
                     !pending.kernel_entered
                         && pending.receipt.completed
                         && pending.payload.completed
+                        && pending.rows.completed
                         && pending.observations.completed
                         && pending.statements.completed
                         && pending.supports.completed
                         && pending.input.completed
                 })
         {
-            // Every original DMA completed and the driver kernel boundary was
-            // provably untouched. No publication can have committed.
             #[cfg(feature = "semantic-policy")]
             if let Some(edge) = self
                 .pending_replay_delivery
@@ -2094,6 +2226,7 @@ impl SemanticTransitionSession {
         let uploads = (|| {
             pending.receipt.complete(&self.provider, &self.stream)?;
             pending.payload.complete(&self.provider, &self.stream)?;
+            pending.rows.complete(&self.provider, &self.stream)?;
             pending
                 .observations
                 .complete(&self.provider, &self.stream)?;
@@ -2132,6 +2265,7 @@ impl SemanticTransitionSession {
         let mut recorder = self.kernel_recorder();
         recorder.read(&pending.receipt.device);
         recorder.read(&pending.payload.device);
+        recorder.read(&pending.rows.device);
         recorder.read(&pending.observations.device);
         recorder.read(&pending.statements.device);
         recorder.read(&pending.supports.device);
@@ -2144,7 +2278,7 @@ impl SemanticTransitionSession {
         if let Some(work) = &pending.native_work {
             recorder.read_write(work);
         }
-        if pending.disposition == 1 {
+        if pending.eligible {
             let (descriptors, raw) = pending._arena.append_storage();
             recorder.write(&descriptors);
             recorder.write(&raw);
@@ -2276,7 +2410,7 @@ impl SemanticTransitionSession {
         if control.word != expected_word
             || header.publication_word != expected_word
             || header.instance != base.instance
-            || header.terminal != 0
+            || header.terminal != lease.header.terminal
             || header.fuel.checked_add(1) != Some(fuel)
             || header.training_cursor != lease.header.training_cursor
             || header.training_rng != lease.header.training_rng
