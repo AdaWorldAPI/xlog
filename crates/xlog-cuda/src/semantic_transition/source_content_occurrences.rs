@@ -126,7 +126,6 @@ struct PreparedContentRetainedOwner {
     _tensors: Vec<PreparedSemanticTensor>,
     _verification_inputs: Vec<PreparedSemanticTensor>,
     _seals: TensorContentSeals,
-    _witness: SemanticTensorContentWitness,
 }
 
 fn same_prepared_content_descriptors(
@@ -672,7 +671,6 @@ impl PreparedTensorContentPlan {
                 _tensors: content.tensors.clone(),
                 _verification_inputs: verification_inputs.unwrap_or_default(),
                 _seals: content.seals.clone(),
-                _witness: witness.clone(),
             });
             original.authenticate(witness, content)?;
         }
