@@ -947,11 +947,15 @@ not compatible with the new shapes.
 ### Semantic runtime checkpoints
 
 The fresh parent's `acknowledgement_payload_capacity_bytes` reserves the full
-receipt bytes for every possible native intent. With `N = intent_entry_capacity`,
-`P = intent_payload_capacity_bytes`, and `E = len(intent_effect)`, it must be at
-least `169*N + P + (N-1)*E`. The native initializer checks this bound and owns
-the acknowledgement queue; callers cannot supply role 32 records. Proposal and
-Drain each reserve a continuation and a delivery-acknowledgement fuel unit.
+delivery and receiver-outcome bytes for every possible native intent. With
+`N = intent_entry_capacity`, `P = intent_payload_capacity_bytes`,
+`E = len(intent_effect)` and the original admitted completed-result content
+bound `R`, it covers `169*N + P + (N-1)*E + N*max(265+R, 4361)`.
+The queue backing additionally contains its 72-byte header and `N` 176-byte
+entries. These are original finite reservations, not reached-work charges or
+permission to invent an outcome. Native owns the queue; callers cannot supply
+role 32 records. Proposal and Drain retain their original continuation and
+delivery-acknowledgement fuel reservations.
 
 For an external effect, the trusted application binds its live receiver once
 with `controller.bind_delivery_receiver(task_use, recipient_id=bytes32,
@@ -974,7 +978,10 @@ actual FINAL intent, then appends it through the native publication CAS. It
 returns the new `(instance, word, logical_digest, state_digest)`; the caller
 must acquire that new parent and save a new checkpoint. The CAS does no model
 step and preserves the selected model allocation, text, theory, cache and RNG.
-The old parent cannot acknowledge again. After a cold restore, bind the same
+An identical retry on the original parent joins the retained acknowledgement
+and returns the same result; it does not deliver or publish again. This ordinary
+receipt-only API rejects a coding frame, whose result requires the paired
+operation below. After a cold restore, bind the same
 trusted receiver to the newly issued task use before invoking
 `controller.checkpoint_pending_output_intents(task_use, checkpoint)`. That
 projection verifies both sealed queues and every stored receipt MAC, returning
@@ -987,24 +994,54 @@ do not identify an execution. The older
 a delivery queue. An exhausted FINAL parent cannot start an unacknowledged
 delivery; an already acknowledged terminal intent cannot be activated again.
 
-An operator can instead bind one nonterminal file-request interval before the
-first publication. The optional parent metadata `nonterminal_intent` is an
+An operator can bind one complete file-request frame before the first
+publication. The optional parent metadata `nonterminal_intent` is an
 exact dictionary with `plan_digest` (32 nonzero bytes),
 `candidate_prefix_begin` and `candidate_prefix_end` (exact `u64` values with
-`begin < end`). The native publisher emits it once, on the first nonterminal
-publication that crosses `end`, after authenticating the committed prefix.
-Its payload is `plan_digest || LE64(begin) || LE64(end-begin) || tokens`, where
+`begin < end`). The end is a capacity upper bound, never completion evidence.
+Only the original Drain into FINAL emits the frame after a proven terminal
+token: its interval is `[begin, terminal_position)`, excluding only that actual
+terminal token. Crossing the capacity bound without a terminal token does not
+emit, crop or complete a request. An ordinary Recompute does not emit one.
+Its payload is `plan_digest || LE64(begin) || LE64(token_count) || tokens`, where
 each original token ID occupies eight little-endian bytes. This is not a byte
 file or an instruction to execute: the trusted application must retain the
 original payload and apply its separately admitted, bounded file projection.
-FINAL output and its acknowledgement-only operation remain unchanged.
+Activation requires the actual current FINAL parent. The coding-frame result
+uses the paired acknowledgement below, including when no Proposal contributed.
 
-After durable checkpoint and actual external execution,
+After durable checkpoint and a signed terminal receiver outcome,
 `controller.acknowledge_replay_delivery(task_use, parent=..., snapshot=...,
-delivery_receipt=..., result_receipt=..., replay_row=..., material_source=...)` accepts one complete
-original episode transport row, including every original material and native
-publication evidence. It rejects actor rows and checkpoint-only referents.
-The result receipt is HMAC-SHA256 under the bound receiver key over
+delivery_receipt=..., receiver_outcome=..., proposals=..., result_receipts=...,
+replay_rows=..., material_source=...)` accepts the complete original contributor
+batch in one operation. `proposals` is the complete immutable original Proposal
+roster, not a caller-selected subset. Obtain contributor indices with
+`controller.coding_intent_contributors(task_use, parent=..., stable_intent=...,
+proposals=..., material_source=...)`; pass the same roster to acknowledgement.
+Native proves contribution from the actual delivered tokens and their original
+provenance, not a repeated token value, selected score or Python eligibility flag.
+
+The required `receiver_outcome` is the exact signed durable record:
+`b"xlog.receiver.outcome.v1\0" || stable_identity || recipient_id ||
+SHA256(effect) || SHA256(payload) || SHA256(delivery_receipt) || checkpoint_digest ||
+LE64(status) || LE64(content_length) || content || mac`.
+The checkpoint digest identifies the original durable checkpoint; the MAC is
+HMAC-SHA256 over all preceding bytes under the same bound receiver key.
+`status=1` means COMPLETED and preserves the full original signed result and
+verification materials. `status=2` means REFUSED before the actual worker
+started, with a nonempty UTF-8 cause of at most 4096 bytes. An exception after
+worker entry is unknown, never a fabricated refusal or completion.
+
+For COMPLETED, `result_receipts` and `replay_rows` are exact tuples in the
+native-proven contributor order, including an authentic empty tuple pair when
+there are no contributors. Each row retains every original material and native
+publication evidence; actor rows and checkpoint-only referents are rejected.
+For REFUSED both tuples are empty even if the proven contributor roster is
+nonempty. Refusal archives the signed outcome but creates no replay row,
+training count or task-observation fact. The complete Proposal roster is still
+authenticated before acknowledgement or an identical retry.
+
+Each result receipt is HMAC-SHA256 under the bound receiver key over
 `b"xlog.replay.result.v2\0"` followed by seven 32-byte fields:
 stable intent, SHA256 of the complete delivery receipt, original action base
 logical identity, original action successor logical identity, the original
@@ -1018,8 +1055,10 @@ Measurement retains its frozen comparator, metric and tolerance identities.
 The delivery receipt alone
 does not attest an execution result or replace the record's result materials.
 
-One original publication CAS commits both the acknowledgement and full result
-archive. An eligible row additionally requires current training rights and
+One original publication CAS commits the delivery/outcome pair and the entire
+result batch. The original 176-byte entry binds both complete signed records;
+neither may be omitted or reconstructed from a digest after restore. An eligible
+row additionally requires current training rights and
 becomes visible to later selection only after that CAS. A `REJECTED` measurement
 retains every original material and signed result but writes no arena slot and
 does not advance the eligible-row count. Both dispositions consume the original
@@ -1036,8 +1075,11 @@ returned identity. Do not submit the acknowledgement again while it is pending.
 Checkpoint restoration reconstitutes the original committed raw slots, but
 their hashes alone do not authorize Training. Before selecting restored append
 rows, call the existing `bind_delivery_receiver` with the current trusted
-receiver. It parses the full archived rows with current live rights and verifies
-their original delivery/result receipts, raw content, dispositions and action coordinates.
+receiver. It authenticates every archived delivery/outcome pair, including
+COMPLETED outcomes with zero rows and REFUSED outcomes, before enabling restored
+training rows. Complete rows retain their original live-rights, result-receipt,
+raw-content, disposition and action-coordinate checks. No digest-only outcome or
+missing zero-row acknowledgement can substitute for the stored signed records.
 Each archived row uses the same per-acquisition metadata, material and evidence
 limits as its original admission; the complete archive retains its separate
 frozen native payload capacity.
@@ -3240,7 +3282,16 @@ recomputed, provenance_record)`. `token_provenance` preserves the complete nativ
 ledger in original order. Its dictionaries retain `source_slot`,
 `logical_position`, `token`, `base_word`, `proposal`, `ordinal`,
 `authority_generation`, `action_receipt_digest`, `origin_logical_digest`,
-`authority_closure_digest`, and `record_digest`. Filled rows must resolve to their
+`authority_closure_digest`, `successor_logical_digest`, and `record_digest`.
+Each complete native record occupies 216 bytes. Original SOURCE records leave
+`successor_logical_digest` zero; newly generated Proposal records retain the
+logical identity of the actual publishing successor. Record identities and the
+publication's logical identity normalize this successor field to zero, avoiding
+a self-reference. The full state identity retains this successor field; its
+other provenance normalization is identical during publication and cold
+restoration. Only newly appended records
+receive the successor identity, and their raw material is resealed before
+publication; earlier records are not rewritten. Filled rows must resolve to their
 original token and position. SOURCE and GENERATED remain distinct; generated
 origins are not rewritten as admitted observations.
 
