@@ -25,23 +25,25 @@ use xlog_cuda::{
     DlpackManagedTensor, Identity256, SemanticAdmissionLimits, SemanticAdmissionRecords,
     SemanticArgument, SemanticContinuationInput, SemanticGradientDeliveryBinding,
     SemanticHypergraphCapacities, SemanticInitialPrefillContentWitness,
-    SemanticInitialPrefillLease, SemanticInitialSourceLayout, SemanticModelForwardWitness,
-    SemanticNonterminalIntentBinding, SemanticObservedSource, SemanticParentBinding,
-    SemanticPolarity, SemanticPredicateRecord, SemanticPreparedStep, SemanticProgramAdmission,
-    SemanticPublishedLease, SemanticRecordRole, SemanticReplayAppendBinding, SemanticRngBinding,
-    SemanticSourceMapping, SemanticStateRecord, SemanticStateRole, SemanticSupportRecord,
-    SemanticTaskContentIdentity, SemanticTaskGoalWitness, SemanticTensorContentWitness,
-    SemanticTensorInput, SemanticTensorLayout, SemanticTextSlot, SemanticTrainingCanary,
-    SemanticTrainingCanaryKind, SemanticTrainingDomain, SemanticTrainingManifest,
-    SemanticTrainingObjective, SemanticTrainingObjectiveGroup, SemanticTrainingObjectiveGroupKind,
-    SemanticTrainingViewBasis, SemanticTrainingViewPort, SemanticTrainingViewRow,
-    SemanticTransitionKind, SemanticTransitionSession, SemanticTruth, SemanticTypedRecord,
+    SemanticInitialPrefillLease, SemanticInitialSourceLayout, SemanticNonterminalIntentBinding,
+    SemanticObservedSource, SemanticParentBinding, SemanticPolarity, SemanticPredicateRecord,
+    SemanticPreparedStep, SemanticProgramAdmission, SemanticPublishedLease, SemanticRecordRole,
+    SemanticReplayAppendBinding, SemanticRngBinding, SemanticSourceMapping, SemanticStateRecord,
+    SemanticStateRole, SemanticSupportRecord, SemanticTaskContentIdentity, SemanticTaskGoalWitness,
+    SemanticTensorContentWitness, SemanticTensorInput, SemanticTensorLayout, SemanticTextSlot,
+    SemanticTrainingCanary, SemanticTrainingCanaryKind, SemanticTrainingDomain,
+    SemanticTrainingManifest, SemanticTrainingObjective, SemanticTrainingObjectiveGroup,
+    SemanticTrainingObjectiveGroupKind, SemanticTrainingViewBasis, SemanticTrainingViewPort,
+    SemanticTrainingViewRow, SemanticTransitionKind, SemanticTransitionSession, SemanticTruth,
+    SemanticTypedRecord,
 };
 use xlog_cuda::{
     SemanticModelContractLayout, SemanticModelMemory, SemanticModelStorage, SemanticModelView,
 };
 #[cfg(feature = "semantic-policy")]
-use xlog_cuda::{SemanticSegmentColdCapacity, SemanticSegmentInstructionAdmission};
+use xlog_cuda::{
+    SemanticModelForwardWitness, SemanticSegmentColdCapacity, SemanticSegmentInstructionAdmission,
+};
 use xlog_prob::exact::GpuConfig;
 
 use crate::guarded_python_callback as recording_callback;
@@ -18309,6 +18311,7 @@ pub(crate) struct PySemanticTensorContentWitness {
     pending_verification: Mutex<Option<PendingPythonContentBinding>>,
 }
 
+#[cfg(feature = "semantic-policy")]
 #[pyclass(
     name = "SemanticModelForwardWitness",
     module = "pyxlog._native",
