@@ -433,6 +433,34 @@ Other sections are neither replayed nor marked complete. Unknown retains the
 original physical custody; known joined child retirement releases its physical
 aliases without changing the immutable frozen proof.
 
+Before freezing these sections, the two genuine CURRENT geometries of the same
+original Update and member may declare one content overlay for each prepared
+kind. Call `bank0.content_overlay(bank1, prepared_kind="recompute" | "proposal",
+allocation_layouts=alternatives)`, where `alternatives` is four ordered tuples of
+`(original_allocation_slot, full_span_bytes, alignment_bytes)`. Their order is
+outer bank zero / child bank zero, zero / one, one / zero, one / one. The result
+is `(allocation, placements)` with one existing geometry-allocation handle and
+four corresponding tuples of `(original_allocation_slot, byte_offset,
+full_span_bytes)`. Lower these placements into the same original descriptors
+before their sole freeze; preserve within-allocation offsets and the genuine
+storage/version partitions. Only owned Capture outputs and their later Verify
+uses are eligible, never borrowed input roots or model bindings. A permitted
+tensor role or a Capture event alone does not establish output ownership.
+
+Inside the original private allocation scope, create one contiguous CUDA UInt8
+backing from that same memory pool and call
+`bank0.bind_content_overlay(bank1, prepared_kind=..., backing=...,
+consumer_stream=...)` before recording. The stream must be the original native
+import and capture stream. The genuine foreign DLPack owner stays foreign; this
+method grants no native allocation provenance. Write the producer's original
+outputs directly into their typed destinations, without retaining a second full
+clone. Native authenticates the four conditional alternatives and their complete
+rosters; Recompute and Proposal, different members and different Updates remain
+disjoint. The original instruction retains physical claims through retirement,
+and unknown completion retains the managed backing and its accounting owner.
+This does not create an allocator, permit sequential reuse or prove whole-peak
+fit within the original memory limit.
+
 Pass the original Historical geometry tuple retained by the plan, in its original
 order, as `source_content` to the same `original_work.admit_plan(...)` that admits
 model work. Native resolves each geometry through its existing once-only recipe
