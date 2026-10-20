@@ -163,10 +163,12 @@ pub use semantic_work::ModelWorkKind;
 pub use semantic_transition::{
     SemanticModelInputGenerationPort, SemanticPreparedSourceCache, SemanticPreparedSourceContent,
     SemanticPreparedSourceContentGeometry, SemanticPreparedSourceContentPorts,
-    SemanticSourceAllocationDescriptor, SemanticSourceContentAllocation,
-    SemanticSourceContentEvent, SemanticSourceContentFamily, SemanticSourceContentGeometryKind,
-    SemanticSourceContentGeometrySeed, SemanticSourceContentKind, SemanticSourceContentOccurrence,
-    SemanticSourceContentPhase, SemanticSourceContentRetirement, SemanticSourceGeometryAllocation,
+    SemanticPreparedTensorContentBindings, SemanticPreparedTensorContentEvent,
+    SemanticPreparedTensorContentReceiver, SemanticSourceAllocationDescriptor,
+    SemanticSourceContentAllocation, SemanticSourceContentEvent, SemanticSourceContentFamily,
+    SemanticSourceContentGeometryKind, SemanticSourceContentGeometrySeed,
+    SemanticSourceContentKind, SemanticSourceContentOccurrence, SemanticSourceContentPhase,
+    SemanticSourceContentRetirement, SemanticSourceGeometryAllocation,
     SemanticSourceGeometryTensor, SemanticSourceTensorDescriptor,
 };
 
