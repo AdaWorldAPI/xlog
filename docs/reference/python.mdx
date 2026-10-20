@@ -2871,10 +2871,12 @@ ordered tuple `(original_step, capture_rows, bank_event_capacity,
 (bank0_content, bank1_content), (bank0_bindings, bank1_bindings))` for every step.
 Each binding record is `(policy_witness_slot_or_None,
 continuation_witness_slot_or_None, model_witness_slot_or_None)`, taken from the
-original binder arguments and continuation tail in the same plan. An absent
-role is `None`, including a Drain without a continuation; slot zero is not an
-absence marker. Native checks that the actual binder uses that original witness
-and derives its additional intrinsic guards before freezing, rather than
+original binder arguments and continuation tail in the same plan. The model slot
+identifies the original model-baseline witness of every Recompute, Proposal and
+Update, independently of whether a Proposal continuation binder takes that
+witness. An absent role is `None`, including a Drain without a continuation;
+slot zero is not an absence marker. Native checks that the actual binder uses
+that original witness and derives its additional intrinsic guards before freezing, rather than
 identifying a binding by equal tensor layouts. These intrinsic guards do not
 advance the public Capture/Verify cursor. Each bank contains the original
 ordered `(kind, receiver_slot, output_slot_or_None, tensors, allocations)` events;
@@ -2884,6 +2886,20 @@ byte offset and native provenance described above. A Verify names its genuine
 witness receiver even when that witness was captured outside the current step.
 Preserve the original body/tail interleaving, rather than appending all tails
 after all bodies. The immutable plan retains the original native backing owners.
+Finalize child sessions before their receiving parent. For each receiver issued
+by another prepared session in that same complete plan, supply
+`receiver_links=((receiver_slot, original_step, original_bank), ...)` to the same
+`finalize_segment_layout` call. The original step and bank issue an immutable
+native proof of the witness category, complete descriptor and retained physical
+custody; a numeric slot or equal geometry alone is not that proof. Receivers
+within one session are resolved from its complete original roster instead.
+During recording, call the same witness's
+`verify(tensors=..., consumer_stream=..., recording_step=current_step)` with the
+genuine current recorder step. The original session authenticates the content;
+the current session authenticates its active step and bank and the original
+child-to-parent Update custody, then consumes its own descriptor and counter.
+The witness owner is not replaced. Cold verification outside recording omits
+`recording_step`; a retained cold continuation cannot accept that argument.
 Every Capture/Verify belongs to this common roster, including SOURCE and CURRENT
 events with an occurrence handle. Every actual native call consumes its next
 original typed descriptor; a SOURCE call additionally verifies its original
