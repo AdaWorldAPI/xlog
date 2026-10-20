@@ -41,7 +41,7 @@ pub(super) struct CurrentContentOverlay {
     span_bytes: u64,
     alignment: u64,
     state: Mutex<ContentOverlayState>,
-    _reservation: SemanticReplayMaterialReservation,
+    _reservation: Arc<SemanticReplayMaterialReservation>,
 }
 
 struct ContentOverlayState {
@@ -152,12 +152,16 @@ impl SemanticPreparedSourceContentGeometry {
         let bytes = count
             .checked_mul(3 * size_of::<(u64, u64, u64)>())
             .and_then(|bytes| {
-                bytes.checked_add(size_of::<CurrentContentOverlay>() + 4 * size_of::<usize>())
+                bytes.checked_add(
+                    size_of::<CurrentContentOverlay>()
+                        + size_of::<SemanticReplayMaterialReservation>()
+                        + 6 * size_of::<usize>(),
+                )
             })
             .ok_or(SemanticTransitionError::GenerationExhausted)?;
-        let reservation = self.material_budget().reserve_auxiliary(
+        let reservation = Arc::new(self.material_budget().reserve_auxiliary(
             u64::try_from(bytes).map_err(|_| SemanticTransitionError::GenerationExhausted)?,
-        )?;
+        )?);
         let mut placements: [Vec<(u64, u64, u64)>; 4] = std::array::from_fn(|alternative| {
             Vec::with_capacity(allocation_layouts[alternative].len())
         });
@@ -344,6 +348,7 @@ impl SemanticPreparedSourceContentGeometry {
             .ok_or(SemanticTransitionError::ObservationMismatch)?;
         // Retain before validating addresses: a rejected import must keep its
         // original foreign token through stream completion, just like success.
+        let retained_owner: Arc<dyn Send + Sync> = owner._reservation.clone();
         state.backing = Some(ContentOverlayBacking {
             tensor,
             consumer_stream,
@@ -359,7 +364,7 @@ impl SemanticPreparedSourceContentGeometry {
                 event,
                 stream: Arc::clone(&session.stream),
                 consumer_stream,
-                _retained_owner: None,
+                _retained_owner: Some(retained_owner),
             })),
         });
         let backing = state
