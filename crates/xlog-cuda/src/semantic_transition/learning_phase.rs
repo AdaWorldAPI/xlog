@@ -152,6 +152,7 @@ pub(super) fn record_allocation_bound(
     recipe: &[SemanticLearningCopyReset],
     history_length: usize,
     history_capacity: usize,
+    model_allocation_metadata_bytes: usize,
 ) -> Result<u64, SemanticTransitionError> {
     let mut bytes = recipe
         .len()
@@ -162,6 +163,7 @@ pub(super) fn record_allocation_bound(
                 size_of::<SemanticReplayMaterialReservation>() + 2 * size_of::<usize>(),
             )
         })
+        .and_then(|bytes| bytes.checked_add(model_allocation_metadata_bytes))
         .ok_or(SemanticTransitionError::GenerationExhausted)?;
     let history_bytes = history_length
         .checked_add(1)
@@ -279,6 +281,26 @@ impl SemanticLearningPhaseTransition {
                 "learning lineage must begin with admitted alignment",
             ));
         }
+        let node = OwnedPublicationMaterial::tree_node_bound(size_of::<(u64, u64)>(), 0)?;
+        let mut workspace_bytes = material
+            .layouts
+            .len()
+            .checked_add(self.recipe.len())
+            .and_then(|count| count.checked_mul(node))
+            .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        for (count, width) in [
+            (self.recipe.len(), size_of::<(u64, u64)>()),
+            (material.model_allocations.len(), size_of::<B>()),
+        ] {
+            workspace_bytes = count
+                .checked_mul(width)
+                .and_then(|bytes| workspace_bytes.checked_add(bytes))
+                .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        }
+        let _workspace_reservation = metadata.budget.reserve_auxiliary(
+            u64::try_from(workspace_bytes)
+                .map_err(|_| SemanticTransitionError::GenerationExhausted)?,
+        )?;
         let expected = material
             .layouts
             .keys()
@@ -305,7 +327,7 @@ impl SemanticLearningPhaseTransition {
         let fold = if self.source == SemanticLearningPhase::Fast
             && self.target == SemanticLearningPhase::Consolidation
         {
-            Some(LearningFoldPlan::prepare(material, self)?)
+            Some(LearningFoldPlan::prepare(material, self, &metadata.budget)?)
         } else {
             None
         };
@@ -313,10 +335,10 @@ impl SemanticLearningPhaseTransition {
         // particular, its masters must not be reset from pre-absorption values.
         if fold.is_none() {
             let original = &material.model_allocations;
-            let mut allocations = original
-                .iter()
-                .map(PublicationByteStorage::copy_owned)
-                .collect::<Result<Vec<_>, _>>()?;
+            let mut allocations = Vec::with_capacity(original.len());
+            for allocation in original {
+                allocations.push(allocation.copy_owned()?);
+            }
             for operation in &self.recipe {
                 if matches!(operation, SemanticLearningCopyReset::Preserve { .. }) {
                     continue;
@@ -550,17 +572,45 @@ struct FoldAssignment {
 
 /// Derived only from the complete original ModelContract and native memory map.
 /// This is an ephemeral launch plan, not a new producer roster or wire format.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub(super) struct LearningFoldPlan {
     assignments: Vec<FoldAssignment>,
     scale_bits: u32,
     phase: u64,
+    _reservation: Arc<SemanticReplayMaterialReservation>,
 }
+
+impl PartialEq for LearningFoldPlan {
+    fn eq(&self, other: &Self) -> bool {
+        self.assignments == other.assignments
+            && self.scale_bits == other.scale_bits
+            && self.phase == other.phase
+    }
+}
+
+impl Eq for LearningFoldPlan {}
 
 fn fold_error() -> SemanticTransitionError {
     publication_input_error(
         "adapter absorption differs from its original model contract or physical views",
     )
+}
+
+fn fold_target_name(
+    prefix: &str,
+    name: &str,
+    suffix: &str,
+) -> Result<String, SemanticTransitionError> {
+    let bytes = prefix
+        .len()
+        .checked_add(name.len())
+        .and_then(|bytes| bytes.checked_add(suffix.len()))
+        .ok_or(SemanticTransitionError::GenerationExhausted)?;
+    let mut result = String::with_capacity(bytes);
+    result.push_str(prefix);
+    result.push_str(name);
+    result.push_str(suffix);
+    Ok(result)
 }
 
 fn schema_array(
@@ -645,25 +695,151 @@ fn view_key<B: PublicationByteStorage>(
 }
 
 impl LearningFoldPlan {
+    pub(super) fn clone_allocation_bytes(&self) -> Result<usize, SemanticTransitionError> {
+        self.assignments
+            .len()
+            .checked_mul(size_of::<FoldAssignment>())
+            .ok_or(SemanticTransitionError::GenerationExhausted)
+    }
+
     fn prepare<B: PublicationByteStorage>(
         material: &PublicationMaterialStorage<B>,
         transition: &SemanticLearningPhaseTransition,
+        budget: &SemanticReplayMaterialBudget,
     ) -> Result<Self, SemanticTransitionError> {
         let record = material
             .ranges
             .iter()
             .find(|r| (r.range.role, r.range.index) == (44, 0))
             .ok_or_else(fold_error)?;
+        let schema_layout = material.contract.model_contract_layout;
+        schema_layout.validate(record.bytes.len() as u64)?;
+        let schema_begin = usize::try_from(schema_layout.schema_begin)
+            .map_err(|_| SemanticTransitionError::GenerationExhausted)?;
+        let schema_bytes = usize::try_from(schema_layout.schema_bytes)
+            .map_err(|_| SemanticTransitionError::GenerationExhausted)?;
+        let _schema_reservation =
+            budget.reserve_json_parse(&record.bytes[schema_begin..schema_begin + schema_bytes])?;
         let schema = retained_model_schema(&record.bytes, material.contract.model_contract_layout)?
             .ok_or_else(fold_error)?;
         let model = &schema["model"];
         let physical = model["physical"].as_object().ok_or_else(fold_error)?;
         let learning = &model["learning"];
         let views = schema_array(&learning["views"])?;
-        let keys = views
+        let leaves = schema_array(&learning["leaves"])?;
+        let buffers = schema_array(&learning["buffers"])?;
+        let state = schema_array(&model["roots"]["adapter"]["modules"][""][1])?;
+        let target_names = state
             .iter()
-            .map(|v| view_key(v, material))
-            .collect::<Result<Vec<_>, _>>()?;
+            .find_map(|field| {
+                let pair = field.as_array()?;
+                (pair.first()?.as_str()? == "target_names")
+                    .then(|| pair.get(1))
+                    .flatten()
+            })
+            .ok_or_else(fold_error)?;
+        let target_names = schema_array(tagged(target_names, "tuple")?)?;
+        let assignment_capacity = target_names
+            .len()
+            .checked_mul(3)
+            .and_then(|targets| targets.checked_add(transition.recipe.len()))
+            .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        let mut alias_count = 0usize;
+        let mut alias_bytes = 0usize;
+        for item in leaves.iter().chain(buffers) {
+            for name in schema_array(&item["aliases"])? {
+                alias_count = alias_count
+                    .checked_add(1)
+                    .ok_or(SemanticTransitionError::GenerationExhausted)?;
+                alias_bytes = alias_bytes
+                    .checked_add(name.as_str().ok_or_else(fold_error)?.len())
+                    .ok_or(SemanticTransitionError::GenerationExhausted)?;
+            }
+        }
+        let mut generated_bytes = 0usize;
+        for (index, target) in target_names.iter().enumerate() {
+            let target = tagged(target, "str")?.as_str().ok_or_else(fold_error)?;
+            let mut digits = 1usize;
+            let mut ordinal = index;
+            while ordinal >= 10 {
+                ordinal /= 10;
+                digits += 1;
+            }
+            for (prefix, suffix, width, copies) in [
+                ("model.", ".weight", target.len(), 2usize),
+                ("adapter.residuals.", ".down", digits, 2),
+                ("adapter.residuals.", ".up", digits, 2),
+                ("adapter.residuals.", ".neutral_down", digits, 1),
+            ] {
+                generated_bytes = prefix
+                    .len()
+                    .checked_add(suffix.len())
+                    .and_then(|bytes| bytes.checked_add(width))
+                    .and_then(|bytes| bytes.checked_mul(copies))
+                    .and_then(|bytes| generated_bytes.checked_add(bytes))
+                    .ok_or(SemanticTransitionError::GenerationExhausted)?;
+            }
+        }
+        let node = OwnedPublicationMaterial::tree_node_bound;
+        let mut workspace_bytes = alias_bytes
+            .checked_add(generated_bytes)
+            .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        for (count, width) in [
+            (views.len(), size_of::<(u64, u64)>()),
+            (material.layouts.len(), node(size_of::<(u64, u64)>(), 0)?),
+            (views.len(), node(size_of::<(u64, u64)>(), 0)?),
+            (views.len(), 2 * node(size_of::<&str>(), size_of::<u64>())?),
+            (views.len(), 2 * node(size_of::<u64>(), 0)?),
+            (
+                alias_count,
+                node(size_of::<String>(), size_of::<(u64, u64)>())?,
+            ),
+            (
+                leaves.len(),
+                node(
+                    size_of::<(u64, u64)>(),
+                    size_of::<&Vec<serde_json::Value>>(),
+                )?,
+            ),
+            (
+                leaves.len(),
+                node(size_of::<(u64, u64)>(), size_of::<(u64, u64)>())?,
+            ),
+            (leaves.len(), node(size_of::<&str>(), 0)?),
+            (buffers.len(), node(size_of::<&str>(), 0)?),
+            (physical.len(), node(size_of::<&str>(), 0)?),
+            (
+                state.len(),
+                node(size_of::<&str>(), size_of::<&serde_json::Value>())?,
+            ),
+            (target_names.len(), 3 * node(size_of::<(u64, u64)>(), 0)?),
+            (target_names.len(), 3 * node(size_of::<String>(), 0)?),
+            (4, size_of::<(u64, u64)>()),
+            (2, size_of::<u64>()),
+        ] {
+            workspace_bytes = count
+                .checked_mul(width)
+                .and_then(|bytes| workspace_bytes.checked_add(bytes))
+                .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        }
+        let _workspace_reservation = budget.reserve_auxiliary(
+            u64::try_from(workspace_bytes)
+                .map_err(|_| SemanticTransitionError::GenerationExhausted)?,
+        )?;
+        let assignment_bytes = assignment_capacity
+            .checked_mul(size_of::<FoldAssignment>())
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    size_of::<SemanticReplayMaterialReservation>() + 2 * size_of::<usize>(),
+                )
+            })
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        let reservation = Arc::new(budget.reserve_auxiliary(assignment_bytes)?);
+        let mut keys = Vec::with_capacity(views.len());
+        for view in views {
+            keys.push(view_key(view, material)?);
+        }
         let expected = material
             .layouts
             .keys()
@@ -777,7 +953,7 @@ impl LearningFoldPlan {
                 return Err(fold_error());
             }
             let names = schema_array(&leaf["aliases"])?;
-            if names.is_empty() || owner_aliases.insert(key, names.clone()).is_some() {
+            if names.is_empty() || owner_aliases.insert(key, names).is_some() {
                 return Err(fold_error());
             }
             for name in names {
@@ -820,7 +996,6 @@ impl LearningFoldPlan {
         if owners != physical.keys().map(String::as_str).collect::<BTreeSet<_>>() {
             return Err(fold_error());
         }
-        let state = schema_array(&model["roots"]["adapter"]["modules"][""][1])?;
         let mut fields = BTreeMap::new();
         for field in state {
             let field = schema_array(field)?;
@@ -849,7 +1024,7 @@ impl LearningFoldPlan {
         {
             return Err(fold_error());
         }
-        let mut assignments = Vec::new();
+        let mut assignments = Vec::with_capacity(assignment_capacity);
         for operation in &transition.recipe {
             let key = operation.key();
             let source = match *operation {
@@ -940,11 +1115,22 @@ impl LearningFoldPlan {
                 .as_u64()
                 .filter(|n| *n > 0)
                 .ok_or_else(fold_error)?;
+            let mut ordinal = index;
+            let mut decimal = [b'0'; usize::BITS as usize];
+            let mut begin = decimal.len() - 1;
+            while ordinal >= 10 {
+                decimal[begin] = b'0' + (ordinal % 10) as u8;
+                ordinal /= 10;
+                begin -= 1;
+            }
+            decimal[begin] = b'0' + ordinal as u8;
+            let index = std::str::from_utf8(&decimal[begin..])
+                .expect("original ordinal contains decimal digits");
             let names = [
-                format!("model.{target}.weight"),
-                format!("adapter.residuals.{index}.down"),
-                format!("adapter.residuals.{index}.up"),
-                format!("adapter.residuals.{index}.neutral_down"),
+                fold_target_name("model.", target, ".weight")?,
+                fold_target_name("adapter.residuals.", index, ".down")?,
+                fold_target_name("adapter.residuals.", index, ".up")?,
+                fold_target_name("adapter.residuals.", index, ".neutral_down")?,
             ];
             let actual = names
                 .iter()
@@ -1013,6 +1199,7 @@ impl LearningFoldPlan {
             assignments,
             scale_bits: scale.to_bits(),
             phase: transition.target as u64,
+            _reservation: reservation,
         })
     }
 }
@@ -1071,12 +1258,20 @@ pub(super) struct OriginalLearningFold {
     assign: Vec<crate::device::RetainedDeviceMemoryCommand>,
     assign_next: usize,
     poisoned: bool,
+    _reservation: Option<Arc<SemanticReplayMaterialReservation>>,
 }
 
 struct LearningFoldKernel {
     descriptor: FoldDeviceAssignment,
     stage: u64,
     command: OriginalNativeCommand,
+}
+
+fn fold_kernel_stage_reached(mode: u64, count: u64, stage: u64) -> bool {
+    count != 0
+        && !(stage == 0 && matches!(mode, 0 | 2))
+        && !(stage == 1 && mode != 2)
+        && !(stage == 2 && mode == 0)
 }
 
 fn resolve_fold_memory_command(
@@ -1108,15 +1303,104 @@ impl SemanticTransitionSession {
         plan: &LearningFoldPlan,
         storage: Arc<PublicationStorage>,
     ) -> Result<OriginalLearningFold, SemanticTransitionError> {
-        // A cold fold has a genuine private writer, not a second persistent
-        // model bank. Preserve all bytes (including alias padding) before the
-        // unchanged compute/scatter/all-view-check law and sole assignment.
-        let scratch = storage
+        let mut kernel_count = 0usize;
+        for assignment in &plan.assignments {
+            let layout = storage.layouts[&assignment.key];
+            let count = layout.dimensions[..layout.rank as usize].iter().try_fold(
+                1u64,
+                |count, &dimension| {
+                    count
+                        .checked_mul(dimension)
+                        .ok_or(SemanticTransitionError::GenerationExhausted)
+                },
+            )?;
+            for stage in 0..4 {
+                kernel_count = kernel_count
+                    .checked_add(usize::from(fold_kernel_stage_reached(
+                        assignment.mode,
+                        count,
+                        stage,
+                    )))
+                    .ok_or(SemanticTransitionError::GenerationExhausted)?;
+            }
+        }
+        let copy_count = storage
             .model_memory
             .allocation_bytes
             .iter()
-            .map(|&bytes| allocate_publication::<u8>(&self.provider, bytes as usize))
-            .collect::<Result<Vec<_>, _>>()?;
+            .filter(|&&bytes| bytes != 0)
+            .count();
+        let command_count = copy_count
+            .checked_mul(2)
+            .and_then(|copies| copies.checked_add(kernel_count))
+            .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        let completion_bytes = usize::try_from(
+            crate::device::ExecutionCompletion::single_stream_allocation_bytes()
+                .map_err(|error| runtime_error("fold completion allocation bound", error))?,
+        )
+        .map_err(|_| SemanticTransitionError::GenerationExhausted)?;
+        let mut host_bytes = size_of::<OriginalLearningFold>()
+            + size_of::<SemanticReplayMaterialReservation>()
+            + 2 * size_of::<usize>();
+        for (count, width) in [
+            (
+                storage.model_memory.allocation_bytes.len(),
+                size_of::<TrackedCudaSlice<u8>>(),
+            ),
+            (
+                plan.assignments.len(),
+                size_of::<Option<TrackedCudaSlice<u8>>>(),
+            ),
+            (plan.assignments.len(), size_of::<FoldDeviceAssignment>()),
+            (kernel_count, size_of::<LearningFoldKernel>()),
+            (
+                copy_count,
+                2 * size_of::<crate::device::RetainedDeviceMemoryCommand>(),
+            ),
+            (command_count, completion_bytes),
+            (
+                plan.assignments
+                    .iter()
+                    .filter(|assignment| matches!(assignment.mode, 1 | 4 | 5))
+                    .count(),
+                OwnedPublicationMaterial::tree_node_bound(
+                    size_of::<(u64, u64)>(),
+                    size_of::<u64>(),
+                )?,
+            ),
+            (
+                1,
+                state_restoration::OriginalDeviceWrite::metadata_allocation_bytes::<u64>(),
+            ),
+            (3, size_of::<u64>()),
+        ] {
+            host_bytes = count
+                .checked_mul(width)
+                .and_then(|bytes| host_bytes.checked_add(bytes))
+                .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        }
+        let reservation = self
+            .replay_material_budget
+            .as_ref()
+            .map(|budget| {
+                budget
+                    .reserve_auxiliary(
+                        u64::try_from(host_bytes)
+                            .map_err(|_| SemanticTransitionError::GenerationExhausted)?,
+                    )
+                    .map(Arc::new)
+            })
+            .transpose()?;
+        // A cold fold has a genuine private writer, not a second persistent
+        // model bank. Preserve all bytes (including alias padding) before the
+        // unchanged compute/scatter/all-view-check law and sole assignment.
+        let mut scratch = Vec::with_capacity(storage.model_memory.allocation_bytes.len());
+        for &bytes in &storage.model_memory.allocation_bytes {
+            scratch.push(allocate_publication::<u8>(
+                &self.provider,
+                usize::try_from(bytes).map_err(|_| SemanticTransitionError::GenerationExhausted)?,
+            )?);
+        }
         let pointer = |key: (u64, u64), bank: usize| {
             let (allocation, offset) = storage.model_memory.location(key.0, key.1)?;
             let base = if bank == 0 {
@@ -1129,7 +1413,7 @@ impl SemanticTransitionSession {
             base.checked_add(offset as u64)
                 .ok_or(SemanticTransitionError::GenerationExhausted)
         };
-        let mut outputs = Vec::new();
+        let mut outputs = Vec::with_capacity(plan.assignments.len());
         let mut effective_outputs = BTreeMap::new();
         for assignment in &plan.assignments {
             let layout = storage.layouts[&assignment.key];
@@ -1158,7 +1442,7 @@ impl SemanticTransitionSession {
             }
             outputs.push(output);
         }
-        let mut descriptors = Vec::new();
+        let mut descriptors = Vec::with_capacity(plan.assignments.len());
         for (assignment, output) in plan.assignments.iter().zip(&outputs) {
             let layout = storage.layouts[&assignment.key];
             let mut descriptor = FoldDeviceAssignment {
@@ -1198,12 +1482,18 @@ impl SemanticTransitionSession {
             // Parallel scatter is safe only for provably disjoint cells. A
             // deliberately overlapping stride uses the same byte-exact law in
             // serial order; the subsequent all-view check still detects conflict.
-            let mut axes = (0..layout.rank as usize)
-                .filter(|&i| layout.dimensions[i] > 1)
-                .collect::<Vec<_>>();
+            let mut axes = [0usize; 4];
+            let mut axis_count = 0;
+            for axis in 0..layout.rank as usize {
+                if layout.dimensions[axis] > 1 {
+                    axes[axis_count] = axis;
+                    axis_count += 1;
+                }
+            }
+            let axes = &mut axes[..axis_count];
             axes.sort_unstable_by_key(|&i| layout.strides_bytes[i]);
             let mut span = layout.element_bytes;
-            for axis in axes {
+            for &axis in axes.iter() {
                 if layout.strides_bytes[axis] < span {
                     descriptor.serial_scatter = 1;
                 }
@@ -1218,30 +1508,28 @@ impl SemanticTransitionSession {
             descriptors.push(descriptor);
         }
         let status = allocate_publication::<u64>(&self.provider, 1)?;
-        let status_write = state_restoration::OriginalDeviceWrite::new(
+        let status_write = state_restoration::OriginalDeviceWrite::new_with_owner(
             &self.stream,
             &[0u64],
             status.view(),
             false,
+            reservation.clone(),
         )?;
-        let status_read = self.stage_publication_read(status.view())?;
+        let status_read =
+            self.stage_publication_read_with_owner(status.view(), reservation.clone())?;
         let execute = self
             .provider
             .device()
             .inner()
             .get_func("xlog_semantic_transition", "semantic_learning_fold")
             .ok_or_else(|| runtime_error("kernel lookup", "learning absorption unavailable"))?;
-        let mut kernels = Vec::new();
+        let mut kernels = Vec::with_capacity(kernel_count);
         // Freeze the same complete compute/scatter/all-view-check sequence.
         // Masters consume already-rounded effective outputs, never an unrounded
         // accumulator, and no assignment enters before every check completes.
         for stage in 0..4u64 {
             for descriptor in &descriptors {
-                if descriptor.count == 0
-                    || (stage == 0 && matches!(descriptor.mode, 0 | 2))
-                    || (stage == 1 && descriptor.mode != 2)
-                    || (stage == 2 && descriptor.mode == 0)
-                {
+                if !fold_kernel_stage_reached(descriptor.mode, descriptor.count, stage) {
                     continue;
                 }
                 kernels.push(LearningFoldKernel {
@@ -1251,8 +1539,8 @@ impl SemanticTransitionSession {
                 });
             }
         }
-        let mut preserve = Vec::new();
-        let mut assign = Vec::new();
+        let mut preserve = Vec::with_capacity(copy_count);
+        let mut assign = Vec::with_capacity(copy_count);
         for (index, allocation) in scratch.iter().enumerate() {
             if allocation.is_empty() {
                 continue;
@@ -1293,6 +1581,7 @@ impl SemanticTransitionSession {
             assign,
             assign_next: 0,
             poisoned: false,
+            _reservation: reservation,
         })
     }
 

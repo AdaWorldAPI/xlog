@@ -5,8 +5,8 @@ usage() {
   cat <<'EOF'
 usage: scripts/stage_pyxlog_kernels.sh [--to <dir>] [--features <cargo-features>]
 
-Stage the generated xlog-cuda kernel artifacts into the pyxlog Python package
-tree so maturin can include them in built wheels.
+Stage generated xlog-cuda kernels for source-tree CUDA execution.
+Distributable pyxlog wheels include kernels directly from their own Cargo build.
 EOF
 }
 

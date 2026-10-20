@@ -3422,6 +3422,19 @@ binding rejects any different pair for the actual bound task. The completed
 terminal ground; slot-zero work is zero, while candidate raw work is exactly
 `edit_commands + added_supports + defined_truth_changes`.
 
+Execution accounting is separate from this structural selection cost. It retains
+the actual model work once and every reached native event, including canaries,
+publication seals, copies, resource checks and the selector compare-and-swap.
+The publisher derives the remaining seal cost from finite retained geometry in
+scratch, charging that metadata walk separately. It executes each payload hash
+and copy once, checks the actual counters against the derived suffix and all
+original resource limits, then attempts one joint publication. The successful
+bank binds the complete cost, including the check and publication tail. A
+mismatch, overflow, resource refusal or failed compare-and-swap publishes
+nothing and retains the reached failure cost. Predictions never replace actual
+counters; the structural-cost cap, training loss and admitted budgets do not
+change.
+
 Learned attempted requests are not duplicated in the ground. Read them from the
 same projection's lane `decoded_text_actions` and `decoded_edit_actions`. The
 optional `edit_solution` is present only for the lowest-numbered admitted lane

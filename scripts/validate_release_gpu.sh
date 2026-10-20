@@ -264,7 +264,6 @@ run_exact_rust_gate "resident semantic acceptance matrix" 1 \
   cargo test --locked --release -p xlog-gpu --lib \
   logic::tests::resident_semantic_acceptance_matrix -- \
   --ignored --exact --nocapture --test-threads=1
-run_cmd bash scripts/stage_pyxlog_kernels.sh
 run_cmd python3 scripts/validate_reproducible_pyxlog_wheel.py \
   --out-dir "$wheel_dir" \
   --compatibility manylinux_2_34

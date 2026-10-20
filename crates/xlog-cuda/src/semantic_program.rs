@@ -191,28 +191,57 @@ impl SemanticProgramAdmission {
         Ok(())
     }
 
+    pub(crate) fn word_count(&self) -> Option<usize> {
+        self.queries
+            .len()
+            .checked_add(self.initial_facts.len())?
+            .checked_mul(4)?
+            .checked_add(self.predicate_arities.len())?
+            .checked_add(
+                self.initial_rules
+                    .len()
+                    .checked_mul(SemanticProgramRule::default().words().len())?,
+            )?
+            .checked_add(5)
+    }
+
     /// Canonical device-bank words, independent of host struct padding.
-    pub(crate) fn words(&self) -> Vec<u64> {
-        let mut words = Vec::new();
-        words.extend([
+    pub(crate) fn visit_words(&self, mut visit: impl FnMut(u64)) {
+        for word in [
             2,
             u64::from(self.predicate_count),
             self.initial_facts.len() as u64,
             self.initial_rules.len() as u64,
             self.queries.len() as u64,
-        ]);
-        words.extend(self.predicate_arities.iter().copied().map(u64::from));
+        ] {
+            visit(word);
+        }
+        for &arity in &self.predicate_arities {
+            visit(u64::from(arity));
+        }
         for fact in self.queries.iter().chain(&self.initial_facts) {
-            words.extend([
+            for word in [
                 u64::from(fact.predicate),
                 u64::from(fact.arity),
                 u64::from(fact.first),
                 u64::from(fact.second),
-            ]);
+            ] {
+                visit(word);
+            }
         }
         for rule in &self.initial_rules {
-            words.extend(rule.words());
+            for word in rule.words() {
+                visit(word);
+            }
         }
+    }
+
+    pub(crate) fn words(&self) -> Vec<u64> {
+        let mut words = Vec::with_capacity(
+            self.word_count()
+                .expect("validated program has a finite canonical encoding"),
+        );
+        self.visit_words(|word| words.push(word));
         words
     }
 }
