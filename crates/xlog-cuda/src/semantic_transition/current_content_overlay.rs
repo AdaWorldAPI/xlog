@@ -9,14 +9,14 @@ use super::*;
 /// Private custody rooted in one original decoded instruction. It survives
 /// retirement of the cold report without a global allocation or actor lookup.
 pub(super) struct ContentOverlayInstruction {
-    groups: Mutex<Vec<std::sync::Weak<CurrentContentOverlay>>>,
+    groups: Mutex<Vec<Arc<CurrentContentOverlay>>>,
     binding: Mutex<()>,
 }
 
 impl ContentOverlayInstruction {
     pub(super) fn metadata_bytes(count: usize) -> Result<usize, SemanticTransitionError> {
         count
-            .checked_mul(2 * size_of::<std::sync::Weak<CurrentContentOverlay>>())
+            .checked_mul(2 * size_of::<Arc<CurrentContentOverlay>>())
             .and_then(|bytes| bytes.checked_add(size_of::<Self>() + 2 * size_of::<usize>()))
             .ok_or(SemanticTransitionError::GenerationExhausted)
     }
@@ -219,7 +219,10 @@ impl SemanticPreparedSourceContentGeometry {
         if groups.len() == groups.capacity() {
             return Err(SemanticTransitionError::ObservationMismatch);
         }
-        groups.push(Arc::downgrade(&owner));
+        // The original instruction retains every physical claim through its
+        // last geometry. Groups retain only weak geometry/actor links, so this
+        // cannot form a cycle or permit reuse after a single pair retires.
+        groups.push(Arc::clone(&owner));
         first[index] = Some(Arc::clone(&owner));
         second[index] = Some(owner);
         Ok(result)
@@ -382,7 +385,7 @@ impl SemanticPreparedSourceContentGeometry {
         })?;
         for other in groups
             .iter()
-            .filter_map(std::sync::Weak::upgrade)
+            .cloned()
             .filter(|other| !Arc::ptr_eq(other, &owner))
         {
             let other_state = other.state.lock().map_err(|_| {
