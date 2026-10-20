@@ -1402,6 +1402,7 @@ fn pyxlog(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<semantic_transition::PySemanticCompletedActionProjection>()?;
     m.add_class::<semantic_transition::PySemanticGradientDelivery>()?;
     m.add_class::<semantic_transition::PySemanticTensorContentWitness>()?;
+    #[cfg(feature = "semantic-policy")]
     m.add_class::<semantic_transition::PySemanticModelForwardWitness>()?;
     #[cfg(feature = "semantic-policy")]
     m.add_class::<semantic_transition::model_forward_stream::PySemanticModelForwardStream>()?;
