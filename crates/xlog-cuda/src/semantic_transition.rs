@@ -5316,12 +5316,22 @@ fn prepare_semantic_tensors(
     inputs: Vec<SemanticTensorInput>,
 ) -> Result<Vec<PreparedSemanticTensor>, SemanticTransitionError> {
     let stream = Arc::clone(provider.device().inner().stream());
-    let mut pending = RetainedTensorAdmission {
-        inputs: Some(inputs),
-        stream: Arc::clone(&stream),
-        consumer_stream: None,
-        ready: false,
-    };
+    prepare_retained_semantic_tensors(
+        provider,
+        RetainedTensorAdmission {
+            inputs: Some(inputs),
+            stream: Arc::clone(&stream),
+            consumer_stream: None,
+            ready: false,
+        },
+    )
+}
+
+fn prepare_retained_semantic_tensors(
+    provider: &CudaKernelProvider,
+    mut pending: RetainedTensorAdmission<SemanticTensorInput>,
+) -> Result<Vec<PreparedSemanticTensor>, SemanticTransitionError> {
+    let stream = Arc::clone(provider.device().inner().stream());
     let mut geometry = Vec::new();
     for input in pending
         .inputs
@@ -31204,7 +31214,6 @@ impl SemanticTransitionSession {
             step,
             tensors,
             consumer_stream,
-            None,
             #[cfg(feature = "semantic-policy")]
             occurrence,
         )
@@ -31215,16 +31224,21 @@ impl SemanticTransitionSession {
         step: &SemanticPreparedStep,
         tensors: Vec<SemanticTensorInput>,
         consumer_stream: u64,
-        forward_role: Option<usize>,
         #[cfg(feature = "semantic-policy")] occurrence: Option<&SemanticSourceContentOccurrence>,
     ) -> Result<SemanticTensorContentWitness, SemanticTransitionError> {
+        let pending = RetainedTensorAdmission {
+            inputs: Some(tensors),
+            stream: Arc::clone(&self.stream),
+            consumer_stream: Some(consumer_stream),
+            ready: false,
+        };
         self.check_prepared_content_stream(step, consumer_stream)?;
-        if tensors.is_empty() {
+        if pending.inputs.as_ref().is_none_or(Vec::is_empty) {
             return Err(publication_input_error(
                 "original content requires an actual tensor roster",
             ));
         }
-        let original = prepare_semantic_tensors(&self.provider, tensors)?;
+        let original = prepare_retained_semantic_tensors(&self.provider, pending)?;
         // Retain actual producers before validating coordinates or consuming
         // a reserved digest. Recording failure poisons this construction.
         let owner = self.steps.get_mut(&step.token).expect("checked fixed step");
@@ -31239,21 +31253,11 @@ impl SemanticTransitionSession {
         let result = (|| {
             let owner = &self.steps[&step.token];
             let original = &owner.content[index].tensors;
-            if let Some(role) = forward_role {
-                if !matches!(original.as_slice(), [tensor]
-                    if tensor.layout.role == 0 && tensor.layout.index == role as u64)
-                {
-                    return Err(publication_input_error(
-                        "model forward content requires its exact baseline or candidate logits occurrence",
-                    ));
-                }
-            } else {
-                validate_content_coordinates(
-                    original
-                        .iter()
-                        .map(|tensor| (tensor.layout.role, tensor.layout.index)),
-                )?;
-            }
+            validate_content_coordinates(
+                original
+                    .iter()
+                    .map(|tensor| (tensor.layout.role, tensor.layout.index)),
+            )?;
             let mut digests = Vec::with_capacity(original.len());
             let prepared = owner.prepared.as_ref().expect("prepared content owner");
             let mut next = prepared.next_digest;
@@ -32213,6 +32217,12 @@ impl SemanticTransitionSession {
         work: Option<DeviceMemoryView<u64>>,
         #[cfg(feature = "semantic-policy")] occurrence: Option<&SemanticSourceContentOccurrence>,
     ) -> Result<(), SemanticTransitionError> {
+        let pending = RetainedTensorAdmission {
+            inputs: Some(tensors),
+            stream: Arc::clone(&self.stream),
+            consumer_stream: Some(consumer_stream),
+            ready: false,
+        };
         self.checked_prepared_content_witness(step, witness)?;
         let build = self
             .prepared_segment
@@ -32241,7 +32251,7 @@ impl SemanticTransitionSession {
                 "retained content requires an actually completed prepared invocation",
             ));
         }
-        let actual = prepare_semantic_tensors(&self.provider, tensors)?;
+        let actual = prepare_retained_semantic_tensors(&self.provider, pending)?;
         let content = &mut self
             .steps
             .get_mut(&step.token)

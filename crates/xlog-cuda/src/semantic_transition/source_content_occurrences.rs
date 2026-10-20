@@ -819,6 +819,43 @@ impl PreparedTensorContentPlan {
 }
 
 impl SemanticTransitionSession {
+    /// Return receiver pins only after every still-owned original step has
+    /// joined its final consumers and the original graph has retired. Drop the
+    /// returned owners outside the Session lock, before releasing producers.
+    pub fn take_prepared_tensor_content_receivers_for_retirement(
+        &mut self,
+        step: &SemanticPreparedStep,
+    ) -> Result<impl Send + 'static, SemanticTransitionError> {
+        self.ensure_quiescent()?;
+        let build = self
+            .prepared_segment
+            .as_ref()
+            .ok_or(SemanticTransitionError::NotCaptured)?;
+        build.check_retained(step, &self.publication_issuer)?;
+        for token in &build.tokens {
+            if self.steps.contains_key(token) {
+                self.retained_prepared_step_final_consumers(&SemanticPreparedStep {
+                    issuer: Arc::clone(&build.issuer),
+                    scope: Arc::clone(&build.scope),
+                    token: *token,
+                })?;
+            }
+        }
+        if build.cancelled.load(Ordering::Acquire) {
+            if build.completed || (build.submitted && !build.has_never_graph_called_proof()) {
+                return Err(SemanticTransitionError::ObservationMismatch);
+            }
+            self.require_original_prepared_graph_retirement()?;
+        } else {
+            self.require_completed_prepared_graph_retirement()?;
+        }
+        Ok(self
+            .steps
+            .get_mut(&step.token)
+            .and_then(|owner| owner.prepared.as_mut())
+            .and_then(|prepared| prepared.content_plan.take()))
+    }
+
     pub fn verify_prepared_tensor_content_in_recording_step(
         &mut self,
         recording_step: &SemanticPreparedStep,
@@ -828,11 +865,20 @@ impl SemanticTransitionSession {
         consumer_stream: u64,
         occurrence: Option<&SemanticSourceContentOccurrence>,
     ) -> Result<(), SemanticTransitionError> {
+        let mut pending = RetainedTensorAdmission {
+            inputs: Some(tensors),
+            stream: Arc::clone(&self.stream),
+            consumer_stream: Some(consumer_stream),
+            ready: false,
+        };
         self.require_prepared_tensor_content_recorder(recording_step)?;
         self.verify_prepared_tensor_content(
             original_step,
             witness,
-            tensors,
+            pending
+                .inputs
+                .take()
+                .expect("retained original producer roster"),
             consumer_stream,
             occurrence,
         )
@@ -847,6 +893,12 @@ impl SemanticTransitionSession {
         tensors: Vec<SemanticTensorInput>,
         consumer_stream: u64,
     ) -> Result<(), SemanticTransitionError> {
+        let pending = RetainedTensorAdmission {
+            inputs: Some(tensors),
+            stream: Arc::clone(&self.stream),
+            consumer_stream: Some(consumer_stream),
+            ready: false,
+        };
         let bank = self.require_prepared_tensor_content_recorder(recording_step)?;
         self.check_prepared_content_stream(recording_step, consumer_stream)?;
         source.checked_prepared_content_witness(original_step, witness)?;
@@ -870,7 +922,7 @@ impl SemanticTransitionSession {
                 "foreign content changed its original Update, bank, provider or material owner",
             ));
         }
-        let actual = prepare_semantic_tensors(&self.provider, tensors)?;
+        let actual = prepare_retained_semantic_tensors(&self.provider, pending)?;
         let content = &source.steps[&original_step.token].content[witness.index];
         if content.tensors.len() != actual.len()
             || content
