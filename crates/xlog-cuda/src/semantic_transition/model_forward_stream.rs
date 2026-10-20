@@ -372,16 +372,48 @@ fn paired_canary_native_work_ceiling(
     Ok(ceiling)
 }
 
-fn stream_comparison_native_work_ceiling() -> Result<[u64; 9], SemanticTransitionError> {
+fn stream_comparison_native_work_ceiling(
+    publication_queries: u64,
+    protected_members: u64,
+) -> Result<[u64; 9], SemanticTransitionError> {
     // Comparison authenticates its five rows (49 slots); two full receipt checks
     // use 28; finite flags use two; three nine-counter validation/merge pairs use 54.
     // Two selection identities use eight, distinct receipt identities use four,
     // and the five paired row-seal checks use 45 more slots.
     let mut ceiling = [0; 9];
+    // The same original gate also acquires its publication (two identities),
+    // checks the objective identity, four truth tokens and their six pairs,
+    // visits every publication query and protected position, and checks three
+    // identities per canary. Its two result passes visit five rows each; final
+    // refusal validation visits five results and four identity words.
+    let gate_slots = stream_work_sum(&[
+        2 * 4,
+        4,
+        4 + 6,
+        publication_queries,
+        protected_members,
+        5 * 3 * 4,
+        5,
+        5,
+        5 + 4,
+    ])?;
+    let word = size_of::<u64>() as u64;
+    let refusal_bytes = size_of::<SemanticTrainingCanaryRefusalRecord>() as u64;
+    // Each existing canary iteration may replace the refusal once in each of
+    // two passes. Include all five result-reason writes, the complete result
+    // records, and both final work-field writes on the refusal branch.
+    let gate_bytes = stream_work_sum(&[
+        refusal_bytes + word,
+        5 * 3 * size_of::<SemanticTrainingCanaryResultRecord>() as u64,
+        2 * 5 * (refusal_bytes - word),
+        5 * word,
+        refusal_bytes + size_of::<u8>() as u64 + 6 * word,
+        6 * word,
+    ])?;
     stream_work_events(
         &mut ceiling,
-        0,
-        49 + 28 + 2 + 54 + 8 + 4 + 45,
+        1,
+        stream_work_sum(&[49 + 28 + 2 + 54 + 8 + 4 + 45, gate_slots])?,
         0,
         stream_work_sum(&[
             size_of::<ModelCanaryStreamState>() as u64,
@@ -390,6 +422,7 @@ fn stream_comparison_native_work_ceiling() -> Result<[u64; 9], SemanticTransitio
             2 * (size_of::<ModelForwardStreamState>() as u64
                 + size_of::<ModelForwardReceipt>() as u64),
             2 * 8,
+            gate_bytes,
         ])?,
         1,
     )?;
@@ -415,6 +448,7 @@ fn stream_comparison_native_work_ceiling() -> Result<[u64; 9], SemanticTransitio
 /// Complete finite producer geometry for one original Update bank. The caller
 /// supplies only the native admitted task-query/protected-roster bounds, never
 /// tile labels, source values, host statistics or purported observed quantities.
+/// Paired obligations and publication queries retain their distinct native owners.
 pub(super) fn model_stream_native_work_ceilings(
     storage: &PublicationStorage,
     rows: usize,
@@ -423,6 +457,7 @@ pub(super) fn model_stream_native_work_ceilings(
     scalar_type: u64,
     block_positions: u64,
     task_queries: u64,
+    publication_queries: u64,
     protected_members: u64,
 ) -> Result<ModelStreamNativeWorkCeilings, SemanticTransitionError> {
     let geometry = StreamGeometry::new(rows, capacity, vocabulary, scalar_type, block_positions)?;
@@ -432,7 +467,7 @@ pub(super) fn model_stream_native_work_ceilings(
             full_forward_native_work_ceiling(storage, geometry, 1)?,
         ],
         canary: paired_canary_native_work_ceiling(geometry, task_queries, protected_members)?,
-        comparison: stream_comparison_native_work_ceiling()?,
+        comparison: stream_comparison_native_work_ceiling(publication_queries, protected_members)?,
     };
     ceilings.combined()?;
     Ok(ceilings)
@@ -1530,6 +1565,16 @@ impl SemanticTransitionSession {
                 .len(),
         )
         .map_err(|_| SemanticTransitionError::GenerationExhausted)?;
+        let publication_queries = u64::try_from(
+            self.task
+                .as_ref()
+                .ok_or(SemanticTransitionError::NotBound)?
+                .0
+                .spec
+                .statement_records
+                .len(),
+        )
+        .map_err(|_| SemanticTransitionError::GenerationExhausted)?;
         let protected_members = u64::try_from(
             prepared
                 .training_view
@@ -1547,6 +1592,7 @@ impl SemanticTransitionSession {
             geometry.scalar_type,
             geometry.block_positions,
             task_queries,
+            publication_queries,
             protected_members,
         )?;
         self.require_model_stream_cold_allowance(step)?;
