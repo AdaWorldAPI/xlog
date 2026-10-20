@@ -300,14 +300,15 @@ impl SemanticPreparedSourceContentGeometry {
         backing: DlpackManagedTensor,
         consumer_stream: u64,
     ) -> Result<(), SemanticTransitionError> {
-        let index = overlay_index(prepared_kind)?;
         // Retain even an invalid handoff until the canonical stream retirement
         // proves that dropping its real managed producer is safe.
         let mut pending = RetainedTensorAdmission {
             inputs: Some(vec![backing]),
             stream: Arc::clone(&session.stream),
+            consumer_stream: Some(consumer_stream),
             ready: false,
         };
+        let index = overlay_index(prepared_kind)?;
         self.require_content_overlay_pair(other)?;
         self.require_content_overlay_backing_stream(
             session,
@@ -358,6 +359,9 @@ impl SemanticPreparedSourceContentGeometry {
             .expect("retained overlay producer")
             .pop()
             .ok_or(SemanticTransitionError::ObservationMismatch)?;
+        // The canonical importer takes this exact token before its first
+        // metadata check; its stream was authenticated above on both sides.
+        pending.ready = true;
         let mut tensors = prepare_semantic_tensors(
             &session.provider,
             vec![SemanticTensorInput {
@@ -368,7 +372,6 @@ impl SemanticPreparedSourceContentGeometry {
                 native_allocation: None,
             }],
         )?;
-        pending.ready = true;
         let tensor = tensors
             .pop()
             .ok_or(SemanticTransitionError::ObservationMismatch)?;

@@ -5231,6 +5231,7 @@ unsafe fn policy_score_cotangent_metadata(
 struct RetainedTensorAdmission<T: Send + 'static> {
     inputs: Option<Vec<T>>,
     stream: Arc<CudaStream>,
+    consumer_stream: Option<u64>,
     ready: bool,
 }
 
@@ -5241,6 +5242,53 @@ impl<T: Send + 'static> Drop for RetainedTensorAdmission<T> {
         };
         if self.ready {
             drop(inputs);
+            return;
+        }
+        if let Some(consumer_stream) = self.consumer_stream {
+            crate::cuda_graph::retire_resources_after_completion(
+                (
+                    Some(inputs),
+                    Arc::clone(&self.stream),
+                    consumer_stream,
+                    None::<cudarc::driver::CudaEvent>,
+                ),
+                |_| Ok::<_, SemanticTransitionError>(()),
+                |owners| {
+                    owners.1.context().bind_to_thread().map_err(|error| {
+                        runtime_error("tensor producer retirement context", error)
+                    })?;
+                    // Store the original event before its record can enter.
+                    // Any record error quarantines this same token/event chain
+                    // without resubmission or an unrelated-stream completion.
+                    owners.3 = Some(owners.1.context().new_event(None).map_err(|error| {
+                        runtime_error("tensor producer retirement event", error)
+                    })?);
+                    let event = owners.3.as_ref().ok_or(SemanticTransitionError::NotBound)?;
+                    // SAFETY: the retained owning context is bound above. The
+                    // caller's original declared stream is decoded canonically;
+                    // invalid or ambiguous handles retain the actual tokens.
+                    unsafe {
+                        cudarc::driver::result::event::record(
+                            event.cu_event(),
+                            dlpack_consumer_stream(owners.2)?,
+                        )
+                    }
+                    .map_err(|error| {
+                        runtime_error("tensor producer retirement event record", error)
+                    })
+                },
+                |owners| {
+                    owners
+                        .3
+                        .as_ref()
+                        .ok_or(SemanticTransitionError::NotBound)?
+                        .synchronize()
+                        .map_err(|error| {
+                            runtime_error("tensor producer retirement completion", error)
+                        })
+                },
+                |_, error| eprintln!("semantic tensor producer retirement incomplete: {error}"),
+            );
             return;
         }
         // Preserve the genuine producer tokens through a failed/unknown cold
@@ -5269,6 +5317,7 @@ fn prepare_semantic_tensors(
     let mut pending = RetainedTensorAdmission {
         inputs: Some(inputs),
         stream: Arc::clone(&stream),
+        consumer_stream: None,
         ready: false,
     };
     let mut geometry = Vec::new();
@@ -5336,6 +5385,7 @@ fn complete_tensor_handoff<T: Send + 'static>(
     let mut pending = RetainedTensorAdmission {
         inputs: Some(inputs),
         stream,
+        consumer_stream: None,
         ready: false,
     };
     let _ordinary = crate::cuda_graph::reserve_uncaptured_stream(&pending.stream)
@@ -33840,6 +33890,7 @@ impl SemanticTransitionSession {
         let mut handoff = RetainedTensorAdmission {
             inputs: Some(tensors),
             stream: Arc::clone(self.provider.device().inner().stream()),
+            consumer_stream: None,
             ready: false,
         };
         if self.is_poisoned() {
@@ -36858,6 +36909,7 @@ impl SemanticTransitionSession {
         let mut handoff = RetainedTensorAdmission {
             inputs: Some(tensors),
             stream: Arc::clone(self.provider.device().inner().stream()),
+            consumer_stream: None,
             ready: false,
         };
         #[cfg(feature = "semantic-policy")]
@@ -37228,6 +37280,7 @@ impl SemanticTransitionSession {
         let mut handoff = RetainedTensorAdmission {
             inputs: Some(tensors),
             stream: Arc::clone(self.provider.device().inner().stream()),
+            consumer_stream: None,
             ready: false,
         };
         self.checked_content_witness(lease, witness)?;
@@ -41758,6 +41811,7 @@ impl SemanticTransitionSession {
         let mut handoff = RetainedTensorAdmission {
             inputs: Some(vec![continuation]),
             stream: Arc::clone(self.provider.device().inner().stream()),
+            consumer_stream: None,
             ready: false,
         };
         let _ordinary = crate::cuda_graph::reserve_uncaptured_stream(&self.stream)
@@ -44591,6 +44645,7 @@ impl SemanticTransitionSession {
                 .collect(),
             ),
             stream: Arc::clone(self.provider.device().inner().stream()),
+            consumer_stream: None,
             ready: false,
         };
         self.ensure_rebindable()?;
@@ -45762,6 +45817,7 @@ impl SemanticTransitionSession {
         let mut handoff = RetainedTensorAdmission {
             inputs: Some(vec![score_cotangents]),
             stream: Arc::clone(self.provider.device().inner().stream()),
+            consumer_stream: None,
             ready: false,
         };
         dlpack_consumer_stream(consumer_stream)?;
