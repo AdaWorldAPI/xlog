@@ -550,11 +550,13 @@ impl PySemanticPreparedSourceContentGeometry {
             match (self.inner.kind(), section) {
                 (xlog_cuda::SemanticSourceContentGeometryKind::Historical, None) => 4,
                 (
-                    xlog_cuda::SemanticSourceContentGeometryKind::Current,
+                    xlog_cuda::SemanticSourceContentGeometryKind::Current
+                    | xlog_cuda::SemanticSourceContentGeometryKind::CurrentDemonstration,
                     Some((SemanticTransitionKind::Recompute, bank)),
                 ) => bank,
                 (
-                    xlog_cuda::SemanticSourceContentGeometryKind::Current,
+                    xlog_cuda::SemanticSourceContentGeometryKind::Current
+                    | xlog_cuda::SemanticSourceContentGeometryKind::CurrentDemonstration,
                     Some((SemanticTransitionKind::Proposal, bank)),
                 ) => 2 + bank,
                 _ => return Err(invalid(
@@ -974,6 +976,7 @@ impl PySemanticPreparedSourceContentGeometry {
         match self.inner.kind() {
             xlog_cuda::SemanticSourceContentGeometryKind::Historical => "historical",
             xlog_cuda::SemanticSourceContentGeometryKind::Current => "current",
+            xlog_cuda::SemanticSourceContentGeometryKind::CurrentDemonstration => "demonstration",
         }
     }
     fn step_index(&self) -> usize {

@@ -382,8 +382,7 @@ impl FrozenSourceContentOccurrences {
         let reservation = recipe.seed.proof.owner.budget.reserve_auxiliary(
             u64::try_from(bytes).map_err(|_| SemanticTransitionError::GenerationExhausted)?,
         )?;
-        let current =
-            recipe.kind == prepared_source_content::SemanticSourceContentGeometryKind::Current;
+        let current = recipe.kind.is_current();
         let mut outputs: [BTreeMap<u64, Vec<SemanticSourceTensorDescriptor>>; 4] =
             std::array::from_fn(|_| BTreeMap::new());
         let mut baselines = [None; 4];

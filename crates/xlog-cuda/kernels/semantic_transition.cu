@@ -931,8 +931,9 @@ struct PreparedActorRefreshDevice {
     uint64_t minimum_generation,stream_serial,family_id,proposal,program[4],phase[4];
     SemanticTrainingViewOriginRecord original_origin;
     uint64_t acquired_generation,model_geometry_digest[4],model_numerical_digest[4];
+    uint64_t role,demonstrated_lane,demonstrated_choices[COMPONENT_COUNT];
 };
-static_assert(sizeof(PreparedActorRefreshDevice)==584,"prepared actor basis ABI");
+static_assert(sizeof(PreparedActorRefreshDevice)==1688,"prepared policy basis ABI");
 struct PreparedModelContextContinuationDevice {
     uint64_t abi,status,source_control,source_lease,target_control,minimum_generation,stream_serial,family_id,proposal;
     uint64_t source_instance[4],target_instance[4],model_geometry_digest[4],model_numerical_digest[4];
@@ -964,10 +965,10 @@ struct Descriptor {
             uint64_t rows,count,bank,directory,directory_count,arena,arena_words,actual;
         } parent,successor;
     } replay;
-    uint64_t policy_work;
+    uint64_t policy_work,policy_score;
 };
-static_assert(sizeof(Descriptor)==1464 && offsetof(Descriptor,backward)==888 &&
-    offsetof(Descriptor,policy_work)==1456,
+static_assert(sizeof(Descriptor)==1472 && offsetof(Descriptor,backward)==888 &&
+    offsetof(Descriptor,policy_work)==1456 && offsetof(Descriptor,policy_score)==1464,
     "original descriptor policy work ABI");
 
 using ReplayCopyDescriptor=Descriptor::PreparedReplayDescriptor::Copy;
@@ -1290,7 +1291,7 @@ static_assert(sizeof(IntentQueueHeader)==88,"intent queue ABI");
 static_assert(sizeof(IntentEntry)==344,"intent entry ABI");
 static_assert(sizeof(AcknowledgementQueueHeader)==72,"acknowledgement queue ABI");
 static_assert(sizeof(AcknowledgementEntry)==136,"acknowledgement entry ABI");
-static_assert(sizeof(Descriptor)==1464,"launch ABI");
+static_assert(sizeof(Descriptor)==1472,"launch ABI");
 static_assert((2*262144+4*65536)*sizeof(uint32_t)<=SCRATCH_BYTES,"serial scratch and completion witnesses");
 #ifdef XLOG_SEMANTIC_POLICY
 #include "semantic_policy_domains.cuh"
@@ -1350,12 +1351,13 @@ __device__ bool text_null_receipt(const Receipt& r) {
         r.factor_denominator.w[0]==1 && !r.factor_denominator.w[1] && !r.factor_denominator.w[2];
 }
 __device__ Receipt component_receipt(const Component& c,const State& state,
-        semantic_graph::NativeWorkTally* work=nullptr) {
+        semantic_graph::NativeWorkTally* work=nullptr,bool sample=true) {
     Receipt r={};r.proposal=state.proposal;r.catalogue_generation=CATALOGUE_GENERATION;
     for(int j=0;j<32;++j){r.catalogue_digest[j]=CATALOGUE_DIGEST[j];r.admission_binding[j]=state.binding_digest[j];}
     r.ordinal=c.ordinal;r.lane=c.lane;r.slot=c.slot;r.field=c.field;r.kind=c.kind;
     r.active_fields=c.kind==COMPONENT_KIND_EDIT ? NO_EDIT_ACTIVE_MASK : 0;
     r.null_fields=c.kind==COMPONENT_KIND_EDIT ? NO_EDIT_NULL_MASK : 0;
+    if(!sample)return r;
     r.key[0]=uint32_t(CATALOGUE_GENERATION);r.key[1]=state.model_generation;
     uint64_t block=uint64_t(COMPONENT_COUNT)*state.proposal+c.ordinal;
     uint64_t stream=(state.stream_serial<<8)|state.family_id;
@@ -1365,6 +1367,8 @@ __device__ Receipt component_receipt(const Component& c,const State& state,
     r.draw=(uint64_t(r.random_words[0])|(uint64_t(r.random_words[1])<<32))&0x7fffffffffffffffULL;
     return r;
 }
+
+#include "semantic_conditional_policy.cuh"
 
 // Source indices are ring identities, not the model's packed physical rows.
 // Only FILLED rows that predate this invocation contribute to its coverage.
@@ -3999,7 +4003,8 @@ extern "C" __global__ void semantic_publication_step_active_gate(uint64_t lease_
 // Preserve the actual result before release permits either physical bank to be
 // reused. Ordinary refusals retain the original parent and its refusal status.
 extern "C" __global__ void semantic_publication_step_result(uint64_t control_ptr,uint64_t lease_ptr,
-        uint64_t result_ptr,uint64_t parent_header_ptr,uint64_t training_origin_ptr) {
+        uint64_t result_ptr,uint64_t parent_header_ptr,uint64_t training_origin_ptr,
+        uint64_t score_ptr,uint64_t score_state0,uint64_t score_state1) {
     if(blockIdx.x || threadIdx.x)return;
     if(!publication_pointer_span(control_ptr,sizeof(PublicationControl),alignof(PublicationControl)) ||
        !publication_pointer_span(lease_ptr,sizeof(PublicationLease),alignof(PublicationLease)) ||
@@ -4046,6 +4051,31 @@ extern "C" __global__ void semantic_publication_step_result(uint64_t control_ptr
     }
     const uint64_t word=publication_load(control.word);
     const auto& bank=*publication_bank(control,word);
+    if(score_ptr) {
+        const uint64_t state_ptr=lease.bank ? score_state1 : score_state0;
+        if(training_origin_ptr || !publication_pointer_span(score_ptr,sizeof(PreparedActorRefreshDevice),alignof(PreparedActorRefreshDevice)) ||
+           !publication_pointer_span(state_ptr,sizeof(State),alignof(State)) ||
+           !publication_pointer_span(parent_header_ptr,sizeof(PublicationHeader),alignof(PublicationHeader))) {
+            semantic_content_integrity_trap();return;
+        }
+        const auto& proof=*reinterpret_cast<const PreparedActorRefreshDevice*>(score_ptr);
+        const auto& state=*reinterpret_cast<const State*>(state_ptr);
+        const auto& parent=*reinterpret_cast<const PublicationHeader*>(parent_header_ptr);
+        if(proof.abi!=1 || proof.status || proof.role!=1 || proof.child_control!=control_ptr ||
+           lease.transition_kind!=1 || word!=lease.word || control.refusal || state.blocks ||
+           state.next_proposal!=parent.proposal || state.proposal!=parent.proposal ||
+           state.model_generation!=parent.model_generation || state.stream_serial!=parent.stream_serial ||
+           state.family_id!=parent.family_id || state.actor_eligible || state.action_batch.abi ||
+           proof.acquired_generation!=parent.model_generation ||
+           !publication_bank_matches(control,bank,word) || !publication_header_equal(parent,bank.header) ||
+           !publication_identity_equal(proof.model_geometry_digest,parent.model_geometry_digest) ||
+           !publication_identity_equal(proof.model_numerical_digest,parent.model_numerical_digest)) {
+            semantic_content_integrity_trap();return;
+        }
+        *reinterpret_cast<PublicationStepResult*>(result_ptr)={2,word,state.status,bank.header,0,{}};
+        return;
+    }
+    if(score_state0 || score_state1) { semantic_content_integrity_trap();return; }
     if(!publication_bank_matches(control,bank,word) || (word!=lease.word &&
        ((lease.word>>1)==(UINT64_MAX>>1) || word!=(((lease.word>>1)+1)<<1 | ((lease.word^1)&1)) ||
         bank.header.base_word!=lease.word))) { semantic_content_integrity_trap();return; }
@@ -5092,7 +5122,9 @@ __device__ bool select_task(const Descriptor& descriptor,State* state,const sema
 __device__ uint64_t publication_actor_refresh_outcome(const ActorRefreshWorkEntry& entry) {
     if(!publication_pointer_span(entry.proof,sizeof(PreparedActorRefreshDevice),alignof(PreparedActorRefreshDevice)))return 2;
     const auto& proof=*reinterpret_cast<const PreparedActorRefreshDevice*>(entry.proof);
-    if(proof.abi!=1 || proof.member_ordinal!=entry.member_ordinal ||
+    if(proof.abi!=1 || proof.member_ordinal!=entry.member_ordinal || proof.role>1 ||
+       (proof.role==0 ? proof.demonstrated_lane!=0 :
+        (proof.demonstrated_lane<1 || proof.demonstrated_lane>2)) ||
        (proof.status!=0 && proof.status!=2) ||
        !publication_pointer_span(proof.child_control,sizeof(PublicationControl),alignof(PublicationControl)) ||
        !publication_pointer_span(proof.target_control,sizeof(PublicationControl),alignof(PublicationControl)) ||
@@ -5134,6 +5166,7 @@ __device__ uint64_t publication_actor_refresh_outcome(const ActorRefreshWorkEntr
         if(refused)return 2;
         const auto& parent=*reinterpret_cast<const PublicationHeader*>(entry.parents[operation]);
         const uint64_t kind=operation==0 ? 2 : 1;
+        const bool score=proof.role==1 && operation==1;
         if(lease.abi!=1 || lease.status || lease.active || lease.transition_kind!=kind ||
            lease.word!=expected_word || lease.bank!=(lease.word&1) || lease.epoch!=(lease.word>>1) ||
            !publication_identity_equal(lease.instance,control.instance) ||
@@ -5142,10 +5175,22 @@ __device__ uint64_t publication_actor_refresh_outcome(const ActorRefreshWorkEntr
            parent.model_generation!=proof.acquired_generation ||
            !publication_identity_equal(parent.model_geometry_digest,proof.model_geometry_digest) ||
            !publication_identity_equal(parent.model_numerical_digest,proof.model_numerical_digest) ||
-           result.abi!=1 || result.header.abi!=1 ||
+           result.abi!=(score ? 2 : 1) || result.header.abi!=1 ||
            !publication_identity_equal(result.header.instance,control.instance) ||
            result.header.publication_word!=result.word || result.header.sealed_epoch!=(result.word>>1) ||
            result.advanced>1 || result.advanced!=uint64_t(result.word!=lease.word && !result.refusal))return 2;
+        if(score) {
+            const auto& state=*reinterpret_cast<const State*>(entry.states[operation]);
+            if(result.word!=lease.word || result.advanced || !publication_header_equal(result.header,parent) ||
+               result.refusal!=state.status || state.blocks || state.next_proposal!=proof.proposal ||
+               state.proposal!=proof.proposal || state.model_generation!=proof.acquired_generation ||
+               state.stream_serial!=proof.stream_serial || state.family_id!=proof.family_id ||
+               state.actor_eligible || state.action_batch.abi)return 2;
+            for(uint32_t word=0;word<sizeof(result.attempt)/sizeof(uint64_t);++word)
+                if(reinterpret_cast<const uint64_t*>(&result.attempt)[word])return 2;
+            refused=result.refusal!=0;
+            continue;
+        }
         if(result.advanced) {
             const uint64_t next=((lease.epoch+1)<<1)|((lease.word^1)&1);
             if(lease.epoch==UINT64_MAX>>1 || result.word!=next || result.header.base_word!=lease.word ||
@@ -5168,7 +5213,7 @@ __device__ uint64_t publication_actor_refresh_outcome(const ActorRefreshWorkEntr
 __device__ void semantic_policy_backward_status_guard(uint64_t status_ptr,uint64_t mode) {
     if(!status_ptr || status_ptr%alignof(uint64_t) || status_ptr>UINT64_MAX-sizeof(uint64_t) ||
        (*reinterpret_cast<const uint64_t*>(status_ptr)!=0 &&
-        !(mode==4 && *reinterpret_cast<const uint64_t*>(status_ptr)==4)))semantic_content_integrity_trap();
+        !((mode==4 || mode==5) && *reinterpret_cast<const uint64_t*>(status_ptr)==4)))semantic_content_integrity_trap();
 }
 #ifdef XLOG_SEMANTIC_POLICY
 __device__ bool semantic_policy_identity_present(const uint64_t identity[4],
@@ -5222,7 +5267,7 @@ __device__ void semantic_policy_backward(const Descriptor& descriptor,
     __shared__ model_policy::BoundedValue bounded_reward_f32,bounded_critic_scale;
     if(threadIdx.x==0) {
         *status=0;
-        if(b.mode==4) {
+        if(b.mode==4 || b.mode==5) {
             const uint64_t address=descriptor.publication.native_work;
             if(!publication_pointer_span(address,sizeof(ActorRefreshWorkEntry),alignof(ActorRefreshWorkEntry)) ||
                !publication_pointer_span(b.objective,sizeof(SemanticTrainingObjectiveRecord),alignof(SemanticTrainingObjectiveRecord)) ||
@@ -5234,8 +5279,9 @@ __device__ void semantic_policy_backward(const Descriptor& descriptor,
                 uint64_t row_bytes=0;
                 if(entry.proof!=b.derived_origin || entry.member_ordinal!=b.member_ordinal ||
                    proof.member_ordinal!=b.member_ordinal || proof.target_header!=b.target_header ||
+                   proof.role!=uint64_t(b.mode==5) ||
                    b.origin_bank!=1 ||
-                   !publication_pointer_span(b.critic_term,sizeof(float),alignof(float)) ||
+                   (b.mode==4 ? !publication_pointer_span(b.critic_term,sizeof(float),alignof(float)) : b.critic_term!=0) ||
                    entry.states[1]!=descriptor.state || entry.readers[1]!=b.origin_lease ||
                    b.member_ordinal>=objective.row_count ||
                    !semantic_graph::checked_mul(objective.row_count,sizeof(SemanticTrainingRosterRow),&row_bytes) ||
@@ -5280,7 +5326,7 @@ __device__ void semantic_policy_backward(const Descriptor& descriptor,
             baseline_cotangents[i]=model_policy::zero_cotangent();
             coefficient_cotangents[i]=model_policy::zero_cotangent();
         }
-        if(threadIdx.x==0) { slot();*reinterpret_cast<float*>(b.critic_term)=0.0f; }
+        if(threadIdx.x==0 && b.critic_term) { slot();*reinterpret_cast<float*>(b.critic_term)=0.0f; }
         return;
     }
     if(*status)return;
@@ -5296,7 +5342,8 @@ __device__ void semantic_policy_backward(const Descriptor& descriptor,
                         backward_program_bank.task,&ground)) *status=1;
                 else {
                     const auto& baseline=ground.query(0,0);
-                    if(baseline.receipt[0]!=semantic_graph::kOk ||
+                    if(b.mode==5)backward_program_bank.selected_rule_count=uint32_t(ground.header[6]);
+                    else if(baseline.receipt[0]!=semantic_graph::kOk ||
                        baseline.receipt[1]!=0x5850524f47515532ULL ||
                        baseline.receipt[40]<backward_program_bank.program.rule_count ||
                        baseline.receipt[40]-backward_program_bank.program.rule_count>ground.header[7]) *status=1;
@@ -5319,7 +5366,7 @@ __device__ void semantic_policy_backward(const Descriptor& descriptor,
                 slot();
                 if(!isfinite(coefficients[i]))*status=1;
             }
-        } else if(b.mode==1 || b.mode==2 || b.mode==3 || b.mode==4) {
+        } else if(b.mode==1 || b.mode==2 || b.mode==3 || b.mode==4 || b.mode==5) {
             if(!b.selection || b.selection%alignof(SemanticTrainingViewSelection) ||
                !b.objective || b.objective%alignof(SemanticTrainingObjectiveRecord) ||
                !b.objective_groups || b.objective_groups%alignof(SemanticTrainingObjectiveGroupRecord) ||
@@ -5399,7 +5446,7 @@ __device__ void semantic_policy_backward(const Descriptor& descriptor,
                                 *status=1;break;
                             }
                             if((b.mode==1 && row.origin_candidate==b.origin_candidate) ||
-                               ((b.mode==2 || b.mode==3) && ordinal==b.member_ordinal)) {
+                               ((b.mode==2 || b.mode==3 || b.mode==5) && ordinal==b.member_ordinal)) {
                                 ++matching_edit_rows;
                                 matching_edit_row=&row;
                             }
@@ -5411,7 +5458,7 @@ __device__ void semantic_policy_backward(const Descriptor& descriptor,
                    ((b.mode==2 || b.mode==4) && (!group_member || b.member_ordinal>=objective.row_count ||
                     !b.critic_term || b.critic_term%alignof(float) ||
                     !publication_pointer_span(b.critic_term,sizeof(float),alignof(float)))) ||
-                   (b.mode==3 && (b.member_ordinal>=objective.row_count ||
+                   ((b.mode==3 || b.mode==5) && (b.member_ordinal>=objective.row_count ||
                     matching_edit_rows!=1)) ||
                    matching_edit_rows>1)*status=1;
                 const auto* origin_lease=reinterpret_cast<const PublicationLease*>(b.origin_lease);
@@ -5431,7 +5478,7 @@ __device__ void semantic_policy_backward(const Descriptor& descriptor,
                     const auto& origin=b.mode==1 ? selection.origin : roster[b.member_ordinal].origin;
                     if(!publication_pointer_span(b.target_header,sizeof(PublicationHeader),alignof(PublicationHeader)) ||
                        target->abi!=1 || origin.present!=1)*status=1;
-                    else if(b.mode!=4 &&
+                    else if(b.mode!=4 && b.mode!=5 &&
                        (!publication_identity_equal(origin.model_geometry_digest,target->model_geometry_digest) ||
                         !publication_identity_equal(origin.model_numerical_digest,target->model_numerical_digest))) *status=1;
                 }
@@ -5449,9 +5496,9 @@ __device__ void semantic_policy_backward(const Descriptor& descriptor,
                        state->family_id!=origin.family_id ||
                         state->proposal!=origin.proposal)*status=1;
                 }
-                if(b.mode==4 && !*status) {
+                if((b.mode==4 || b.mode==5) && !*status) {
                     const auto* proof=reinterpret_cast<const PreparedActorRefreshDevice*>(b.derived_origin);
-                    if(!owned || !state || state->status || !apply_actor ||
+                    if(!owned || !state || state->status || (b.mode==4 ? !apply_actor : !apply_edit) ||
                        !publication_pointer_span(b.derived_origin,sizeof(PreparedActorRefreshDevice),alignof(PreparedActorRefreshDevice)) ||
                        proof->abi!=1 || proof->status || proof->member_ordinal!=b.member_ordinal ||
                        proof->target_header!=b.target_header || proof->target_bank>1 ||
@@ -5470,13 +5517,14 @@ __device__ void semantic_policy_backward(const Descriptor& descriptor,
                         const auto* original=reinterpret_cast<const uint64_t*>(&proof->original_origin);
                         if(row.ordinal!=b.member_ordinal || row.basis!=1 || row.origin.present!=1 ||
                            row.origin.transition!=1 || row.origin_candidate==committed_append_origin ||
-                           child.abi!=1 || child.word!=4 ||
+                           child.abi!=1 || child.word!=(b.mode==5 ? 3 : 4) ||
                            !publication_pointer_span(child.banks[1],sizeof(PublicationBank),alignof(PublicationBank)) ||
                            !publication_identity_equal(child.instance,origin_lease->instance) ||
                            state->model_generation!=proof->acquired_generation ||
                            state->stream_serial!=proof->stream_serial || state->family_id!=proof->family_id ||
-                           state->proposal!=proof->proposal || state->next_proposal!=proof->proposal+1 ||
-                           state->actor_eligible!=1 || target.model_generation!=proof->acquired_generation ||
+                           state->proposal!=proof->proposal || state->next_proposal!=proof->proposal+uint64_t(b.mode==4) ||
+                           (b.mode==4 ? state->actor_eligible!=1 : (state->blocks!=0 || state->actor_eligible || state->action_batch.abi)) ||
+                           target.model_generation!=proof->acquired_generation ||
                            !publication_identity_equal(proof->model_geometry_digest,target.model_geometry_digest) ||
                            !publication_identity_equal(proof->model_numerical_digest,target.model_numerical_digest)) *status=1;
                         if(!*status) {
@@ -5491,16 +5539,37 @@ __device__ void semantic_policy_backward(const Descriptor& descriptor,
                             if(actual[word]!=original[word])*status=1;
                         }
                         const auto& batch=state->action_batch;
-                        if(batch.abi!=1 || batch.actor_eligible!=1 || batch.model_generation!=proof->acquired_generation ||
+                        if(b.mode==4 && (batch.abi!=1 || batch.actor_eligible!=1 || batch.model_generation!=proof->acquired_generation ||
                            batch.stream_serial!=proof->stream_serial || batch.family_id!=proof->family_id ||
                            batch.proposal!=proof->proposal || batch.base_word!=3 || batch.next_word!=4 ||
                            batch.rng_base!=COMPONENT_COUNT*proof->proposal || batch.rng_span!=COMPONENT_COUNT ||
-                           batch.rng_successor!=COMPONENT_COUNT*(proof->proposal+1)) *status=1;
+                           batch.rng_successor!=COMPONENT_COUNT*(proof->proposal+1))) *status=1;
+                        if(b.mode==5) {
+                            if(proof->demonstrated_lane<1 || proof->demonstrated_lane>2)*status=1;
+                            for(uint32_t ordinal=0;ordinal<COMPONENT_COUNT;++ordinal) {
+                                const uint32_t choice=receipts[ordinal].choice;slot();
+                                const uint64_t original=proof->demonstrated_choices[ordinal];slot();
+                                const uint64_t draw=receipts[ordinal].draw;slot();
+                                if(choice!=original || draw)*status=1;
+                                for(uint32_t word=0;word<4;++word) {
+                                    const uint32_t counter=receipts[ordinal].counter[word];slot();
+                                    const uint32_t random=receipts[ordinal].random_words[word];slot();
+                                    if(counter || random)*status=1;
+                                }
+                                for(uint32_t word=0;word<2;++word) {
+                                    const uint32_t key=receipts[ordinal].key[word];slot();
+                                    if(key)*status=1;
+                                }
+                            }
+                        }
                     }
                 }
                 if(apply_edit && !*status) {
                     const auto& origin=matching_edit_row->origin;
-                    if(state->model_generation!=origin.model_generation ||
+                    if(b.mode==5) {
+                        const auto& proof=*reinterpret_cast<const PreparedActorRefreshDevice*>(b.derived_origin);
+                        edit_lane=uint32_t(proof.demonstrated_lane-1);
+                    } else if(state->model_generation!=origin.model_generation ||
                        state->stream_serial!=origin.stream_serial ||
                         state->family_id!=origin.family_id || state->proposal!=origin.proposal) {
                         *status=1;
@@ -5531,11 +5600,11 @@ __device__ void semantic_policy_backward(const Descriptor& descriptor,
                             }
                             if(edit_lane==UINT32_MAX)*status=1;
                         }
-                        bounded_edit_scale=policy_scalar_divide(policy_exact_scalar(double(objective_coefficients[3])),
-                            policy_uint64_bound(edit_denominator));
-                        edit_scale=bounded_edit_scale.value;
-                        if(!isfinite(edit_scale))*status=1;
                     }
+                    bounded_edit_scale=policy_scalar_divide(policy_exact_scalar(double(objective_coefficients[3])),
+                        policy_uint64_bound(edit_denominator));
+                    edit_scale=bounded_edit_scale.value;
+                    if(!isfinite(edit_scale))*status=1;
                 }
                 if(apply_actor && !*status) {
                     const auto& origin=b.mode==1 ? selection.origin : roster[b.member_ordinal].origin;
@@ -7016,7 +7085,9 @@ __device__ uint64_t publication_initialize_actor_refresh(const Descriptor& descr
     const uint64_t address=descriptor.publication.lease;
     if(!publication_pointer_span(address,sizeof(PreparedActorRefreshDevice),alignof(PreparedActorRefreshDevice)))return 1;
     auto& proof=*reinterpret_cast<PreparedActorRefreshDevice*>(address);
-    if(proof.abi!=1 || proof.status!=1)return 1;
+    if(proof.abi!=1 || proof.status!=1 || proof.role>1 ||
+       (proof.role==0 ? proof.demonstrated_lane!=0 :
+        (proof.demonstrated_lane<1 || proof.demonstrated_lane>2)))return 1;
     // Entered refusal is not interchangeable with the initial never-entered
     // marker. No failure below permits a second initialization or a new draw.
     proof.status=semantic_graph::written_word(2,work);
@@ -8343,6 +8414,10 @@ extern "C" __global__ void semantic_transition_execute(Descriptor descriptor) {
     auto components=reinterpret_cast<const Component*>(descriptor.components);
     auto books=reinterpret_cast<const uint64_t*>(descriptor.codebooks);
     auto task=reinterpret_cast<const uint64_t*>(descriptor.task);
+    const bool fixed_score=descriptor.policy_score!=0;
+    const auto* demonstration=reinterpret_cast<const PreparedActorRefreshDevice*>(descriptor.policy_score);
+    if(fixed_score && !publication_pointer_span(descriptor.policy_score,sizeof(PreparedActorRefreshDevice),
+            alignof(PreparedActorRefreshDevice))) { semantic_content_integrity_trap();return; }
     auto viability=legal+262144;
     __shared__ semantic_graph::ResidentHandle base;
     __shared__ PublicationBank* acquired_bank;
@@ -8410,7 +8485,7 @@ extern "C" __global__ void semantic_transition_execute(Descriptor descriptor) {
                 failed=1;state->status=7;
             }
         } else program_bank=TaskProgramBank{};
-        const bool critic_admissible=!task || !descriptor.policy.z ||
+        const bool critic_admissible=fixed_score || !task || !descriptor.policy.z ||
             (task && !failed && task_critic_admissible(descriptor.task_return_bound,descriptor.policy,&sampler_work));
         execution_work_merge_native(state->execution_work,sampler_work);
         sampler_work=semantic_graph::NativeWorkTally{};
@@ -8420,6 +8495,11 @@ extern "C" __global__ void semantic_transition_execute(Descriptor descriptor) {
             if(!control.continuation) { semantic_content_integrity_trap();return; }
             const auto& pending=*reinterpret_cast<const PendingContinuation*>(control.continuation);
             transition_kind=pending.transition_kind;
+            if(fixed_score && (transition_kind!=1 || demonstration->abi!=1 || demonstration->status ||
+               demonstration->role!=1 || demonstration->demonstrated_lane<1 || demonstration->demonstrated_lane>2 ||
+               demonstration->child_control!=descriptor.publication.control)) {
+                semantic_content_integrity_trap();return;
+            }
             uint8_t numerical=1;
             if(transition_kind==3) {
                 if(pending.numerical_admissibility || pending.training_selection ||
@@ -8546,7 +8626,7 @@ extern "C" __global__ void semantic_transition_execute(Descriptor descriptor) {
                 base={header.semantic_owner,semantic_graph::kRootKind,header.semantic_slot,header.semantic_generation};
                 state->model_generation=uint32_t(header.model_generation);state->family_id=uint32_t(header.family_id);
                 state->stream_serial=header.stream_serial;state->proposal=state->next_proposal=header.proposal;
-                publication_refusal_snapshot(descriptor,base,acquired_bank,state);
+                if(!fixed_score)publication_refusal_snapshot(descriptor,base,acquired_bank,state);
                 numerical_refused=true;failed=1;
                 state->status=state->execution_work.overflow ? 11 :
                     training_status ? 11+training_status :
@@ -8585,9 +8665,26 @@ extern "C" __global__ void semantic_transition_execute(Descriptor descriptor) {
     if(threadIdx.x==0) {
         if(!failed && descriptor.publication.control) {
             auto& control=*reinterpret_cast<PublicationControl*>(descriptor.publication.control);
-            control.refusal=publication_begin(descriptor,state,&acquired_bank,&acquired_word,&structural_end,&publication_held,&publication_staged);
-            if(control.refusal){failed=1;state->status=10;}
-            else {
+            if(fixed_score) {
+                PublicationAttemptWork admission_work(state->execution_work);
+                const auto& lease=*reinterpret_cast<const PublicationLease*>(descriptor.publication.lease);
+                acquired_bank=publication_acquired_bank(control,lease,&admission_work.actual);
+                acquired_word=lease.word;
+                if(!acquired_bank || publication_load(control.word)!=lease.word || lease.transition_kind!=1 ||
+                   publication_validate_selected_model(control,*acquired_bank,&admission_work.actual) ||
+                   !publication_model_cache_ready(control,*acquired_bank,&admission_work.actual) ||
+                   acquired_bank->header.model_generation!=demonstration->acquired_generation ||
+                   !publication_identity_equal(acquired_bank->header.model_geometry_digest,
+                       demonstration->model_geometry_digest,&admission_work.actual) ||
+                   !publication_identity_equal(acquired_bank->header.model_numerical_digest,
+                       demonstration->model_numerical_digest,&admission_work.actual)) {
+                    semantic_content_integrity_trap();return;
+                }
+            } else {
+                control.refusal=publication_begin(descriptor,state,&acquired_bank,&acquired_word,&structural_end,&publication_held,&publication_staged);
+                if(control.refusal){failed=1;state->status=10;}
+            }
+            if(!failed) {
                 base={acquired_bank->header.semantic_owner,semantic_graph::kRootKind,
                     acquired_bank->header.semantic_slot,acquired_bank->header.semantic_generation};
                 state->model_generation=uint32_t(acquired_bank->header.model_generation);
@@ -8600,8 +8697,8 @@ extern "C" __global__ void semantic_transition_execute(Descriptor descriptor) {
         if(!failed && task && (task[0]!=9 || task[1]!=descriptor.arena[1])) {
             failed=1;state->status=7;
         }
-        if(!failed && task)state->actor_eligible=program_bank.task.actor_eligible;
-        if(!failed && task && !task_ground_acquire(descriptor,acquired_bank,program_bank.task,transition_kind,state)) {
+        if(!failed && task && !fixed_score)state->actor_eligible=program_bank.task.actor_eligible;
+        if(!failed && task && !task_ground_acquire(descriptor,acquired_bank,program_bank.task,fixed_score ? 2 : transition_kind,state)) {
             failed=1;state->status=9;
         }
         if(!failed && program_bank.editable) {
@@ -8723,7 +8820,7 @@ extern "C" __global__ void semantic_transition_execute(Descriptor descriptor) {
     __syncthreads();
     execution_work_merge_parallel(state->execution_work,sampler_work);
     if(threadIdx.x==0) {
-        if(!failed) {
+        if(!failed && !fixed_score) {
             if(acquired_bank && transition_kind!=1)
                 publication_snapshot(descriptor,base,&state->semantic_receipts[0],&state->execution_work);
             else semantic_call(descriptor,semantic_graph::kResidentPreflightTransitionAdmission,&base,nullptr,&state->semantic_receipts[0],nullptr,nullptr,&state->execution_work);
@@ -8732,7 +8829,7 @@ extern "C" __global__ void semantic_transition_execute(Descriptor descriptor) {
                 (acquired_bank ? acquired_bank->header.semantic_digest[i] : books[17+i]);
             if(failed)state->status=4;
         }
-        if(!failed && task && transition_kind==1) {
+        if(!failed && !fixed_score && task && transition_kind==1) {
             state->execution_work.active_candidate=1;
             if(!(program_bank.editable
                 ? task_program_queries(descriptor,task,program_bank,0,nullptr,0,0,
@@ -8791,7 +8888,7 @@ extern "C" __global__ void semantic_transition_execute(Descriptor descriptor) {
             ? reinterpret_cast<uint8_t*>(descriptor.policy.final_masks)+component.offset : nullptr;
         uint8_t* active_sets=descriptor.policy.z
             ? reinterpret_cast<uint8_t*>(descriptor.policy.active_sets)+component.offset : nullptr;
-        if(threadIdx.x==0 && ordinal%68==0) {
+        if(threadIdx.x==0 && !fixed_score && ordinal%68==0) {
             state->execution_work.active_candidate=lane+2;
             semantic_call(descriptor,semantic_graph::kResidentForkAdmission,&base,nullptr,&candidate,nullptr,nullptr,&state->execution_work);
             lane_live=candidate.words[41]!=0;
@@ -8809,12 +8906,15 @@ extern "C" __global__ void semantic_transition_execute(Descriptor descriptor) {
             }
             __syncthreads();
             if(threadIdx.x==0) {
-                Receipt result=component_receipt(component,*state,&sampler_work);
+                Receipt result=component_receipt(component,*state,&sampler_work,!fixed_score);
+                if(fixed_score && demonstration->demonstrated_choices[ordinal]!=TEXT_NULL) {
+                    failed=1;state->status=2;
+                }
                 result.choice=TEXT_NULL;result.legal_count=result.active_count=1;
                 result.p.w[0]=result.q.w[0]=result.factor_denominator.w[0]=1;
                 result.cdf_end=result.mass=uint64_t(1)<<63;
                 retain_policy_cell(descriptor.policy,component,result,0.0f,U192{},U192{},true);
-                receipts[ordinal]=result;++state->blocks;
+                receipts[ordinal]=result;if(!fixed_score)++state->blocks;
                 semantic_graph::charge_native(&sampler_work,semantic_graph::NativeWorkEvent::CanonicalByte,sizeof(Receipt));
             }
             execution_work_merge_parallel(state->execution_work,sampler_work);
@@ -8888,28 +8988,13 @@ extern "C" __global__ void semantic_transition_execute(Descriptor descriptor) {
             __syncthreads();
         }
         if(threadIdx.x==0) {
-            Receipt result=component_receipt(component,*state,&sampler_work);result.legal_count=count;
-            float maximum=row[sorted[0]];
+            Receipt result=component_receipt(component,*state,&sampler_work,!fixed_score);
+            float maximum=0.0f;
             U192 g={{0,0,0}},active_sum={{0,0,0}};
-            ++state->blocks;
-            if(count==1) {
-                result.choice=sorted[0];result.p.w[0]=result.q.w[0]=result.factor_denominator.w[0]=1;
-                result.active_count=1;result.cdf_end=result.mass=uint64_t(1)<<63;
-                if(active_sets)active_sets[sorted[0]]=1;
-            } else {
-                g=sub(shifted(1,149),shifted(count,118));
-                U192 prefix={{0,0,0}};
-                uint32_t h=0;
-                for(uint32_t i=0;i<count;++i) {
-                    semantic_graph::charge_native(&sampler_work,semantic_graph::NativeWorkEvent::CdfStep,1);
-                    U192 d=distance_scaled(maximum,row[sorted[i]]);
-                    prefix=add(prefix,d);
-                    if(compare(multiply(d,i+1),add(prefix,g))<0){h=i+1;active_sum=prefix;}
-                }
-                result.active_count=h;result.q=shifted(h,149);
-                if(active_sets)for(uint32_t i=0;i<h;++i)active_sets[sorted[i]]=1;
-                U192 cumulative={{0,0,0}};
-                uint64_t lower=0;
+            if(!fixed_score)++state->blocks;
+            bool supported=semantic_conditional_policy::prepare_conditional_cell(
+                row,sorted,count,active_sets,result,maximum,g,active_sum,&sampler_work);
+            if(count>1) {
                 // Restore original categorical order, independently of compaction.
                 uint32_t n=0;
                 for(uint32_t i=0;i<component.cardinality;++i)if((mask[i] ||
@@ -8917,26 +9002,11 @@ extern "C" __global__ void semantic_transition_execute(Descriptor descriptor) {
                     legal_category(component,i,books,components,support,
                         32+(edit/2)*68+(edit%2)*18,program_bank,viable,choices,
                         actions[edit][0],actions[edit][1],actions[edit][2],&sampler_work))legal[n++]=i;
-                for(uint32_t index=0;index<count;++index) {
-                    semantic_graph::charge_native(&sampler_work,semantic_graph::NativeWorkEvent::CdfStep,1);
-                    uint32_t i=legal[index];
-                    U192 base=add(active_sum,g), hd=multiply(distance_scaled(maximum,row[i]),h);
-                    U192 p=shifted(h,118);
-                    if(compare(base,hd)>0)p=add(p,sub(base,hd));
-                    U192 below=cumulative;
-                    cumulative=add(cumulative,p);
-                    uint64_t upper=boundary(cumulative,h);
-                    if(result.draw>=lower && result.draw<upper) {
-                        result.choice=i;result.p=p;result.cdf_start=lower;result.cdf_end=upper;
-                        result.selected_rank=index;result.cumulative_mass_below=below;
-                        result.mass=upper-lower;result.factor_denominator=multiply(shifted(h,86),result.mass);
-                    }
-                    lower=upper;
-                }
-                if(compare(cumulative,result.q)!=0 || lower!=(uint64_t(1)<<63) || result.mass==0) {
-                    failed=1;state->status=3;
-                }
             }
+            supported &= semantic_conditional_policy::retain_selected_probability(
+                row,legal,count,fixed_score,fixed_score ? uint32_t(demonstration->demonstrated_choices[ordinal]) : 0,
+                result,maximum,g,active_sum,&sampler_work);
+            if(!supported) { failed=1;state->status=fixed_score ? 2 : 3; }
             if(component.kind==COMPONENT_KIND_EDIT) {
                 choices[component.field]=result.choice;
                 if(choices[0]==ACTION_APPLY && component.field>=1) {
@@ -8951,7 +9021,7 @@ extern "C" __global__ void semantic_transition_execute(Descriptor descriptor) {
             retain_policy_cell(descriptor.policy,component,result,maximum,g,active_sum,count==1);
             receipts[ordinal]=result;
             semantic_graph::charge_native(&sampler_work,semantic_graph::NativeWorkEvent::CanonicalByte,sizeof(Receipt));
-            if(!failed && component.kind==COMPONENT_KIND_EDIT && component.field==17) {
+            if(!failed && !fixed_score && component.kind==COMPONENT_KIND_EDIT && component.field==17) {
                 auto output=&state->semantic_receipts[1+lane*3+component.slot];
                 if(choices[0]==ACTION_APPLY && choices[1]==2 && program_bank.editable &&
                    candidate.words[0]==semantic_graph::kOk) {
@@ -8989,7 +9059,7 @@ extern "C" __global__ void semantic_transition_execute(Descriptor descriptor) {
                     if(output->words[0]==0)output->words[1]=0;
                 }
             }
-            if(!failed && ordinal%68==67) {
+            if(!failed && !fixed_score && ordinal%68==67) {
                 uint64_t admission=semantic_graph::kResidentSealAdmission;
                 if(task) {
                     if(state->task_evaluation.lane_refusal[lane]) {
@@ -9051,6 +9121,13 @@ extern "C" __global__ void semantic_transition_execute(Descriptor descriptor) {
         }
         __syncthreads();
 #endif
+    }
+    if(fixed_score) {
+        if(threadIdx.x==0) {
+            state->execution_work.active_candidate=0;
+            if(state->execution_work.overflow)state->status=11;
+        }
+        return;
     }
     if(threadIdx.x==0) {
         if(failed && lane_live) {
