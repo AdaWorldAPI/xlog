@@ -3575,6 +3575,8 @@ pub(super) fn continuation_preparation_geometry_native_work_ceiling(
             0,
             ceiling_sum([
                 12,
+                // The optional six-word capacity cause is not known until binding.
+                6,
                 s,
                 ceiling_product(s, s.saturating_sub(1))? / 2,
                 publication_source_validation_native_work_ceiling(contract)?,
@@ -3592,6 +3594,7 @@ pub(super) fn continuation_preparation_geometry_native_work_ceiling(
             0,
             ceiling_sum([
                 64,
+                6 * size_of::<u64>() as u64, // Private capacity-cause snapshot.
                 2 * size_of::<PublicationRange>() as u64 + 5 * 8,
                 ceiling_product(rows, size_of::<SemanticActiveRow>() as u64)?,
                 size_of::<PendingContinuation>() as u64 - 3 * 8,
@@ -3935,7 +3938,9 @@ fn publication_finalization_native_work_ceiling(
         capacity(15, 0)?,
         capacity(31, 0)?,
     ])?;
-    add_native_work_ceiling(&mut result, [0, 11 + 5 + 4, 0, 0, 0, 0, 0, 0, fixed])?;
+    // Execute validates the optional capacity cause once, including its refusal
+    // prefix before publication begins. Cold geometry reserves the present case.
+    add_native_work_ceiling(&mut result, [0, 11 + 5 + 4 + 6, 0, 0, 0, 0, 0, 0, fixed])?;
     native_work_ceiling_units(result)?;
     Ok(result)
 }

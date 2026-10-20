@@ -615,6 +615,64 @@ impl PreparedTensorContentPlan {
         Ok(())
     }
 
+    pub(super) fn require_capacity_payload(
+        &self,
+        bank: usize,
+        witness: &SemanticTensorContentWitness,
+        anchor: &PreparedSemanticTensor,
+        payload: &PreparedSemanticTensor,
+        allocation_ordinal: u64,
+    ) -> Result<u64, SemanticTransitionError> {
+        self.require_binding(bank, PreparedContentBindingKind::Continuation, witness)?;
+        let plan = &self.banks[bank];
+        let slot = plan
+            .bindings
+            .continuation_slot
+            .expect("checked continuation slot");
+        let state = plan
+            .state
+            .lock()
+            .map_err(|_| publication_input_error("prepared content custody is poisoned"))?;
+        let event = plan
+            .events
+            .iter()
+            .find(|event| {
+                event.kind == SemanticSourceContentKind::Capture && event.output_slot == Some(slot)
+            })
+            .ok_or(SemanticTransitionError::ObservationMismatch)?;
+        let descriptor = event
+            .tensors
+            .iter()
+            .find(|tensor| tensor.layout == anchor.layout)
+            .ok_or(SemanticTransitionError::ObservationMismatch)?;
+        let (base, span, _) = state
+            .allocations
+            .get(&allocation_ordinal)
+            .ok_or(SemanticTransitionError::ObservationMismatch)?;
+        let bytes = tensor_layout_bytes(&payload.layout)? as u64;
+        if descriptor.allocation_slot != allocation_ordinal
+            || descriptor.byte_offset != 0
+            || event
+                .allocations
+                .iter()
+                .find(|allocation| allocation.slot == allocation_ordinal)
+                .is_none_or(|allocation| allocation.span_bytes != *span)
+            || bytes == 0
+            || bytes != *span
+            || payload.data != *base
+            || anchor.data != *base
+            || payload
+                .source
+                .as_ref()
+                .is_none_or(|source| source.len() as u64 != bytes)
+        {
+            return Err(publication_input_error(
+                "capacity payload differs from its original frozen allocation and witnessed anchor",
+            ));
+        }
+        Ok(*span)
+    }
+
     pub(super) fn claim(
         &self,
         session: &SemanticTransitionSession,
