@@ -1,11 +1,12 @@
-//! Original frozen source content expressions and their immutable projections.
+//! Original frozen tensor-content descriptors and source occurrence projections.
 
 use super::prepared_import::PySemanticPreparedSourceContent;
 use super::*;
 use xlog_cuda::{
-    SemanticSourceAllocationDescriptor, SemanticSourceContentAllocation,
-    SemanticSourceContentEvent, SemanticSourceContentFamily, SemanticSourceContentKind,
-    SemanticSourceContentOccurrence, SemanticSourceContentPhase, SemanticSourceTensorDescriptor,
+    SemanticPreparedTensorContentEvent, SemanticSourceAllocationDescriptor,
+    SemanticSourceContentAllocation, SemanticSourceContentEvent, SemanticSourceContentFamily,
+    SemanticSourceContentKind, SemanticSourceContentOccurrence, SemanticSourceContentPhase,
+    SemanticSourceTensorDescriptor,
 };
 
 #[pyclass(
@@ -147,7 +148,7 @@ fn prepared_kind_name(
     }
 }
 
-pub(super) fn reserve_events(
+pub(super) fn reserve_events<E>(
     events: &Bound<'_, PyAny>,
     pool: &xlog_cuda::SemanticReplayMaterialBudget,
 ) -> PyResult<xlog_cuda::SemanticReplayMaterialReservation> {
@@ -155,9 +156,7 @@ pub(super) fn reserve_events(
     let rows = exact_tuple(events, None, &mut transport)?;
     let mut extent = rows
         .len()
-        .checked_mul(std::mem::size_of::<
-            SemanticSourceContentEvent<SemanticSourceContentAllocation>,
-        >())
+        .checked_mul(std::mem::size_of::<E>())
         .ok_or_else(|| invalid("source content input roster extent overflow"))?;
     for row in rows.iter() {
         let row = exact_tuple(&row, Some(5), &mut transport)?;
@@ -588,6 +587,64 @@ pub(super) fn parse_allocation_descriptors(
 pub(super) fn parse_events(
     events: &Bound<'_, PyAny>,
 ) -> PyResult<Vec<SemanticSourceContentEvent<SemanticSourceContentAllocation>>> {
+    parse_event_descriptors(
+        events,
+        |family, receiver_slot, output_slot, tensors, allocations| {
+            Ok(SemanticSourceContentEvent {
+                family: family
+                    .extract::<PyRef<'_, PySemanticSourceContentFamily>>()?
+                    .inner
+                    .clone(),
+                receiver_slot,
+                output_slot,
+                tensors,
+                allocations,
+            })
+        },
+    )
+}
+
+pub(super) fn parse_prepared_events(
+    events: &Bound<'_, PyAny>,
+) -> PyResult<Vec<SemanticPreparedTensorContentEvent>> {
+    parse_event_descriptors(
+        events,
+        |kind, receiver_slot, output_slot, tensors, allocations| {
+            if !kind.is_exact_instance_of::<PyString>() {
+                return Err(invalid(
+                    "prepared tensor content kind must be an exact string",
+                ));
+            }
+            let kind = match kind.extract::<&str>()? {
+                "capture" => SemanticSourceContentKind::Capture,
+                "verify" => SemanticSourceContentKind::Verify,
+                _ => {
+                    return Err(invalid(
+                        "prepared tensor content kind must be capture or verify",
+                    ))
+                }
+            };
+            Ok(SemanticPreparedTensorContentEvent {
+                kind,
+                receiver_slot,
+                output_slot,
+                tensors,
+                allocations,
+            })
+        },
+    )
+}
+
+fn parse_event_descriptors<E>(
+    events: &Bound<'_, PyAny>,
+    mut event: impl FnMut(
+        &Bound<'_, PyAny>,
+        u64,
+        Option<u64>,
+        Vec<SemanticSourceTensorDescriptor>,
+        Vec<SemanticSourceAllocationDescriptor<SemanticSourceContentAllocation>>,
+    ) -> PyResult<E>,
+) -> PyResult<Vec<E>> {
     // Reuse the original cold-metadata transport bound; this is not a native
     // operation count, content price, remaining budget or numerical allowance.
     let mut budget = 16 * 1024 * 1024;
@@ -595,22 +652,12 @@ pub(super) fn parse_events(
     let mut result = Vec::with_capacity(rows.len());
     for row in rows.iter() {
         let row = exact_tuple(&row, Some(5), &mut budget)?;
-        let family = row
-            .get_item(0)?
-            .extract::<PyRef<'_, PySemanticSourceContentFamily>>()?
-            .inner
-            .clone();
+        let kind = row.get_item(0)?;
         let receiver = unsigned(&row.get_item(1)?)?;
         let output = optional_unsigned(&row.get_item(2)?)?;
         let tensors = parse_tensor_descriptors(&row.get_item(3)?, &mut budget)?;
         let allocations = parse_allocation_descriptors(&row.get_item(4)?, &mut budget)?;
-        result.push(SemanticSourceContentEvent {
-            family,
-            receiver_slot: receiver,
-            output_slot: output,
-            tensors,
-            allocations,
-        });
+        result.push(event(&kind, receiver, output, tensors, allocations)?);
     }
     Ok(result)
 }

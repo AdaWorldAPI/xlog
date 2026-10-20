@@ -951,7 +951,9 @@ impl PySemanticPreparedSourceContentGeometry {
             original.require_events(events)?;
         }
         if cache.occurrences.is_none() {
-            let _input = source_content_occurrences::reserve_events(events, &pool)?;
+            let _input = source_content_occurrences::reserve_events::<
+                xlog_cuda::SemanticSourceContentEvent<xlog_cuda::SemanticSourceContentAllocation>,
+            >(events, &pool)?;
             let events_native = source_content_occurrences::parse_events(events)?;
             let metadata =
                 source_content_occurrences::reserve_occurrences(events_native.len(), &pool)?;
