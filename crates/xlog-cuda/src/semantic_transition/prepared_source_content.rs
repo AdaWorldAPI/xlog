@@ -565,6 +565,9 @@ pub struct SemanticSourceGeometryTensor {
 }
 
 impl SemanticSourceGeometryAllocation {
+    pub(super) fn belongs_to(&self, owner: &SourceContentGeometryOwner) -> bool {
+        Arc::ptr_eq(&self.scope, &owner.scope)
+    }
     fn declared(
         scope: &Arc<()>,
         port: SourceGeometryAllocationPort,
@@ -945,7 +948,7 @@ impl SourceContentGeometryOwner {
         Ok(())
     }
 
-    fn classify_tensor(
+    pub(super) fn classify_tensor(
         &self,
         allocation: &SemanticSourceGeometryAllocation,
         descriptor: &super::source_content_occurrences::SemanticSourceTensorDescriptor,
