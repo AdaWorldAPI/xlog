@@ -7839,6 +7839,122 @@ fn bind_archived_replay_row(
     Ok(ColdValue::Sequence(fields))
 }
 
+fn read_replay_material_pair(
+    material: &Bound<'_, PyAny>,
+    budget: &mut usize,
+    max_material_bytes: usize,
+    total_material_bytes: &mut usize,
+    unique_materials: &mut BTreeMap<String, ColdValue>,
+    material_sources: &Arc<material_source::MaterialSourceRegistry>,
+) -> PyResult<ColdValue> {
+    let pair = object_sequence(material, budget)?;
+    if pair.len() != 2 {
+        return Err(invalid(
+            "replay material requires its reference and original payload or reconstruction",
+        ));
+    }
+    let reference = read_material_reference(&pair[0], budget)?;
+    let payload = if pair[1].is_none() {
+        ReplayPayloadView::Reconstructed
+    } else if pair[1].is_exact_instance_of::<PyBytes>() {
+        ReplayPayloadView::Bytes(exact_replay_bytes(&pair[1])?)
+    } else {
+        ReplayPayloadView::Stored(material_source::StoredMaterial::read(&pair[1])?)
+    };
+    let payload = bind_replay_material_payload(
+        &reference,
+        payload,
+        max_material_bytes,
+        total_material_bytes,
+        unique_materials,
+        material_sources,
+    )?;
+    Ok(ColdValue::Sequence(vec![reference, payload]))
+}
+
+type LoadedCodingProposal = (
+    xlog_cuda::SemanticReplayMaterial,
+    xlog_cuda::SemanticResolvedReplayMaterial,
+    xlog_cuda::SemanticReplayLoadedMaterial,
+);
+
+fn read_coding_proposals(
+    proposals: &Bound<'_, PyAny>,
+    budget: &mut usize,
+    max_material_bytes: usize,
+    total_material_bytes: &mut usize,
+    max_evidence_bytes: usize,
+    unique_materials: &mut BTreeMap<String, ColdValue>,
+    material_sources: &Arc<material_source::MaterialSourceRegistry>,
+) -> PyResult<Vec<LoadedCodingProposal>> {
+    if !proposals.is_exact_instance_of::<PyTuple>() {
+        return Err(invalid(
+            "coding Proposal custody requires its original tuple",
+        ));
+    }
+    let candidates = object_sequence(proposals, budget)?;
+    let mut originals = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let fields = object_sequence(&candidate, budget)?;
+        if fields.len() != 5 {
+            return Err(invalid("coding Proposal requires original B/S, base material, action material and evidence"));
+        }
+        let before = ColdValue::read(&fields[0], budget, 0)?;
+        let after = ColdValue::read(&fields[1], budget, 0)?;
+        let predecessor = read_replay_material_pair(
+            &fields[2],
+            budget,
+            max_material_bytes,
+            total_material_bytes,
+            unique_materials,
+            material_sources,
+        )?;
+        let action = read_replay_material_pair(
+            &fields[3],
+            budget,
+            max_material_bytes,
+            total_material_bytes,
+            unique_materials,
+            material_sources,
+        )?;
+        let predecessor = ReplayMaterial::parse(&predecessor, &BTreeSet::new())?;
+        let action = ReplayMaterial::parse(&action, &BTreeSet::new())?;
+        if predecessor.kind != "logical-state"
+            || predecessor.identity != before.text()?
+            || action.kind != "action"
+            || predecessor.reconstruction.is_some()
+            || action.reconstruction.is_some()
+        {
+            return Err(invalid(
+                "coding Proposal must retain its actual native base and original action witness",
+            ));
+        }
+        let evidence = exact_replay_bytes(&fields[4])?;
+        if evidence.len() > max_evidence_bytes {
+            return Err(invalid(
+                "coding Proposal evidence exceeds its original native limit",
+            ));
+        }
+        let evidence = ColdValue::ReplayBytes(material_source::ReplayPayload::new(
+            material_sources,
+            evidence,
+        )?)
+        .load_payload()?;
+        let replay = xlog_cuda::SemanticReplayMaterial::decode_owned(
+            predecessor.load_original()?,
+            evidence,
+            replay_digest_identity(before.text()?)?,
+            replay_digest_identity(after.text()?)?,
+        )
+        .map_err(xlog_err)?;
+        let original = replay
+            .resolve_predecessor(predecessor.load_original()?)
+            .map_err(xlog_err)?;
+        originals.push((replay, original, action.load_original()?));
+    }
+    Ok(originals)
+}
+
 fn read_replay_rows(
     value: &Bound<'_, PyAny>,
     budget: &mut usize,
@@ -7847,11 +7963,33 @@ fn read_replay_rows(
     max_evidence_bytes: usize,
     material_sources: &Arc<material_source::MaterialSourceRegistry>,
 ) -> PyResult<ColdValue> {
-    if max_material_bytes == 0 || total_material_bytes == 0 || max_evidence_bytes == 0 {
+    if total_material_bytes == 0 {
+        return Err(invalid("replay kit byte caps must be positive integers"));
+    }
+    read_replay_rows_with_materials(
+        value,
+        budget,
+        max_material_bytes,
+        &mut total_material_bytes,
+        max_evidence_bytes,
+        &mut BTreeMap::new(),
+        material_sources,
+    )
+}
+
+fn read_replay_rows_with_materials(
+    value: &Bound<'_, PyAny>,
+    budget: &mut usize,
+    max_material_bytes: usize,
+    total_material_bytes: &mut usize,
+    max_evidence_bytes: usize,
+    unique_materials: &mut BTreeMap<String, ColdValue>,
+    material_sources: &Arc<material_source::MaterialSourceRegistry>,
+) -> PyResult<ColdValue> {
+    if max_material_bytes == 0 || max_evidence_bytes == 0 {
         return Err(invalid("replay kit byte caps must be positive integers"));
     }
     let mut rows = Vec::new();
-    let mut unique_materials = BTreeMap::<String, ColdValue>::new();
     for row in object_sequence(value, budget)? {
         let fields = object_sequence(&row, budget)?;
         if fields.len() != 5 {
@@ -7861,29 +7999,14 @@ fn read_replay_rows(
         }
         let mut materials = Vec::new();
         for material in object_sequence(&fields[3], budget)? {
-            let pair = object_sequence(&material, budget)?;
-            if pair.len() != 2 {
-                return Err(invalid(
-                    "replay material requires its reference and original payload or reconstruction",
-                ));
-            }
-            let reference = read_material_reference(&pair[0], budget)?;
-            let payload = if pair[1].is_none() {
-                ReplayPayloadView::Reconstructed
-            } else if pair[1].is_exact_instance_of::<PyBytes>() {
-                ReplayPayloadView::Bytes(exact_replay_bytes(&pair[1])?)
-            } else {
-                ReplayPayloadView::Stored(material_source::StoredMaterial::read(&pair[1])?)
-            };
-            let payload = bind_replay_material_payload(
-                &reference,
-                payload,
+            materials.push(read_replay_material_pair(
+                &material,
+                budget,
                 max_material_bytes,
-                &mut total_material_bytes,
-                &mut unique_materials,
+                total_material_bytes,
+                unique_materials,
                 material_sources,
-            )?;
-            materials.push(ColdValue::Sequence(vec![reference, payload]));
+            )?);
         }
         let evidence = exact_replay_bytes(&fields[4])?;
         if evidence.len() > max_evidence_bytes {
@@ -8595,6 +8718,28 @@ impl ReplayRow {
             .map_err(xlog_err)
     }
 
+    fn coding_proposal_materials(
+        &self,
+        replay: &xlog_cuda::SemanticReplayMaterial,
+    ) -> PyResult<(
+        xlog_cuda::SemanticResolvedReplayMaterial,
+        xlog_cuda::SemanticReplayLoadedMaterial,
+    )> {
+        let identity = self.action_identity()?;
+        let action = self
+            .materials
+            .iter()
+            .find(|material| {
+                material.kind == "action"
+                    && replay_digest_identity(&material.identity).ok() == Some(identity)
+            })
+            .ok_or_else(|| invalid("coding contributor has no original native action witness"))?;
+        Ok((
+            self.resolve_native_predecessor(replay)?,
+            action.load_original()?,
+        ))
+    }
+
     fn action_identity(&self) -> PyResult<Identity256> {
         let mut actions = self.materials.iter().filter(|item| item.kind == "action");
         let action = actions
@@ -8793,6 +8938,7 @@ impl ReplayRow {
                 training_seed,
                 task_content,
                 origin,
+                actor_refresh::original_edit_demonstration_material_roots(self)?,
             )
             .map_err(xlog_err)
     }
@@ -11179,7 +11325,8 @@ impl TaskAuthority {
                             )
                         })?;
                     if binding.observation_record != statement
-                        || observation[0] != 1
+                        || !matches!(observation[0], 1 | 2)
+                        || (observation[0] == 2 && observation[6..10] != observation[10..14])
                         || !matches!(observation[1], 1 | 2)
                         || observation[2..]
                             .chunks_exact(4)
@@ -13315,6 +13462,8 @@ struct PendingDeliveryReceiver {
             Identity256,
             Identity256,
             OriginalVerificationMaterials,
+            xlog_cuda::SemanticResolvedReplayMaterial,
+            xlog_cuda::SemanticReplayLoadedMaterial,
         )>,
     >,
 }
@@ -22877,6 +23026,11 @@ impl PySemanticTransitionController {
                 let row = row.cast::<PyTuple>()?;
                 let observed = row.get_item(3)?;
                 let original = match outcome {
+                    xlog_cuda::SemanticPreparedStepOutcome::PolicyScore { .. } => {
+                        return Err(invalid(
+                            "a private demonstration score is not a public action outcome",
+                        ));
+                    }
                     xlog_cuda::SemanticPreparedStepOutcome::Skipped { .. } => None,
                     xlog_cuda::SemanticPreparedStepOutcome::Completed { outcome, .. } => {
                         transition_refusal_report(py, outcome)?
@@ -26622,6 +26776,8 @@ impl PySemanticTransitionController {
                             Identity256,
                             Identity256,
                             OriginalVerificationMaterials,
+                            xlog_cuda::SemanticResolvedReplayMaterial,
+                            xlog_cuda::SemanticReplayLoadedMaterial,
                         )>() as u64)
                     })
                     .ok_or_else(|| invalid("receiver acquisition metadata extent overflow"))?,
@@ -26748,14 +26904,18 @@ impl PySemanticTransitionController {
                     let training_row = row.training_view_row()?;
                     let verification_materials = row.acquired_verification_materials()?;
                     let action_identity = row.action_identity()?;
+                    let replay = row.native_replay()?.material;
+                    let (original, action) = row.coding_proposal_materials(&replay)?;
                     parsed.push((
-                        row.native_replay()?.material,
+                        replay,
                         training_row,
                         bytes.clone(),
                         action_identity,
                         record_digest,
                         evidence_digest,
                         verification_materials,
+                        original,
+                        action,
                     ));
                 }
             }
@@ -27035,14 +27195,95 @@ impl PySemanticTransitionController {
         Ok(result.unbind())
     }
 
-    /// Publish the authenticated acquired replay row and its delivery receipt
+    /// Prove the ordered original Proposal roster from the actual delivered tokens.
+    #[pyo3(signature = (task_use, *, parent, stable_intent, proposals, material_source))]
+    fn coding_intent_contributors(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        task_use: &PySemanticTransitionTaskUse,
+        parent: &Bound<'_, PySemanticPublishedParent>,
+        stable_intent: &Bound<'_, PyAny>,
+        proposals: &Bound<'_, PyAny>,
+        material_source: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyTuple>> {
+        let controller = slf.borrow();
+        let acquired = parent.borrow();
+        controller.session.borrow(py).require_creator()?;
+        controller.require_issued(task_use)?;
+        acquired.require_task(py, task_use)?;
+        if acquired.session.as_ptr() != controller.session.as_ptr() {
+            return Err(invalid(
+                "coding contributor parent belongs to another Session",
+            ));
+        }
+        if !proposals.is_exact_instance_of::<PyTuple>() {
+            return Err(invalid(
+                "coding Proposal custody requires its original tuple",
+            ));
+        }
+        let stable = exact_replay_bytes(stable_intent)?;
+        let stable = Identity256::from_bytes(
+            stable
+                .try_into()
+                .map_err(|_| invalid("coding intent identity must contain exactly 32 bytes"))?,
+        );
+        let limits = {
+            let session = controller.session.borrow(py);
+            let owner = session.owner()?;
+            task_use.require_current(&owner)?;
+            owner
+                .replay_append_limits(&*acquired.lease()?)
+                .map_err(xlog_err)?
+        };
+        let [metadata_limit, material_limit, total_limit, evidence_limit] = limits.map(|limit| {
+            usize::try_from(limit)
+                .map_err(|_| invalid("coding contributor limit exceeds host address space"))
+        });
+        let mut budget = metadata_limit?;
+        let material_limit = material_limit?;
+        let mut total_limit = total_limit?;
+        let evidence_limit = evidence_limit?;
+        bind_inherited_material_source(
+            py,
+            &controller.session.borrow(py),
+            &task_use.checkpoint.material_sources,
+            material_source,
+        )?;
+        let pool = task_use.checkpoint.material_sources.native_budget()?;
+        let _metadata = pool.reserve_auxiliary(budget as u64).map_err(xlog_err)?;
+        let mut unique_materials = BTreeMap::new();
+        let originals = read_coding_proposals(
+            proposals,
+            &mut budget,
+            material_limit,
+            &mut total_limit,
+            evidence_limit,
+            &mut unique_materials,
+            &task_use.checkpoint.material_sources,
+        )?;
+        let proposals = originals
+            .iter()
+            .map(|(replay, original, action)| (replay, original, action))
+            .collect::<Vec<_>>();
+        let session = controller.session.borrow(py);
+        let mut owner = session.owner()?;
+        task_use.require_current(&owner)?;
+        let indices = owner
+            .coding_intent_contributors(&*acquired.lease()?, stable, &proposals)
+            .map_err(xlog_err)?;
+        drop(owner);
+        drop(session);
+        Ok(PyTuple::new(py, indices)?.unbind())
+    }
+
+    /// Publish the authenticated acquired replay batch and its delivery receipt
     /// through the same native acknowledgement operation.
-    #[pyo3(signature = (task_use, *, parent, snapshot, delivery_receipt, result_receipt, replay_row, material_source))]
+    #[pyo3(signature = (task_use, *, parent, snapshot, delivery_receipt, receiver_outcome, proposals, result_receipts, replay_rows, material_source))]
     #[expect(
         clippy::too_many_arguments,
         reason = "replay acknowledgement retains its original authority, receipts and complete row"
     )]
-    /// Acquire and acknowledge one original replay row. An entered/unknown
+    /// Acquire and acknowledge one complete contributor batch. An entered/unknown
     /// result raises SemanticReplayDeliveryPending with its original owners.
     fn acknowledge_replay_delivery(
         slf: &Bound<'_, Self>,
@@ -27051,8 +27292,10 @@ impl PySemanticTransitionController {
         parent: &Bound<'_, PySemanticPublishedParent>,
         snapshot: &Bound<'_, PyAny>,
         delivery_receipt: &Bound<'_, PyAny>,
-        result_receipt: &Bound<'_, PyAny>,
-        replay_row: &Bound<'_, PyAny>,
+        receiver_outcome: &Bound<'_, PyAny>,
+        proposals: &Bound<'_, PyAny>,
+        result_receipts: &Bound<'_, PyAny>,
+        replay_rows: &Bound<'_, PyAny>,
         material_source: &Bound<'_, PyAny>,
     ) -> PyResult<Py<PyTuple>> {
         let controller = slf.borrow();
@@ -27063,21 +27306,21 @@ impl PySemanticTransitionController {
         if acquired.session.as_ptr() != controller.session.as_ptr() {
             return Err(invalid("replay delivery parent belongs to another Session"));
         }
-        if !delivery_receipt.is_exact_instance_of::<PyBytes>()
-            || !result_receipt.is_exact_instance_of::<PyBytes>()
+        if !result_receipts.is_exact_instance_of::<PyTuple>()
+            || !replay_rows.is_exact_instance_of::<PyTuple>()
         {
             return Err(invalid(
-                "replay acknowledgement requires exact delivery and result receipt bytes",
+                "replay delivery requires the complete original receipt and row tuples",
             ));
         }
+        let delivery = exact_replay_bytes(delivery_receipt)?;
+        let outcome = exact_replay_bytes(receiver_outcome)?;
         let binding = task_use.delivery_binding()?;
         let limits = {
             let session = controller.session.borrow(py);
             let owner = session.owner()?;
             if owner.replay_delivery_pending() {
-                return Err(invalid(
-                    "replay delivery already entered; resolve its original parent instead of resubmitting",
-                ));
+                return Err(invalid("replay delivery already entered; resolve its original parent instead of resubmitting"));
             }
             task_use.require_current(&owner)?;
             owner
@@ -27091,6 +27334,10 @@ impl PySemanticTransitionController {
             });
         let metadata_limit = metadata_limit?;
         let mut budget = metadata_limit;
+        let pool = task_use.checkpoint.material_sources.native_budget()?;
+        let _input_metadata = pool
+            .reserve_auxiliary(metadata_limit as u64)
+            .map_err(xlog_err)?;
         let snapshot = AuthoritySnapshot::parse(&ColdValue::read(snapshot, &mut budget, 0)?)?;
         bind_inherited_material_source(
             py,
@@ -27098,64 +27345,123 @@ impl PySemanticTransitionController {
             &task_use.checkpoint.material_sources,
             material_source,
         )?;
-        let carrier = PyTuple::new(py, [replay_row])?;
-        let values = read_replay_rows(
-            carrier.as_any(),
+        let material_limit = material_limit?;
+        let mut total_material_limit = total_material_limit?;
+        let evidence_limit = evidence_limit?;
+        let mut unique_materials = BTreeMap::new();
+        let proposal_materials = read_coding_proposals(
+            proposals,
             &mut budget,
-            material_limit?,
-            total_material_limit?,
-            evidence_limit?,
+            material_limit,
+            &mut total_material_limit,
+            evidence_limit,
+            &mut unique_materials,
             &task_use.checkpoint.material_sources,
         )?;
-        let original = &values.fields(1)?[0];
-        if original.canonical_bytes().len() > metadata_limit {
+        let values = read_replay_rows_with_materials(
+            replay_rows,
+            &mut budget,
+            material_limit,
+            &mut total_material_limit,
+            evidence_limit,
+            &mut unique_materials,
+            &task_use.checkpoint.material_sources,
+        )?;
+        let result_values = object_sequence(result_receipts, &mut budget)?;
+        let ColdValue::Sequence(originals) = &values else {
+            return Err(invalid("replay batch lost its original row roster"));
+        };
+        if originals.len() != result_values.len() {
             return Err(invalid(
-                "canonical replay row exceeds its original append metadata capacity",
+                "replay acknowledgement requires one result signature per contributing Proposal",
             ));
         }
-        // Unlike the identity projection, this original checkpoint codec
-        // retains every material and evidence byte for authenticated restore.
-        let canonical_row = checkpoint_cold_value_bytes(original);
-        let row = ReplayRow::parse_with_live(original, &task_use.authority.live)?;
-        if !matches!(&row.basis, ReplayBasis::Episode { .. }) {
-            return Err(invalid(
-                "replay acknowledgement requires one original executable episode",
+        let pool = task_use.checkpoint.material_sources.native_budget()?;
+        let _metadata = pool
+            .reserve_auxiliary(
+                (metadata_limit as u64)
+                    .checked_mul(
+                        originals
+                            .len()
+                            .checked_add(1)
+                            .ok_or_else(|| invalid("replay batch metadata extent overflow"))?
+                            as u64,
+                    )
+                    .ok_or_else(|| invalid("replay batch metadata extent overflow"))?,
+            )
+            .map_err(xlog_err)?;
+        let mut acquisitions = Vec::with_capacity(originals.len());
+        let mut results = Vec::with_capacity(originals.len());
+        let mut trains = false;
+        for (original, result) in originals.iter().zip(&result_values) {
+            if original.canonical_bytes().len() > metadata_limit {
+                return Err(invalid(
+                    "canonical replay row exceeds its original append metadata capacity",
+                ));
+            }
+            let canonical_row = checkpoint_cold_value_bytes(original);
+            let row = ReplayRow::parse_with_live(original, &task_use.authority.live)?;
+            if !matches!(&row.basis, ReplayBasis::Episode { .. }) {
+                return Err(invalid(
+                    "replay acknowledgement requires original executable episodes",
+                ));
+            }
+            let envelope = replay_json_object(replay_json_field(&row.record, "envelope")?)?;
+            if replay_json_value(replay_json_field(&envelope, "actor_eligible")?)?
+                != serde_json::Value::Bool(false)
+                || row.checkpoint_referent()?.is_some()
+            {
+                return Err(invalid(
+                    "acquired replay delivery requires non-actor rows without checkpoint referents",
+                ));
+            }
+            let result = exact_replay_bytes(result)?;
+            trains |= ReplayRow::result_permission_disposition(result)? == 1;
+            let record_digest =
+                Identity256::from_bytes(Sha256::digest(row.record_line.as_bytes()).into());
+            let evidence_digest = Identity256::from_bytes(Sha256::digest(&row.evidence).into());
+            let action_identity = row.action_identity()?;
+            let verification_materials = row.acquired_verification_materials()?;
+            let training_row = row.training_view_row()?;
+            let replay = row.native_replay()?.material;
+            let (original, action) = row.coding_proposal_materials(&replay)?;
+            acquisitions.push((
+                replay,
+                training_row,
+                canonical_row,
+                action_identity,
+                record_digest,
+                evidence_digest,
+                verification_materials,
+                original,
+                action,
             ));
+            results.push(result.to_vec());
         }
-        let envelope = replay_json_object(replay_json_field(&row.record, "envelope")?)?;
-        if replay_json_value(replay_json_field(&envelope, "actor_eligible")?)?
-            != serde_json::Value::Bool(false)
-            || row.checkpoint_referent()?.is_some()
-        {
-            return Err(invalid(
-                "acquired replay delivery requires a non-actor row without a checkpoint referent",
-            ));
-        }
-        let record_digest =
-            Identity256::from_bytes(Sha256::digest(row.record_line.as_bytes()).into());
-        let evidence_digest = Identity256::from_bytes(Sha256::digest(&row.evidence).into());
-        let action_identity = row.action_identity()?;
-        let verification_materials = row.acquired_verification_materials()?;
-        let disposition =
-            ReplayRow::result_permission_disposition(result_receipt.cast::<PyBytes>()?.as_bytes())?;
-        let training_row = row.training_view_row()?;
-        let replay = row.native_replay()?;
-        // Construct all Python custody before native entry. The native pending
-        // owner independently retains the actual uploaded receipts and row.
+        // Construct the whole Python custody before native entry. A completion
+        // of unknown status retains this same roster and never resubmits it.
         let pending = replay_delivery_pending_error(py, slf, parent)?;
         pending
             .value(py)
             .setattr("delivery_receipt", delivery_receipt)?;
         pending
             .value(py)
-            .setattr("result_receipt", result_receipt)?;
+            .setattr("result_receipts", result_receipts)?;
+        pending.value(py).setattr("replay_rows", replay_rows)?;
+        pending
+            .value(py)
+            .setattr("receiver_outcome", receiver_outcome)?;
+        pending.value(py).setattr("proposals", proposals)?;
+        pending
+            .value(py)
+            .setattr("material_source", material_source)?;
         let session = controller.session.borrow(py);
         let mut owner = session.owner()?;
         task_use.require_current(&owner)?;
         {
             let mut state = task_use.state()?;
             state.revalidate_activation(&task_use.authority, snapshot)?;
-            if disposition == 1 {
+            if trains {
                 if let Err(error) = task_use
                     .authority
                     .check_use("training", &state.snapshot, false)
@@ -27167,18 +27473,14 @@ impl PySemanticTransitionController {
         }
         let result = owner.acknowledge_loaded_replay_delivery(
             &*acquired.lease()?,
-            delivery_receipt.cast::<PyBytes>()?.as_bytes(),
-            result_receipt.cast::<PyBytes>()?.as_bytes(),
+            delivery,
+            outcome,
+            &results,
             binding.recipient_id,
             &binding.verification_key,
             &binding.expected_effect,
-            &replay.material,
-            training_row,
-            &canonical_row,
-            action_identity,
-            record_digest,
-            evidence_digest,
-            verification_materials.as_ref(),
+            proposal_materials,
+            acquisitions,
         );
         let entered = owner.replay_delivery_pending();
         drop(owner);
@@ -28476,6 +28778,11 @@ impl PySemanticTransitionController {
             let step = &steps[index];
             let completed = &outcomes[index];
             let native_step = match completed {
+                xlog_cuda::SemanticPreparedStepOutcome::PolicyScore { .. } => {
+                    return Err(invalid(
+                        "a private demonstration score has no published action observation",
+                    ));
+                }
                 xlog_cuda::SemanticPreparedStepOutcome::Skipped { step, .. }
                 | xlog_cuda::SemanticPreparedStepOutcome::Completed { step, .. } => step,
             };
@@ -28485,6 +28792,11 @@ impl PySemanticTransitionController {
                 ));
             }
             let (transition, status, refusal, invocation, bank) = match completed {
+                xlog_cuda::SemanticPreparedStepOutcome::PolicyScore { .. } => {
+                    return Err(invalid(
+                        "a private demonstration score has no published action observation",
+                    ));
+                }
                 xlog_cuda::SemanticPreparedStepOutcome::Skipped { status, .. } => {
                     (None, *status, None, py.None(), None)
                 }

@@ -71,7 +71,8 @@ pub(in crate::semantic_transition) struct OriginalModelContextAcknowledgement {
     receipt: Arc<[u8]>,
     receipt_digest: Identity256,
     recipient: Identity256,
-    result_receipt: Option<Arc<[u8]>>,
+    replay_batch: Option<Arc<[u8]>>,
+    receiver_outcome: Option<Arc<[u8]>>,
     _reservation: Arc<SemanticReplayMaterialReservation>,
 }
 
@@ -343,7 +344,9 @@ impl SemanticTransitionSession {
                 || successor.sealed_epoch != successor.publication_word >> 1
                 || successor.fuel.checked_add(1) != Some(edge.base_header.fuel)
                 || !model_context_model_header_unchanged(&edge.base_header, successor)
-                || edge.base_header.terminal != u64::from(edge.result_receipt.is_none()) * 2
+                || !matches!(edge.base_header.terminal, 0 | 2)
+                || (edge.replay_batch.is_none() && edge.base_header.terminal != 2)
+                || edge.replay_batch.is_some() != edge.receiver_outcome.is_some()
                 || successor.terminal != edge.base_header.terminal
                 || Identity256::from_bytes(Sha256::digest(&edge.receipt).into())
                     != edge.receipt_digest
@@ -428,7 +431,7 @@ impl SemanticTransitionSession {
         receipt: &[u8],
         receipt_digest: Identity256,
         recipient: Identity256,
-        result_receipt: Option<&[u8]>,
+        replay_batch: Option<(&[u8], &[u8])>,
     ) -> Result<Option<Arc<Mutex<OriginalModelContextAcknowledgement>>>, SemanticTransitionError>
     {
         let Some(owner) = self
@@ -472,9 +475,12 @@ impl SemanticTransitionSession {
             .count();
         let bytes = size_of::<OriginalModelContextAcknowledgement>()
             .checked_add(size_of::<Mutex<OriginalModelContextAcknowledgement>>())
-            .and_then(|bytes| bytes.checked_add(7 * size_of::<usize>()))
+            .and_then(|bytes| bytes.checked_add(9 * size_of::<usize>()))
             .and_then(|bytes| bytes.checked_add(receipt.len()))
-            .and_then(|bytes| bytes.checked_add(result_receipt.map_or(0, <[u8]>::len)))
+            .and_then(|bytes| bytes.checked_add(replay_batch.map_or(0, |(rows, _)| rows.len())))
+            .and_then(|bytes| {
+                bytes.checked_add(replay_batch.map_or(0, |(_, outcome)| outcome.len()))
+            })
             .and_then(|bytes| bytes.checked_add(count.checked_mul(size_of::<PublicationRange>())?))
             .and_then(|bytes| {
                 bytes.checked_add(
@@ -516,7 +522,8 @@ impl SemanticTransitionSession {
             receipt: Arc::from(receipt),
             receipt_digest,
             recipient,
-            result_receipt: result_receipt.map(Arc::from),
+            replay_batch: replay_batch.map(|(rows, _)| Arc::from(rows)),
+            receiver_outcome: replay_batch.map(|(_, outcome)| Arc::from(outcome)),
             _reservation: reservation,
         }));
         let mut original = owner
