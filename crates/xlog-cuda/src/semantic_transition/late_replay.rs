@@ -117,8 +117,8 @@ pub(super) struct ReplayAuthentication {
     refusal: Option<u64>,
     lease: Option<Arc<Mutex<SemanticPublishedLease>>>,
     reads: Option<Arc<ReplayAuthenticationReads>>,
-    verified: bool,
-    completed: bool,
+    pub(super) verified: bool,
+    pub(super) completed: bool,
     _effect_reservation: Option<SemanticReplayMaterialReservation>,
 }
 
@@ -575,6 +575,9 @@ impl SemanticTransitionSession {
         Ok((result.rows, result.limits))
     }
 
+    /// Read the complete restored archive, or register the trusted scope of a
+    /// native-proven original import before its first parent. Early registration
+    /// never authenticates subsequently attached history.
     pub fn replay_loaded_append_rows(
         &mut self,
         recipient: Identity256,
@@ -587,6 +590,81 @@ impl SemanticTransitionSession {
             ));
         }
         self.replay_append_rows_inner(recipient, key, effect)
+    }
+
+    fn require_original_receiver_registration(&self) -> Result<(), SemanticTransitionError> {
+        self.ensure_quiescent()?;
+        // A publication is never removed, and every state restore retains its
+        // original owner before submitting work. Together these native owners
+        // distinguish an original import from an unactivated restored bank.
+        if self.publication.is_some()
+            || self.state_material_restore.is_some()
+            || self.publication_preparation.is_some()
+            || self.task_ground.is_none()
+            || !self.task_observations_authenticated
+            || !self.graph.authenticated_supports().is_empty()
+        {
+            return Err(publication_input_error(
+                "receiver registration requires the original task without restored history",
+            ));
+        }
+        #[cfg(feature = "semantic-policy")]
+        if self.model_context_continuation.is_some() {
+            return Err(publication_input_error(
+                "receiver registration must precede model context continuation",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "semantic-policy")]
+    pub(super) fn require_unexecuted_receiver_history(
+        &self,
+        material: &OwnedPublicationMaterial,
+    ) -> Result<(), SemanticTransitionError> {
+        let range = |role| {
+            material
+                .ranges
+                .iter()
+                .find(|range| (range.range.role, range.range.index) == (role, 0))
+                .ok_or(SemanticTransitionError::ObservationMismatch)
+        };
+        let intents = range(30)?;
+        let intent_payload = range(31)?;
+        let acknowledgements = range(32)?;
+        let appends = range(56)?;
+        let append_payload = range(57)?;
+        let ground = range(58)?;
+        let layout = self
+            .task_ground
+            .as_ref()
+            .ok_or(SemanticTransitionError::NotBound)?
+            .layout;
+        layout.validate(&ground.bytes)?;
+        // Check header-only extents before the canonical parsers: a nonempty
+        // hostile roster cannot allocate temporary rows during this proof.
+        if intents.bytes.len() != size_of::<IntentQueueHeader>()
+            || acknowledgements.bytes.len() != size_of::<AcknowledgementQueueHeader>()
+            || appends.bytes.len() != size_of::<SemanticTrainingReplayAppendHeader>()
+            || !output_intents_from_ranges(intents, intent_payload)?.is_empty()
+            || !acknowledgement_receipts(&acknowledgements.bytes, acknowledgements.capacity)?
+                .is_empty()
+            || !append_rows_from_ranges(appends, append_payload)?.is_empty()
+            || self
+                .replay_authentication
+                .as_ref()
+                .is_some_and(|registration| {
+                    intent_payload.bytes.as_slice() != registration.effect.as_slice()
+                })
+            || ground.bytes[64..layout.query_offset]
+                .iter()
+                .any(|&byte| byte != 0)
+        {
+            return Err(publication_input_error(
+                "unactivated model context cannot carry executed receiver history",
+            ));
+        }
+        Ok(())
     }
 
     fn replay_append_rows_inner(
@@ -657,6 +735,25 @@ impl SemanticTransitionSession {
                 verified: false,
                 completed: false,
                 _effect_reservation: effect_reservation,
+            });
+        }
+        if self.publication.is_none() {
+            self.require_original_receiver_registration()?;
+            let reservation = self
+                .replay_material_budget
+                .as_ref()
+                .map(|budget| {
+                    budget
+                        .reserve_auxiliary(
+                            (size_of::<SemanticReplayAppendRows>() + 2 * size_of::<usize>()) as u64,
+                        )
+                        .map(Arc::new)
+                })
+                .transpose()?;
+            return Ok(SemanticReplayAppendRows {
+                rows: Vec::new(),
+                limits: [0; 4],
+                _reservation: reservation,
             });
         }
         if self
@@ -1015,6 +1112,22 @@ impl SemanticTransitionSession {
             ));
         }
         if original.completed {
+            return Ok(());
+        }
+        if original.lease.is_none() {
+            self.require_original_receiver_registration()?;
+            if !acquisitions.is_empty() {
+                return Err(publication_input_error(
+                    "original receiver registration cannot authenticate archived rows",
+                ));
+            }
+            // Scope registration is not historical authentication. A later
+            // restore must either verify its archive or prove an unexecuted
+            // dormant target at the canonical state-material ingress.
+            self.replay_authentication
+                .as_mut()
+                .expect("original receiver registration")
+                .completed = true;
             return Ok(());
         }
         let verified = original.verified;

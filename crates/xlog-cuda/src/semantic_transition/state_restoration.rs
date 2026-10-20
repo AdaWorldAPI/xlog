@@ -814,6 +814,19 @@ impl SemanticTransitionSession {
                 "state restoration requires a fresh uncaptured task-bound Session",
             ));
         }
+        if self
+            .replay_authentication
+            .as_ref()
+            .is_some_and(|original| !original.completed)
+        {
+            return Err(publication_input_error(
+                "state restoration cannot replace unfinished receiver authentication",
+            ));
+        }
+        #[cfg(feature = "semantic-policy")]
+        if dormant_context.is_some() {
+            self.require_unexecuted_receiver_history(&material)?;
+        }
         let retain_current_models = immutable_models.is_some_and(RestoredModelOwners::current);
         if retain_current_models && transition.is_some() {
             return Err(publication_input_error(
@@ -882,7 +895,7 @@ impl SemanticTransitionSession {
             })
             .ok_or(SemanticTransitionError::ObservationMismatch)?;
         ground.layout.validate(&saved_ground.bytes)?;
-        self.task_observations_authenticated = !saved_ground.bytes[64..ground.layout.query_offset]
+        let observations_authenticated = !saved_ground.bytes[64..ground.layout.query_offset]
             .chunks_exact(144)
             .any(|observation| observation[..8] != [0; 8]);
         let header = material.bank.header;
@@ -1023,6 +1036,15 @@ impl SemanticTransitionSession {
         if let Some(original) = &resident_restoration {
             original.retain_native_restore(&owner)?;
         }
+        self.task_observations_authenticated = observations_authenticated;
+        if let Some(original) = self.replay_authentication.as_mut() {
+            // Early scope registration never authenticates a subsequently
+            // attached archive. The original verifier must run again, unless
+            // the dormant restore proves its complete history unexecuted.
+            original.verified = false;
+            original.completed = false;
+            self.task_observations_authenticated = false;
+        }
         self.state_material_restore = Some(owner);
         self.resolve_state_material_restore()
     }
@@ -1141,6 +1163,18 @@ impl SemanticTransitionSession {
                 StateRestoreStage::Catalogue => {
                     if !self.original_restoration_may_submit(Some(&owner), None) {
                         return Err(SemanticTransitionError::Poisoned);
+                    }
+                    #[cfg(feature = "semantic-policy")]
+                    if owner.dormant_context.is_some() {
+                        if !self.graph.authenticated_supports().is_empty() {
+                            return Err(publication_input_error(
+                                "unactivated model context cannot inherit authenticated result supports",
+                            ));
+                        }
+                        self.task_observations_authenticated = true;
+                        if let Some(registration) = self.replay_authentication.as_mut() {
+                            registration.completed = true;
+                        }
                     }
                     let admission = self
                         .graph
