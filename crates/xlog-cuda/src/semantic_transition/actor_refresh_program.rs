@@ -2284,12 +2284,11 @@ impl SemanticTransitionSession {
         frozen.transferred = true;
     }
 
-    pub(super) fn admit_future_original_program_instruction(
-        &mut self,
-        frozen: &mut OriginalProgramContextContinuation,
-        parent: &SemanticPublishedLease,
-        instruction_bytes: &[u8],
-    ) -> Result<SemanticSegmentInstructionAdmission, SemanticTransitionError> {
+    pub(super) fn require_frozen_original_program_checkpoint_source(
+        &self,
+        frozen: &OriginalProgramContextContinuation,
+        admission: Option<&SemanticSegmentInstructionAdmission>,
+    ) -> Result<(), SemanticTransitionError> {
         self.ensure_quiescent()?;
         self.require_closed_evaluations()?;
         self.require_frozen_original_program_scope(frozen)?;
@@ -2299,7 +2298,6 @@ impl SemanticTransitionSession {
             .ok_or_else(invalid_program)?;
         let build = self.prepared_segment.as_ref().ok_or_else(invalid_program)?;
         if !frozen.transferred
-            || frozen.admission.is_some()
             || !Arc::ptr_eq(&program.owner, &frozen.source_program)
             || program.identity != frozen.program_identity
             || Identity256::from_bytes(Sha256::digest(&program.bytes).into())
@@ -2315,7 +2313,6 @@ impl SemanticTransitionSession {
                 .steps
                 .iter()
                 .any(|(token, step)| step.identity.is_none() && !build.tokens.contains(token))
-            || build.program_admission.is_some()
             || !build.finished
             || build.capturing
             || build.submitted
@@ -2323,6 +2320,37 @@ impl SemanticTransitionSession {
         {
             return Err(invalid_program());
         }
+        match admission {
+            None => {
+                if frozen.admission.is_some() || build.program_admission.is_some() {
+                    return Err(invalid_program());
+                }
+            }
+            Some(admission) => {
+                if frozen
+                    .admission
+                    .as_ref()
+                    .is_none_or(|original| !original.same_handle(admission))
+                    || build
+                        .program_admission
+                        .as_ref()
+                        .is_none_or(|original| !original.same_handle(admission))
+                    || self.instruction_admission(admission)?.state != InstructionState::Admitted
+                {
+                    return Err(invalid_program());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn admit_future_original_program_instruction(
+        &mut self,
+        frozen: &mut OriginalProgramContextContinuation,
+        parent: &SemanticPublishedLease,
+        instruction_bytes: &[u8],
+    ) -> Result<SemanticSegmentInstructionAdmission, SemanticTransitionError> {
+        self.require_frozen_original_program_checkpoint_source(frozen, None)?;
         let admission = self.issue_original_segment_instruction(
             parent,
             frozen.first_program_ordinal(),
@@ -2600,7 +2628,7 @@ impl SemanticTransitionSession {
         )
     }
 
-    fn bind_segment_checkpoint_source_digest(
+    pub(super) fn bind_segment_checkpoint_source_digest(
         &mut self,
         admission: &SemanticSegmentInstructionAdmission,
         digest: Identity256,

@@ -74,6 +74,14 @@ impl SemanticTransitionSession {
         loaded: &mut SemanticReplayLoadedMaterial,
     ) -> Result<(Identity256, bool), SemanticTransitionError> {
         self.ensure_rebindable()?;
+        self.verify_checkpoint_loaded_source_content(parent, loaded)
+    }
+
+    pub(super) fn verify_checkpoint_loaded_source_content(
+        &self,
+        parent: &SemanticPublishedLease,
+        loaded: &mut SemanticReplayLoadedMaterial,
+    ) -> Result<(Identity256, bool), SemanticTransitionError> {
         self.checked_reader(parent)?;
         loaded.require_budget(self.replay_material_budget.as_ref().ok_or_else(|| {
             publication_input_error("checkpoint source lost its original capacity pool")
