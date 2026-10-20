@@ -32999,7 +32999,7 @@ impl SemanticTransitionSession {
             .ok_or(SemanticTransitionError::NotBound)?;
         // Shared arena, scratch, immutable catalogue and the actual feedback
         // descriptor owners remain part of this same strict recorded launch.
-        let mut recorder = self.kernel_recorder();
+        let mut recorder = self.kernel_recorder()?;
         self.publication
             .as_ref()
             .ok_or(SemanticTransitionError::NotBound)?
@@ -35286,7 +35286,7 @@ impl SemanticTransitionSession {
             lease: token.map_or(0, |token| self.readers[&token].device.device_ptr_value()),
             native_work: native_work.as_ref().map_or(0, |work| *work.device_ptr()),
         };
-        let mut recorder = self.kernel_recorder();
+        let mut recorder = self.kernel_recorder()?;
         if let Some(token) = token {
             recorder.read_write(&self.readers[&token].device);
         }
@@ -38568,7 +38568,7 @@ impl SemanticTransitionSession {
                     operation: 6,
                     native_work: 0,
                 };
-                let mut recorder = self.kernel_recorder();
+                let mut recorder = self.kernel_recorder()?;
                 recorder.read(&state.receipt);
                 recorder.read(&state.input);
                 recorder.read(&self.readers[&parent.token].device);
@@ -43834,7 +43834,7 @@ impl SemanticTransitionSession {
             operation: 9,
             native_work: 0,
         };
-        let mut recorder = self.kernel_recorder();
+        let mut recorder = self.kernel_recorder()?;
         recorder.read(&source);
         recorder.read(&input_device);
         recorder.read(&self.readers[&lease.token].device);
@@ -45240,7 +45240,7 @@ impl SemanticTransitionSession {
             let io = self.prepared_kernel_io(step, bank)?;
             self.validate_ranges_with(&io)?;
             let mut descriptor = self.descriptor_with(&io);
-            let mut recorder = self.kernel_recorder_with(&io);
+            let mut recorder = self.kernel_recorder_with(&io)?;
             if kind == SemanticTransitionKind::Proposal {
                 if let Some(staged) = self
                     .actor_refresh
@@ -45344,7 +45344,7 @@ impl SemanticTransitionSession {
         let io = self.prepared_drain_kernel_io(step)?;
         self.validate_ranges_with(&io)?;
         let descriptor = self.descriptor_with(&io);
-        let recorder = self.kernel_recorder_with(&io);
+        let recorder = self.kernel_recorder_with(&io)?;
         let execute = self.execute.clone();
         enqueue_recorded(&self.domain, &mut self.poisoned, recorder, |enqueue| {
             // SAFETY: the drain descriptor retains the canonical publication,
@@ -47443,7 +47443,7 @@ impl SemanticTransitionSession {
         self.validate_ranges()?;
         let descriptor = self.descriptor();
         let execute = self.execute.clone();
-        let recorder = self.kernel_recorder();
+        let recorder = self.kernel_recorder()?;
         self.graph.enter_transition();
         // Remain poisoned through EndCapture and instantiation, including unwind.
         // Admission inside capture transfers the actual owners to the graph.
@@ -47498,7 +47498,7 @@ impl SemanticTransitionSession {
         if self.next_proposal > u64::from(u32::MAX) {
             return Err(SemanticTransitionError::GenerationExhausted);
         }
-        let recorder = self.kernel_recorder();
+        let recorder = self.kernel_recorder()?;
         // SAFETY: every captured allocation is registered, owned, and cannot be
         // rebound or observed until terminal completion. Graph has no host nodes.
         enqueue_recorded(&self.domain, &mut self.poisoned, recorder, |stream| {
@@ -48776,22 +48776,24 @@ impl SemanticTransitionSession {
                 if let Some(source) = &output.admissibility.source {
                     ranges.push((output.admissibility.data, source.len() as u64));
                 }
-                if let Some(source) = &output.baseline_logits.source {
-                    ranges.push((output.baseline_logits.data, source.len() as u64));
-                }
-                if let Some(source) = &output.candidate_logits.source {
-                    ranges.push((output.candidate_logits.data, source.len() as u64));
+                for scratch in &output.stream_scratch {
+                    if scratch.source.is_some() {
+                        ranges.push((scratch.data, tensor_layout_bytes(&scratch.layout)? as u64));
+                    }
                 }
             }
         }
         disjoint_ranges(&ranges)
     }
 
-    fn kernel_recorder(&self) -> LaunchRecorder {
+    fn kernel_recorder(&self) -> Result<LaunchRecorder, SemanticTransitionError> {
         self.kernel_recorder_with(&self.transition_kernel_io())
     }
 
-    fn kernel_recorder_with(&self, io: &TransitionKernelIo<'_>) -> LaunchRecorder {
+    fn kernel_recorder_with(
+        &self,
+        io: &TransitionKernelIo<'_>,
+    ) -> Result<LaunchRecorder, SemanticTransitionError> {
         // Replay custody is never exposed as a numerical alias. Retain all
         // original private destinations for the complete captured transaction.
         let mut recorder = self.domain.new_strict_recorder();
@@ -48845,7 +48847,7 @@ impl SemanticTransitionSession {
         if let Some(selection) = io.training_selection {
             recorder.read(selection);
         }
-        recorder
+        Ok(recorder)
     }
 }
 
@@ -50536,7 +50538,7 @@ mod tests {
             session.capture().unwrap();
             assert_eq!(session.captured.as_ref().unwrap().node_count().unwrap(), 1);
             if failure == 0 {
-                let recorder = session.kernel_recorder();
+                let recorder = session.kernel_recorder().unwrap();
                 let graph = session.captured.as_ref().unwrap();
                 let result = enqueue_recorded(&domain, &mut session.poisoned, recorder, |stream| {
                     graph.launch_in(stream)?;

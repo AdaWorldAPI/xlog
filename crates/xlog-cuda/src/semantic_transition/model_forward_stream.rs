@@ -1273,10 +1273,22 @@ impl SemanticTransitionSession {
         .model_update
         .as_ref()
         .expect("checked update");
-        if update.forward_recorded != stream.role as u8 {
-            return Err(publication_input_error(
-                "full forwards begin in original baseline then candidate order",
-            ));
+        if stream.role == 1 {
+            let baseline = update.forward_streams[0]
+                .as_ref()
+                .ok_or(SemanticTransitionError::ObservationMismatch)?;
+            if baseline
+                .owner
+                .recording
+                .lock()
+                .map_err(|_| SemanticTransitionError::ObservationMismatch)?
+                .phase
+                != 2
+            {
+                return Err(publication_input_error(
+                    "candidate full forward begins after the original baseline finishes",
+                ));
+            }
         }
         let inputs = self.model_forward_stream_inputs(step, stream)?;
         self.begin_model_forward_stream_inner(stream, inputs)
@@ -1432,19 +1444,7 @@ impl SemanticTransitionSession {
                 "full forward finish requires its actual producer model work",
             ));
         }
-        let witness = self.finish_model_forward_stream_inner(stream, allocation_witness, inputs)?;
-        self.steps
-            .get_mut(&step.token)
-            .expect("checked step")
-            .prepared
-            .as_mut()
-            .expect("checked prepared owner")
-            .branches[stream.update_bank()?]
-        .model_update
-        .as_mut()
-        .expect("checked original update")
-        .forward_recorded += 1;
-        Ok(witness)
+        self.finish_model_forward_stream_inner(stream, allocation_witness, inputs)
     }
 
     pub(super) fn finish_model_forward_stream_inner(
