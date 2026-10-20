@@ -131,6 +131,8 @@ __device__ bool decode(const uint64_t* words,uint64_t count,Task* output) {
 }
 
 struct Query { uint64_t receipt[42],truth,attained; };
+// The first word is an origin tag: zero is absent, one is Action, two is Intent.
+// The historical action word group holds the origin identity for either tag.
 struct Observation { uint64_t present,truth,receipt[4],action[4],intent[4],support[4]; };
 static_assert(sizeof(Query)==352,"task query record ABI");
 static_assert(sizeof(Observation)==144,"task observation record ABI");
@@ -159,7 +161,12 @@ __device__ bool decode_plane(uint64_t address,uint64_t bytes,const Task& task,Pl
     for(uint32_t index=0;index<task.bindings;++index) {
         const auto& observation=plane.observations[index];
         const auto* words=reinterpret_cast<const uint64_t*>(&observation);
-        if(observation.present>1 || observation.truth>3)return false;
+        if(observation.present>2 || observation.truth>3)return false;
+        if(observation.present==2) {
+            if(observation.truth!=1 && observation.truth!=2)return false;
+            for(uint32_t word=0;word<4;++word)
+                if(observation.action[word]!=observation.intent[word])return false;
+        }
         if(!observation.present) {
             for(uint32_t field=0;field<18;++field)if(words[field])return false;
         } else for(uint32_t identity=0;identity<4;++identity)
@@ -178,7 +185,8 @@ struct Observations {
         semantic_program::Fact fact{};
         task.observation_fact(index,&fact);
         const auto& observation=plane.observations[index];
-        return {fact,observation.truth,observation.present};
+        // The generic program evaluator consumes presence, not an origin tag.
+        return {fact,observation.truth,uint64_t(observation.present!=0)};
     }
     __device__ bool protected_fact(semantic_program::Fact fact) const {
         for(uint32_t index=0;index<task.bindings;++index) {
@@ -209,7 +217,7 @@ __device__ bool attained(const Task& task,const Plane& plane,uint32_t slot,uint3
         ++*inspected;
         const uint32_t binding=uint32_t(row[3+row[1]+index]);
         const auto& observation=plane.observations[binding];
-        if(observation.present!=1 || observation.truth!=1 || fact_index==fact_count)return false;
+        if((observation.present!=1 && observation.present!=2) || observation.truth!=1 || fact_index==fact_count)return false;
         semantic_program::Fact observed{};task.observation_fact(binding,&observed);
         if(observed.predicate!=query_fact.predicate || observed.arity!=query_fact.arity ||
            observed.first!=query_fact.first ||

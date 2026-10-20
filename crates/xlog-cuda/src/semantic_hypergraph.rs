@@ -292,8 +292,9 @@ impl SemanticRootSupport {
         admission.statement_key(statement.ok_or_else(|| {
             admission_error("authenticated observation requires its original protected statement")
         })?)?;
-        if observation[0] != 1
+        if !matches!(observation[0], 1 | 2)
             || !matches!(observation[1], 1 | 2)
+            || (observation[0] == 2 && observation[6..10] != observation[10..14])
             || observation[2..]
                 .chunks_exact(4)
                 .any(|identity| identity == [0; 4])
