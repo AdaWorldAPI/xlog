@@ -138,9 +138,8 @@ pub use semantic_transition::{
     SemanticPreparedResidentModelRestoration, SemanticPrivateModelContextCheckpointOrigin,
     SemanticPrivateModelContextCheckpointSave, SemanticResidentModelRead,
     SemanticRestoredModelContextPrefill, SemanticSegmentInstructionAdmission,
-    SemanticSelectedPolicyGradients, SemanticTransitionSessionConstruction,
-    SemanticUpdateCanaryMeasurement, SemanticUpdateForwardReceipt,
-    SemanticUpdateForwardReceiptMaterial, SemanticUpdateMeasurements,
+    SemanticTransitionSessionConstruction, SemanticUpdateCanaryMeasurement,
+    SemanticUpdateForwardReceipt, SemanticUpdateForwardReceiptMaterial, SemanticUpdateMeasurements,
 };
 #[cfg(feature = "semantic-policy")]
 pub use semantic_transition::{

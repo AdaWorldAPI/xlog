@@ -2,7 +2,7 @@
 
 use super::*;
 
-const SUCCESSOR_CUSTODY_ROLES: [u64; 9] = [14, 27, 28, 30, 31, 32, 33, 39, 48];
+const SUCCESSOR_CUSTODY_ROLES: [u64; 10] = [2, 14, 27, 28, 30, 31, 32, 33, 39, 48];
 
 /// Canonical replay roots belonging to one original completed Proposal.
 #[cfg(feature = "semantic-policy")]

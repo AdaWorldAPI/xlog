@@ -669,9 +669,9 @@ static void unbounded_policy_refusal_preserves_acquired_publication() {
 
 static void backward_completion_rejects_every_error_status() {
     uint64_t status=0;
-    semantic_policy_backward_status_guard(reinterpret_cast<uint64_t>(&status));
+    semantic_policy_backward_status_guard(reinterpret_cast<uint64_t>(&status),0);
     for(uint64_t failure : {uint64_t(1),uint64_t(2),uint64_t(3),UINT64_MAX}) {
-        require_content_trap([&] { status=failure;semantic_policy_backward_status_guard(reinterpret_cast<uint64_t>(&status)); },
+        require_content_trap([&] { status=failure;semantic_policy_backward_status_guard(reinterpret_cast<uint64_t>(&status),0); },
             "backward completion accepted a mutated device error status");
     }
 }
