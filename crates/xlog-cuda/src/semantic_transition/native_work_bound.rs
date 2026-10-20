@@ -335,6 +335,17 @@ pub(super) fn model_scratch_native_work_ceiling(
     ])
 }
 
+/// The original continuation retains six FP64 bounds per physical block.
+pub(super) fn numerical_block_snapshot_native_work_ceiling(
+    physical_blocks: usize,
+) -> Result<[u64; 9], SemanticTransitionError> {
+    let blocks = u64::try_from(physical_blocks).map_err(|_| native_work_ceiling_overflow())?;
+    let bytes = ceiling_product(blocks, 6 * size_of::<f64>() as u64)?;
+    let ceiling = [1, 0, 0, 0, 0, 0, 0, 0, bytes];
+    native_work_ceiling_units(ceiling)?;
+    Ok(ceiling)
+}
+
 pub(super) fn model_scratch_initialization_ceiling(
     capacity: usize,
 ) -> Result<[u64; 9], SemanticTransitionError> {
