@@ -4516,10 +4516,12 @@ impl TextBindingStorage {
 }
 
 fn enqueue_numerical_block_snapshot(
+    provider: &CudaKernelProvider,
     domain: &ResidentExecutionDomain,
     poisoned: &mut bool,
     original: &PreparedSemanticTensor,
     destination: &TrackedCudaSlice<f64>,
+    work: Option<DeviceMemoryView<u64>>,
 ) -> Result<(), SemanticTransitionError> {
     let source = original
         .source
@@ -4534,21 +4536,42 @@ fn enqueue_numerical_block_snapshot(
             "original block bounds differ from the frozen native capacity",
         ));
     }
+    let bytes = u64::try_from(bytes).map_err(|_| SemanticTransitionError::GenerationExhausted)?;
+    let execute = provider
+        .device()
+        .inner()
+        .get_func(
+            "xlog_semantic_transition",
+            "semantic_numerical_block_snapshot",
+        )
+        .ok_or_else(|| runtime_error("kernel lookup", "block bound snapshot unavailable"))?;
     let mut recorder = domain.new_strict_recorder();
     recorder.read(source);
     recorder.write(destination);
+    if let Some(work) = &work {
+        recorder.read_write(work);
+    }
+    let arguments = (
+        *source.device_ptr(),
+        destination.device_ptr_value(),
+        bytes,
+        work.as_ref().map_or(0, |work| *work.device_ptr()),
+    );
     enqueue_recorded(domain, poisoned, recorder, |enqueue| {
         // SAFETY: the original typed witness established the exact contiguous
-        // FP64 span and the destination is a disjoint native-owned allocation.
+        // FP64 span. The disjoint destination and original tally share this
+        // command's recorded allocation and completion custody.
         unsafe {
-            sys::cuMemcpyDtoDAsync_v2(
-                destination.device_ptr_value(),
-                *source.device_ptr(),
-                bytes,
-                enqueue.stream().cu_stream(),
+            execute.launch_in(
+                enqueue,
+                LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (1, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                arguments,
             )
         }
-        .result()
         .map_err(|error| XlogError::Kernel(format!("block bound snapshot: {error}")))
     })
 }

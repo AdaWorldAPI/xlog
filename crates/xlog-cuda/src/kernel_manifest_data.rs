@@ -694,6 +694,7 @@ pub const KERNEL_MODULES: &[KernelModuleSpec] = &[
             "semantic_publication_step_active_gate",
             "semantic_publication_step_release",
             "semantic_publication_model_seals",
+            "semantic_numerical_block_snapshot",
             "semantic_publication_step_result",
             "semantic_publication_prepare_continuation",
             "semantic_model_forward_stream_begin",
@@ -767,6 +768,7 @@ mod tests {
             "semantic_publication_step_release",
             "semantic_publication_step_result",
             "semantic_publication_model_seals",
+            "semantic_numerical_block_snapshot",
         ] {
             assert!(
                 module.kernels.contains(&entry),
