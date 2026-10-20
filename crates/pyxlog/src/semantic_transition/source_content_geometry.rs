@@ -1062,17 +1062,20 @@ impl PySemanticPreparedSourceContentGeometry {
                 "content overlay retains one original backing handoff",
             ));
         }
-        let check = || {
-            self.require_original(py)?;
-            other.require_original(py)
-        };
-        validate_producer_device_guarded(backing, device, &check)?;
-        // Keep the actual producer object before any managed-token callback.
+        // Keep the actual producer object before every producer callback.
         // A failed or unknown native handoff does not discard that owner.
         cache.content_overlay_backings[index] = Some(ContentOverlayBacking {
             _producer: backing.clone().unbind(),
             _metadata: metadata,
         });
+        // A producer can reenter an existing geometry getter, whose cache lock
+        // is blocking. No cache mutex may survive across that Python callback.
+        drop(cache);
+        let check = || {
+            self.require_original(py)?;
+            other.require_original(py)
+        };
+        validate_producer_device_guarded(backing, device, &check)?;
         let mut handoff = TensorHandoff(vec![crate::dlpack_from_py_for_stream_guarded(
             backing,
             producer_stream,
