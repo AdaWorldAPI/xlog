@@ -274,6 +274,23 @@ struct GeometryProjections {
     context: Option<GeometryTuple>,
     contract: Option<Py<material_bytes::PySemanticMaterialBytes>>,
     occurrences: Option<source_content_occurrences::OriginalSourceContentOccurrences>,
+    content_overlays: [Option<GeometryTuple>; 2],
+    content_overlay_backings: [Option<ContentOverlayBacking>; 2],
+}
+
+struct ContentOverlayBacking {
+    _producer: Py<PyAny>,
+    _metadata: xlog_cuda::SemanticReplayMaterialReservation,
+}
+
+fn content_overlay_kind(value: &Bound<'_, PyAny>) -> PyResult<(SemanticTransitionKind, usize)> {
+    match ColdValue::read(value, &mut 128, 0)?.text()? {
+        "recompute" => Ok((SemanticTransitionKind::Recompute, 0)),
+        "proposal" => Ok((SemanticTransitionKind::Proposal, 1)),
+        _ => Err(invalid(
+            "content overlay prepared_kind must be recompute or proposal",
+        )),
+    }
 }
 
 /// Geometry identity is an original native allocation port, not a device pointer.
@@ -913,6 +930,174 @@ fn model_memory_projection(
 
 #[pymethods]
 impl PySemanticPreparedSourceContentGeometry {
+    #[pyo3(signature = (other, *, prepared_kind, allocation_layouts))]
+    fn content_overlay(
+        &self,
+        py: Python<'_>,
+        other: &Self,
+        prepared_kind: &Bound<'_, PyAny>,
+        allocation_layouts: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyTuple>> {
+        self.require_original(py)?;
+        other.require_original(py)?;
+        let (kind, index) = content_overlay_kind(prepared_kind)?;
+        let mut remaining = 1usize << 24;
+        let alternatives = exact_tuple(allocation_layouts, Some(4), &mut remaining)?;
+        let mut count = 0usize;
+        for alternative in alternatives.iter() {
+            count = add(
+                count,
+                exact_tuple(&alternative, None, &mut remaining)?.len(),
+            )?;
+        }
+        let input_metadata =
+            self.reserve(multiply(count, std::mem::size_of::<(u64, u64, u64)>())?)?;
+        let mut layouts: [Vec<(u64, u64, u64)>; 4] = std::array::from_fn(|_| Vec::new());
+        for (index, alternative) in alternatives.iter().enumerate() {
+            let rows = exact_tuple(&alternative, None, &mut remaining)?;
+            layouts[index].reserve_exact(rows.len());
+            for row in rows.iter() {
+                let row = exact_tuple(&row, Some(3), &mut remaining)?;
+                layouts[index].push((
+                    ColdValue::read(&row.get_item(0)?, &mut remaining, 0)?.unsigned()?,
+                    ColdValue::read(&row.get_item(1)?, &mut remaining, 0)?.unsigned()?,
+                    ColdValue::read(&row.get_item(2)?, &mut remaining, 0)?.unsigned()?,
+                ));
+            }
+        }
+        let mut cache = self
+            .projections
+            .try_lock()
+            .map_err(|_| invalid("original content overlay is already being projected"))?;
+        let (allocation, placements) = self
+            .inner
+            .content_overlay(&other.inner, kind, layouts)
+            .map_err(xlog_err)?;
+        drop(input_metadata);
+        if let Some(original) = &cache.content_overlays[index] {
+            return Ok(original.value.clone_ref(py));
+        }
+        let mut extent = add(
+            python_metadata_tuple_extent(py, 2)?,
+            python_metadata_tuple_extent(py, 4)?,
+        )?;
+        for rows in &placements {
+            extent = add(extent, python_metadata_tuple_extent(py, rows.len())?)?;
+            extent = add(
+                extent,
+                multiply(
+                    rows.len(),
+                    add(
+                        python_metadata_tuple_extent(py, 3)?,
+                        add(
+                            multiply(3, integer_extent(py)?)?,
+                            std::mem::size_of::<Py<PyTuple>>(),
+                        )?,
+                    )?,
+                )?,
+            )?;
+        }
+        extent = add(extent, multiply(4, std::mem::size_of::<Py<PyTuple>>())?)?;
+        let metadata = self.reserve(extent)?;
+        let allocation = self.allocation(py, allocation)?;
+        let mut alternatives = Vec::with_capacity(4);
+        for rows in placements {
+            let rows = rows
+                .into_iter()
+                .map(|row| row.into_pyobject(py).map(|row| row.unbind()))
+                .collect::<PyResult<Vec<_>>>()?;
+            alternatives.push(PyTuple::new(py, rows)?.unbind());
+        }
+        let value = (allocation, PyTuple::new(py, alternatives)?)
+            .into_pyobject(py)?
+            .unbind();
+        cache.content_overlays[index] = Some(GeometryTuple {
+            value: value.clone_ref(py),
+            _metadata: metadata,
+        });
+        Ok(value)
+    }
+
+    #[pyo3(signature = (other, *, prepared_kind, backing, consumer_stream))]
+    fn bind_content_overlay(
+        &self,
+        py: Python<'_>,
+        other: &Self,
+        prepared_kind: &Bound<'_, PyAny>,
+        backing: &Bound<'_, PyAny>,
+        consumer_stream: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        self.require_original(py)?;
+        other.require_original(py)?;
+        let (kind, index) = content_overlay_kind(prepared_kind)?;
+        let stream = ColdValue::read(consumer_stream, &mut 128, 0)?.unsigned()?;
+        let producer_stream = i64::try_from(stream)
+            .map_err(|_| invalid("content overlay stream exceeds DLPack address space"))?;
+        if matches!(stream, 0 | 2) {
+            return Err(invalid(
+                "content overlay requires an explicit supported CUDA consumer stream",
+            ));
+        }
+        let instruction = self
+            .instruction
+            .upgrade()
+            .ok_or_else(|| invalid("content overlay lost its original instruction owner"))?;
+        if other
+            .instruction
+            .upgrade()
+            .is_none_or(|other| !Arc::ptr_eq(&instruction, &other))
+        {
+            return Err(invalid(
+                "content overlay banks belong to different original instructions",
+            ));
+        }
+        let device = instruction.session.borrow(py).device_ordinal;
+        let metadata = self.reserve(std::mem::size_of::<ContentOverlayBacking>())?;
+        let mut cache = self
+            .projections
+            .try_lock()
+            .map_err(|_| invalid("original content overlay backing is already being bound"))?;
+        if cache.content_overlay_backings[index].is_some() {
+            return Err(invalid(
+                "content overlay retains one original backing handoff",
+            ));
+        }
+        let check = || {
+            self.require_original(py)?;
+            other.require_original(py)
+        };
+        validate_producer_device_guarded(backing, device, &check)?;
+        // Keep the actual producer object before any managed-token callback.
+        // A failed or unknown native handoff does not discard that owner.
+        cache.content_overlay_backings[index] = Some(ContentOverlayBacking {
+            _producer: backing.clone().unbind(),
+            _metadata: metadata,
+        });
+        let mut handoff = TensorHandoff(vec![crate::dlpack_from_py_for_stream_guarded(
+            backing,
+            producer_stream,
+            &check,
+        )?]);
+        check()?;
+        let session = instruction.session.borrow(py);
+        session.require_creator()?;
+        let owner = session.owner()?;
+        let backing = handoff
+            .0
+            .pop()
+            .ok_or_else(|| invalid("content overlay lost its real managed backing"))?;
+        self.inner
+            .bind_content_overlay(
+                &other.inner,
+                &owner,
+                &instruction.inner,
+                kind,
+                backing,
+                stream,
+            )
+            .map_err(xlog_err)
+    }
+
     #[pyo3(signature = (phase, kind, *, prepared_kind=None, prepared_bank=None))]
     fn content_family(
         &self,

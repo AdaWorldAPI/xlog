@@ -3,6 +3,9 @@
 use super::resident_model_memory::ResidentModelMemoryOwner;
 use super::*;
 
+#[path = "current_content_overlay.rs"]
+mod current_content_overlay;
+
 /// Original decoded inputs used by the same private-child constructor.
 /// None of these metadata values grants numerical access or a native allowance.
 pub struct SemanticSourceContentGeometrySeed {
@@ -522,6 +525,8 @@ pub(super) struct SourceContentGeometryOwner {
         Mutex<Option<Arc<super::source_content_occurrences::FrozenSourceContentOccurrences>>>,
     uniform: Mutex<Option<[SemanticPolicyNumericalDomainLayout; 3]>>,
     input_generation: Option<SemanticModelInputGenerationPort>,
+    overlays: Mutex<[Option<Arc<current_content_overlay::CurrentContentOverlay>>; 2]>,
+    overlay_instruction: Arc<current_content_overlay::ContentOverlayInstruction>,
     _reservation: Arc<SemanticReplayMaterialReservation>,
 }
 
@@ -542,6 +547,7 @@ enum SourceGeometryAllocationPort {
     Source,
     Feedback(usize),
     Uniform(usize),
+    ContentOverlay(usize),
 }
 
 /// Original physical allocation geometry, before any backing is allocated.
@@ -649,6 +655,7 @@ impl SourceContentGeometryOwner {
             | SourceGeometryAllocationPort::Feedback(_) => section.map(|(kind, _)| (kind, 0)),
             // Uniform outputs retain their exact native Proposal bank.
             SourceGeometryAllocationPort::Uniform(_) => section,
+            SourceGeometryAllocationPort::ContentOverlay(_) => None,
             SourceGeometryAllocationPort::Model(_) => unreachable!(),
         })
     }
@@ -660,6 +667,9 @@ impl SourceContentGeometryOwner {
     ) -> Result<(), SemanticTransitionError> {
         self.require_geometry_section(section)?;
         self.require_allocation(allocation, allocation.span_bytes)?;
+        if let SourceGeometryAllocationPort::ContentOverlay(index) = allocation.port {
+            return self.require_content_overlay_section(index, section);
+        }
         if allocation.prepared_section != self.allocation_section(allocation.port, section)? {
             return Err(publication_input_error(
                 "content allocation belongs to another original prepared child section",
@@ -755,6 +765,13 @@ impl SourceContentGeometryOwner {
         self.require_allocation_section(declared, Some(section))?;
         self.classify_tensor(declared, descriptor, Some(section))?;
         self.require_current_section(session, step, section)?;
+        if matches!(
+            declared.port,
+            SourceGeometryAllocationPort::ContentOverlay(_)
+        ) {
+            return self
+                .require_prepared_content_overlay(session, section, declared, descriptor, tensor);
+        }
         if matches!(declared.port, SourceGeometryAllocationPort::Model(_)) {
             let actual = tensor.native_allocation.as_ref().ok_or_else(|| {
                 publication_input_error(
@@ -850,6 +867,7 @@ impl SourceContentGeometryOwner {
                     .ok_or(SemanticTransitionError::ObservationMismatch)?
             }
             SourceGeometryAllocationPort::Model(_) => unreachable!(),
+            SourceGeometryAllocationPort::ContentOverlay(_) => unreachable!(),
         };
         let expected = view
             .allocation_provenance()
@@ -1158,6 +1176,9 @@ impl SourceContentGeometryOwner {
         allocation: &SemanticSourceGeometryAllocation,
         span: u64,
     ) -> Result<(), SemanticTransitionError> {
+        if let SourceGeometryAllocationPort::ContentOverlay(index) = allocation.port {
+            return self.require_content_overlay_allocation(index, allocation, span);
+        }
         let scope = if matches!(allocation.port, SourceGeometryAllocationPort::Model(_)) {
             self.model_scope()
         } else {
@@ -1176,6 +1197,14 @@ impl SourceContentGeometryOwner {
         allocation: &SemanticSourceGeometryAllocation,
     ) -> Result<Option<DeviceAllocationProvenance>, SemanticTransitionError> {
         self.require_allocation(allocation, allocation.span_bytes)?;
+        if matches!(
+            allocation.port,
+            SourceGeometryAllocationPort::ContentOverlay(_)
+        ) {
+            // The real backing is a foreign managed owner. It never acquires
+            // XLOG native provenance by being placed in an authenticated group.
+            return Ok(None);
+        }
         let recipe = self
             .recipe
             .lock()
@@ -1255,6 +1284,7 @@ impl SourceContentGeometryOwner {
                 .as_ref()
                 .and_then(|layouts| layouts.get(index))
                 .map(|layout| layout.allocation.clone()),
+            SourceGeometryAllocationPort::ContentOverlay(_) => unreachable!(),
         };
         if provenance
             .as_ref()
@@ -1319,6 +1349,11 @@ impl SourceContentGeometryOwner {
                     .ok_or(SemanticTransitionError::ObservationMismatch)?,
             )?)
             .map_err(|_| SemanticTransitionError::GenerationExhausted)?,
+            SourceGeometryAllocationPort::ContentOverlay(_) => {
+                return Err(publication_input_error(
+                    "content overlay tensors come from their complete original capture roster",
+                ));
+            }
         };
         if byte_offset
             .checked_add(bytes)
@@ -1443,6 +1478,7 @@ impl SemanticPreparedSourceContentGeometry {
         if self.owner.kind != proof.kind {
             return Err(SemanticTransitionError::ObservationMismatch);
         }
+        self.owner.bind_content_overlay_actor_refresh(proof)?;
         let mut original =
             self.owner.current.lock().map_err(|_| {
                 publication_input_error("original actor geometry custody is poisoned")
@@ -1704,10 +1740,12 @@ impl SemanticPreparedSourceContentGeometry {
                 "original content occurrences freeze once before physical binding",
             ));
         }
+        let overlay_rosters = self.owner.prepare_content_overlay_rosters(&events)?;
         let frozen = super::source_content_occurrences::FrozenSourceContentOccurrences::new(
             &self.owner,
             events,
         )?;
+        self.owner.freeze_content_overlay_rosters(overlay_rosters)?;
         let handles = frozen.occurrence_handles();
         *original = Some(frozen);
         Ok(handles)
@@ -2135,6 +2173,12 @@ impl SemanticTransitionSession {
                     + 2 * size_of::<SemanticPreparedSourceContentGeometry>(),
             )
             .and_then(|bytes| {
+                bytes.checked_add(
+                    current_content_overlay::ContentOverlayInstruction::metadata_bytes(count)
+                        .ok()?,
+                )
+            })
+            .and_then(|bytes| {
                 bytes.checked_add(seeds.len().checked_mul(
                     size_of::<SemanticSourceContentGeometrySeed>()
                         + 2 * size_of::<usize>()
@@ -2176,6 +2220,7 @@ impl SemanticTransitionSession {
             projections.push(geometry);
         }
         let mut handles = Vec::with_capacity(count);
+        let overlay_instruction = current_content_overlay::ContentOverlayInstruction::new(count)?;
         for (step_index, step) in steps.iter().enumerate() {
             if step.kind != Some(SemanticTransitionKind::Update) {
                 continue;
@@ -2217,6 +2262,8 @@ impl SemanticTransitionSession {
                                 reader: Mutex::new(None),
                                 occurrences: Mutex::new(None),
                                 uniform: Mutex::new(None),
+                                overlays: Mutex::new(std::array::from_fn(|_| None)),
+                                overlay_instruction: Arc::clone(&overlay_instruction),
                                 input_generation: if kind.is_current() {
                                     Some(input_generations.port(step_index)?)
                                 } else {
