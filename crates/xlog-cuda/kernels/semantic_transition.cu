@@ -6903,9 +6903,7 @@ __device__ uint64_t publication_initialize_model_context_continuation(const Desc
     if(!publication_pointer_span(descriptor.publication.native_work,sizeof(semantic_graph::NativeWorkTally),alignof(semantic_graph::NativeWorkTally)) ||
        !publication_pointer_span(address,sizeof(PreparedModelContextContinuationDevice),alignof(PreparedModelContextContinuationDevice)))return 1;
     auto& proof=*reinterpret_cast<PreparedModelContextContinuationDevice*>(address);
-    if(proof.abi!=1 || proof.status!=1 || proof.role>1 ||
-       (proof.role==0 ? proof.demonstrated_lane!=0 :
-        (proof.demonstrated_lane<1 || proof.demonstrated_lane>2)))return 1;
+    if(proof.abi!=1 || proof.status!=1)return 1;
     // Once entered, an unknown owner must recover this original command rather
     // than submit another initialization or rebuild a captured continuation.
     proof.status=semantic_graph::written_word(2,work);
@@ -7087,7 +7085,9 @@ __device__ uint64_t publication_initialize_actor_refresh(const Descriptor& descr
     const uint64_t address=descriptor.publication.lease;
     if(!publication_pointer_span(address,sizeof(PreparedActorRefreshDevice),alignof(PreparedActorRefreshDevice)))return 1;
     auto& proof=*reinterpret_cast<PreparedActorRefreshDevice*>(address);
-    if(proof.abi!=1 || proof.status!=1)return 1;
+    if(proof.abi!=1 || proof.status!=1 || proof.role>1 ||
+       (proof.role==0 ? proof.demonstrated_lane!=0 :
+        (proof.demonstrated_lane<1 || proof.demonstrated_lane>2)))return 1;
     // Entered refusal is not interchangeable with the initial never-entered
     // marker. No failure below permits a second initialization or a new draw.
     proof.status=semantic_graph::written_word(2,work);
