@@ -133,10 +133,10 @@ pub(crate) struct PySemanticEvaluationCohort {
 /// Single original forward/objective recording; no backward or publication.
 #[pyclass(name = "SemanticModelEvaluation", module = "pyxlog._native", frozen)]
 pub(crate) struct PySemanticModelEvaluation {
-    parent: Py<PySemanticPublishedParent>,
-    inner: SemanticModelEvaluation,
+    pub(super) parent: Py<PySemanticPublishedParent>,
+    pub(super) inner: SemanticModelEvaluation,
     cohort: Py<PySemanticEvaluationCohort>,
-    binding: (Option<String>, Vec<u8>),
+    pub(super) binding: (Option<String>, Vec<u8>),
     closed: AtomicBool,
     output: Mutex<Option<Py<PySemanticTensorContentWitness>>>,
     completed: Mutex<Option<Py<PySemanticCompletedModelEvaluation>>>,
@@ -164,6 +164,41 @@ pub(super) struct PendingEvaluationPreparation {
     result: Option<Py<PySemanticModelEvaluation>>,
     phase_entered: bool,
     phase_bound: bool,
+}
+
+#[pymethods]
+impl PySemanticModelEvaluation {
+    #[pyo3(signature = (*, vocabulary, scalar_type=5, block_positions=64))]
+    fn prepare_model_forward_stream(
+        slf: Py<Self>,
+        py: Python<'_>,
+        vocabulary: &Bound<'_, PyAny>,
+        scalar_type: u64,
+        block_positions: u64,
+    ) -> PyResult<super::model_forward_stream::PySemanticModelForwardStream> {
+        let vocabulary = ColdValue::read(vocabulary, &mut 128, 0)?.unsigned()?;
+        let evaluation = slf.borrow(py);
+        let parent = evaluation.parent.borrow(py);
+        let session = parent.session.borrow(py);
+        session.require_creator()?;
+        let mut owner = session.owner()?;
+        evaluation.check(py, &owner)?;
+        let inner = owner
+            .prepare_evaluation_model_forward_stream(
+                &*parent.lease()?,
+                &evaluation.inner,
+                vocabulary,
+                scalar_type,
+                block_positions,
+            )
+            .map_err(xlog_err)?;
+        Ok(
+            super::model_forward_stream::PySemanticModelForwardStream::from_evaluation(
+                inner,
+                slf.clone_ref(py),
+            ),
+        )
+    }
 }
 
 impl PySemanticModelEvaluation {
@@ -380,7 +415,7 @@ impl PySemanticModelEvaluation {
         Ok(observation)
     }
 
-    fn check(&self, py: Python<'_>, owner: &SemanticTransitionSession) -> PyResult<()> {
+    pub(super) fn check(&self, py: Python<'_>, owner: &SemanticTransitionSession) -> PyResult<()> {
         if self.closed.load(Ordering::Acquire) {
             return Err(invalid("read-only evaluation is already closed"));
         }
