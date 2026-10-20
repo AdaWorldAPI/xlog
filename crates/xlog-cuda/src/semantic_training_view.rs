@@ -910,6 +910,10 @@ impl SemanticSelectedTrainingView {
         self.arena.canaries.view()
     }
 
+    pub(crate) fn canary_rows(&self) -> [u64; 5] {
+        self.arena.canary_rows
+    }
+
     #[cfg(feature = "semantic-policy")]
     pub(crate) fn protected_members(&self) -> DeviceMemoryView<u64> {
         self.arena
@@ -1278,6 +1282,7 @@ pub(crate) struct PreparedOriginalTrainingRoster {
     pub groups: Vec<SemanticTrainingObjectiveGroupRecord>,
     pub group_members: Vec<u64>,
     pub canaries: Vec<SemanticTrainingCanaryRecord>,
+    canary_rows: [u64; 5],
     pub protected_members: Vec<u64>,
     #[cfg(feature = "semantic-policy")]
     actor_group_member_count: u64,
@@ -1326,6 +1331,7 @@ pub(crate) struct SemanticTrainingViewArena {
     groups: TrackedCudaSlice<SemanticTrainingObjectiveGroupRecord>,
     group_members: TrackedCudaSlice<u64>,
     canaries: TrackedCudaSlice<SemanticTrainingCanaryRecord>,
+    canary_rows: [u64; 5],
     #[cfg(feature = "semantic-policy")]
     protected_members: TrackedCudaSlice<u64>,
     #[cfg(feature = "semantic-policy")]
@@ -1565,6 +1571,7 @@ impl SemanticTrainingViewArena {
         self.initial_row_count = prepared.initial_row_count;
         self.materialized = true;
         self.protected_member_count = prepared.protected_member_count;
+        self.canary_rows = prepared.canary_rows;
         self.prefix_identity = prepared.prefix_identity;
         #[cfg(feature = "semantic-policy")]
         {
@@ -2227,6 +2234,7 @@ impl SemanticTrainingViewArena {
         group_members.resize(member_capacity, 0);
         groups.resize(8, SemanticTrainingObjectiveGroupRecord::default());
         canaries.resize(5, SemanticTrainingCanaryRecord::default());
+        let canary_rows = std::array::from_fn(|index| canaries[index].row_ordinal);
         protected_members.resize(protected_capacity, 0);
         descriptors.resize(
             replay_capacity.row_capacity,
@@ -2242,6 +2250,7 @@ impl SemanticTrainingViewArena {
             groups,
             group_members,
             canaries,
+            canary_rows,
             protected_members,
             #[cfg(feature = "semantic-policy")]
             actor_group_member_count,
@@ -2336,6 +2345,7 @@ impl SemanticTrainingViewArena {
             groups,
             group_members,
             canaries,
+            canary_rows,
             protected_members,
             #[cfg(feature = "semantic-policy")]
             actor_group_member_count,
@@ -2452,6 +2462,7 @@ impl SemanticTrainingViewArena {
             groups: device_groups,
             group_members: device_group_members,
             canaries: device_canaries,
+            canary_rows,
             #[cfg(feature = "semantic-policy")]
             protected_members: device_protected_members,
             #[cfg(feature = "semantic-policy")]

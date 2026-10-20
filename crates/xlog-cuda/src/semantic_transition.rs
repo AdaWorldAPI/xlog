@@ -5698,12 +5698,14 @@ struct ModelForwardReceipt {
     role: u64,
     generation: u64,
     work_sequence: u64,
-    logits: u64,
+    stream_state: u64,
     scalar_type: u64,
     row_count: u64,
     capacity: u64,
     vocabulary: u64,
-    strides_bytes: [u64; 3],
+    block_positions: u64,
+    row_seals: u64,
+    finite: u64,
     model_geometry_digest: Identity256,
     model_numerical_digest: Identity256,
     logits_digest: Identity256,
@@ -5720,15 +5722,15 @@ impl ModelForwardReceipt {
             self.role,
             self.generation,
             self.work_sequence,
-            self.logits,
+            self.stream_state,
             self.scalar_type,
             self.row_count,
             self.capacity,
             self.vocabulary,
-        ]
-        .into_iter()
-        .chain(self.strides_bytes)
-        {
+            self.block_positions,
+            self.row_seals,
+            self.finite,
+        ] {
             bytes.extend_from_slice(&word.to_le_bytes());
         }
         for identity in [
@@ -5755,18 +5757,25 @@ pub struct SemanticUpdateForwardReceipt {
 #[cfg(feature = "semantic-policy")]
 #[derive(Clone, Debug)]
 pub struct SemanticUpdateForwardReceiptMaterial {
+    pub abi: u64,
+    pub availability: u64,
     pub role: u64,
     pub generation: u64,
     pub work_sequence: u64,
+    pub stream_state: u64,
     pub scalar_type: u64,
-    pub dimensions: [u64; 3],
-    pub strides_bytes: [u64; 3],
+    pub row_count: u64,
+    pub capacity: u64,
+    pub vocabulary: u64,
+    pub block_positions: u64,
+    pub row_seals: u64,
+    pub finite: u64,
     pub model_geometry_digest: Identity256,
     pub model_numerical_digest: Identity256,
     pub logits_digest: Identity256,
     pub identity: Identity256,
-    /// Exact private receipt words, including the original pointer value as data,
-    /// not a live address or execution grant. Its SHA-256 seal is the final 32 bytes.
+    /// Exact private receipt words, including original pointer values as inert data.
+    /// Its SHA-256 seal is the final 32 bytes, over the preceding 200 bytes.
     pub canonical_bytes: Vec<u8>,
 }
 
@@ -27552,7 +27561,7 @@ impl SemanticTransitionSession {
                 receipts,
                 refusal,
                 state,
-                logits,
+                forward_streams,
                 work_count,
             ) = {
                 let prepared = self.steps[&step.token]
@@ -27571,10 +27580,20 @@ impl SemanticTransitionSession {
                     .model_update
                     .as_ref()
                     .ok_or(SemanticTransitionError::ObservationMismatch)?;
-                let output = update
-                    .output
-                    .as_ref()
-                    .ok_or(SemanticTransitionError::ObservationMismatch)?;
+                let forwards = update.forward_streams.each_ref().map(|stream| {
+                    stream
+                        .as_ref()
+                        .map(|stream| {
+                            (
+                                stream.state_pointer(),
+                                stream.row_seals_pointer(),
+                                stream.geometry(),
+                            )
+                        })
+                        .ok_or(SemanticTransitionError::ObservationMismatch)
+                });
+                let [baseline, candidate] = forwards;
+                let forwards = [baseline?, candidate?];
                 let work = prepared
                     .model_work
                     .as_ref()
@@ -27588,10 +27607,7 @@ impl SemanticTransitionSession {
                     update.forward_receipts.view(),
                     update.refusal.view(),
                     branch.state.view(),
-                    [
-                        (output.baseline_logits.data, output.baseline_logits.layout),
-                        (output.candidate_logits.data, output.candidate_logits.layout),
-                    ],
+                    forwards,
                     work.recording.events().len() as u64,
                 )
             };
@@ -27739,17 +27755,22 @@ impl SemanticTransitionSession {
                 }
                 let bytes = receipt.canonical_bytes();
                 let material = if receipt.availability == 2 {
-                    let (address, layout) = logits[role];
-                    let digest: [u8; 32] = Sha256::digest(&bytes[..bytes.len() - 32]).into();
-                    if receipt.abi != 1
+                    let (state, row_seals, (rows, capacity, vocabulary, scalar, block_positions)) =
+                        forward_streams[role];
+                    let digest: [u8; 32] = Sha256::digest(&bytes[..200]).into();
+                    if receipt.abi != 2
                         || receipt.role != role as u64
                         || receipt.work_sequence == 0
                         || receipt.work_sequence > work_count
-                        || receipt.logits != address
-                        || receipt.scalar_type != layout.scalar_type
+                        || binding.2.checked_add(role as u64) != Some(receipt.generation)
+                        || receipt.stream_state != state
+                        || receipt.row_seals != row_seals
+                        || receipt.scalar_type != scalar
                         || [receipt.row_count, receipt.capacity, receipt.vocabulary]
-                            != layout.dimensions[..3]
-                        || receipt.strides_bytes != layout.strides_bytes[..3]
+                            != [rows, capacity, vocabulary]
+                        || receipt.block_positions != block_positions
+                        || receipt.finite > 1
+                        || (result.advanced == 1 && receipt.finite != 1)
                         || receipt.model_geometry_digest != binding.3
                         || receipt.identity != Identity256::from_bytes(digest)
                         || receipt.model_numerical_digest == Identity256::default()
@@ -27765,12 +27786,19 @@ impl SemanticTransitionSession {
                         return Err(SemanticTransitionError::ObservationMismatch);
                     }
                     Some(SemanticUpdateForwardReceiptMaterial {
+                        abi: receipt.abi,
+                        availability: receipt.availability,
                         role: receipt.role,
                         generation: receipt.generation,
                         work_sequence: receipt.work_sequence,
+                        stream_state: receipt.stream_state,
                         scalar_type: receipt.scalar_type,
-                        dimensions: [receipt.row_count, receipt.capacity, receipt.vocabulary],
-                        strides_bytes: receipt.strides_bytes,
+                        row_count: receipt.row_count,
+                        capacity: receipt.capacity,
+                        vocabulary: receipt.vocabulary,
+                        block_positions: receipt.block_positions,
+                        row_seals: receipt.row_seals,
+                        finite: receipt.finite,
                         model_geometry_digest: receipt.model_geometry_digest,
                         model_numerical_digest: receipt.model_numerical_digest,
                         logits_digest: receipt.logits_digest,

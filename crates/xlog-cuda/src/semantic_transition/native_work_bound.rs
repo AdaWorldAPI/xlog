@@ -2239,6 +2239,7 @@ impl FrozenColdEvaluationContent {
         model_snapshot: [u64; 9],
         model_contract_guard: [u64; 9],
         step_input_preparation: Option<([u64; 9], [u64; 9])>,
+        stream_ceiling: [u64; 9],
     ) -> Result<Self, SemanticTransitionError> {
         let original = cohort.content_tensors();
         if original.len() != 17 || output.len() != 3 || objective.len() != 8 {
@@ -2333,6 +2334,7 @@ impl FrozenColdEvaluationContent {
         for _ in 0..4 {
             add_native_work_ceiling(&mut ceiling, model_ceiling)?;
         }
+        add_native_work_ceiling(&mut ceiling, stream_ceiling)?;
         for verify in [false, true] {
             let occurrence = cohort.content_native_work_ceiling(verify)?;
             for _ in 0..remaining[1][usize::from(verify)] {

@@ -1404,6 +1404,12 @@ fn pyxlog(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<semantic_transition::PySemanticTensorContentWitness>()?;
     m.add_class::<semantic_transition::PySemanticModelForwardWitness>()?;
     #[cfg(feature = "semantic-policy")]
+    m.add_class::<semantic_transition::model_forward_stream::PySemanticModelForwardStream>()?;
+    #[cfg(feature = "semantic-policy")]
+    m.add_class::<semantic_transition::model_forward_stream::PySemanticModelCanaryStream>()?;
+    #[cfg(feature = "semantic-policy")]
+    m.add_class::<semantic_transition::model_forward_stream::PySemanticModelCanaryWitness>()?;
+    #[cfg(feature = "semantic-policy")]
     m.add_class::<semantic_transition::PySemanticPolicyInvocation>()?;
     #[cfg(feature = "semantic-policy")]
     m.add_class::<semantic_transition::PySemanticRetainedReplayMember>()?;
