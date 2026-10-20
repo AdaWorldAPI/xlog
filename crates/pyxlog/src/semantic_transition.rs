@@ -18432,14 +18432,25 @@ impl PySemanticTensorContentWitness {
     /// complete witness and original graph through guaranteed creator cleanup.
     /// Use the actual consumer stream or legacy default stream 1. Per-thread
     /// default stream 2 is rejected on every thread before producer handoff.
-    #[pyo3(signature = (*, tensors, consumer_stream, occurrence=None))]
+    #[pyo3(signature = (*, tensors, consumer_stream, occurrence=None, recording_step=None))]
     fn verify(
         &self,
         py: Python<'_>,
         tensors: &Bound<'_, PyAny>,
         consumer_stream: &Bound<'_, PyAny>,
         occurrence: Option<&Bound<'_, PyAny>>,
+        recording_step: Option<Py<PySemanticPreparedStep>>,
     ) -> PyResult<()> {
+        #[cfg(not(feature = "semantic-policy"))]
+        if recording_step.is_some() {
+            return Err(invalid("recorded content requires semantic-policy support"));
+        }
+        #[cfg(feature = "semantic-policy")]
+        if recording_step.is_some() && !matches!(self.parent, ContentStepOwner::Prepared(_)) {
+            return Err(invalid(
+                "recorded content requires its original prepared witness",
+            ));
+        }
         let occurrence = original_source_content_occurrence(occurrence)?;
         let session = self.session.borrow(py);
         let mut budget = 16 * 1024 * 1024;
@@ -18466,7 +18477,43 @@ impl PySemanticTensorContentWitness {
                     "tensor content authority changed during producer callback",
                 ));
             }
-            self.parent.check_producer_stream(py, &owner, stream)
+            self.parent.check_producer_stream(py, &owner, stream)?;
+            #[cfg(feature = "semantic-policy")]
+            if let Some(recording_step) = &recording_step {
+                let recording_step = recording_step.borrow(py);
+                let recording = recording_step.session.borrow(py);
+                recording.require_creator()?;
+                if !recording.recording.load(Ordering::Acquire)
+                    || !matches!(self.parent, ContentStepOwner::Prepared(_))
+                {
+                    return Err(invalid(
+                        "recorded content requires its original prepared witness and recorder",
+                    ));
+                }
+                if recording_step.session.as_ptr() == self.session.as_ptr() {
+                    recording_step.content_binding_with_owner(py, &owner)?;
+                    owner
+                        .require_prepared_tensor_content_recorder(&recording_step.inner)
+                        .map_err(xlog_err)?;
+                } else {
+                    let (custody, source_bank) =
+                        session.actor_refresh_custody()?.ok_or_else(|| {
+                            invalid("foreign prepared content has no original parent custody")
+                        })?;
+                    let recording_owner = recording.owner()?;
+                    recording_step.content_binding_with_owner(py, &recording_owner)?;
+                    let bank = recording_owner
+                        .require_prepared_tensor_content_recorder(&recording_step.inner)
+                        .map_err(xlog_err)?;
+                    if bank != source_bank || occurrence.is_some() {
+                        return Err(invalid(
+                            "foreign content changed its original bank or SOURCE authority",
+                        ));
+                    }
+                    custody.require_update(py, &recording_step, bank)?;
+                }
+            }
+            Ok(())
         };
         check()?;
         #[cfg(feature = "semantic-policy")]
@@ -18572,13 +18619,38 @@ impl PySemanticTensorContentWitness {
                     })
                     .transpose()?;
                 #[cfg(feature = "semantic-policy")]
-                let result = owner.verify_prepared_tensor_content(
-                    &step.inner,
-                    &self.inner,
-                    tensors.into_native(),
-                    stream,
-                    occurrence.as_ref().map(|occurrence| &occurrence.inner),
-                );
+                let result = if let Some(recording_step) = recording_step.as_ref() {
+                    let recording_step = recording_step.borrow(py);
+                    if recording_step.session.as_ptr() == self.session.as_ptr() {
+                        owner.verify_prepared_tensor_content_in_recording_step(
+                            &recording_step.inner,
+                            &step.inner,
+                            &self.inner,
+                            tensors.into_native(),
+                            stream,
+                            occurrence.as_ref().map(|occurrence| &occurrence.inner),
+                        )
+                    } else {
+                        let recording = recording_step.session.borrow(py);
+                        let mut recording_owner = recording.owner()?;
+                        recording_owner.verify_prepared_foreign_tensor_content(
+                            &recording_step.inner,
+                            &mut owner,
+                            &step.inner,
+                            &self.inner,
+                            tensors.into_native(),
+                            stream,
+                        )
+                    }
+                } else {
+                    owner.verify_prepared_tensor_content(
+                        &step.inner,
+                        &self.inner,
+                        tensors.into_native(),
+                        stream,
+                        occurrence.as_ref().map(|occurrence| &occurrence.inner),
+                    )
+                };
                 #[cfg(not(feature = "semantic-policy"))]
                 let result = owner.verify_prepared_tensor_content(
                     &step.inner,
@@ -21111,12 +21183,13 @@ impl PySemanticTransitionController {
     /// pre-effect plan. All Capture/Verify calls share one ordered roster;
     /// SOURCE occurrences additionally retain their original frozen handles.
     #[cfg(feature = "semantic-policy")]
-    #[pyo3(signature = (task_use, *, layouts))]
+    #[pyo3(signature = (task_use, *, layouts, receiver_links=None))]
     fn finalize_segment_layout(
         &self,
         py: Python<'_>,
         task_use: Py<PySemanticTransitionTaskUse>,
         layouts: &Bound<'_, PyAny>,
+        receiver_links: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         let session = self.session.borrow(py);
         session.require_creator()?;
@@ -21148,6 +21221,57 @@ impl PySemanticTransitionController {
             }
         }
         let pool = session.material_sources.native_budget()?;
+        let mut transport = 16 * 1024 * 1024;
+        let receiver_links = receiver_links
+            .map(|value| source_content_occurrences::exact_tuple(value, None, &mut transport))
+            .transpose()?;
+        let receiver_count = receiver_links.as_ref().map_or(0, |links| links.len());
+        let receiver_bytes = receiver_count
+            .checked_mul(std::mem::size_of::<
+                xlog_cuda::SemanticPreparedTensorContentReceiver,
+            >())
+            .ok_or_else(|| invalid("segment external receiver extent overflow"))?;
+        let _receiver_metadata = pool
+            .reserve_auxiliary(
+                u64::try_from(receiver_bytes)
+                    .map_err(|_| invalid("segment external receiver extent exceeds u64"))?,
+            )
+            .map_err(xlog_err)?;
+        let mut receivers = Vec::new();
+        receivers
+            .try_reserve_exact(receiver_count)
+            .map_err(|_| invalid("segment external receiver reservation failed"))?;
+        // Issue immutable source proofs before entering the current native
+        // owner. Each child has already finalized its own original plan.
+        if let Some(links) = receiver_links {
+            for link in links.iter() {
+                let link = source_content_occurrences::exact_tuple(&link, Some(3), &mut transport)?;
+                let slot = ColdValue::read(&link.get_item(0)?, &mut 128, 0)?.unsigned()?;
+                let source_value = link.get_item(1)?;
+                let source_step = source_value.extract::<PyRef<'_, PySemanticPreparedStep>>()?;
+                if source_step.session.as_ptr() == self.session.as_ptr() {
+                    return Err(invalid(
+                        "same-session receivers use their original complete segment roster",
+                    ));
+                }
+                let bank =
+                    usize::try_from(ColdValue::read(&link.get_item(2)?, &mut 128, 0)?.unsigned()?)
+                        .map_err(|_| {
+                            invalid("external receiver bank exceeds native address space")
+                        })?;
+                if bank > 1 {
+                    return Err(invalid("external receiver requires an original bank"));
+                }
+                let source = source_step.session.borrow(py);
+                let source_owner = source.owner()?;
+                source_step.content_binding_with_owner(py, &source_owner)?;
+                receivers.push(
+                    source_owner
+                        .prepared_tensor_content_receiver(&source_step.inner, bank, slot)
+                        .map_err(xlog_err)?,
+                );
+            }
+        }
         let row_bytes = std::mem::size_of::<(
             SemanticPreparedStep,
             usize,
@@ -21226,7 +21350,7 @@ impl PySemanticTransitionController {
             rows.push((step.inner.clone(), tensors, events, content, bindings));
         }
         owner
-            .finalize_prepared_segment_layout(&rows)
+            .finalize_prepared_segment_layout(&rows, &receivers)
             .map_err(xlog_err)
     }
 
