@@ -3158,6 +3158,632 @@ pub(super) fn group_critic_native_work_ceiling(
     Ok(ceiling)
 }
 
+/// Enclose the existing five canaries from their original forward geometry.
+/// Each canary names one row, with at most `capacity` target positions.
+pub(super) fn update_canary_native_work_ceiling(
+    storage: &PublicationStorage,
+    capacity: u64,
+    vocabulary: u64,
+    seal_count: u64,
+    task_queries: u64,
+) -> Result<[u64; 9], SemanticTransitionError> {
+    let scans = ceiling_sum([
+        ceiling_product(14, ceiling_product(capacity, vocabulary)?)?,
+        // Normalizer constants, obligation metadata, protected-member checks,
+        // retained/drift position scans (including skipped labels/kinds).
+        ceiling_product(7, capacity)?,
+        task_queries,
+        2 * (4 * 4 + 3) + (4 + 6) + 5 + (5 + 4),
+        5,
+        2 * 8 + 8 + 4 + 5 * 12 + 24,
+        storage.bank_templates[0].len() as u64,
+    ])?;
+    let writes = ceiling_sum([
+        2 * (2 * size_of::<ModelForwardReceipt>() as u64 + 13 * 8 + 3 * 32 + 8),
+        5 * 3 * size_of::<SemanticTrainingCanaryResultRecord>() as u64,
+        10 * (size_of::<SemanticTrainingCanaryRefusalRecord>() as u64 - 8),
+        2 * size_of::<SemanticTrainingCanaryRefusalRecord>() as u64 + 8 + 1 + 5 * 8 + 8 + 5 * 8 + 8,
+    ])?;
+    let mut ceiling = [3, scans, 0, 0, 0, 0, 0, 0, writes];
+    let mut guard = model_contract_guard_native_work_ceiling(storage, &storage.bank_templates[0])?;
+    guard[0] = 0;
+    repeat_native_ceiling(&mut ceiling, guard, 2)?;
+    repeat_native_ceiling(
+        &mut ceiling,
+        publication_hash_ceiling(size_of::<ModelForwardReceipt>() as u64 - 32)?,
+        4,
+    )?;
+    repeat_native_ceiling(
+        &mut ceiling,
+        publication_hash_ceiling(b"xlog.semantic.model-numerics.v1\0".len() as u64)?,
+        2,
+    )?;
+    let folds = ceiling_sum([2, ceiling_product(2, seal_count)?])?;
+    repeat_native_ceiling(&mut ceiling, publication_hash_ceiling(80)?, folds)?;
+    add_native_work_ceiling(
+        &mut ceiling,
+        [0, 0, 0, 0, 0, 0, 0, 0, ceiling_product(80, folds)?],
+    )?;
+    native_work_ceiling_units(ceiling)?;
+    Ok(ceiling)
+}
+
+fn publication_hash_ceiling(bytes: u64) -> Result<[u64; 9], SemanticTransitionError> {
+    if bytes > u64::MAX / 8 {
+        return Err(native_work_ceiling_overflow());
+    }
+    let blocks = ceiling_sum([bytes, 9 + 63])? / 64;
+    Ok([0, 0, 0, 0, 0, 0, 0, blocks, 32])
+}
+
+fn text_binding_validation_native_work_ceiling() -> Result<[u64; 9], SemanticTransitionError> {
+    // Original source/selection roster, original text rows, and the optional
+    // non-Proposal selected-row scan all have the same fixed 32-slot bank.
+    Ok([
+        0,
+        3 * 32,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        32 * size_of::<SemanticTextRow>() as u64,
+    ])
+}
+
+fn active_origin_validation_native_work_ceiling(
+    n: u64,
+    feedback: u64,
+) -> Result<[u64; 9], SemanticTransitionError> {
+    let rows = ceiling_sum([32, feedback])?;
+    Ok([
+        0,
+        ceiling_sum([
+            n,                         // Original feedback-directory search.
+            ceiling_product(2, rows)?, // Shape and matched active-row visits.
+            2 * 32 * 32,               // Each kind's bounded source selection passes.
+            feedback,
+        ])?,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ])
+}
+
+fn continuation_validation_native_work_ceiling(
+    storage: &PublicationStorage,
+) -> Result<[u64; 9], SemanticTransitionError> {
+    continuation_validation_geometry_native_work_ceiling(
+        &storage.contract_value,
+        storage.bank_templates[0].len(),
+        storage.continuation_templates.len(),
+        storage.layouts.len(),
+        storage.allocations.len(),
+    )
+}
+
+fn model_update_validation_native_work_ceiling(
+    n: u64,
+    s: u64,
+) -> Result<u64, SemanticTransitionError> {
+    let pairs = ceiling_product(n, n.saturating_sub(1))? / 2;
+    ceiling_sum([
+        n,
+        pairs,
+        ceiling_product(n, n)?,
+        ceiling_product(n, ceiling_sum([3, n, s])?)?,
+        pairs,
+    ])
+}
+
+fn continuation_validation_geometry_native_work_ceiling(
+    contract: &PublicationContract,
+    directory_count: usize,
+    continuation_count: usize,
+    layout_count: usize,
+    allocation_count: usize,
+) -> Result<[u64; 9], SemanticTransitionError> {
+    let n = u64::try_from(directory_count).map_err(|_| native_work_ceiling_overflow())?;
+    let p = u64::try_from(continuation_count).map_err(|_| native_work_ceiling_overflow())?;
+    // Source, authority and layout-table are the original three non-tensor
+    // pending roles. The validator itself requires precisely this roster.
+    let t = p.checked_sub(3).ok_or_else(native_work_ceiling_overflow)?;
+    let b = u64::try_from(layout_count).map_err(|_| native_work_ceiling_overflow())?;
+    let s = u64::try_from(allocation_count).map_err(|_| native_work_ceiling_overflow())?;
+    let rows = ceiling_sum([32, contract.feedback_capacity])?;
+    let pairs = |count: u64| -> Result<u64, SemanticTransitionError> {
+        Ok(ceiling_product(count, count.saturating_sub(1))? / 2)
+    };
+    // A malformed private Update binding count is rejected above n. Include
+    // every reached directory, binding, storage and prior-binding visit up to
+    // that original directory geometry, not merely the successful allocation count.
+    let model_update = model_update_validation_native_work_ceiling(n, s)?;
+    let slots = ceiling_sum([
+        4 * 4, // Original instance, topology, table and prefix identities.
+        model_update,
+        n,
+        p,
+        n, // Prefix search, pending tensor table, expected-directory scan.
+        ceiling_product(t, ceiling_sum([1, p])?)?,
+        pairs(t)?,
+        ceiling_product(p, ceiling_sum([1, n])?)?,
+        pairs(p)?,
+        1,             // Original authority storage entry.
+        32 * (1 + 32), // Source rows and their complete original source search.
+        ceiling_product(t, ceiling_sum([p, t, n, b, 4, rows])?)?,
+    ])?;
+    let mut result = [
+        0,
+        slots,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        ceiling_product(t, 29 * size_of::<u64>() as u64)?,
+    ];
+    add_native_work_ceiling(&mut result, text_binding_validation_native_work_ceiling()?)?;
+    add_native_work_ceiling(
+        &mut result,
+        active_origin_validation_native_work_ceiling(n, contract.feedback_capacity)?,
+    )?;
+    native_work_ceiling_units(result)?;
+    Ok(result)
+}
+
+/// Extent validation and the actual snapshot each resolve every original row
+/// once. The copy kernel shares that resolution across its byte-copy threads.
+pub(super) fn replay_metadata_native_work_ceiling(
+    rows: u64,
+    directory_count: u64,
+) -> Result<[u64; 9], SemanticTransitionError> {
+    Ok([
+        0,
+        ceiling_product(
+            2,
+            ceiling_product(rows, ceiling_sum([directory_count, 2])?)?,
+        )?,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ])
+}
+
+pub(super) fn continuation_preparation_native_work_ceiling(
+    storage: &PublicationStorage,
+) -> Result<[u64; 9], SemanticTransitionError> {
+    continuation_preparation_geometry_native_work_ceiling(
+        &storage.contract_value,
+        &storage.bank_templates[0],
+        storage.continuation_templates.len(),
+        storage.layouts.len(),
+        storage.allocations.len(),
+        continuation_copy_capacity_native_work_ceiling(&storage.continuation_templates, |slot| {
+            storage
+                .allocations
+                .get(slot)
+                .map(|allocation| allocation.entry().bytes)
+                .ok_or(SemanticTransitionError::ObservationMismatch)
+        })?,
+    )
+}
+
+pub(super) fn continuation_copy_capacity_native_work_ceiling(
+    ranges: &[PublicationRange],
+    allocation_bytes: impl Fn(usize) -> Result<u64, SemanticTransitionError>,
+) -> Result<u64, SemanticTransitionError> {
+    ranges
+        .iter()
+        .filter(|range| is_tensor_role(range.role))
+        .try_fold(0, |total, range| {
+            let slot =
+                usize::try_from(range.storage_slot).map_err(|_| native_work_ceiling_overflow())?;
+            ceiling_sum([
+                total,
+                allocation_bytes(slot)?
+                    .checked_sub(range.offset_bytes)
+                    .ok_or_else(native_work_ceiling_overflow)?,
+            ])
+        })
+}
+
+pub(super) fn continuation_preparation_geometry_native_work_ceiling(
+    contract: &PublicationContract,
+    directory: &[PublicationRange],
+    continuation_count: usize,
+    layout_count: usize,
+    allocation_count: usize,
+    copy_capacity: u64,
+) -> Result<[u64; 9], SemanticTransitionError> {
+    let mut result = continuation_validation_geometry_native_work_ceiling(
+        contract,
+        directory.len(),
+        continuation_count,
+        layout_count,
+        allocation_count,
+    )?;
+    let n = u64::try_from(directory.len()).map_err(|_| native_work_ceiling_overflow())?;
+    let p = u64::try_from(continuation_count).map_err(|_| native_work_ceiling_overflow())?;
+    let s = u64::try_from(allocation_count).map_err(|_| native_work_ceiling_overflow())?;
+    let rows = ceiling_sum([32, contract.feedback_capacity])?;
+    // Preparation validates text and active origin before the final complete
+    // continuation validator. Admission later has its separate original meter.
+    add_native_work_ceiling(&mut result, text_binding_validation_native_work_ceiling()?)?;
+    add_native_work_ceiling(
+        &mut result,
+        active_origin_validation_native_work_ceiling(n, contract.feedback_capacity)?,
+    )?;
+    add_native_work_ceiling(&mut result, [0, ceiling_sum([n, 32])?, 0, 0, 0, 0, 0, 0, 0])?;
+    let mut guard = model_contract_guard_geometry_native_work_ceiling(contract, directory)?;
+    guard[0] = 0;
+    add_native_work_ceiling(&mut result, guard)?;
+    add_native_work_ceiling(
+        &mut result,
+        [
+            0,
+            ceiling_sum([
+                12,
+                s,
+                ceiling_product(s, s.saturating_sub(1))? / 2,
+                publication_source_validation_native_work_ceiling(contract)?,
+                n,
+                ceiling_product(3, p)?,
+                rows,
+                p,
+                32 * 32,
+            ])?,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            ceiling_sum([
+                64,
+                2 * size_of::<PublicationRange>() as u64 + 5 * 8,
+                ceiling_product(rows, size_of::<ActiveRow>() as u64)?,
+                size_of::<PendingContinuation>() as u64 - 3 * 8,
+                ceiling_product(p, 2 * 8)?,
+                size_of::<PublicationRange>() as u64 + 2 * 8,
+                32 * (size_of::<SourceSlot>() as u64 + 2 * 8),
+            ])?,
+        ],
+    )?;
+    // Each original nonempty D2D chunk contains at least one byte. Its
+    // canonical destination backing therefore bounds both bytes and commands.
+    result[0] = ceiling_sum([1, copy_capacity])?;
+    result[8] = ceiling_sum([result[8], copy_capacity])?;
+    native_work_ceiling_units(result)?;
+    Ok(result)
+}
+
+fn publication_source_validation_native_work_ceiling(
+    contract: &PublicationContract,
+) -> Result<u64, SemanticTransitionError> {
+    let window = contract.window_capacity;
+    ceiling_sum([
+        ceiling_product(2, window)?,
+        ceiling_product(window, window.saturating_sub(1))? / 2,
+        ceiling_product(window, contract.terminal_token_count)?,
+        ceiling_product(window, ceiling_sum([window, 1])?)?,
+    ])
+}
+
+/// The publisher seals each payload once. Prediction repeats only bounded
+/// metadata walks/materialization, never a payload hash or copy. Both banks'
+/// real backing capacities enclose every reachable success and refusal prefix.
+fn publication_finalization_native_work_ceiling(
+    storage: &PublicationStorage,
+) -> Result<[u64; 9], SemanticTransitionError> {
+    let n = storage.bank_templates[0].len() as u64;
+    let t = storage.layouts.len() as u64;
+    let contract = storage.contract_value;
+    let window = contract.window_capacity;
+    let rows = ceiling_sum([window, contract.feedback_capacity])?;
+    let mut result = [0; 9];
+    add_native_work_ceiling(
+        &mut result,
+        continuation_validation_native_work_ceiling(storage)?,
+    )?;
+    add_native_work_ceiling(&mut result, text_binding_validation_native_work_ceiling()?)?;
+    add_native_work_ceiling(&mut result, [0, ceiling_sum([n, 32])?, 0, 0, 0, 0, 0, 0, 0])?;
+    let p = storage.continuation_templates.len() as u64;
+    let pending_layouts = p.checked_sub(3).ok_or_else(native_work_ceiling_overflow)?;
+    let preserves = storage.bank_templates[0]
+        .iter()
+        .filter(|range| {
+            matches!(range.role, 32 | 44 | 56 | 57)
+                || range.role == SemanticStateRole::TaskGround as u64
+        })
+        .count() as u64;
+    // Applying the continuation repeats Update-binding validation, then walks
+    // the original output/destination rosters and resolves each logical view.
+    // Payload copies have their separate original backing-capacity enclosure.
+    let apply_visits = ceiling_sum([
+        model_update_validation_native_work_ceiling(n, storage.allocations.len() as u64)?,
+        p,
+        n,
+        ceiling_product(3, n)?,
+        ceiling_product(n, n)?,
+        n,
+        ceiling_product(p, ceiling_sum([1, n])?)?,
+        ceiling_product(
+            pending_layouts,
+            ceiling_sum([p, pending_layouts, n, t, rows, 1])?,
+        )?,
+        ceiling_product(3, n)?,
+        ceiling_product(preserves, ceiling_sum([2, n, t, 4])?)?,
+    ])?;
+    let apply_bytes = ceiling_sum([
+        ceiling_product(n, 3 * size_of::<PublicationRange>() as u64 + 2 * 8)?,
+        ceiling_product(p, 3 * 8)?,
+        3 * 8,
+        ceiling_product(pending_layouts, 29 * 8)?,
+        ceiling_product(preserves, size_of::<PublicationRange>() as u64 + 2 * 8)?,
+    ])?;
+    add_native_work_ceiling(
+        &mut result,
+        [0, apply_visits, 0, 0, 0, 0, 0, 0, apply_bytes],
+    )?;
+    let capacity = |role, index| -> Result<u64, SemanticTransitionError> {
+        storage.bank_templates.iter().try_fold(0, |bytes, bank| {
+            let range = bank
+                .iter()
+                .find(|range| range.role == role && range.index == index)
+                .ok_or(SemanticTransitionError::ObservationMismatch)?;
+            let entry = storage
+                .allocations
+                .get(
+                    usize::try_from(range.storage_slot)
+                        .map_err(|_| native_work_ceiling_overflow())?,
+                )
+                .ok_or(SemanticTransitionError::ObservationMismatch)?
+                .entry();
+            Ok(bytes.max(
+                entry
+                    .bytes
+                    .checked_sub(range.offset_bytes)
+                    .ok_or_else(native_work_ceiling_overflow)?,
+            ))
+        })
+    };
+    // Admission validates both directories through the original finite
+    // producer geometry. The selected-model guard can occur once before
+    // admission and once in admission (or its numerical-refusal branch).
+    for directory in &storage.bank_templates {
+        let mut validation = step_input_producer_native_work_ceiling(storage, &[], directory)?;
+        validation[0] = 0;
+        add_native_work_ceiling(&mut result, validation)?;
+    }
+    let mut guard = model_contract_guard_native_work_ceiling(storage, &storage.bank_templates[0])?;
+    guard[0] = 0;
+    repeat_native_ceiling(&mut result, guard, 2)?;
+    // Two lane probes and the final selected source preparation each validate
+    // the same window; a refused probe stops at its actually reached prefix.
+    let source_visits = publication_source_validation_native_work_ceiling(&contract)?;
+    let prepare_visits = ceiling_sum([
+        source_visits,
+        ceiling_product(2, window)?,
+        ceiling_product(window, contract.terminal_token_count)?,
+    ])?;
+    let prepare_bytes = ceiling_sum([
+        size_of::<PublicationHeader>() as u64 + 8,
+        ceiling_product(window, 2 * size_of::<SourceSlot>() as u64 + 8)?,
+        ceiling_product(16, ceiling_product(window, contract.terminal_token_count)?)?,
+    ])?;
+    add_native_work_ceiling(
+        &mut result,
+        [
+            0,
+            ceiling_sum([
+                source_visits,
+                ceiling_product(3, prepare_visits)?,
+                contract.prefix_capacity,
+                window,
+            ])?,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            ceiling_product(3, prepare_bytes)?,
+        ],
+    )?;
+    let intents = capacity(30, 0)?
+        .checked_sub(size_of::<IntentQueueHeader>() as u64)
+        .ok_or_else(native_work_ceiling_overflow)?
+        / size_of::<IntentEntry>() as u64;
+    // Original intent validation hashes its effect once, each actual payload,
+    // and each identity/chain. Partitioning adds at most two SHA padding blocks
+    // per original entry above the full-capacity payload enclosure.
+    add_native_work_ceiling(&mut result, publication_hash_ceiling(capacity(31, 0)?)?)?;
+    let mut intent_payload = publication_hash_ceiling(capacity(31, 0)?)?;
+    intent_payload[7] = ceiling_sum([intent_payload[7], ceiling_product(2, intents)?])?;
+    intent_payload[8] = ceiling_product(32, intents)?;
+    add_native_work_ceiling(&mut result, intent_payload)?;
+    repeat_native_ceiling(&mut result, publication_hash_ceiling(25 * 8)?, intents)?;
+    repeat_native_ceiling(&mut result, publication_hash_ceiling(80)?, intents)?;
+    add_native_work_ceiling(
+        &mut result,
+        [
+            0,
+            ceiling_sum([ceiling_product(intents, 1 + 5 * 4)?, 4])?,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            ceiling_product(intents, 25 * 8 + 80)?,
+        ],
+    )?;
+    for range in &storage.bank_templates[0] {
+        let role = range.role;
+        let bytes = capacity(role, range.index)?;
+        let coverage = u64::from(role == 1 || (4..=13).contains(&role));
+        let logical = u64::from(matches!(role, 2 | 14 | 15 | 48));
+        let intent = u64::from(matches!(role, 30 | 31));
+        let attempt = u64::from(matches!(role, 14 | 27 | 30 | 32 | 33));
+        let attempt_target = 2 * u64::from(role == 33);
+        let descriptor = u64::from(matches!(role, 27 | 28 | 30 | 31 | 32 | 33));
+        let preserve = u64::from(
+            matches!(role, 32 | 44 | 56 | 57) || role == SemanticStateRole::TaskGround as u64,
+        );
+        let occurrences = ceiling_sum([
+            1,
+            coverage,
+            logical,
+            intent,
+            attempt,
+            attempt_target,
+            descriptor,
+            preserve,
+        ])?;
+        let mut digest = content_digest_ceiling(bytes, 29, false)?;
+        digest[0] = 0;
+        if (51..=54).contains(&role) {
+            digest[1] = rows;
+        }
+        repeat_native_ceiling(&mut result, digest, occurrences)?;
+        // The predictor constructs the same small content-view framing for
+        // logical/attempt/descriptor hashes; SHA runs only in the actual suffix.
+        let predicted_views = ceiling_sum([logical, intent, attempt, attempt_target, descriptor])?;
+        add_native_work_ceiling(
+            &mut result,
+            [
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                ceiling_product(predicted_views, 29 * size_of::<u64>() as u64)?,
+            ],
+        )?;
+        // Logical/descriptor and directory folds, plus one coverage fold. A
+        // model view has two numerical folds and the logical backing fold too.
+        let folds = ceiling_sum([2, coverage, if (18..=25).contains(&role) { 3 } else { 0 }])?;
+        repeat_native_ceiling(&mut result, publication_hash_ceiling(80)?, folds)?;
+        add_native_work_ceiling(
+            &mut result,
+            [0, 0, 0, 0, 0, 0, 0, 0, ceiling_product(folds, 80)?],
+        )?;
+        add_native_work_ceiling(
+            &mut result,
+            publication_hash_ceiling(size_of::<PublicationRange>() as u64)?,
+        )?;
+        add_native_work_ceiling(
+            &mut result,
+            [0, 0, 0, 0, 0, 0, 0, 0, size_of::<PublicationRange>() as u64],
+        )?;
+        if (18..=25).contains(&role) {
+            let backing = storage.bank_templates.iter().try_fold(0, |bound, bank| {
+                let range = bank
+                    .iter()
+                    .find(|item| item.role == role && item.index == range.index)
+                    .ok_or(SemanticTransitionError::ObservationMismatch)?;
+                let allocation = storage
+                    .allocations
+                    .get(range.storage_slot as usize)
+                    .ok_or(SemanticTransitionError::ObservationMismatch)?;
+                Ok::<_, SemanticTransitionError>(bound.max(allocation.entry().bytes))
+            })?;
+            add_native_work_ceiling(&mut result, publication_hash_ceiling(backing)?)?;
+        }
+    }
+    // One real search/layout pass for sealing and one for coverage. Future
+    // logical/attempt/descriptor searches are also walked once by prediction.
+    let searches = ceiling_sum([
+        ceiling_product(2, ceiling_product(n, ceiling_sum([n, t])?)?)?,
+        ceiling_product(n, n.saturating_sub(1))? / 2,
+        ceiling_product(ceiling_sum([window, 25])?, n)?,
+        ceiling_product(3, n)?,
+        window,
+    ])?;
+    add_native_work_ceiling(
+        &mut result,
+        [0, ceiling_product(2, searches)?, 0, 0, 0, 0, 0, 0, 0],
+    )?;
+    // Each selected source can create one provenance record, with its original
+    // receipt and logical record hashes. Action, attempt and logical publication
+    // add at most three other codebook occurrences.
+    let codebooks = ceiling_sum([window, 3])?;
+    let mut codebook = content_digest_ceiling(capacity(48, 0)?, 29, false)?;
+    codebook[0] = 0;
+    repeat_native_ceiling(&mut result, codebook, codebooks)?;
+    repeat_native_ceiling(
+        &mut result,
+        publication_hash_ceiling(size_of::<SemanticTransitionReceipt>() as u64)?,
+        window,
+    )?;
+    repeat_native_ceiling(
+        &mut result,
+        publication_hash_ceiling(size_of::<TokenProvenance>() as u64)?,
+        window,
+    )?;
+    for (bytes, count) in [
+        (size_of::<PublicationBank>() as u64, 1),
+        (size_of::<PublicationHeader>() as u64, 1),
+        (32 * size_of::<SourceSlot>() as u64, 1),
+        (
+            COMPONENT_COUNT as u64 * size_of::<SemanticTransitionReceipt>() as u64,
+            1,
+        ),
+        (
+            7 * size_of::<crate::semantic_hypergraph::SemanticResidentReceiptRecord>() as u64,
+            2,
+        ),
+        (size_of::<SemanticActionBatchReceipt>() as u64, 2),
+        (80, 4),
+        (9 * size_of::<u64>() as u64, 1),
+        (25 * size_of::<u64>() as u64, 1),
+        (contract.model_contract_layout.schema_bytes, 1),
+        (
+            b"xlog.semantic.model-identity.v1\0".len() as u64 + 32 + 8 + 32,
+            1,
+        ),
+        (b"xlog.semantic.model-numerics.v1\0".len() as u64, 1),
+        (capacity(31, 0)?, 2),
+    ] {
+        repeat_native_ceiling(&mut result, publication_hash_ceiling(bytes)?, count)?;
+    }
+    let fixed = ceiling_sum([
+        size_of::<DeviceState>() as u64,
+        136 * size_of::<SemanticTransitionReceipt>() as u64,
+        3 * size_of::<SemanticActionBatchReceipt>() as u64,
+        2 * size_of::<ExecutionWork>() as u64,
+        3 * size_of::<PublicationHeader>() as u64,
+        2 * size_of::<CompletionCoverage>() as u64,
+        size_of::<AttemptReceipt>() as u64,
+        size_of::<IntentEntry>() as u64,
+        12 * size_of::<PublicationRange>() as u64,
+        ceiling_product(window, 2 * size_of::<TokenProvenance>() as u64 + 16 * 8)?,
+        // Fixed identity copies and scalar writes in action/coverage/attempt,
+        // model-contract, intent, equality and publication closure.
+        (16 + 4 + 13 + 9 + 25 + 19 + 8 + 5 + 4 + 4 * 5 + 10 + 11) * 8,
+        4 * 80,
+        capacity(30, 0)?,
+        capacity(15, 0)?,
+        capacity(31, 0)?,
+    ])?;
+    add_native_work_ceiling(&mut result, [0, 11 + 5 + 4, 0, 0, 0, 0, 0, 0, fixed])?;
+    native_work_ceiling_units(result)?;
+    Ok(result)
+}
+
 /// The protected attainment fold visits actual closure facts and explicit
 /// edges. This bounds the same reached TableSlot events, not structural cost.
 fn attainment_native_work_ceiling(
@@ -3323,6 +3949,53 @@ pub(super) fn actor_refresh_transition_native_work_ceilings(
                 ceiling_product(2, ground_bytes)?,
             ],
         )?;
+        // Continuation copies reach their own byte-writing boundaries. Bound
+        // each original output by its fixed logical tensor capacity, including
+        // packed active rows; cache preservation and the layout table use the
+        // largest retained native backing in the two publication banks.
+        let continuation = child.steps[&handles[index].token]
+            .prepared
+            .as_ref()
+            .and_then(|prepared| prepared.branches[index].continuation.as_ref())
+            .ok_or(SemanticTransitionError::NotBound)?;
+        add_native_work_ceiling(
+            ceiling,
+            publication_finalization_native_work_ceiling(storage)?,
+        )?;
+        for source in &continuation.sources {
+            let bytes = source.layout.dimensions[..source.layout.rank as usize]
+                .iter()
+                .try_fold(source.layout.element_bytes, |bytes, dimension| {
+                    ceiling_product(bytes, *dimension)
+                })?;
+            add_native_work_ceiling(ceiling, [0, 0, 0, 0, 0, 0, 0, 0, bytes])?;
+        }
+        for original in storage.bank_templates[0]
+            .iter()
+            .filter(|range| matches!(range.role, 4 | 5 | 55))
+        {
+            let mut bytes = 0;
+            for bank in &storage.bank_templates {
+                let range = bank
+                    .iter()
+                    .find(|range| range.role == original.role && range.index == original.index)
+                    .ok_or(SemanticTransitionError::ObservationMismatch)?;
+                let slot = usize::try_from(range.storage_slot)
+                    .map_err(|_| native_work_ceiling_overflow())?;
+                bytes = bytes.max(
+                    storage
+                        .allocations
+                        .get(slot)
+                        .ok_or(SemanticTransitionError::ObservationMismatch)?
+                        .entry()
+                        .bytes,
+                );
+            }
+            if original.role == 55 {
+                bytes = ceiling_sum([bytes, 2 * size_of::<u64>() as u64])?;
+            }
+            add_native_work_ceiling(ceiling, [0, 0, 0, 0, 0, 0, 0, 0, bytes])?;
+        }
         // apply_continuation preserves these exact original non-tensor roles,
         // including their unused backing. Both publication banks are possible;
         // select the larger retained physical extent per canonical role/index.
@@ -3362,6 +4035,13 @@ pub(super) fn actor_refresh_transition_native_work_ceilings(
                 usize::try_from(arena[6]).map_err(|_| native_work_ceiling_overflow())?,
             )?;
             add_native_work_ceiling(ceiling, [0, 0, 0, 0, 0, 0, 0, 0, bytes])?;
+            add_native_work_ceiling(
+                ceiling,
+                io.replay_custody
+                    .as_ref()
+                    .expect("checked original replay custody")
+                    .successor_metadata_native_work_ceiling()?,
+            )?;
         }
         if index == 0 {
             if io.policy.is_some() {
@@ -3392,6 +4072,9 @@ pub(super) fn actor_refresh_transition_native_work_ceilings(
                 .iter()
                 .map(|component| u64::from(component.cardinality)),
         )?;
+        // The immutable support bank is proved binary before publication can
+        // read support or retire a root; its later numerical scan is separate.
+        add_native_work_ceiling(ceiling, [0, 0, 0, cells, 0, 0, 0, 0, 0])?;
         let edit_cells = ceiling_sum(
             components
                 .iter()

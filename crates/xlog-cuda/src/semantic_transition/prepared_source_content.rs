@@ -2201,7 +2201,7 @@ impl SemanticTransitionSession {
 pub(super) struct SourcePublicationGeometry {
     proof: SemanticReplayStateMaterialProof,
     admission: Arc<SemanticReplayStateMaterialAdmission>,
-    storage: PublicationStorageGeometry,
+    pub(super) storage: PublicationStorageGeometry,
     inputs: Vec<StepInputPlan>,
     feedback_schema: SemanticFeedbackSchema,
     feedback_plan: FeedbackAllocationPlan,

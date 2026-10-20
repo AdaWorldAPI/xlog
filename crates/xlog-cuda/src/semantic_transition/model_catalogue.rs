@@ -168,15 +168,17 @@ impl FrozenModelCatalogue {
 
     fn project(
         &self,
-        original: &ActionCodebooks,
+        original_words: &[u64],
+        original_program: Option<Identity256>,
+        original_binding: SemanticCatalogueBinding,
         member: usize,
     ) -> Result<Vec<u64>, SemanticTransitionError> {
         let selected = self
             .members
             .get(member)
             .ok_or(SemanticTransitionError::ObservationMismatch)?;
-        if selected.program != original.program_binding
-            || !normalized(&original.words).eq(selected.words.iter().copied())
+        if selected.program != original_program
+            || !normalized(original_words).eq(selected.words.iter().copied())
         {
             return Err(publication_input_error(
                 "model catalogue requires its original cold context recipe",
@@ -191,7 +193,7 @@ impl FrozenModelCatalogue {
                     .sum::<usize>(),
         );
         words.resize(HEADER_WORDS, 0);
-        words[..25].copy_from_slice(&original.words[..25]);
+        words[..25].copy_from_slice(&original_words[..25]);
         words[21..25].fill(0);
         words[25..29].copy_from_slice(&identity_words(*self.binding.digest.as_bytes()));
         words[37] = self.statement_bytes as u64;
@@ -246,7 +248,7 @@ impl FrozenModelCatalogue {
         words[9] = (words.len() * 8) as u64 - words[8];
         let mut hash = Sha256::new();
         hash.update(b"xlog.semantic.model-context-resolution.v1\0");
-        hash.update(original.binding.digest.as_bytes());
+        hash.update(original_binding.digest.as_bytes());
         for &word in &words {
             hash.update(word.to_le_bytes());
         }
@@ -256,6 +258,92 @@ impl FrozenModelCatalogue {
 }
 
 impl ActionCodebooks {
+    pub(super) fn bind_admission_words(
+        admission: &SemanticAdmission,
+        owner: u64,
+        program: Option<Identity256>,
+        words: &mut [u64],
+    ) -> Result<SemanticCatalogueBinding, SemanticTransitionError> {
+        if words.len() < HEADER_WORDS
+            || words[10..14] != identity_words(*admission.schema_generation().as_bytes())
+        {
+            return Err(publication_input_error(
+                "action catalogue changes its original schema",
+            ));
+        }
+        words[14] = owner;
+        words[15] = admission.base().slot() as u64;
+        words[16] = admission.base().generation();
+        words[17..21].copy_from_slice(&identity_words(
+            *admission.base_snapshot().digest().as_bytes(),
+        ));
+        words[21..25].fill(0);
+        let mut hash = Sha256::new();
+        hash.update(b"xlog.semantic.action-binding.v5\0");
+        hash.update(CATALOGUE_DIGEST);
+        hash.update(admission.identity().as_bytes());
+        if let Some(identity) = program {
+            hash.update(identity.as_bytes());
+        }
+        for &word in words.iter() {
+            hash.update(word.to_le_bytes());
+        }
+        let digest = Identity256::from_bytes(hash.finalize().into());
+        words[21..25].copy_from_slice(&identity_words(*digest.as_bytes()));
+        Ok(SemanticCatalogueBinding {
+            generation: CATALOGUE_GENERATION,
+            digest,
+        })
+    }
+
+    /// Rebind runtime root coordinates without rebuilding immutable meanings.
+    /// The original projection reservation already encloses the retained old
+    /// words, one local recipe, its replacement projection and both component
+    /// rosters. The restore caller owns the unprojected and pinned-copy claim.
+    pub(super) fn rebind_restored_root(
+        &mut self,
+        admission: &SemanticAdmission,
+        owner: u64,
+        program: Option<&crate::SemanticProgramAdmission>,
+    ) -> Result<(), SemanticTransitionError> {
+        let program_binding = program.map(Self::program_binding);
+        if program_binding != self.program_binding {
+            return Err(publication_input_error(
+                "restored catalogue changes its original program",
+            ));
+        }
+        let original = match &self.model_catalogue {
+            Some((catalogue, member)) => {
+                &catalogue
+                    .members
+                    .get(*member)
+                    .ok_or(SemanticTransitionError::ObservationMismatch)?
+                    .words
+            }
+            None => &self.words,
+        };
+        let mut words = Vec::new();
+        words
+            .try_reserve_exact(original.len())
+            .map_err(|error| runtime_error("restored catalogue allocation", error))?;
+        words.extend_from_slice(original);
+        let local_binding =
+            Self::bind_admission_words(admission, owner, program_binding, &mut words)?;
+        if let Some((catalogue, member)) = &self.model_catalogue {
+            words = catalogue.project(&words, program_binding, local_binding, *member)?;
+        }
+        let (components, input_cells) = Self::component_geometry(&words, program.is_some())?;
+        if words.len() != self.words.len() || input_cells != self.input_cells {
+            return Err(publication_input_error(
+                "restored catalogue changes its allocated geometry",
+            ));
+        }
+        self.binding.digest = Identity256::from_bytes(words_identity(&words, 21));
+        self.words = words;
+        self.components = components.into_iter().collect();
+        Ok(())
+    }
+
     pub(super) fn project_model_catalogue(
         &mut self,
         catalogue: Arc<FrozenModelCatalogue>,
@@ -278,7 +366,7 @@ impl ActionCodebooks {
             ._reservation
             .budget
             .reserve_auxiliary(bytes as u64)?;
-        let words = catalogue.project(self, member)?;
+        let words = catalogue.project(&self.words, self.program_binding, self.binding, member)?;
         let (components, cells) = Self::component_geometry(&words, self.program_binding.is_some())?;
         self.binding.digest = Identity256::from_bytes(words_identity(&words, 21));
         self.words = words;
@@ -314,7 +402,12 @@ impl ContextBuffers {
         catalogue: &FrozenModelCatalogue,
         member: usize,
     ) -> Result<Self, SemanticTransitionError> {
-        let words = catalogue.project(&session.codebooks, member)?;
+        let words = catalogue.project(
+            &session.codebooks.words,
+            session.codebooks.program_binding,
+            session.codebooks.binding,
+            member,
+        )?;
         let (components, cells) = ActionCodebooks::component_geometry(
             &words,
             session.codebooks.program_binding.is_some(),
