@@ -1282,8 +1282,13 @@ static_assert(sizeof(PublicationControl)==144,"publication control ABI");
 static_assert(sizeof(PublicationBank)==47192,"publication bank ABI");
 static_assert(sizeof(ModelContractLayout)==48,"model contract byte layout ABI");
 static_assert(sizeof(PublicationContract)==424,"publication contract ABI");
-static_assert(sizeof(PendingContinuation)==352,"pending continuation ABI");
-static_assert(sizeof(ContinuationInputs)==216,"continuation input ABI");
+static_assert(sizeof(PendingContinuation)==360 && alignof(PendingContinuation)==8 &&
+    offsetof(PendingContinuation,capacity_refusal)==352,"pending continuation ABI");
+static_assert(sizeof(ContinuationInputs)==248 && alignof(ContinuationInputs)==8 &&
+    offsetof(ContinuationInputs,capacity_refusal_source)==216 &&
+    offsetof(ContinuationInputs,capacity_refusal)==224 &&
+    offsetof(ContinuationInputs,capacity_allocation_ordinal)==232 &&
+    offsetof(ContinuationInputs,capacity_bytes)==240,"continuation input ABI");
 static_assert(sizeof(TextRow)==16,"compact text row ABI");
 static_assert(sizeof(TextBinding)==24,"compact text binding ABI");
 static_assert(sizeof(ModelUpdateBinding)==32,"model update binding ABI");
