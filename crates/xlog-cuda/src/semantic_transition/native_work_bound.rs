@@ -539,7 +539,7 @@ impl FrozenModelContextPreparation {
         let directory = &storage.bank_templates[0];
         let models = directory
             .iter()
-            .filter(|range| matches!(range.role, 18..=20))
+            .filter(|range| matches!(range.role, 18..=25))
             .count();
         let model_roster_bytes = models
             .checked_mul(2 * size_of::<u64>())

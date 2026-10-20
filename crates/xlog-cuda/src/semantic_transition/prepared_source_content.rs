@@ -2385,7 +2385,7 @@ impl SourcePublicationGeometry {
             .ok_or(SemanticTransitionError::ObservationMismatch)?;
         let model_ranges = directory
             .iter()
-            .filter(|range| matches!(range.role, 18..=20))
+            .filter(|range| matches!(range.role, 18..=25))
             .count()
             .checked_add(1)
             .ok_or(SemanticTransitionError::GenerationExhausted)?;
@@ -3026,7 +3026,7 @@ impl native_work_bound::FrozenColdSourceContent {
             let model_ranges = owner
                 .directory
                 .iter()
-                .filter(|range| matches!(range.role, 18..=20))
+                .filter(|range| matches!(range.role, 18..=25))
                 .count()
                 .checked_add(1)
                 .ok_or(SemanticTransitionError::GenerationExhausted)?;

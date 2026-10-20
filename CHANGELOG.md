@@ -23,6 +23,10 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- *(cuda)* authenticate the complete acquired typed model and learning-state
+  roster, including optimizer, schedule, gradient and accumulation views, through
+  the original model-content witness. Prepared reservations and native work
+  ceilings include every view without replacing the acquired baseline.
 - *(runtime)* encode each resident-route certificate node from its local fields once, avoiding repeated recursive plan formatting for deep unary plans while preserving exact expression constants and route identity.
 - *(runtime)* preserve nullary schemas when initializing mutually recursive predicates.
 - *(runtime)* serialize execution statistics through a JSON encoder so diagnostic text and operation names are escaped correctly.

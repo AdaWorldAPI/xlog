@@ -751,7 +751,7 @@ impl SemanticTransitionSession {
             lease
                 .directory
                 .iter()
-                .filter(|range| matches!(range.role, 18..=20))
+                .filter(|range| matches!(range.role, 18..=25))
                 .count()
                 .checked_add(1)
                 .ok_or(SemanticTransitionError::GenerationExhausted)?,
@@ -761,7 +761,7 @@ impl SemanticTransitionSession {
         for range in lease
             .directory
             .iter()
-            .filter(|range| matches!(range.role, 18..=20))
+            .filter(|range| matches!(range.role, 18..=25))
         {
             let mut layout = *storage
                 .layouts
