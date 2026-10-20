@@ -196,10 +196,11 @@ impl SemanticPreparedTensorContentReceiver {
             publication_input_error("original content receiver custody is poisoned")
         })?;
         let event = &plan.events[self.index];
-        if state
-            .witnesses
-            .get(&self.slot)
-            .is_none_or(|original| !original.matches(witness))
+        if state.cursor <= self.index
+            || state
+                .witnesses
+                .get(&self.slot)
+                .is_none_or(|original| !original.matches(witness))
             || !same_source_tensor_geometry(&event.tensors, &content.tensors)
             || content.native_work_ceiling(true)? != plan.verify_ceilings[self.index]
             || matches!(&content.seals, TensorContentSeals::Model(_)) != self.model
@@ -1047,9 +1048,9 @@ impl SemanticTransitionSession {
                     .proof
                     .inner
                     .content_geometry
-                    .iter()
+                    .get(staged.target_bank)
                     .map(|geometry| &geometry.owner)
-                    .find(|owner| allocation.belongs_to(owner))
+                    .filter(|owner| allocation.belongs_to(owner))
             })
             .ok_or_else(|| {
                 publication_input_error(

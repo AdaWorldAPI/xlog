@@ -32213,14 +32213,18 @@ impl SemanticTransitionSession {
             ));
         }
         if recorded {
-            self.record_prepared_tensor_content_with_work(
+            let result = self.record_prepared_tensor_content_with_work(
                 step,
                 witness,
                 true,
                 work.as_ref(),
                 #[cfg(feature = "semantic-policy")]
                 occurrence,
-            )
+            );
+            if result.is_err() {
+                self.poisoned = true;
+            }
+            result
         } else {
             #[cfg(feature = "semantic-policy")]
             if occurrence.is_some() {
