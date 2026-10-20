@@ -862,16 +862,6 @@ impl PrivateReplayChildCustody {
         ))
     }
 
-    pub(in crate::semantic_transition) fn require_future_import_structure(
-        &self,
-        py: Python<'_>,
-    ) -> PyResult<()> {
-        self.instruction
-            .upgrade()
-            .ok_or_else(|| invalid("future import lost its original instruction owner"))?
-            .require_future_import_structure(py, self)
-    }
-
     pub(in crate::semantic_transition) fn begin_original_import_execution(
         &self,
         py: Python<'_>,
@@ -1463,28 +1453,22 @@ impl PrivateReplayChildCustody {
         if cancelled {
             return member.finish_cancelled_private_segment(py);
         }
-        let unpublished = {
+        let mode = {
             let state = member
-                .group_use
+                .source_target
                 .lock()
                 .map_err(|_| invalid("original retained target use is poisoned"))?;
             match state.completion {
-                Some(RetainedTargetCompletion::Published) => None,
-                Some(RetainedTargetCompletion::Unpublished) => Some(
-                    state
-                        .update
-                        .as_ref()
-                        .ok_or_else(|| invalid("original unpublished target has no Update"))?
-                        .clone_ref(py),
-                ),
+                Some(RetainedTargetCompletion::Published) => RetainedFinalUseMode::Published,
+                Some(RetainedTargetCompletion::Unpublished) => RetainedFinalUseMode::Unpublished,
                 None => {
                     return Err(invalid(
                         "source final use requires its actual original target outcome",
-                    ))
+                    ));
                 }
             }
         };
-        member.finish_retained_import(py, unpublished)
+        member.finish_retained_import(py, mode, None)
     }
 
     pub(in crate::semantic_transition) fn release_session(&self, py: Python<'_>) -> PyResult<()> {
