@@ -7477,15 +7477,6 @@ __device__ uint64_t publication_begin(const Descriptor& descriptor,State* state,
     uint64_t intent_status=publication_validate_intents(control,ranges,bank.header.range_count,
         bank.header.terminal==1 ? bank.header.terminal_position : (terminal_possible ? terminal_bound : UINT64_MAX),work);
     if(intent_status)return intent_status;
-    if(contract.nonterminal_intent_mode==1 && bank.header.terminal==0 &&
-       bank.header.prefix_extent<contract.nonterminal_intent_prefix_end &&
-       *end>=contract.nonterminal_intent_prefix_end) {
-        const auto* intent_range=publication_find_range(ranges,bank.header.range_count,30,0,work);
-        const auto* queue=reinterpret_cast<const IntentQueueHeader*>(publication_range_bytes(control,*intent_range));
-        const uint64_t needed=48+8*(contract.nonterminal_intent_prefix_end-contract.nonterminal_intent_prefix_begin);
-        if(queue->capacity-queue->count<2 || needed>UINT64_MAX-contract.final_intent_payload_bytes ||
-           needed+contract.final_intent_payload_bytes>queue->payload_capacity_bytes-queue->payload_used_bytes)return 5;
-    }
     // The inactive bank and its exclusive semantic root can be reused only after
     // its reader count is zero. Remaining descendants are traced by the owner.
     if(next.header.abi==1 && next.header.semantic_slot!=0 &&
@@ -7633,15 +7624,6 @@ __device__ uint64_t publication_append_final_intent(const PublicationControl& co
             next.header.terminal_position,contract.nonterminal_intent_plan_digest,work);
     }
     return publication_append_prefix_intent(control,base,next,0,next.header.prefix_extent,nullptr,work);
-}
-__device__ uint64_t publication_append_nonterminal_intent(const PublicationControl& control,const PublicationBank& base,
-        PublicationBank& next,semantic_graph::NativeWorkTally* work=nullptr) {
-    const auto& contract=*reinterpret_cast<const PublicationContract*>(control.contract);
-    if(contract.nonterminal_intent_mode!=1 || next.header.terminal!=0 ||
-       base.header.prefix_extent>=contract.nonterminal_intent_prefix_end ||
-       next.header.prefix_extent<contract.nonterminal_intent_prefix_end)return 0;
-    return publication_append_prefix_intent(control,base,next,contract.nonterminal_intent_prefix_begin,
-        contract.nonterminal_intent_prefix_end,contract.nonterminal_intent_plan_digest,work);
 }
 __device__ void publication_snapshot(const Descriptor& descriptor,const semantic_graph::ResidentHandle& root,
         semantic_graph::Receipt* receipt,ExecutionWork* work=nullptr) {
@@ -7918,16 +7900,14 @@ struct PublicationIntentPrediction {
     }
 };
 
-__device__ bool publication_predict_intent(const PublicationControl& control,const PublicationBank& base,
-        const PublicationBank& bank,bool drain,bool no_draw,PublicationSealPrediction& cost,PublicationIntentPrediction& result) {
+__device__ bool publication_predict_intent(const PublicationControl& control,
+        const PublicationBank& bank,bool drain,PublicationSealPrediction& cost,PublicationIntentPrediction& result) {
     const auto& contract=*reinterpret_cast<const PublicationContract*>(control.contract);
-    result.append=drain || (!no_draw && contract.nonterminal_intent_mode==1 && bank.header.terminal==0 &&
-        base.header.prefix_extent<contract.nonterminal_intent_prefix_end &&
-        bank.header.prefix_extent>=contract.nonterminal_intent_prefix_end);
+    result.append=drain;
     if(!result.append)return true;
     result.planned=contract.nonterminal_intent_mode==1;
     result.begin=result.planned ? contract.nonterminal_intent_prefix_begin : 0;
-    result.end=drain ? (result.planned ? bank.header.terminal_position : bank.header.prefix_extent) : contract.nonterminal_intent_prefix_end;
+    result.end=result.planned ? bank.header.terminal_position : bank.header.prefix_extent;
     if(result.planned && result.end>contract.nonterminal_intent_prefix_end)return false;
     const auto* ranges=reinterpret_cast<const PublicationRange*>(control.directories[bank.header.publication_word&1]);
     const auto* entries=cost.find(ranges,bank.header.range_count,30);
@@ -8085,7 +8065,7 @@ __device__ uint64_t publication_publish(const Descriptor& descriptor,Publication
         replay_copy_extent(control,next,descriptor.replay.successor,&prediction.overhead) : 0;
     if(!prediction.logical(control,next,!no_draw) ||
        !publication_predict_provenance_annotation(control,base,next,prediction) ||
-       !publication_predict_intent(control,base,next,drain,no_draw,prediction,intent_prediction) ||
+       !publication_predict_intent(control,next,drain,prediction,intent_prediction) ||
        !publication_predict_attempt(control,base,next,pending.transition_kind,intent_prediction,prediction))return 1;
     const auto* predicted_attempt=prediction.find(ranges,next.header.range_count,33);
     if(!predicted_attempt || !prediction.range(control,*predicted_attempt,false) ||
@@ -8115,7 +8095,6 @@ __device__ uint64_t publication_publish(const Descriptor& descriptor,Publication
     if(publication_logical_digest(control,next,work))return 1;
     if(publication_annotate_provenance(control,base,next,work))return 1;
     if(drain && publication_append_final_intent(control,base,next,work))return 1;
-    if(!drain && !no_draw && publication_append_nonterminal_intent(control,base,next,work))return 1;
     if(publication_write_attempt(control,next,base,pending.transition_kind,work))return 1;
     auto* attempt_range=const_cast<PublicationRange*>(publication_find_range(ranges,next.header.range_count,33,0,work));
     if(!attempt_range || publication_range_digest(control,*attempt_range,nullptr,attempt_range->digest,nullptr,work) ||
