@@ -20622,7 +20622,14 @@ content_kernel_parameter!(learning_phase::FoldDeviceAssignment);
 content_kernel_parameter!(PolicyUniformDescriptor);
 
 const _: () = assert!(size_of::<PendingContinuation>() == 360);
+const _: () = assert!(std::mem::align_of::<PendingContinuation>() == 8);
+const _: () = assert!(std::mem::offset_of!(PendingContinuation, capacity_refusal) == 352);
 const _: () = assert!(size_of::<ContinuationInputs>() == 248);
+const _: () = assert!(std::mem::align_of::<ContinuationInputs>() == 8);
+const _: () = assert!(std::mem::offset_of!(ContinuationInputs, capacity_refusal_source) == 216);
+const _: () = assert!(std::mem::offset_of!(ContinuationInputs, capacity_refusal) == 224);
+const _: () = assert!(std::mem::offset_of!(ContinuationInputs, capacity_allocation_ordinal) == 232);
+const _: () = assert!(std::mem::offset_of!(ContinuationInputs, capacity_bytes) == 240);
 const _: () = assert!(size_of::<SemanticCapacityRefusalRecord>() == 48);
 const _: () = assert!(size_of::<SemanticTransitionReceipt>() == 296);
 const _: () = assert!(size_of::<DeviceTaskFacts>() == 40);
