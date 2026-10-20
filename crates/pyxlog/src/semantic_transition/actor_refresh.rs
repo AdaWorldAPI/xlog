@@ -551,6 +551,13 @@ enum ActorRefreshCompletion {
     Observed {
         _outcomes: Vec<xlog_cuda::SemanticPreparedStepOutcome>,
     },
+    Scored {
+        _outcomes: Vec<xlog_cuda::SemanticPreparedStepOutcome>,
+        status: u64,
+    },
+    ScoreSkipped {
+        _outcomes: Vec<xlog_cuda::SemanticPreparedStepOutcome>,
+    },
     InitializerRefused {
         _certificate: xlog_cuda::SemanticActorRefreshInitializerRefusal,
     },
@@ -626,6 +633,59 @@ pub(super) fn replay_source_projection(
     source: &VerifiedCheckpointSource,
 ) -> PyResult<Py<PyTuple>> {
     source_content_geometry::source_task_projection(py, source)
+}
+
+fn original_edit_demonstration_materials(
+    row: &ReplayRow,
+) -> PyResult<Option<[&ReplayMaterial; 4]>> {
+    if !matches!(row.basis, ReplayBasis::Episode { .. }) {
+        return Ok(None);
+    }
+    let trace = replay_json_object(replay_json_field(&row.record, "action_trace")?)?;
+    let solution = replay_json_field(&trace, "edit_solution")?;
+    if replay_json_value(solution)?.is_null() {
+        return Ok(None);
+    }
+    let solution = replay_json_object(solution)?;
+    let ground = replay_json_object(replay_json_field(&trace, "task_ground")?)?;
+    let envelope = replay_json_object(replay_json_field(&row.record, "envelope")?)?;
+    let resolve = |object: &ReplayJsonObject, field: &str, kind: &str| -> PyResult<&ReplayMaterial> {
+        let value = replay_json_value(replay_json_field(object, field)?)?;
+        let identity = value.as_str().ok_or_else(|| invalid(
+            "edit demonstration requires its original material identity"))?;
+        replay_digest_identity(identity)?;
+        let mut matches = row.materials.iter().filter(|original| {
+            original.identity == identity && original.kind == kind
+        });
+        let original = matches.next().ok_or_else(|| invalid(
+            "edit demonstration lost its original solving material"))?;
+        if matches.next().is_some() {
+            return Err(invalid("edit demonstration material identity is ambiguous"));
+        }
+        Ok(original)
+    };
+    Ok(Some([
+        resolve(&envelope, "action_identity", "action")?,
+        resolve(&envelope, "edit_codebook_identity", "codebook")?,
+        resolve(&solution, "witness_identity", "edit-solution")?,
+        resolve(&ground, "witness_identity", "task-ground")?,
+    ]))
+}
+
+/// Freeze only bytes already resolved by the original admitted row and its
+/// material-source owner. A later preparation cannot replace these four roots.
+pub(super) fn original_edit_demonstration_material_roots(
+    row: &ReplayRow,
+) -> PyResult<Option<[Identity256; 4]>> {
+    let Some(originals) = original_edit_demonstration_materials(row)? else {
+        return Ok(None);
+    };
+    let mut roots = [Identity256::default(); 4];
+    for (index, original) in originals.iter().enumerate() {
+        let bytes = original.load_original()?;
+        roots[index] = Identity256::from_bytes(Sha256::digest(bytes.as_bytes()).into());
+    }
+    Ok(Some(roots))
 }
 
 impl ActorRefreshCustody {
@@ -778,6 +838,18 @@ impl ActorRefreshCustody {
                     let source = session.borrow(py);
                     let mut owner = source.owner()?;
                     match owner.complete_prepared_segment() {
+                        Ok(outcomes) if self.proof.is_demonstration() => {
+                            match outcomes.last() {
+                                Some(xlog_cuda::SemanticPreparedStepOutcome::PolicyScore { status, .. }) => {
+                                    let status = *status;
+                                    ActorRefreshCompletion::Scored { _outcomes: outcomes, status }
+                                }
+                                Some(xlog_cuda::SemanticPreparedStepOutcome::Skipped { .. }) => {
+                                    ActorRefreshCompletion::ScoreSkipped { _outcomes: outcomes }
+                                }
+                                _ => return Err(invalid("demonstration completion requires its actual native score or skipped step")),
+                            }
+                        }
                         Ok(outcomes) => ActorRefreshCompletion::Observed { _outcomes: outcomes },
                         Err(xlog_cuda::SemanticTransitionError::PublicationRefused { .. }) => {
                             ActorRefreshCompletion::InitializerRefused { _certificate: owner.actor_refresh_initializer_refusal()
@@ -2047,6 +2119,11 @@ impl ActorRefreshCustody {
 
 #[pymethods]
 impl PySemanticPreparedActorRefresh {
+    #[getter]
+    fn is_demonstration(&self) -> bool {
+        self.inner.proof.is_demonstration()
+    }
+
     /// Expose only the cached native disposition to this child's original
     /// one-shot producer retirement callback, after real final-use quiescence.
     #[pyo3(signature = (bank, task_use, prepared, steps))]
@@ -2110,10 +2187,13 @@ impl PySemanticPreparedActorRefresh {
             ));
         }
         match child.completion.as_ref() {
-            Some(ActorRefreshCompletion::Observed { .. }) => Ok("observed"),
+            Some(ActorRefreshCompletion::Observed { .. }) if !self.inner.proof.is_demonstration() => Ok("observed"),
+            Some(ActorRefreshCompletion::Scored { status: 0, .. }) if self.inner.proof.is_demonstration() => Ok("scored"),
+            Some(ActorRefreshCompletion::Scored { .. }) if self.inner.proof.is_demonstration() => Ok("score_refused"),
+            Some(ActorRefreshCompletion::ScoreSkipped { .. }) if self.inner.proof.is_demonstration() => Ok("score_skipped"),
             Some(ActorRefreshCompletion::Cancelled { .. }) => Ok("cancelled"),
             Some(ActorRefreshCompletion::InitializerRefused { .. }) => Ok("initializer_refused"),
-            None => Err(invalid(
+            _ => Err(invalid(
                 "actor retirement has no original cached native disposition",
             )),
         }
@@ -2637,6 +2717,29 @@ impl PySemanticPreparedStep {
         refresh_snapshot: &Bound<'_, PyAny>,
         content_geometry: &Bound<'_, PyAny>,
     ) -> PyResult<Py<PySemanticPreparedActorRefresh>> {
+        prepare_policy_refresh(slf, py, member_ordinal, refresh_snapshot, content_geometry, false)
+    }
+
+    #[pyo3(signature = (member_ordinal, *, refresh_snapshot, content_geometry))]
+    fn prepare_edit_demonstration(
+        slf: Py<Self>,
+        py: Python<'_>,
+        member_ordinal: &Bound<'_, PyAny>,
+        refresh_snapshot: &Bound<'_, PyAny>,
+        content_geometry: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PySemanticPreparedActorRefresh>> {
+        prepare_policy_refresh(slf, py, member_ordinal, refresh_snapshot, content_geometry, true)
+    }
+}
+
+fn prepare_policy_refresh(
+    slf: Py<PySemanticPreparedStep>,
+    py: Python<'_>,
+    member_ordinal: &Bound<'_, PyAny>,
+    refresh_snapshot: &Bound<'_, PyAny>,
+    content_geometry: &Bound<'_, PyAny>,
+    demonstration: bool,
+) -> PyResult<Py<PySemanticPreparedActorRefresh>> {
         let ordinal = ColdValue::read(member_ordinal, &mut 128, 0)?.unsigned()?;
         let geometry = exact_tuple(content_geometry, Some(2), &mut 128)?;
         let geometry = [
@@ -2673,6 +2776,7 @@ impl PySemanticPreparedStep {
             if !Arc::ptr_eq(&stored.scope, &update.scope)
                 || stored.actor_refreshes.iter().any(|original| {
                     original.member_ordinal == ordinal && original.update.as_ptr() == slf.as_ptr()
+                        && original.proof.is_demonstration() == demonstration
                 })
             {
                 return Err(invalid(
@@ -2710,8 +2814,35 @@ impl PySemanticPreparedStep {
             .map_err(xlog_err)?
             .checked_add(position as u64)
             .ok_or_else(|| invalid("actor Program ordinal overflow"))?;
-        let proof = owner
-            .prepare_actor_refresh(
+        let geometries = [
+            geometry[0].borrow(py).native().clone(),
+            geometry[1].borrow(py).native().clone(),
+        ];
+        let proof = if demonstration {
+            let originals = original_edit_demonstration_materials(&replay)?
+                .ok_or_else(|| invalid("supervised edit requires its original native solving witness"))?;
+            let retain = |original: &ReplayMaterial| -> PyResult<_> {
+                let bytes = original.load_original()?;
+                let reservation = original.source()?.native_budget()?.reserve_auxiliary(
+                    u64::try_from(bytes.as_bytes().len()).map_err(|_| invalid("demonstration material exceeds u64"))?
+                ).map_err(xlog_err)?;
+                Ok((xlog_cuda::SemanticCompletedStepWitnessMaterial {
+                        identity: replay_digest_identity(&original.identity)?,
+                        bytes: bytes.as_bytes().to_vec(),
+                    }, reservation))
+            };
+            // Each copy remains paired with its original allocation reservation
+            // until the native owner has authenticated and decoded all bytes.
+            let originals = [retain(originals[0])?, retain(originals[1])?,
+                retain(originals[2])?, retain(originals[3])?];
+            owner.prepare_edit_demonstration(
+                &update.inner,
+                &*instruction.parent.borrow(py).lease()?,
+                program_ordinal, ordinal, &material.material, batch_identity, batch_bytes.as_bytes(),
+                &originals[0].0, &originals[1].0, &originals[2].0, &originals[3].0, geometries,
+            )
+        } else {
+            owner.prepare_actor_refresh(
                 &update.inner,
                 &*instruction.parent.borrow(py).lease()?,
                 program_ordinal,
@@ -2719,12 +2850,9 @@ impl PySemanticPreparedStep {
                 &material.material,
                 batch_identity,
                 batch_bytes.as_bytes(),
-                [
-                    geometry[0].borrow(py).native().clone(),
-                    geometry[1].borrow(py).native().clone(),
-                ],
+                geometries,
             )
-            .map_err(xlog_err)?;
+        }.map_err(xlog_err)?;
         drop(owner);
         let custody = Arc::new(ActorRefreshCustody {
             update: slf.clone_ref(py),
@@ -2747,5 +2875,4 @@ impl PySemanticPreparedStep {
             .actor_refreshes
             .push(Arc::clone(&custody));
         Py::new(py, PySemanticPreparedActorRefresh { inner: custody })
-    }
 }

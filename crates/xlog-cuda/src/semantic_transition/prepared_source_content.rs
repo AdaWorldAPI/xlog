@@ -18,10 +18,17 @@ pub struct SemanticSourceContentGeometrySeed {
     pub metadata: Arc<dyn Send + Sync>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SemanticSourceContentGeometryKind {
     Historical,
     Current,
+    CurrentDemonstration,
+}
+
+impl SemanticSourceContentGeometryKind {
+    pub(super) fn is_current(self) -> bool {
+        matches!(self, Self::Current | Self::CurrentDemonstration)
+    }
 }
 
 /// An immutable declaration owned by the original admitted instruction.
@@ -609,7 +616,8 @@ impl SourceContentGeometryOwner {
         match (self.kind, section) {
             (SemanticSourceContentGeometryKind::Historical, None) => Ok(()),
             (
-                SemanticSourceContentGeometryKind::Current,
+                SemanticSourceContentGeometryKind::Current
+                | SemanticSourceContentGeometryKind::CurrentDemonstration,
                 Some((SemanticTransitionKind::Recompute | SemanticTransitionKind::Proposal, bank)),
             ) if bank < 2 => Ok(()),
             _ => Err(publication_input_error(
@@ -654,7 +662,7 @@ impl SourceContentGeometryOwner {
                 "content allocation belongs to another original prepared child section",
             ));
         }
-        if self.kind == SemanticSourceContentGeometryKind::Current
+        if self.kind.is_current()
             && matches!(allocation.port, SourceGeometryAllocationPort::Uniform(_))
             && section.map(|(kind, _)| kind) != Some(SemanticTransitionKind::Proposal)
         {
@@ -873,7 +881,8 @@ impl SourceContentGeometryOwner {
             .as_ref()
             .ok_or(SemanticTransitionError::NotBound)?;
         let actor = &staged.proof.inner;
-        if self.kind != SemanticSourceContentGeometryKind::Current
+        if !self.kind.is_current()
+            || self.kind != actor.kind
             || build.transitions
                 != [
                     SemanticTransitionKind::Recompute,
@@ -1366,7 +1375,7 @@ impl SemanticPreparedSourceContentGeometry {
             .iter()
             .position(|token| *token == step.token)
             .ok_or(SemanticTransitionError::ObservationMismatch)?;
-        if self.owner.kind != SemanticSourceContentGeometryKind::Current
+        if !self.owner.kind.is_current()
             || self.owner.bank != Some(bank)
             || self.owner.step_index != step_index
             || self.owner.member.ordinal != member.ordinal
@@ -1375,6 +1384,7 @@ impl SemanticPreparedSourceContentGeometry {
             || self.owner.member.bytes_identity != member.bytes_identity
             || self.owner.member.content_identity != member.content_identity
             || self.owner.member.origin != member.origin
+            || self.owner.member.edit_demonstration_material_roots != member.edit_demonstration_material_roots
             || !Arc::ptr_eq(&self.owner.instruction, instruction)
             || !Arc::ptr_eq(&self.owner.seed.material.owner, &material.owner)
             || target
@@ -1426,6 +1436,9 @@ impl SemanticPreparedSourceContentGeometry {
         &self,
         proof: &Arc<actor_refresh::PreparedActorRefreshOwner>,
     ) -> Result<(), SemanticTransitionError> {
+        if self.owner.kind != proof.kind {
+            return Err(SemanticTransitionError::ObservationMismatch);
+        }
         let mut original =
             self.owner.current.lock().map_err(|_| {
                 publication_input_error("original actor geometry custody is poisoned")
@@ -1571,6 +1584,27 @@ impl SemanticPreparedSourceContentGeometry {
         Identity256::from_bytes(bytes)
     }
 
+    pub(super) fn require_original_codebook_material(
+        &self,
+        material: &SemanticCompletedStepWitnessMaterial,
+    ) -> Result<(), SemanticTransitionError> {
+        let original = &self.owner.seed.proof.owner;
+        let range = original.directory.iter().find(|range| range.role == 48 && range.index == 0)
+            .ok_or(SemanticTransitionError::ObservationMismatch)?;
+        let header_bytes = model_catalogue::HEADER_WORDS.checked_mul(size_of::<u64>())
+            .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        if material.identity != self.codebook_identity(21)
+            || material.bytes.len() as u64 != range.length_bytes
+            || material.bytes.len() < header_bytes
+            || !material.bytes.len().is_multiple_of(size_of::<u64>())
+            || material.bytes[..header_bytes].as_chunks::<8>().0.iter()
+                .zip(original.codebook_header).any(|(bytes, word)| u64::from_le_bytes(*bytes) != word)
+        {
+            return Err(publication_input_error("demonstration codebook differs from its authenticated original source geometry"));
+        }
+        Ok(())
+    }
+
     pub fn feedback_schema(&self) -> &SemanticFeedbackSchema {
         &self.owner.publication.feedback_schema
     }
@@ -1604,7 +1638,11 @@ impl SemanticPreparedSourceContentGeometry {
             (SemanticSourceContentGeometryKind::Historical, None) => {
                 Ok(SemanticSourceContentFamily::new(&self.owner, phase, kind))
             }
-            (SemanticSourceContentGeometryKind::Current, Some((operation, bank)))
+            (
+                SemanticSourceContentGeometryKind::Current
+                | SemanticSourceContentGeometryKind::CurrentDemonstration,
+                Some((operation, bank)),
+            )
                 if bank < 2
                     && matches!(
                         operation,
@@ -1679,7 +1717,8 @@ impl SemanticPreparedSourceContentGeometry {
     pub fn restore_material_mode(&self) -> Result<&'static str, SemanticTransitionError> {
         match self.owner.kind {
             SemanticSourceContentGeometryKind::Historical => Ok("checkpoint-model"),
-            SemanticSourceContentGeometryKind::Current => Err(publication_input_error(
+            SemanticSourceContentGeometryKind::Current
+            | SemanticSourceContentGeometryKind::CurrentDemonstration => Err(publication_input_error(
                 "current geometry uses its original native-bank adoption, not checkpoint restoration",
             )),
         }
@@ -1700,7 +1739,7 @@ impl SemanticPreparedSourceContentGeometry {
         ),
         SemanticTransitionError,
     > {
-        if self.owner.kind == SemanticSourceContentGeometryKind::Current {
+        if self.owner.kind.is_current() {
             return Err(publication_input_error(
                 "CURRENT model context belongs to its original future actor producer",
             ));
@@ -2071,7 +2110,7 @@ impl SemanticTransitionSession {
         let per_update = actors
             .len()
             .checked_mul(2)
-            .and_then(|count| count.checked_add(edits.len()))
+            .and_then(|count| count.checked_add(edits.len().checked_mul(3)?))
             .ok_or(SemanticTransitionError::GenerationExhausted)?;
         let count = updates
             .checked_mul(per_update)
@@ -2131,6 +2170,7 @@ impl SemanticTransitionSession {
             for (kind, members) in [
                 (SemanticSourceContentGeometryKind::Historical, edits),
                 (SemanticSourceContentGeometryKind::Current, actors),
+                (SemanticSourceContentGeometryKind::CurrentDemonstration, edits),
             ] {
                 for member in members {
                     let index = original_seeds
@@ -2138,7 +2178,7 @@ impl SemanticTransitionSession {
                         .position(|(ordinal, _)| *ordinal == member.ordinal)
                         .ok_or(SemanticTransitionError::ObservationMismatch)?;
                     let banks: &[Option<usize>] =
-                        if kind == SemanticSourceContentGeometryKind::Current {
+                        if kind.is_current() {
                             &[Some(0), Some(1)]
                         } else {
                             &[None]
@@ -2162,9 +2202,7 @@ impl SemanticTransitionSession {
                                 reader: Mutex::new(None),
                                 occurrences: Mutex::new(None),
                                 uniform: Mutex::new(None),
-                                input_generation: if kind
-                                    == SemanticSourceContentGeometryKind::Current
-                                {
+                                input_generation: if kind.is_current() {
                                     Some(input_generations.port(step_index)?)
                                 } else {
                                     None
