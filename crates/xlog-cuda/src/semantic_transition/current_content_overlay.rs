@@ -258,6 +258,37 @@ impl SemanticPreparedSourceContentGeometry {
         Ok(())
     }
 
+    /// Authenticate the immutable producer stream before a foreign callback.
+    /// The canonical DLPack decoder preserves legacy stream 1 as CUDA stream 0.
+    pub fn require_content_overlay_backing_stream(
+        &self,
+        session: &SemanticTransitionSession,
+        instruction_admission: &SemanticSegmentInstructionAdmission,
+        consumer_stream: u64,
+    ) -> Result<(), SemanticTransitionError> {
+        let instruction = session.instruction_admission(instruction_admission)?;
+        if !Arc::ptr_eq(&self.owner.instruction, &instruction.instruction)
+            || session
+                .graph
+                .cold_work_allowance()
+                .as_ref()
+                .is_none_or(|allowance| !Arc::ptr_eq(allowance, &self.owner.allowance))
+        {
+            return Err(publication_input_error(
+                "content overlay backing changed its original instruction",
+            ));
+        }
+        let stream = dlpack_consumer_stream(consumer_stream)?;
+        if stream != session.stream.cu_stream()
+            || stream != session.provider.device().inner().stream().cu_stream()
+        {
+            return Err(publication_input_error(
+                "content overlay producer must use its original native import and capture stream",
+            ));
+        }
+        Ok(())
+    }
+
     /// Import the caller's original contiguous UInt8 pool block. The managed
     /// producer remains foreign and is retained by both original geometries.
     pub fn bind_content_overlay(
@@ -278,22 +309,18 @@ impl SemanticPreparedSourceContentGeometry {
             ready: false,
         };
         self.require_content_overlay_pair(other)?;
-        let instruction = session.instruction_admission(instruction_admission)?;
-        if !Arc::ptr_eq(&self.owner.instruction, &instruction.instruction)
-            || session
-                .graph
-                .cold_work_allowance()
-                .as_ref()
-                .is_none_or(|allowance| !Arc::ptr_eq(allowance, &self.owner.allowance))
-            || session.prepared_segment.as_ref().is_some_and(|build| {
-                build.capturing || build.submitted || build.finished || build.graph_call_entered
-            })
-        {
+        self.require_content_overlay_backing_stream(
+            session,
+            instruction_admission,
+            consumer_stream,
+        )?;
+        if session.prepared_segment.as_ref().is_some_and(|build| {
+            build.capturing || build.submitted || build.finished || build.graph_call_entered
+        }) {
             return Err(publication_input_error(
                 "content overlay backing changed its original instruction or entered after recording",
             ));
         }
-        dlpack_consumer_stream(consumer_stream)?;
         let owner = self.owner.content_overlay_owner(index)?;
         let other_owner = other.owner.content_overlay_owner(index)?;
         if !Arc::ptr_eq(&owner, &other_owner) {
@@ -518,10 +545,10 @@ impl SourceContentGeometryOwner {
         })?;
         if section.1 > 1
             || !state.bound
-            || state
-                .backing
-                .as_ref()
-                .is_none_or(|backing| backing.consumer_stream != consumer_stream)
+            || state.backing.as_ref().is_none_or(|backing| {
+                dlpack_consumer_stream(backing.consumer_stream)
+                    .map_or(true, |stream| stream as u64 != consumer_stream)
+            })
         {
             return Err(publication_input_error(
                 "CURRENT content changed its original overlay consumer stream",

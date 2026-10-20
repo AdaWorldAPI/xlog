@@ -1052,6 +1052,19 @@ impl PySemanticPreparedSourceContentGeometry {
             ));
         }
         let device = instruction.session.borrow(py).device_ordinal;
+        let check = || {
+            self.require_original(py)?;
+            other.require_original(py)?;
+            let session = instruction.session.borrow(py);
+            session.require_creator()?;
+            let owner = session.owner()?;
+            self.inner
+                .require_content_overlay_backing_stream(&owner, &instruction.inner, stream)
+                .map_err(xlog_err)
+        };
+        // Authenticate the original native import stream before asking the
+        // producer to enqueue readiness or transfer any managed owner.
+        check()?;
         let metadata = self.reserve(std::mem::size_of::<ContentOverlayBacking>())?;
         let mut cache = self
             .projections
@@ -1071,10 +1084,6 @@ impl PySemanticPreparedSourceContentGeometry {
         // A producer can reenter an existing geometry getter, whose cache lock
         // is blocking. No cache mutex may survive across that Python callback.
         drop(cache);
-        let check = || {
-            self.require_original(py)?;
-            other.require_original(py)
-        };
         validate_producer_device_guarded(backing, device, &check)?;
         let mut handoff = TensorHandoff(vec![crate::dlpack_from_py_for_stream_guarded(
             backing,
