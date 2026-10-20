@@ -302,7 +302,13 @@ impl PreparedTensorContentPlan {
                     ));
                 }
                 let original = if event.kind == SemanticSourceContentKind::Verify {
-                    capture_owner(bank, event.receiver_slot)?.unwrap_or(step)
+                    match capture_owner(bank, event.receiver_slot)? {
+                        Some(original) => original,
+                        None if bindings[bank].model_slot == Some(event.receiver_slot) => step,
+                        None => return Err(publication_input_error(
+                            "prepared verification requires its original predeclared capture or structural model witness owner",
+                        )),
+                    }
                 } else {
                     step
                 };
@@ -351,9 +357,11 @@ impl PreparedTensorContentPlan {
                 }
             }
             if binding.model_slot.is_some_and(|slot| {
-                !events.iter().any(|event| {
-                    event.kind == SemanticSourceContentKind::Verify && event.receiver_slot == slot
-                })
+                events.iter().any(|event| event.output_slot == Some(slot))
+                    || !events.iter().any(|event| {
+                        event.kind == SemanticSourceContentKind::Verify
+                            && event.receiver_slot == slot
+                    })
             }) {
                 return Err(publication_input_error(
                     "prepared block binding has no original model verification witness slot",
