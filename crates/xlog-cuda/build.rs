@@ -564,7 +564,9 @@ fn main() {
     );
     println!(
         "cargo:rerun-if-changed={}",
-        kernels_dir.join("semantic_conditional_policy.cuh").display()
+        kernels_dir
+            .join("semantic_conditional_policy.cuh")
+            .display()
     );
     println!(
         "cargo:rerun-if-changed={}",
@@ -573,6 +575,12 @@ fn main() {
     println!(
         "cargo:rerun-if-changed={}",
         kernels_dir.join("semantic_policy_domains.cuh").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        kernels_dir
+            .join("semantic_model_forward_stream.cuh")
+            .display()
     );
     println!(
         "cargo:rerun-if-changed={}",

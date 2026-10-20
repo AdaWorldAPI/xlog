@@ -853,10 +853,6 @@ impl SemanticModelForwardStream {
         self.owner.row_seals.device_ptr_value()
     }
 
-    pub(super) fn native_work_pointer(&self) -> u64 {
-        self.state_pointer() + std::mem::offset_of!(ModelForwardStreamState, work) as u64
-    }
-
     pub(super) fn native_work_ceiling(&self) -> [u64; 9] {
         self.owner.native_work_ceiling
     }
@@ -936,14 +932,6 @@ impl SemanticModelCanaryStream {
 
     pub(super) fn receipt_pointer(&self) -> u64 {
         self.owner.receipt.device_ptr_value()
-    }
-
-    pub(super) fn native_work_pointers(&self) -> [u64; 3] {
-        [
-            self.owner.forwards[0].native_work_pointer(),
-            self.owner.forwards[1].native_work_pointer(),
-            self.state_pointer() + std::mem::offset_of!(ModelCanaryStreamState, work) as u64,
-        ]
     }
 
     pub(super) fn complete_native_work_ceiling(&self) -> Result<[u64; 9], SemanticTransitionError> {

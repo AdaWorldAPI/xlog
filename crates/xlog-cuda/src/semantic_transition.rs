@@ -15557,7 +15557,7 @@ impl PreparedModelUpdate {
         recorder.write(&self.canary_results);
         recorder.write(&self.admissibility);
         recorder.write(&self.refusal);
-        recorder.write(&native_work);
+        recorder.read_write(&native_work);
         let admissibility_source = output.admissibility.data;
         let canary_results = self.canary_results.device_ptr_value();
         let admissibility_destination = self.admissibility.device_ptr_value();
@@ -15569,7 +15569,18 @@ impl PreparedModelUpdate {
             .accounted_external_bytes
             .checked_add(native_resident_bytes)
             .ok_or(SemanticTransitionError::GenerationExhausted)?;
-        let logits = output.baseline_logits.layout;
+        let [baseline, candidate] = self.forward_streams.each_ref().map(|stream| {
+            stream
+                .as_ref()
+                .ok_or(SemanticTransitionError::ObservationMismatch)
+        });
+        let baseline = baseline?;
+        let candidate = candidate?;
+        let comparison = self
+            .canary_stream
+            .as_ref()
+            .ok_or(SemanticTransitionError::ObservationMismatch)?;
+        let (row_count, capacity, vocabulary, scalar_type, block_positions) = baseline.geometry();
         let canary_inputs = ModelUpdateCanaryInputs {
             control: storage.control.device_ptr_value(),
             lease: reader.device_ptr_value(),
@@ -15588,15 +15599,17 @@ impl PreparedModelUpdate {
             candidate_seal_count: self.forward_seals.len() as u64,
             retention_labels: *retention_labels.device_ptr(),
             kinds: *kinds.device_ptr(),
-            baseline_logits: output.baseline_logits.data,
-            candidate_logits: output.candidate_logits.data,
-            scalar_type: logits.scalar_type,
-            row_count: logits.dimensions[0],
-            capacity: logits.dimensions[1],
-            vocabulary: logits.dimensions[2],
-            row_stride_bytes: logits.strides_bytes[0],
-            position_stride_bytes: logits.strides_bytes[1],
-            vocabulary_stride_bytes: logits.strides_bytes[2],
+            baseline_state: baseline.state_pointer(),
+            candidate_state: candidate.state_pointer(),
+            baseline_row_seals: baseline.row_seals_pointer(),
+            candidate_row_seals: candidate.row_seals_pointer(),
+            comparison_state: comparison.state_pointer(),
+            comparison_receipt: comparison.receipt_pointer(),
+            scalar_type,
+            row_count,
+            capacity,
+            vocabulary,
+            block_positions,
             model_work: model_work.descriptor_for_bank(bank),
             accounted_reserved_bytes,
             // Initialization is original producer work. Native acceptance
@@ -15607,7 +15620,6 @@ impl PreparedModelUpdate {
             admissibility_destination,
             refusal_destination,
             native_work: *native_work.device_ptr(),
-            forward_native_work: self.forward_native_work.device_ptr_value(),
         };
         enqueue_recorded(domain, poisoned, recorder, |enqueue| {
             // SAFETY: the producer gate was checked by the same captured
@@ -15672,15 +15684,17 @@ struct ModelUpdateCanaryInputs {
     candidate_seal_count: u64,
     retention_labels: u64,
     kinds: u64,
-    baseline_logits: u64,
-    candidate_logits: u64,
+    baseline_state: u64,
+    candidate_state: u64,
+    baseline_row_seals: u64,
+    candidate_row_seals: u64,
+    comparison_state: u64,
+    comparison_receipt: u64,
     scalar_type: u64,
     row_count: u64,
     capacity: u64,
     vocabulary: u64,
-    row_stride_bytes: u64,
-    position_stride_bytes: u64,
-    vocabulary_stride_bytes: u64,
+    block_positions: u64,
     model_work: ModelWorkInput,
     accounted_reserved_bytes: u64,
     copy_bytes: u64,
@@ -15689,10 +15703,9 @@ struct ModelUpdateCanaryInputs {
     admissibility_destination: u64,
     refusal_destination: u64,
     native_work: u64,
-    forward_native_work: u64,
 }
 
-const _: () = assert!(size_of::<ModelUpdateCanaryInputs>() == 296);
+const _: () = assert!(size_of::<ModelUpdateCanaryInputs>() == 304);
 
 struct ModelUpdateCanaryInputsParam(ModelUpdateCanaryInputs);
 
