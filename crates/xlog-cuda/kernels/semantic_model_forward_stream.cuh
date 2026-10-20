@@ -594,7 +594,7 @@ extern "C" __global__ void semantic_model_canary_stream_block_positions(ModelCan
     const auto* labels=reinterpret_cast<const int64_t*>(inputs.retention_labels);
     const auto* kinds=reinterpret_cast<const int64_t*>(inputs.kinds);
     const auto* members=reinterpret_cast<const uint64_t*>(inputs.protected_members);
-    ModelUpdateCanaryInputs geometry{};geometry.scalar_type=state.scalar_type;
+    ModelCanaryLogitLayout geometry{};geometry.scalar_type=state.scalar_type;
     geometry.vocabulary=state.vocabulary;geometry.position_stride_bytes=inputs.position_stride_bytes;
     geometry.vocabulary_stride_bytes=state.scalar_type==6 ? 4 : 2;
     ExecutionWork calculation{};
@@ -625,8 +625,8 @@ extern "C" __global__ void semantic_model_canary_stream_block_positions(ModelCan
         if(!metric_position)continue;
         uint64_t baseline_token=0,candidate_token=0;
         if(canary.kind!=3 &&
-           (!semantic_canary_argmax(geometry,inputs.baseline_logits,0,local,baseline_token,calculation,work) ||
-            !semantic_canary_argmax(geometry,inputs.candidate_logits,0,local,candidate_token,calculation,work))) {
+           (!semantic_canary_argmax(geometry,inputs.baseline_logits,local,baseline_token,calculation,work) ||
+            !semantic_canary_argmax(geometry,inputs.candidate_logits,local,candidate_token,calculation,work))) {
             output.reason=(canary.kind==1 || canary.kind==4) ? 7 : 1;continue;
         }
         if(canary.kind==1 || canary.kind==4) {
@@ -647,8 +647,8 @@ extern "C" __global__ void semantic_model_canary_stream_block_positions(ModelCan
         } else if(canary.kind==3) {
             ++output.positions;
             double baseline_max=0.0,baseline_log=0.0,candidate_max=0.0,candidate_log=0.0;
-            if(!semantic_canary_log_normalizer(geometry,inputs.baseline_logits,0,local,baseline_max,baseline_log,calculation,work) ||
-               !semantic_canary_log_normalizer(geometry,inputs.candidate_logits,0,local,candidate_max,candidate_log,calculation,work)) {
+            if(!semantic_canary_log_normalizer(geometry,inputs.baseline_logits,local,baseline_max,baseline_log,calculation,work) ||
+               !semantic_canary_log_normalizer(geometry,inputs.candidate_logits,local,candidate_max,candidate_log,calculation,work)) {
                 output.reason=1;continue;
             }
             double maximum=__longlong_as_double((long long)output.maximum_bits);
@@ -800,14 +800,14 @@ __device__ void semantic_stream_merge_work(const ModelForwardStreamState& baseli
         const auto& actual=*sources[source];
         uint64_t sum=0;
         for(uint32_t event=0;event<9;++event) {
-            semantic_graph::charge_native(native,semantic_graph::NativeWorkEvent::TableSlot,1);
+            semantic_canary_charge(work,native,1,1);
             if(actual.events[event]>UINT64_MAX-sum) { native->overflow=work.overflow=1;return; }
             sum+=actual.events[event];
         }
         if(actual.overflow || sum!=actual.units) { native->overflow=work.overflow=1;return; }
         execution_work_merge_native(work,actual);
         for(uint32_t event=0;event<9;++event) {
-            semantic_graph::charge_native(native,semantic_graph::NativeWorkEvent::TableSlot,1);
+            semantic_canary_charge(work,native,1,1);
             semantic_graph::charge_native(native,static_cast<semantic_graph::NativeWorkEvent>(event),actual.events[event]);
         }
         if(native->overflow)work.overflow=1;

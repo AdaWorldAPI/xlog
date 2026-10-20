@@ -910,25 +910,19 @@ struct ModelForwardSealInput {
     uint64_t role,index,tensor_digest,backing_digest;
 };
 struct ModelForwardReceipt {
-    uint64_t abi,availability,role,generation,work_sequence,logits,scalar_type,row_count,capacity,vocabulary;
-    uint64_t strides_bytes[3],model_geometry_digest[4],model_numerical_digest[4];
+    uint64_t abi,availability,role,generation,work_sequence,stream_state,scalar_type,row_count,capacity,vocabulary;
+    uint64_t block_positions,row_seals,finite,model_geometry_digest[4],model_numerical_digest[4];
     uint64_t logits_digest[4],identity[4];
-};
-struct ModelForwardReceiptInputs {
-    uint64_t control,lease,candidate_seals,candidate_seal_count;
-    uint64_t role,work_sequence,logits,scalar_type,row_count,capacity,vocabulary;
-    uint64_t row_stride_bytes,position_stride_bytes,vocabulary_stride_bytes;
-    uint64_t logits_digest,receipt,native_work;
 };
 struct ModelUpdateCanaryInputs {
     uint64_t control,lease,selection,roster_rows,objective,canaries,canary_count;
     uint64_t protected_members,protected_member_count,task,task_words,evidence,evidence_count,forward_receipts;
-    uint64_t candidate_seal_count,retention_labels,kinds,baseline_logits,candidate_logits;
-    uint64_t scalar_type,row_count,capacity,vocabulary;
-    uint64_t row_stride_bytes,position_stride_bytes,vocabulary_stride_bytes;
+    uint64_t candidate_seal_count,retention_labels,kinds;
+    uint64_t baseline_state,candidate_state,baseline_row_seals,candidate_row_seals,comparison_state,comparison_receipt;
+    uint64_t scalar_type,row_count,capacity,vocabulary,block_positions;
     ModelWorkInput model_work;
     uint64_t accounted_reserved_bytes,copy_bytes,admissibility_source,results;
-    uint64_t admissibility_destination,refusal_destination,native_work,forward_native_work;
+    uint64_t admissibility_destination,refusal_destination,native_work;
 };
 struct PolicyAdjointNumericalDescriptor {
     uint64_t parameter_errors,text_errors,baseline_errors;
@@ -1214,8 +1208,8 @@ static_assert(sizeof(SemanticTrainingCanaryRefusalRecord)==152,"training canary 
 static_assert(sizeof(ModelUpdateEvidenceSource)==48,"model update evidence ABI");
 static_assert(sizeof(ModelForwardSealInput)==32,"model forward seal ABI");
 static_assert(sizeof(ModelForwardReceipt)==232,"model forward receipt ABI");
-static_assert(sizeof(ModelForwardReceiptInputs)==136,"model forward receipt input ABI");
-static_assert(sizeof(ModelUpdateCanaryInputs)==296,"training canary input ABI");
+static_assert(offsetof(ModelForwardReceipt,identity)==200,"model forward receipt seal ABI");
+static_assert(sizeof(ModelUpdateCanaryInputs)==304,"training canary input ABI");
 static_assert(sizeof(PolicyAdjointNumericalDescriptor)==96,"policy adjoint numerical ABI");
 static_assert(sizeof(PolicyBackward)==296,"policy backward ABI");
 
@@ -2729,10 +2723,19 @@ __device__ void semantic_canary_merge(ExecutionWork& work,semantic_graph::Native
     if(reached.overflow)native->overflow=work.overflow=1;
 }
 
-__device__ bool semantic_canary_argmax(const ModelUpdateCanaryInputs& inputs,uint64_t pointer,
-        uint64_t row,uint64_t position,uint64_t& token,ExecutionWork& work,
+__device__ void publication_fold(uint64_t* digest,uint64_t role,uint64_t index,const uint64_t* content,
+        semantic_graph::NativeWorkTally* work=nullptr);
+__device__ uint64_t publication_validate_selected_model(const PublicationControl& control,
+        const PublicationBank& bank,semantic_graph::NativeWorkTally* work);
+
+struct ModelCanaryLogitLayout {
+    uint64_t scalar_type,vocabulary,position_stride_bytes,vocabulary_stride_bytes;
+};
+
+__device__ bool semantic_canary_argmax(const ModelCanaryLogitLayout& inputs,uint64_t pointer,
+        uint64_t position,uint64_t& token,ExecutionWork& work,
         semantic_graph::NativeWorkTally* native_work) {
-    const uint64_t base=row*inputs.row_stride_bytes+position*inputs.position_stride_bytes;
+    const uint64_t base=position*inputs.position_stride_bytes;
     double maximum=-INFINITY;token=0;
     for(uint64_t vocabulary=0;vocabulary<inputs.vocabulary;++vocabulary) {
         semantic_canary_charge(work,native_work,1,1);
@@ -2744,10 +2747,10 @@ __device__ bool semantic_canary_argmax(const ModelUpdateCanaryInputs& inputs,uin
     return true;
 }
 
-__device__ bool semantic_canary_log_normalizer(const ModelUpdateCanaryInputs& inputs,uint64_t pointer,
-        uint64_t row,uint64_t position,double& maximum,double& logarithm,ExecutionWork& work,
+__device__ bool semantic_canary_log_normalizer(const ModelCanaryLogitLayout& inputs,uint64_t pointer,
+        uint64_t position,double& maximum,double& logarithm,ExecutionWork& work,
         semantic_graph::NativeWorkTally* native_work) {
-    const uint64_t base=row*inputs.row_stride_bytes+position*inputs.position_stride_bytes;
+    const uint64_t base=position*inputs.position_stride_bytes;
     maximum=-INFINITY;
     for(uint64_t vocabulary=0;vocabulary<inputs.vocabulary;++vocabulary) {
         semantic_canary_charge(work,native_work,1,1);
@@ -2768,190 +2771,29 @@ __device__ bool semantic_canary_log_normalizer(const ModelUpdateCanaryInputs& in
     return isfinite(logarithm);
 }
 
-__device__ void publication_fold(uint64_t* digest,uint64_t role,uint64_t index,const uint64_t* content,
-        semantic_graph::NativeWorkTally* work=nullptr);
-__device__ uint64_t publication_validate_selected_model(const PublicationControl& control,
-        const PublicationBank& bank,semantic_graph::NativeWorkTally* work);
-
-extern "C" __global__ void semantic_publication_record_model_forward_receipts(
-        ModelForwardReceiptInputs inputs) {
-    if(blockIdx.x || threadIdx.x)return;
-    if(!publication_pointer_span(inputs.native_work,sizeof(semantic_graph::NativeWorkTally),alignof(semantic_graph::NativeWorkTally))) {
-        semantic_content_integrity_trap();return;
-    }
-    auto* work=reinterpret_cast<semantic_graph::NativeWorkTally*>(inputs.native_work);
-    if(!inputs.role)*work={};
-    semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::Command,1);
-    if(!inputs.control || inputs.control%alignof(PublicationControl) ||
-       !inputs.lease || inputs.lease%alignof(PublicationLease) ||
-       !inputs.candidate_seals || inputs.candidate_seals%alignof(ModelForwardSealInput) ||
-       !inputs.candidate_seal_count || inputs.role>1 || !inputs.work_sequence || !inputs.logits ||
-       !inputs.logits_digest || inputs.logits_digest%alignof(uint64_t) ||
-       !inputs.receipt || inputs.receipt%alignof(ModelForwardReceipt)) {
-        semantic_content_integrity_trap();return;
-    }
-    const uint64_t element_bytes=inputs.scalar_type==6 ? 4 : 2;
-    if((inputs.scalar_type!=4 && inputs.scalar_type!=5 && inputs.scalar_type!=6) ||
-       !inputs.row_count || !inputs.capacity || !inputs.vocabulary ||
-       inputs.vocabulary_stride_bytes!=element_bytes ||
-       inputs.vocabulary>UINT64_MAX/element_bytes ||
-       inputs.position_stride_bytes!=inputs.vocabulary*element_bytes ||
-       inputs.capacity>UINT64_MAX/inputs.position_stride_bytes ||
-       inputs.row_stride_bytes!=inputs.capacity*inputs.position_stride_bytes ||
-       inputs.row_count>UINT64_MAX/inputs.row_stride_bytes) {
-        semantic_content_integrity_trap();return;
-    }
-    const auto& control=*reinterpret_cast<const PublicationControl*>(inputs.control);
-    const auto& lease=*reinterpret_cast<const PublicationLease*>(inputs.lease);
-    const auto* base=publication_acquired_bank(control,lease,work);
-    // The one-shot receipt allocation starts as not executed. Only the original
-    // forward producer changes its availability; terminal failure is not a receipt.
-    reinterpret_cast<ModelForwardReceipt*>(inputs.receipt)->availability=semantic_graph::written_word(1,work);
-    if(!base || publication_validate_selected_model(control,*base,work) ||
-       base->header.model_generation>=UINT32_MAX) {
-        semantic_content_integrity_trap();return;
-    }
-    const uint64_t directory=control.directories[base->header.publication_word&1];
-    if(!directory || directory%alignof(PublicationRange)) {
-        semantic_content_integrity_trap();return;
-    }
-    const auto* ranges=reinterpret_cast<const PublicationRange*>(directory);
-    const auto* seals=reinterpret_cast<const ModelForwardSealInput*>(inputs.candidate_seals);
-    uint64_t numerical[4];
-    const char domain[]="xlog.semantic.model-numerics.v1";
-    semantic_graph::sha256(reinterpret_cast<const uint8_t*>(domain),sizeof(domain),numerical,work);
-    publication_fold(numerical,0,0,base->header.model_geometry_digest,work);
-    uint64_t seal_index=0;
-    for(uint64_t range_index=0;inputs.role && range_index<base->header.range_count;++range_index) {
-        semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::TableSlot,1);
-        const auto& range=ranges[range_index];
-        if(range.role<18 || range.role>25)continue;
-        if(seal_index>=inputs.candidate_seal_count) {
-            semantic_content_integrity_trap();return;
-        }
-        const auto& seal=seals[seal_index++];
-        if(seal.role!=range.role || seal.index!=range.index ||
-           !seal.tensor_digest || seal.tensor_digest%alignof(uint64_t) ||
-           !seal.backing_digest || seal.backing_digest%alignof(uint64_t)) {
-            semantic_content_integrity_trap();return;
-        }
-        publication_fold(numerical,seal.role,seal.index,
-            reinterpret_cast<const uint64_t*>(seal.tensor_digest),work);
-        publication_fold(numerical,seal.role,seal.index,
-            reinterpret_cast<const uint64_t*>(seal.backing_digest),work);
-    }
-    if(inputs.role && seal_index!=inputs.candidate_seal_count) {
-        semantic_content_integrity_trap();return;
-    }
-    ModelForwardReceipt receipt{};
-    semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::CanonicalByte,sizeof(receipt)+13*sizeof(uint64_t));
-    receipt.abi=1;receipt.availability=2;receipt.role=inputs.role;
-    receipt.generation=base->header.model_generation+inputs.role;
-    receipt.work_sequence=inputs.work_sequence;
-    receipt.logits=inputs.logits;
-    receipt.scalar_type=inputs.scalar_type;receipt.row_count=inputs.row_count;
-    receipt.capacity=inputs.capacity;receipt.vocabulary=inputs.vocabulary;
-    receipt.strides_bytes[0]=inputs.row_stride_bytes;
-    receipt.strides_bytes[1]=inputs.position_stride_bytes;
-    receipt.strides_bytes[2]=inputs.vocabulary_stride_bytes;
-    semantic_graph::copy_identity(receipt.model_geometry_digest,
-        base->header.model_geometry_digest,work);
-    semantic_graph::copy_identity(receipt.model_numerical_digest,
-        inputs.role ? numerical : base->header.model_numerical_digest,work);
-    semantic_graph::copy_identity(receipt.logits_digest,
-        reinterpret_cast<const uint64_t*>(inputs.logits_digest),work);
-    semantic_graph::sha256(reinterpret_cast<const uint8_t*>(&receipt),
-        sizeof(ModelForwardReceipt)-sizeof(receipt.identity),receipt.identity,work);
-    *reinterpret_cast<ModelForwardReceipt*>(inputs.receipt)=receipt;
-    semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::CanonicalByte,sizeof(receipt));
-}
-
-__device__ bool semantic_forward_receipt_valid(const ModelForwardReceipt& receipt,
-        uint64_t role,const ModelUpdateCanaryInputs& inputs,const PublicationHeader& baseline,
-        semantic_graph::NativeWorkTally* work) {
-    if(receipt.abi!=1 || receipt.availability!=2 || receipt.role!=role ||
-       receipt.generation!=baseline.model_generation+role || !receipt.work_sequence ||
-       receipt.logits!=(role ? inputs.candidate_logits : inputs.baseline_logits) ||
-       receipt.scalar_type!=inputs.scalar_type || receipt.row_count!=inputs.row_count ||
-       receipt.capacity!=inputs.capacity || receipt.vocabulary!=inputs.vocabulary ||
-       receipt.strides_bytes[0]!=inputs.row_stride_bytes ||
-       receipt.strides_bytes[1]!=inputs.position_stride_bytes ||
-       receipt.strides_bytes[2]!=inputs.vocabulary_stride_bytes ||
-       !publication_identity_equal(receipt.model_geometry_digest,baseline.model_geometry_digest,work) ||
-       (!role && !publication_identity_equal(receipt.model_numerical_digest,
-           baseline.model_numerical_digest,work)))return false;
-    uint64_t identity[4];
-    semantic_graph::sha256(reinterpret_cast<const uint8_t*>(&receipt),
-        sizeof(ModelForwardReceipt)-sizeof(receipt.identity),identity,work);
-    return publication_identity_equal(identity,receipt.identity,work);
-}
-
-__device__ bool semantic_task_canary_evidence(const ModelUpdateCanaryInputs& inputs,
-        const SemanticTrainingCanaryRecord& canary,const uint64_t* task,
-        const SemanticTrainingObjectiveRecord& objective,uint64_t window,uint64_t& baseline_correct,
-        uint64_t& candidate_correct,uint64_t& lost,ExecutionWork& work,
-        semantic_graph::NativeWorkTally* native_work) {
-    TaskProgramBank bank{};
-    if(!task_program_bank(task,inputs.task_words,&bank))return false;
-    const uint64_t* goal=bank.task.goal_witness;
-    bool roots[4]={false,false,false,false};
-    for(uint32_t root=0;root<4;++root)
-        for(uint32_t word=0;word<4;++word) {
-            semantic_canary_charge(work,native_work,1,1);
-            roots[root]|=goal[root*4+word]!=0;
-        }
-    if(!roots[0] || !roots[1] || !roots[2] || !roots[3] ||
-       !goal[16] || !goal[17])return false;
-    if(objective.canary_source_offset>inputs.protected_member_count ||
-       objective.canary_source_words>inputs.protected_member_count-objective.canary_source_offset ||
-       objective.canary_source_words<13 || canary.obligation_member_offset>inputs.protected_member_count ||
-       canary.obligation_member_count>inputs.protected_member_count-canary.obligation_member_offset)return false;
-    const auto* members=reinterpret_cast<const uint64_t*>(inputs.protected_members);
-    const auto* source=members+objective.canary_source_offset;
-    const uint64_t queries=source[12];
-    if(!queries || queries>(UINT64_MAX-13)/5 || objective.canary_source_words!=13+5*queries ||
-       canary.obligation_member_count!=queries)return false;
-    for(uint32_t identity=0;identity<3;++identity) {
-        semantic_canary_charge(work,native_work,1,1);
-        if(!(source[identity*4]|source[identity*4+1]|source[identity*4+2]|source[identity*4+3]))return false;
-    }
-    baseline_correct=0;candidate_correct=0;lost=0;
-    for(uint64_t obligation=0;obligation<queries;++obligation) {
-        semantic_canary_charge(work,native_work,1,1);
-        const uint64_t position=members[canary.obligation_member_offset+obligation];
-        if(position==UINT64_MAX || position>=window)return false;
-        uint64_t baseline_token{};
-        uint64_t candidate_token{};
-        if(!semantic_canary_argmax(inputs,inputs.baseline_logits,canary.row_ordinal,
-                position,baseline_token,work,native_work) ||
-           !semantic_canary_argmax(inputs,inputs.candidate_logits,canary.row_ordinal,
-                position,candidate_token,work,native_work))return false;
-        const uint64_t* statement=source+13+obligation*5;
-        if(!(statement[0]|statement[1]|statement[2]|statement[3]) || statement[4]>3)return false;
-        const uint64_t truth=statement[4];
-        const uint64_t expected=objective.truth_tokens[truth];
-        const bool baseline_ok=baseline_token==expected;
-        const bool candidate_ok=candidate_token==expected;
-        baseline_correct+=baseline_ok;candidate_correct+=candidate_ok;
-        lost+=baseline_ok && !candidate_ok;
-    }
-    return true;
-}
-
+#include "semantic_model_forward_stream.cuh"
 extern "C" __global__ void semantic_publication_prepare_model_update_admissibility(
         ModelUpdateCanaryInputs inputs) {
     if(blockIdx.x || threadIdx.x)return;
     if(!publication_pointer_span(inputs.native_work,sizeof(semantic_graph::NativeWorkTally),
             alignof(semantic_graph::NativeWorkTally))) { semantic_content_integrity_trap();return; }
     auto* native_work=reinterpret_cast<semantic_graph::NativeWorkTally*>(inputs.native_work);
-    *native_work=semantic_graph::NativeWorkTally{};
+    // The original model scratch already owns preparation and binding work.
+    // This gate extends that same replay's tally; resetting it loses reached work.
     semantic_graph::charge_native(native_work,semantic_graph::NativeWorkEvent::Command,1);
     ExecutionWork work{};
     execution_work_merge_native(work,*native_work);
-    if(!publication_pointer_span(inputs.forward_native_work,sizeof(semantic_graph::NativeWorkTally),
-        alignof(semantic_graph::NativeWorkTally))) { semantic_content_integrity_trap();return; }
-    semantic_canary_merge(work,native_work,
-        *reinterpret_cast<const semantic_graph::NativeWorkTally*>(inputs.forward_native_work));
+    if(!publication_pointer_span(inputs.baseline_state,sizeof(ModelForwardStreamState),alignof(ModelForwardStreamState)) ||
+       !publication_pointer_span(inputs.candidate_state,sizeof(ModelForwardStreamState),alignof(ModelForwardStreamState)) ||
+       !publication_pointer_span(inputs.comparison_state,sizeof(ModelCanaryStreamState),alignof(ModelCanaryStreamState))) {
+        semantic_content_integrity_trap();return;
+    }
+    const auto& baseline=*reinterpret_cast<const ModelForwardStreamState*>(inputs.baseline_state);
+    const auto& candidate=*reinterpret_cast<const ModelForwardStreamState*>(inputs.candidate_state);
+    const auto& comparison=*reinterpret_cast<const ModelCanaryStreamState*>(inputs.comparison_state);
+    // The three original producers finish before this one ordered gate. Their
+    // reached events enter the selected model scratch once, also on refusal.
+    semantic_stream_merge_work(baseline,candidate,comparison,work,native_work);
     if(!inputs.control || inputs.control%alignof(PublicationControl) ||
        !inputs.lease || inputs.lease%alignof(PublicationLease) ||
        !inputs.selection || inputs.selection%alignof(SemanticTrainingViewSelection) ||
@@ -2961,28 +2803,21 @@ extern "C" __global__ void semantic_publication_prepare_model_update_admissibili
        !inputs.task || inputs.task%alignof(uint64_t) || inputs.task_words<39 ||
        (inputs.protected_member_count && (!inputs.protected_members ||
         inputs.protected_members%alignof(uint64_t))) ||
-       !inputs.forward_receipts || inputs.forward_receipts%alignof(ModelForwardReceipt) ||
+       !publication_pointer_span(inputs.forward_receipts,2*sizeof(ModelForwardReceipt),alignof(ModelForwardReceipt)) ||
+       !publication_pointer_span(inputs.comparison_receipt,sizeof(ModelCanaryStreamReceipt),alignof(ModelCanaryStreamReceipt)) ||
        !inputs.retention_labels || inputs.retention_labels%alignof(int64_t) ||
        !inputs.kinds || inputs.kinds%alignof(int64_t) ||
-       !inputs.baseline_logits || !inputs.candidate_logits ||
        !inputs.admissibility_source || !inputs.results ||
        inputs.results%alignof(SemanticTrainingCanaryResultRecord) ||
        !inputs.admissibility_destination || !inputs.refusal_destination ||
        inputs.refusal_destination%alignof(SemanticTrainingCanaryRefusalRecord)) {
         semantic_content_integrity_trap();return;
     }
-    const uint64_t element_bytes=inputs.scalar_type==6 ? 4 : 2;
     if((inputs.scalar_type!=4 && inputs.scalar_type!=5 && inputs.scalar_type!=6) ||
-       !inputs.row_count || !inputs.capacity || !inputs.vocabulary ||
-       inputs.vocabulary>UINT64_MAX/element_bytes ||
-       inputs.vocabulary_stride_bytes!=element_bytes ||
-       inputs.position_stride_bytes!=inputs.vocabulary*element_bytes ||
-       inputs.position_stride_bytes>UINT64_MAX/inputs.capacity ||
-       inputs.row_stride_bytes!=inputs.capacity*inputs.position_stride_bytes ||
-       inputs.row_stride_bytes>UINT64_MAX/inputs.row_count ||
-       inputs.baseline_logits%element_bytes || inputs.candidate_logits%element_bytes ||
-       inputs.baseline_logits>UINT64_MAX-inputs.row_count*inputs.row_stride_bytes ||
-       inputs.candidate_logits>UINT64_MAX-inputs.row_count*inputs.row_stride_bytes ||
+       !inputs.row_count || !inputs.capacity || !inputs.vocabulary || !inputs.block_positions ||
+       inputs.row_count>UINT64_MAX/(4*sizeof(uint64_t)) ||
+       !publication_pointer_span(inputs.baseline_row_seals,inputs.row_count*4*sizeof(uint64_t),alignof(uint64_t)) ||
+       !publication_pointer_span(inputs.candidate_row_seals,inputs.row_count*4*sizeof(uint64_t),alignof(uint64_t)) ||
        inputs.row_count>UINT64_MAX/sizeof(SemanticTrainingRosterRow) ||
        inputs.capacity>UINT64_MAX/inputs.row_count) {
         semantic_content_integrity_trap();return;
@@ -2998,21 +2833,22 @@ extern "C" __global__ void semantic_publication_prepare_model_update_admissibili
     const auto* task=reinterpret_cast<const uint64_t*>(inputs.task);
     const auto* protected_members=reinterpret_cast<const uint64_t*>(inputs.protected_members);
     const auto* forward_receipts=reinterpret_cast<const ModelForwardReceipt*>(inputs.forward_receipts);
+    const auto& comparison_receipt=*reinterpret_cast<const ModelCanaryStreamReceipt*>(inputs.comparison_receipt);
+    const auto* baseline_row_seals=reinterpret_cast<const uint64_t*>(inputs.baseline_row_seals);
+    const auto* candidate_row_seals=reinterpret_cast<const uint64_t*>(inputs.candidate_row_seals);
     const auto* retention_labels=reinterpret_cast<const int64_t*>(inputs.retention_labels);
-    const auto* kinds=reinterpret_cast<const int64_t*>(inputs.kinds);
     auto* results=reinterpret_cast<SemanticTrainingCanaryResultRecord*>(inputs.results);
     const uint8_t numerical=*reinterpret_cast<const uint8_t*>(inputs.admissibility_source);
     TaskProgramBank program_bank{};
-    if(numerical>1 || objective.evaluator_abi!=3 || objective.canary_count!=5 ||
+    const bool valid_inputs=!(numerical>1 || objective.evaluator_abi!=3 || objective.canary_count!=5 ||
        objective.row_count!=selection.row_count || objective.capacity!=inputs.capacity ||
        objective.protected_member_count!=inputs.protected_member_count ||
        !selection.row_count || selection.row_count>inputs.row_count || selection.capacity!=inputs.capacity ||
         task[0]!=9 || !task[1] ||
         !task_program_bank(task,inputs.task_words,&program_bank) ||
-       !publication_identity_equal(objective.task_identity,task+2,&input_work)) {
-        semantic_content_integrity_trap();return;
-    }
+       !publication_identity_equal(objective.task_identity,task+2,&input_work));
     semantic_canary_merge(work,native_work,input_work);
+    if(!valid_inputs) { semantic_content_integrity_trap();return; }
     const double evaluator_min=__longlong_as_double((long long)objective.evaluator_min_bits);
     const double evaluator_max=__longlong_as_double((long long)objective.evaluator_max_bits);
     if(!isfinite(evaluator_min) || !isfinite(evaluator_max) || evaluator_min>evaluator_max) {
@@ -3047,8 +2883,22 @@ extern "C" __global__ void semantic_publication_prepare_model_update_admissibili
        work.model_events!=inputs.model_work.count || work.model_bound!=inputs.model_work.bound)
         global_reason=5;
     semantic_graph::NativeWorkTally receipt_work{};
-    if(!global_reason && (!semantic_forward_receipt_valid(forward_receipts[0],0,inputs,base->header,&receipt_work) ||
-             !semantic_forward_receipt_valid(forward_receipts[1],1,inputs,base->header,&receipt_work) ||
+    if(!global_reason && (!semantic_stream_forward_valid(baseline,forward_receipts[0],inputs.baseline_state,
+                inputs.baseline_row_seals,0,base->header,&receipt_work) ||
+             !semantic_stream_forward_valid(candidate,forward_receipts[1],inputs.candidate_state,
+                inputs.candidate_row_seals,1,base->header,&receipt_work) ||
+             baseline.row_count!=inputs.row_count || candidate.row_count!=inputs.row_count ||
+             baseline.capacity!=inputs.capacity || candidate.capacity!=inputs.capacity ||
+             baseline.vocabulary!=inputs.vocabulary || candidate.vocabulary!=inputs.vocabulary ||
+             baseline.scalar_type!=inputs.scalar_type || candidate.scalar_type!=inputs.scalar_type ||
+             baseline.finite>1 || candidate.finite>1 ||
+             baseline.block_positions!=inputs.block_positions || candidate.block_positions!=inputs.block_positions ||
+             !publication_identity_equal(baseline.selection_identity,selection.identity,&receipt_work) ||
+             !publication_identity_equal(candidate.selection_identity,selection.identity,&receipt_work) ||
+             comparison.publication_word!=base->header.publication_word ||
+             comparison.scalar_type!=inputs.scalar_type || comparison.block_positions!=inputs.block_positions ||
+             !semantic_stream_comparison_valid(comparison,comparison_receipt,forward_receipts,
+                selection,canaries,inputs.row_count,inputs.capacity,inputs.vocabulary,&receipt_work) ||
              forward_receipts[0].work_sequence>=forward_receipts[1].work_sequence ||
              forward_receipts[1].work_sequence>inputs.model_work.count ||
             publication_identity_equal(forward_receipts[0].identity,forward_receipts[1].identity,&receipt_work) ||
@@ -3057,6 +2907,15 @@ extern "C" __global__ void semantic_publication_prepare_model_update_admissibili
               forward_receipts[1].model_numerical_digest[2] ||
               forward_receipts[1].model_numerical_digest[3])))
         global_reason=9;
+    for(uint64_t item=0;!global_reason && item<5;++item) {
+        semantic_graph::charge_native(&receipt_work,semantic_graph::NativeWorkEvent::TableSlot,1);
+        const auto& row=comparison.rows[item];
+        if(row.row_ordinal>=selection.row_count || row.row_ordinal>=inputs.row_count ||
+           !publication_identity_equal(row.baseline_digest,baseline_row_seals+row.row_ordinal*4,&receipt_work) ||
+           !publication_identity_equal(row.candidate_digest,candidate_row_seals+row.row_ordinal*4,&receipt_work))
+            global_reason=9;
+    }
+    if(!global_reason && !semantic_stream_full_finite(baseline,candidate,&receipt_work))global_reason=1;
     semantic_canary_merge(work,native_work,receipt_work);
     uint64_t seen=0;
     SemanticTrainingCanaryRefusalRecord refusal{};refusal.abi=1;
@@ -3109,85 +2968,13 @@ extern "C" __global__ void semantic_publication_prepare_model_update_admissibili
         semantic_canary_charge(work,native_work,1,1);
         uint64_t reason=global_reason;
         // Availability describes this calculation, not whole-Update acceptance.
-        uint64_t availability=reason ? 0 : 1;
+        uint64_t availability=reason && reason!=1 ? 0 : 1;
         double measurement=0.0;
-        const uint64_t row_offset=canary.row_ordinal*inputs.capacity;
-        if(!reason && (canary.kind==1 || canary.kind==4)) {
-            uint64_t baseline_correct=0,candidate_correct=0,lost=0;
-            if(!canary.obligation_member_count) {
+        if(!reason && canary.kind!=5) {
+            if(!semantic_stream_canary_measurement(comparison,item,canary,availability,reason,measurement)) {
                 semantic_content_integrity_trap();return;
             }
-            if(!semantic_task_canary_evidence(inputs,canary,task,objective,row.window,baseline_correct,
-                    candidate_correct,lost,work,native_work))reason=7;
-            else if(!reason && canary.kind==1) {
-                measurement=__ddiv_rn(double(int64_t(candidate_correct)-int64_t(baseline_correct)),double(canary.obligation_member_count));
-                availability=2;
-            }
-            else if(!reason) {
-                measurement=-__ddiv_rn(double(lost),double(canary.obligation_member_count));
-                availability=2;
-                if(lost)reason=7;
-            }
-        } else if(!reason && canary.kind==2) {
-            uint64_t denominator=0,baseline_correct=0,candidate_correct=0,protected_lost=0;
-            uint64_t protected_index=0;
-            for(uint64_t position=0;position<row.window;++position) {
-                semantic_canary_charge(work,native_work,1,1);
-                const int64_t label=retention_labels[row_offset+position];
-                if(label<0)continue;
-                if(uint64_t(label)>=inputs.vocabulary) { reason=5;break; }
-                ++denominator;
-                uint64_t baseline_token=0,candidate_token=0;
-                if(!semantic_canary_argmax(inputs,inputs.baseline_logits,canary.row_ordinal,position,baseline_token,work,native_work) ||
-                   !semantic_canary_argmax(inputs,inputs.candidate_logits,canary.row_ordinal,position,candidate_token,work,native_work)) {
-                    reason=1;break;
-                }
-                const bool baseline_ok=baseline_token==uint64_t(label),candidate_ok=candidate_token==uint64_t(label);
-                baseline_correct+=baseline_ok;candidate_correct+=candidate_ok;
-                if(protected_index<canary.protected_member_count &&
-                   position==protected_members[canary.protected_member_offset+protected_index]) {
-                    protected_lost+=baseline_ok && !candidate_ok;
-                    ++protected_index;
-                }
-            }
-            if(protected_index!=canary.protected_member_count)reason=5;
-            if(!denominator)reason=5;
-            else if(!reason) {
-                measurement=__ddiv_rn(double(int64_t(candidate_correct)-int64_t(baseline_correct)),double(denominator));
-                availability=2;
-                if(protected_lost)reason=6;
-            }
-        } else if(!reason && canary.kind==3) {
-            uint64_t positions=0;double maximum=0.0;
-            for(uint64_t position=0;position<row.window;++position) {
-                semantic_canary_charge(work,native_work,1,1);
-                if(!kinds[row_offset+position])continue;
-                ++positions;double baseline_max=0.0,baseline_log=0.0,candidate_max=0.0,candidate_log=0.0;
-                if(!semantic_canary_log_normalizer(inputs,inputs.baseline_logits,canary.row_ordinal,position,baseline_max,baseline_log,work,native_work) ||
-                   !semantic_canary_log_normalizer(inputs,inputs.candidate_logits,canary.row_ordinal,position,candidate_max,candidate_log,work,native_work)) {
-                    reason=1;break;
-                }
-                semantic_canary_charge(work,native_work,2,1);
-                const uint64_t baseline_base=canary.row_ordinal*inputs.row_stride_bytes+position*inputs.position_stride_bytes;
-                for(uint64_t vocabulary=0;vocabulary<inputs.vocabulary;++vocabulary) {
-                    semantic_canary_charge(work,native_work,1,2);
-                    const uint64_t offset=baseline_base+vocabulary*inputs.vocabulary_stride_bytes;
-                    const double baseline=__dsub_rn(__dsub_rn(
-                        semantic_canary_logit(inputs.baseline_logits,inputs.scalar_type,offset),baseline_max),baseline_log);
-                    const double candidate=__dsub_rn(__dsub_rn(
-                        semantic_canary_logit(inputs.candidate_logits,inputs.scalar_type,offset),candidate_max),candidate_log);
-                    const double difference=fabs(__dsub_rn(candidate,baseline));
-                    if(!isfinite(difference)) { reason=1;break; }
-                    if(difference>maximum)maximum=difference;
-                }
-                if(reason)break;
-            }
-            if(!positions)reason=5;
-            else {
-                measurement=maximum;
-                if(!reason)availability=2;
-            }
-        } else if(!reason && canary.kind==5) {
+        } else if(!reason) {
             const double memory_ratio=__ddiv_rn(double(inputs.accounted_reserved_bytes),double(canary.memory_limit));
             const double work_ratio=__ddiv_rn(double(work.raw),double(canary.work_limit));
             measurement=memory_ratio>work_ratio ? memory_ratio : work_ratio;
