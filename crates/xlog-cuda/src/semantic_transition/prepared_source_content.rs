@@ -572,7 +572,7 @@ pub struct SemanticSourceGeometryTensor {
 
 impl SemanticSourceGeometryAllocation {
     pub(super) fn belongs_to(&self, owner: &SourceContentGeometryOwner) -> bool {
-        Arc::ptr_eq(&self.scope, &owner.scope)
+        owner.require_allocation(self, self.span_bytes).is_ok()
     }
     fn declared(
         scope: &Arc<()>,
@@ -992,6 +992,9 @@ impl SourceContentGeometryOwner {
                 && original.byte_offset == descriptor.byte_offset
         };
         match allocation.port {
+            SourceGeometryAllocationPort::ContentOverlay(_) => {
+                return self.classify_content_overlay_tensor(allocation, descriptor, section);
+            }
             SourceGeometryAllocationPort::Model(index) => {
                 let (memory, layouts) = self.model_geometry();
                 for view in &memory.views {
