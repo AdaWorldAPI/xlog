@@ -613,21 +613,32 @@ allocation. This is distinct from the full model-content witness, which also
 retains buffers. Buffers do not gain fabricated gradient, presence or phase-mask
 leaves; all genuine parameter destinations must still be present exactly once.
 
-An Update with a fresh actor execution and an overlapping historical Edit row
-retains two independent contributions for the same original ordinal and bank.
-The issued actor owner provides
+An Update retains independent CURRENT actor and CURRENT Edit-demonstration
+contributions, including when both use the same original ordinal and bank.
+`update.prepare_edit_demonstration(member_ordinal, refresh_snapshot=...,
+content_geometry=(bank0, bank1))` returns the same native
+`SemanticPreparedActorRefresh` owner with `is_demonstration=True`. It uses the
+original row's full ordered choice tuple and causal prefix with CURRENT logits,
+parameters and legal support. It scores the genuine solving witness without a
+draw, RNG advance, world execution or Proposal publication. Unsupported choices
+refuse the whole Update; all original Edit rows and denominators remain.
+
+Both issued roles provide
 `refresh.require_current_target_basis(template_task_use, bank, child_step)`
 for an ordinary producer to authenticate its exact target task and original
 issued child before binding the model realization. This checks retained native
 CURRENT model owners and the original child scope; it does not execute a graph,
 read device storage, or infer CURRENT ownership from equal tensor contents.
 Inside that child's original one-shot `prepared.finish_segment()` callback,
-`refresh.retirement_observation(bank, task_use, prepared, steps)` returns exactly
-`"observed"`, `"cancelled"` or `"initializer_refused"`. It authenticates the same
+`refresh.retirement_observation(bank, task_use, prepared, steps)` authenticates the same
 retained child objects and the ordered step tuple actually delivered to the
 producer, or an empty tuple if preparation stopped before that handoff. It is
 available only after native graph retirement and final-use quiescence; it
-returns no R/P outcomes and starts no numerical work.
+starts no numerical work. Actor completion remains `"observed"`. Demonstration
+completion is `"scored"` or `"score_refused"`; `"score_skipped"` means the original
+Recompute refused and the scoring branch was genuinely unentered. Both roles
+retain `"cancelled"` and `"initializer_refused"` for those original outcomes.
+These scoring outcomes do not create an action or episode.
 The callback window closes on every return or error. An uncertain callback
 retains the original owners and cannot be repeated as another cleanup attempt.
 Inside that same genuine final callback, each original
@@ -638,22 +649,21 @@ reader, performs no numerical work and releases no storage. An earlier cleanup,
 Python retirement flag or unknown completion cannot expose this receipt. Release
 the compiler's corresponding counter alias before the native producer storage is
 retired; a surviving imported alias still retains its original allocation.
-Register the fresh actor's delivery with `actor_refresh=refresh`. Register the
-historical demonstration with `group_member=member, edit_only=True`, and pass
-the same `edit_only=True` to `member.group_update_vjp(...)`. The native owner
-freezes each source's exact Session, Proposal or invocation, and delivery role;
-the two deliveries cannot replace each other. Record the fresh actor VJP before
-the overlapping historical Edit VJP. Both original roots, together with the
-other critic and supervised roots, belong to the same single backward. Each
-contribution retains its original group denominator, model realization and
-demonstration prefix. Without a fresh actor overlap, the default
-`edit_only=False` preserves the existing native actor/Edit membership dispatch.
+Register either role's delivery through
+`update.register_gradient_delivery(..., actor_refresh=original_owner)`; a CURRENT
+demonstration does not use `group_member` or `edit_only`. The original owner
+provides `group_update_vjp_layouts(...)` and `group_update_vjp(...)` and freezes
+its exact Session, native phase, tape and delivery role. The two roles cannot
+replace each other. Record actor VJPs before demonstration VJPs in the same
+single backward with the other critic and supervised roots. Demonstrations use
+only the genuine solving Edit components and no critic contribution, while
+retaining the full choice tuple as conditions. Historical SOURCE read/text
+custody for other protected objectives remains independent of this CURRENT
+scoring and derivative path.
 
 Before numerical recording, query
 `refresh.group_update_vjp_layouts(update_step, bank, consumer_stream=...)` for
-the original CURRENT child, or
-`member.group_update_vjp_layouts(update_step, bank, consumer_stream=...,
-edit_only=...)` for the original historical owner. Each returns nine ordered
+the original CURRENT actor or demonstration child. Each returns nine ordered
 `(NativeTensorAllocation, shape, element_strides, dlpack_dtype)` rows from the
 same temporal adjoints subsequently exported by `group_update_vjp`: FP32
 parameter `[P]`, text `[32,V]`, baseline `[1,C]`; FP64 envelopes `[P,2]`,
@@ -862,6 +872,12 @@ The support is either `("admitted", record_index)` or
 `("authenticated", binding_ordinal, original_observation_words)`; the latter
 retains all eighteen original signed-reference words, not a replacement admitted
 support index. These metadata grant no publication or execution authority.
+The first word distinguishes an absent record (`0`), an authenticated Action
+origin (`1`) and an authenticated Intent origin (`2`). An Intent-origin record
+binds its origin identity to the same stable intent and retains a real verifier
+truth; the program evaluator consumes boolean presence, not this origin tag.
+A receiver refusal is a signed acknowledgement event, not a failed verifier
+observation for a command that did not execute.
 
 During replay, `restore_invocation(task_use, restored_parent, full_row,
 transition)` returns `(original_model_output, finalize_continuation,

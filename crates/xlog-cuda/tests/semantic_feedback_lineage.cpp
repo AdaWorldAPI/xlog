@@ -1438,7 +1438,7 @@ static void recompute_execution_preserves_proposal_state(bool drain_required) {
     PublicationStepResult result{};
     semantic_publication_step_result(reinterpret_cast<uint64_t>(&fixture.control),
         reinterpret_cast<uint64_t>(&fixture.lease),reinterpret_cast<uint64_t>(&result),
-        reinterpret_cast<uint64_t>(&parent),0);
+        reinterpret_cast<uint64_t>(&parent),0,0,0,0);
     require(result.abi==1 && result.advanced==1 && result.word==fixture.control.word && !result.refusal,
         "recompute completion lost its actual publication outcome");
     semantic_publication_step_release(reinterpret_cast<uint64_t>(&fixture.control),reinterpret_cast<uint64_t>(&fixture.lease));
@@ -1492,7 +1492,7 @@ static void completed_step_result_survives_publication_bank_reuse() {
     require(publication_acquire(fixture.control,original)==0,"completion result fixture reader refused");
     fixture.publish();
     semantic_publication_step_result(reinterpret_cast<uint64_t>(&fixture.control),reinterpret_cast<uint64_t>(&original),
-        reinterpret_cast<uint64_t>(&result),reinterpret_cast<uint64_t>(&fixture.banks[original.bank].header),0);
+        reinterpret_cast<uint64_t>(&result),reinterpret_cast<uint64_t>(&fixture.banks[original.bank].header),0,0,0,0);
     require(result.abi==1 && !result.refusal && result.word==fixture.control.word &&
         std::memcmp(&result.header,&fixture.banks[result.word&1].header,sizeof(PublicationHeader))==0,
         "step result did not preserve the actual post-transition publication header");
@@ -1503,11 +1503,11 @@ static void completed_step_result_survives_publication_bank_reuse() {
         "step result changed after physical publication bank reuse");
     require_content_trap([&] {
         semantic_publication_step_result(reinterpret_cast<uint64_t>(&fixture.control),reinterpret_cast<uint64_t>(&original),
-            reinterpret_cast<uint64_t>(&result),reinterpret_cast<uint64_t>(&fixture.banks[original.bank].header),0);
+            reinterpret_cast<uint64_t>(&result),reinterpret_cast<uint64_t>(&fixture.banks[original.bank].header),0,0,0,0);
     },"step result accepted a released publication reader");
     fixture.control.refusal=5;
     semantic_publication_step_result(reinterpret_cast<uint64_t>(&fixture.control),reinterpret_cast<uint64_t>(&fixture.lease),
-        reinterpret_cast<uint64_t>(&result),reinterpret_cast<uint64_t>(&fixture.banks[fixture.lease.bank].header),0);
+        reinterpret_cast<uint64_t>(&result),reinterpret_cast<uint64_t>(&fixture.banks[fixture.lease.bank].header),0,0,0,0);
     require(result.abi==1 && result.refusal==5 && result.word==fixture.lease.word,
         "step result lost an actual non-publishing refusal");
 }
@@ -1515,7 +1515,7 @@ static void completed_step_result_survives_publication_bank_reuse() {
 static void next_step_stops_after_actual_nonpublication() {
     StepPublicationFixture fixture;PublicationStepResult result{};PublicationLease next{};uint64_t conditional=1;
     semantic_publication_step_result(reinterpret_cast<uint64_t>(&fixture.control),reinterpret_cast<uint64_t>(&fixture.lease),
-        reinterpret_cast<uint64_t>(&result),reinterpret_cast<uint64_t>(&fixture.banks[fixture.lease.bank].header),0);
+        reinterpret_cast<uint64_t>(&result),reinterpret_cast<uint64_t>(&fixture.banks[fixture.lease.bank].header),0,0,0,0);
     const auto readers=fixture.control.reader_counts[fixture.lease.bank];
     semantic_publication_step_admit(reinterpret_cast<uint64_t>(&fixture.control),reinterpret_cast<uint64_t>(&next),1,
         reinterpret_cast<uint64_t>(&conditional),reinterpret_cast<uint64_t>(&result));
@@ -1541,7 +1541,7 @@ static void next_step_stops_after_actual_nonpublication() {
     PublicationLease previous{};require(publication_acquire(progressing.control,previous)==0,"advance fixture reader refused");
     progressing.publish();
     semantic_publication_step_result(reinterpret_cast<uint64_t>(&progressing.control),reinterpret_cast<uint64_t>(&previous),
-        reinterpret_cast<uint64_t>(&result),reinterpret_cast<uint64_t>(&progressing.banks[previous.bank].header),0);
+        reinterpret_cast<uint64_t>(&result),reinterpret_cast<uint64_t>(&progressing.banks[previous.bank].header),0,0,0,0);
     require(publication_release(progressing.control,previous)==0,"advance fixture reader release refused");
     semantic_publication_step_admit(reinterpret_cast<uint64_t>(&progressing.control),reinterpret_cast<uint64_t>(&next),1,
         reinterpret_cast<uint64_t>(&conditional),reinterpret_cast<uint64_t>(&result));
