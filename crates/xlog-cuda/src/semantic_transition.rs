@@ -39,6 +39,12 @@ use late_replay::{PendingReplayDelivery, ReplayAuthentication};
 #[cfg(feature = "semantic-policy")]
 mod model_evaluation;
 #[cfg(feature = "semantic-policy")]
+mod model_forward_stream;
+#[cfg(feature = "semantic-policy")]
+pub use model_forward_stream::{
+    SemanticModelCanaryStream, SemanticModelCanaryWitness, SemanticModelForwardStream,
+};
+#[cfg(feature = "semantic-policy")]
 mod native_work_bound;
 #[cfg(feature = "semantic-policy")]
 mod policy_work;
@@ -5797,28 +5803,6 @@ pub struct SemanticUpdateMeasurements {
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct ModelForwardReceiptInputs {
-    control: u64,
-    lease: u64,
-    candidate_seals: u64,
-    candidate_seal_count: u64,
-    role: u64,
-    work_sequence: u64,
-    logits: u64,
-    scalar_type: u64,
-    row_count: u64,
-    capacity: u64,
-    vocabulary: u64,
-    row_stride_bytes: u64,
-    position_stride_bytes: u64,
-    vocabulary_stride_bytes: u64,
-    logits_digest: u64,
-    receipt: u64,
-    native_work: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
 struct PublicationCommand {
     control: u64,
     lease: u64,
@@ -6459,7 +6443,6 @@ const _: () = assert!(size_of::<ModelUpdateBinding>() == 32);
 const _: () = assert!(size_of::<ModelUpdateEvidenceSource>() == 48);
 const _: () = assert!(size_of::<ModelForwardSealInput>() == 32);
 const _: () = assert!(size_of::<ModelForwardReceipt>() == 232);
-const _: () = assert!(size_of::<ModelForwardReceiptInputs>() == 136);
 const _: () = assert!(size_of::<PublicationCommand>() == 32);
 const _: () = assert!(size_of::<PublicationDeliveryInput>() == 88);
 const _: () = assert!(size_of::<PublicationLease>() == 88);
@@ -15417,12 +15400,14 @@ struct PreparedModelUpdate {
     evidence_owners: Arc<Vec<ModelUpdateEvidenceOwner>>,
     forward_seals: TrackedCudaSlice<ModelForwardSealInput>,
     forward_receipts: TrackedCudaSlice<ModelForwardReceipt>,
-    forward_native_work: TrackedCudaSlice<u64>,
+    #[cfg(feature = "semantic-policy")]
+    forward_streams: [Option<SemanticModelForwardStream>; 2],
+    #[cfg(feature = "semantic-policy")]
+    canary_stream: Option<SemanticModelCanaryStream>,
     admissibility: TrackedCudaSlice<u8>,
     canary_results: TrackedCudaSlice<SemanticTrainingCanaryResultRecord>,
     refusal: TrackedCudaSlice<SemanticTrainingCanaryRefusalRecord>,
     output: Option<BoundModelUpdate>,
-    forward_recorded: u8,
     #[cfg_attr(
         not(feature = "semantic-policy"),
         expect(
@@ -15431,7 +15416,6 @@ struct PreparedModelUpdate {
         )
     )]
     admissibility_copy: CudaFunction,
-    forward_receipt: CudaFunction,
 }
 
 struct BoundModelUpdate {
@@ -15440,13 +15424,15 @@ struct BoundModelUpdate {
     digest_cells: Vec<Arc<TrackedCudaSlice<u64>>>,
     allocations: Vec<PreparedSemanticTensor>,
     admissibility: PreparedSemanticTensor,
-    baseline_logits: PreparedSemanticTensor,
-    candidate_logits: PreparedSemanticTensor,
+    stream_scratch: [PreparedSemanticTensor; 4],
     _slab_backing: PreparedSemanticTensor,
     #[cfg(feature = "semantic-policy")]
     accounted_external_bytes: u64,
     _witness: SemanticTensorContentWitness,
+    #[cfg(feature = "semantic-policy")]
     _forward_witnesses: [SemanticModelForwardWitness; 2],
+    #[cfg(feature = "semantic-policy")]
+    _canary_witness: SemanticModelCanaryWitness,
 }
 
 struct ModelUpdateEvidenceOwner {
@@ -15469,7 +15455,7 @@ impl PreparedModelUpdate {
         }
     }
 
-    fn record(&self, recorder: &mut LaunchRecorder) {
+    fn record(&self, recorder: &mut LaunchRecorder) -> Result<(), SemanticTransitionError> {
         if let Some(canaries) = &self.canaries {
             recorder.read(canaries);
         }
@@ -15485,7 +15471,15 @@ impl PreparedModelUpdate {
         }
         recorder.read(&self.forward_seals);
         recorder.read_write(&self.forward_receipts);
-        recorder.read(&self.forward_native_work);
+        #[cfg(feature = "semantic-policy")]
+        {
+            for stream in self.forward_streams.iter().flatten() {
+                stream.record(recorder)?;
+            }
+            if let Some(stream) = &self.canary_stream {
+                stream.record(recorder)?;
+            }
+        }
         recorder.read_write(&self.admissibility);
         recorder.read_write(&self.refusal);
         recorder.read_write(&self.canary_results);
@@ -15498,16 +15492,16 @@ impl PreparedModelUpdate {
             if let Some(source) = &output.admissibility.source {
                 recorder.read(source);
             }
-            if let Some(source) = &output.baseline_logits.source {
-                recorder.read(source);
-            }
-            if let Some(source) = &output.candidate_logits.source {
-                recorder.read(source);
+            for scratch in &output.stream_scratch {
+                if let Some(source) = &scratch.source {
+                    recorder.read(source);
+                }
             }
             for cells in &output.digest_cells {
                 recorder.read(cells.as_ref());
             }
         }
+        Ok(())
     }
 
     #[cfg(feature = "semantic-policy")]
@@ -15534,7 +15528,7 @@ impl PreparedModelUpdate {
         let mut recorder = domain.new_strict_recorder();
         storage.record(&mut recorder);
         recorder.read(reader);
-        self.record(&mut recorder);
+        self.record(&mut recorder)?;
         model_work.record_reads(&mut recorder);
         recorder.read(task);
         let selection = training_view.selection();
@@ -15690,24 +15684,6 @@ struct ModelUpdateCanaryInputs {
 }
 
 const _: () = assert!(size_of::<ModelUpdateCanaryInputs>() == 296);
-
-struct ModelForwardReceiptInputsParam(ModelForwardReceiptInputs);
-
-impl crate::cuda_compat::KernelParamStorage for ModelForwardReceiptInputsParam {
-    fn as_kernel_param(&self) -> *mut std::ffi::c_void {
-        (&self.0 as *const ModelForwardReceiptInputs)
-            .cast_mut()
-            .cast()
-    }
-}
-
-impl crate::cuda_compat::IntoKernelParamStorage for ModelForwardReceiptInputs {
-    type Storage = ModelForwardReceiptInputsParam;
-
-    fn into_kernel_param_storage(self) -> Self::Storage {
-        ModelForwardReceiptInputsParam(self)
-    }
-}
 
 struct ModelUpdateCanaryInputsParam(ModelUpdateCanaryInputs);
 
@@ -16185,15 +16161,19 @@ pub struct SemanticTensorContentWitness {
     _witness: Arc<()>,
 }
 
-/// Opaque proof that the native receipt node for one exact logits occurrence
-/// was inserted while its model producer's prepared bank capture was active.
+/// Opaque proof that an original full-forward stream finished during its
+/// producer's prepared capture.
+#[cfg(feature = "semantic-policy")]
 #[derive(Clone)]
 pub struct SemanticModelForwardWitness {
-    issuer: Arc<()>,
-    reader_token: u64,
-    bank: usize,
-    role: usize,
-    content: SemanticTensorContentWitness,
+    stream: SemanticModelForwardStream,
+}
+
+#[cfg(feature = "semantic-policy")]
+impl SemanticModelForwardWitness {
+    fn from_stream(stream: SemanticModelForwardStream) -> Self {
+        Self { stream }
+    }
 }
 
 fn retain_initial_prefill_verification_inputs(
@@ -25385,8 +25365,7 @@ impl SemanticTransitionSession {
                 bytes.checked_add(
                     1 + 5 * size_of::<SemanticTrainingCanaryResultRecord>()
                         + size_of::<SemanticTrainingCanaryRefusalRecord>()
-                        + 2 * size_of::<ModelForwardReceipt>()
-                        + 11 * size_of::<u64>(),
+                        + 2 * size_of::<ModelForwardReceipt>(),
                 )
             })
             .ok_or(SemanticTransitionError::GenerationExhausted)?;
@@ -25564,8 +25543,6 @@ impl SemanticTransitionSession {
         let result_kernel = kernel("semantic_publication_step_result")?;
         let model_update_admissibility_copy =
             kernel("semantic_publication_prepare_model_update_admissibility")?;
-        let model_update_forward_receipt =
-            kernel("semantic_publication_record_model_forward_receipts")?;
         let mut writes = Vec::new();
         let catalogue = if replace_catalogue {
             Some(self.prepare_model_generation_catalogue(
@@ -25688,9 +25665,6 @@ impl SemanticTransitionSession {
                             .map_err(|error| {
                                 runtime_error("model forward receipt allocation", error)
                             })?;
-                    let forward_native_work = reservation
-                        .alloc::<u64>(11)
-                        .map_err(|error| runtime_error("model forward work allocation", error))?;
                     writes.push(state_restoration::OriginalDeviceWrite::new(
                         &self.stream,
                         &[ModelForwardReceipt::default(); 2],
@@ -25750,14 +25724,15 @@ impl SemanticTransitionSession {
                         ),
                         forward_seals,
                         forward_receipts,
-                        forward_native_work,
+                        #[cfg(feature = "semantic-policy")]
+                        forward_streams: [None, None],
+                        #[cfg(feature = "semantic-policy")]
+                        canary_stream: None,
                         admissibility,
                         canary_results,
                         refusal,
                         output: None,
-                        forward_recorded: 0,
                         admissibility_copy: model_update_admissibility_copy.clone(),
-                        forward_receipt: model_update_forward_receipt.clone(),
                     }))
                 };
                 let model_updates: [Option<PreparedModelUpdate>; 2] =
@@ -31251,176 +31226,6 @@ impl SemanticTransitionSession {
         Ok(())
     }
 
-    /// Bind the complete producer-owned model backing after the original
-    /// selected-view backward and optimizer update were recorded. The output is
-    /// copied into the inactive neural bank by a prepared CUDA node before the
-    /// sole publication transition commits its pointer and generation state.
-    /// Record one baseline or candidate forward at the actual producer site.
-    /// The receipt node is inserted into the active prepared bank capture and
-    /// cannot be reconstructed later from handoff argument position.
-    pub fn record_prepared_model_forward(
-        &mut self,
-        step: &SemanticPreparedStep,
-        bank: usize,
-        role: usize,
-        logits: SemanticTensorInput,
-        consumer_stream: u64,
-    ) -> Result<SemanticModelForwardWitness, SemanticTransitionError> {
-        self.check_prepared_content_stream(step, consumer_stream)?;
-        if bank > 1 || role > 1 {
-            return Err(publication_input_error(
-                "prepared model forward bank and role must be zero or one",
-            ));
-        }
-        if self.prepared_transition_kind(step)? != SemanticTransitionKind::Update {
-            return Err(publication_input_error(
-                "model forward receipts belong only to a prepared update",
-            ));
-        }
-        let content = self.capture_prepared_tensor_roster(
-            step,
-            vec![logits],
-            consumer_stream,
-            Some(role),
-            #[cfg(feature = "semantic-policy")]
-            None,
-        )?;
-        let storage = Arc::clone(self.prepared_publication()?);
-        let owner = self
-            .steps
-            .get_mut(&step.token)
-            .expect("checked update step");
-        let prepared = owner.prepared.as_mut().expect("prepared update owner");
-        if prepared
-            .model_work
-            .as_ref()
-            .is_none_or(|work| work.capture_bank != Some(bank))
-        {
-            return Err(publication_input_error(
-                "model forward receipt requires the active producer bank capture",
-            ));
-        }
-        let training_view = prepared.training_view.as_ref().ok_or_else(|| {
-            publication_input_error("prepared update has no native training view")
-        })?;
-        let work_sequence = prepared
-            .model_work
-            .as_ref()
-            .expect("active model work checked above")
-            .next_slot()
-            .map_err(publication_input_error)?;
-        if work_sequence == 0 {
-            return Err(publication_input_error(
-                "model forward receipt requires recorded producer work before the logits occurrence",
-            ));
-        }
-        let tensor = owner.content[content.index]
-            .tensors
-            .first()
-            .ok_or(SemanticTransitionError::ObservationMismatch)?
-            .clone();
-        let layout = tensor.layout;
-        let row_count = training_view.roster_rows().len() as u64;
-        let capacity = training_view.capacity() as u64;
-        if !matches!(
-            (layout.scalar_type, layout.element_bytes),
-            (4, 2) | (5, 2) | (6, 4)
-        ) || layout.role != 0
-            || layout.index != role as u64
-            || layout.rank != 3
-            || layout.logical_axis != u64::MAX
-            || layout.dimensions[0] != row_count
-            || layout.dimensions[1] != capacity
-            || layout.dimensions[2] == 0
-            || layout.dimensions[3] != 0
-            || layout.strides_bytes[2] != layout.element_bytes
-            || layout.strides_bytes[1]
-                != layout.dimensions[2]
-                    .checked_mul(layout.element_bytes)
-                    .unwrap_or(0)
-            || layout.strides_bytes[0]
-                != layout.dimensions[1]
-                    .checked_mul(layout.strides_bytes[1])
-                    .unwrap_or(0)
-            || layout.strides_bytes[3] != 0
-            || tensor.logical_begin != 0
-            || tensor.logical_end != 0
-        {
-            return Err(publication_input_error(
-                "model forward logits must be aligned contiguous F16/BF16/F32 [rows,capacity,vocabulary] with its explicit role",
-            ));
-        }
-        let TensorContentSeals::Captured(digests) = &owner.content[content.index].seals else {
-            return Err(SemanticTransitionError::ObservationMismatch);
-        };
-        let (logits_digest, digest_cells) = captured_tensor_digest_pointer(digests, 0)?;
-        let update = prepared.branches[bank]
-            .model_update
-            .as_mut()
-            .ok_or_else(|| publication_input_error("prepared branch has no model update"))?;
-        if update.forward_recorded != role as u8 {
-            return Err(publication_input_error(
-                "model forwards must be recorded exactly once in baseline then candidate order",
-            ));
-        }
-        update.forward_recorded += 1;
-        let receipt = update.forward_receipts.device_ptr_value()
-            + (role * size_of::<ModelForwardReceipt>()) as u64;
-        let inputs = ModelForwardReceiptInputs {
-            control: storage.control.device_ptr_value(),
-            lease: prepared.reader.device_ptr_value(),
-            candidate_seals: update.forward_seals.device_ptr_value(),
-            candidate_seal_count: update.forward_seals.len() as u64,
-            role: role as u64,
-            work_sequence: work_sequence as u64,
-            logits: tensor.data,
-            scalar_type: layout.scalar_type,
-            row_count,
-            capacity,
-            vocabulary: layout.dimensions[2],
-            row_stride_bytes: layout.strides_bytes[0],
-            position_stride_bytes: layout.strides_bytes[1],
-            vocabulary_stride_bytes: layout.strides_bytes[2],
-            logits_digest,
-            receipt,
-            native_work: update.forward_native_work.device_ptr_value(),
-        };
-        let mut recorder = self.domain.new_strict_recorder();
-        storage.record(&mut recorder);
-        recorder.read(&prepared.reader);
-        recorder.read(&update.forward_seals);
-        recorder.read(digest_cells.as_ref());
-        recorder.write(&update.forward_receipts);
-        recorder.read_write(&update.forward_native_work);
-        let result = enqueue_recorded(&self.domain, &mut self.poisoned, recorder, |enqueue| {
-            // SAFETY: all pointers name retained native or producer-owned storage;
-            // the launch is captured immediately after the actual forward.
-            unsafe {
-                update.forward_receipt.clone().launch_in(
-                    enqueue,
-                    LaunchConfig {
-                        grid_dim: (1, 1, 1),
-                        block_dim: (1, 1, 1),
-                        shared_mem_bytes: 0,
-                    },
-                    (inputs,),
-                )
-            }
-            .map_err(|error| XlogError::Kernel(error.to_string()))
-        });
-        if result.is_err() {
-            self.poisoned = true;
-        }
-        result?;
-        Ok(SemanticModelForwardWitness {
-            issuer: Arc::clone(&self.publication_issuer),
-            reader_token: step.token,
-            bank,
-            role,
-            content,
-        })
-    }
-
     #[expect(
         clippy::too_many_arguments,
         reason = "the native update handoff binds model geometry, numerical validity and canary evidence"
@@ -33055,7 +32860,7 @@ impl SemanticTransitionSession {
                     }
                 }
                 if let Some(update) = &branch.model_update {
-                    update.record(&mut recorder);
+                    update.record(&mut recorder)?;
                 }
                 #[cfg(feature = "semantic-policy")]
                 {
@@ -48732,7 +48537,7 @@ impl SemanticTransitionSession {
             custody.record(&mut recorder);
         }
         if let Some(update) = io.model_update {
-            update.record(&mut recorder);
+            update.record(&mut recorder)?;
         }
         recorder.write(&self.scratch);
         recorder.write(io.receipts);
