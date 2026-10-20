@@ -775,6 +775,53 @@ impl SemanticTransitionSession {
         Ok(())
     }
 
+    /// Authenticate the original source while its issued continuation owns the
+    /// finished, unused captured segment. This grants no execution or rebinding.
+    pub fn verify_model_context_checkpoint_loaded_source(
+        &self,
+        continuation: &SemanticModelContextContinuation,
+        parent: &SemanticPublishedLease,
+        loaded: &mut SemanticReplayLoadedMaterial,
+    ) -> Result<(Identity256, bool), SemanticTransitionError> {
+        self.require_activated_model_context_checkpoint(continuation, parent)?;
+        let program = continuation
+            .inner
+            .program
+            .lock()
+            .map_err(|_| SemanticTransitionError::Poisoned)?;
+        self.require_frozen_original_program_checkpoint_source(&program, None)?;
+        self.verify_checkpoint_loaded_source_content(parent, loaded)
+    }
+
+    /// Bind only the same continuation's native admission before parent handoff.
+    pub fn bind_model_context_checkpoint_loaded_source(
+        &mut self,
+        continuation: &SemanticModelContextContinuation,
+        admission: &SemanticSegmentInstructionAdmission,
+        parent: &SemanticPublishedLease,
+        loaded: &mut SemanticReplayLoadedMaterial,
+        source_checkpoint: Identity256,
+        source_proposal_spent: u64,
+        source_assignments: &[u8],
+    ) -> Result<(), SemanticTransitionError> {
+        self.require_activated_model_context_checkpoint(continuation, parent)?;
+        self.require_segment_instruction_admission(admission, parent)?;
+        let program = continuation
+            .inner
+            .program
+            .lock()
+            .map_err(|_| SemanticTransitionError::Poisoned)?;
+        self.require_frozen_original_program_checkpoint_source(&program, Some(admission))?;
+        let (digest, _) = self.verify_checkpoint_loaded_source_content(parent, loaded)?;
+        self.bind_segment_checkpoint_source_digest(
+            admission,
+            digest,
+            source_checkpoint,
+            source_proposal_spent,
+            source_assignments,
+        )
+    }
+
     fn require_model_context_numerical_contract(
         &self,
         continuation: &SemanticModelContextContinuation,

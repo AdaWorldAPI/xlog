@@ -656,6 +656,31 @@ impl FrozenSourceContentOccurrences {
                 } else {
                     false
                 };
+                if continuation {
+                    let original = &recipe.seed.proof.owner;
+                    let storage = &recipe.publication.storage;
+                    native_work_bound::add_native_work_ceiling(
+                        &mut ceiling,
+                        native_work_bound::continuation_preparation_geometry_native_work_ceiling(
+                            &original.contract,
+                            &storage.bank_templates[0],
+                            storage.continuation_templates.len(),
+                            original.layouts.len(),
+                            storage.allocation_bytes.len(),
+                            native_work_bound::continuation_copy_capacity_native_work_ceiling(
+                                &storage.continuation_templates,
+                                |slot| {
+                                    storage
+                                        .allocation_bytes
+                                        .get(slot)
+                                        .copied()
+                                        .map(|bytes| bytes as u64)
+                                        .ok_or(SemanticTransitionError::ObservationMismatch)
+                                },
+                            )?,
+                        )?,
+                    )?;
+                }
                 let kinds: &[SourceNativeContentGuard] = if policy {
                     &[
                         SourceNativeContentGuard::PolicyBinding,

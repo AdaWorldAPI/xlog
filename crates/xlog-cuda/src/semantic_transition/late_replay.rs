@@ -1413,7 +1413,13 @@ impl SemanticTransitionSession {
         &self,
         restoration: &Arc<state_restoration::OriginalStateMaterialRestore>,
         material: &state_restoration::RestoredReplayAppendMaterial,
-    ) -> Result<Vec<state_restoration::OriginalDeviceWrite>, SemanticTransitionError> {
+    ) -> Result<
+        (
+            Vec<state_restoration::OriginalDeviceWrite>,
+            Option<Arc<SemanticReplayMaterialReservation>>,
+        ),
+        SemanticTransitionError,
+    > {
         self.require_restored_replay_append_material(restoration, material)?;
         let (entries, payload) = material.records();
         let arena = Arc::clone(
@@ -1431,13 +1437,64 @@ impl SemanticTransitionSession {
                 "restored replay queue differs from its original cold arena",
             ));
         }
+        let row_metadata_bytes =
+            OwnedPublicationMaterial::tree_node_bound(size_of::<Identity256>(), 0)?
+                .checked_add(size_of::<AppendPayload<'_>>())
+                .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        let parse_bytes = usize::try_from(header.count)
+            .ok()
+            .and_then(|count| count.checked_mul(row_metadata_bytes))
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    size_of::<SemanticReplayMaterialReservation>() + 2 * size_of::<usize>(),
+                )
+            })
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        let _parse_reservation = self
+            .replay_material_budget
+            .as_ref()
+            .map(|budget| budget.reserve_auxiliary(parse_bytes))
+            .transpose()?;
         let rows = append_rows_from_ranges(entries, payload)?;
         if !rows.is_empty() {
             arena.require_append_authentication();
         }
         let (descriptors, raw) = arena.append_storage();
         let mut eligible_count = 0;
-        let mut writes = Vec::new();
+        let mut write_count = 0usize;
+        let mut write_bytes =
+            size_of::<SemanticReplayMaterialReservation>() + 2 * size_of::<usize>();
+        for row in rows.iter().filter(|row| row.entry.disposition == 1) {
+            write_count = write_count
+                .checked_add(2)
+                .ok_or(SemanticTransitionError::GenerationExhausted)?;
+            for bytes in [
+                state_restoration::OriginalDeviceWrite::metadata_allocation_bytes::<u8>(),
+                state_restoration::OriginalDeviceWrite::metadata_allocation_bytes::<
+                    TrainingViewRowDescriptor,
+                >(),
+                row.raw.len().max(1),
+                size_of::<TrainingViewRowDescriptor>(),
+            ] {
+                write_bytes = write_bytes
+                    .checked_add(bytes)
+                    .ok_or(SemanticTransitionError::GenerationExhausted)?;
+            }
+        }
+        let reservation = self
+            .replay_material_budget
+            .as_ref()
+            .map(|budget| {
+                budget
+                    .reserve_auxiliary(
+                        u64::try_from(write_bytes)
+                            .map_err(|_| SemanticTransitionError::GenerationExhausted)?,
+                    )
+                    .map(Arc::new)
+            })
+            .transpose()?;
+        let mut writes = Vec::with_capacity(write_count);
         for row in &rows {
             if row.entry.disposition == 2 {
                 continue;
@@ -1468,20 +1525,22 @@ impl SemanticTransitionSession {
                 raw.slice(descriptor.raw_offset as usize..descriptor.raw_offset as usize + raw_len);
             let physical = arena.physical_ordinal(expected_ordinal)?;
             let target_descriptor = descriptors.slice(physical..physical + 1);
-            writes.push(state_restoration::OriginalDeviceWrite::new(
+            writes.push(state_restoration::OriginalDeviceWrite::new_with_owner(
                 &self.stream,
                 row.raw,
                 target,
                 false,
+                reservation.clone(),
             )?);
-            writes.push(state_restoration::OriginalDeviceWrite::new(
+            writes.push(state_restoration::OriginalDeviceWrite::new_with_owner(
                 &self.stream,
                 &[descriptor],
                 target_descriptor,
                 false,
+                reservation.clone(),
             )?);
         }
-        Ok(writes)
+        Ok((writes, reservation))
     }
 
     /// Original finite transport limits, sealed before any publication or result acquisition.
