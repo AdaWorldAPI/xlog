@@ -1437,18 +1437,23 @@ impl PrivateReplayChildCustody {
         let member = member.expect("original completed replay member");
         let member = member.borrow(py);
         if member.completed.load(Ordering::Acquire) {
-            let mode = member
-                .final_use
-                .try_lock()
-                .map_err(|_| invalid("original source final use is already active or poisoned"))?
-                .mode
-                .ok_or_else(|| invalid("original final-use acknowledgment has no disposition"))?;
+            let (mode, target) = {
+                let original = member.final_use.try_lock().map_err(|_| {
+                    invalid("original source final use is already active or poisoned")
+                })?;
+                (
+                    original.mode.ok_or_else(|| {
+                        invalid("original final-use acknowledgment has no disposition")
+                    })?,
+                    original.target.clone(),
+                )
+            };
             if (mode == RetainedFinalUseMode::Cancelled) != cancelled {
                 return Err(invalid(
                     "original source final use changed its cancellation disposition",
                 ));
             }
-            return member.require_final_use_ack(py, mode, None);
+            return member.require_final_use_ack(py, mode, target.as_ref());
         }
         if cancelled {
             return member.finish_cancelled_private_segment(py);

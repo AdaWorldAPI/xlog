@@ -18869,9 +18869,15 @@ impl PySemanticRetainedReplayMember {
             }
         };
         if self.completed.load(Ordering::Acquire) {
-            let target = unpublished_update
-                .as_ref()
-                .map(|update| update.borrow(py).inner.clone());
+            let target = match &unpublished_update {
+                Some(update) => Some(update.borrow(py).inner.clone()),
+                None => self
+                    .final_use
+                    .try_lock()
+                    .map_err(|_| invalid("original final use is already active or poisoned"))?
+                    .target
+                    .clone(),
+            };
             return self.require_final_use_ack(py, mode, target.as_ref());
         }
         let (session, target) = {
@@ -18926,16 +18932,20 @@ impl PySemanticRetainedReplayMember {
             .final_use
             .try_lock()
             .map_err(|_| invalid("original final use is already active or poisoned"))?;
+        let same_target = match (mode, target, original.target.as_ref()) {
+            (RetainedFinalUseMode::Cancelled, None, None) => true,
+            (
+                RetainedFinalUseMode::Published | RetainedFinalUseMode::Unpublished,
+                Some(target),
+                Some(stored),
+            ) => stored.same_handle(target),
+            _ => false,
+        };
         if !self.completed.load(Ordering::Acquire)
             || original.active
             || original.mode != Some(mode)
             || !original.completion.state_finished
-            || target.is_some_and(|target| {
-                original
-                    .target
-                    .as_ref()
-                    .is_none_or(|stored| !stored.same_handle(target))
-            })
+            || !same_target
         {
             return Err(invalid(
                 "final-use acknowledgment changed its original source, target or disposition",
@@ -19360,89 +19370,6 @@ impl PySemanticPolicyInvocation {
         Ok(PyTuple::new(py, capsules)?.unbind())
     }
 
-    /// Consume this prepared proposal's exact retained tape against the
-    /// prepared Update step's resident actor/critic/cost objective. The caller
-    /// invokes this method for every proposal invocation in the frozen segment
-    /// and joins every returned root into one GraphTask. Native selection makes
-    /// unselected invocations graph-connected zeros; Python never reads the
-    /// selected ordinal, reconstructs selected scores, or runs a second primal.
-    ///
-    /// Returns FP32 parameter, full MASK and component-baseline adjoints,
-    /// then their three full FP64 E[...,2] ordinary/underflow envelopes and
-    /// three contiguous FP64 D[2,...,4] bounds in actor/full and (M,O,U,I)
-    /// order. E and D.full.O/U come from the same coherent result. These are
-    /// selected-tape bounds, not pre-draw support/prefix coverage. Only the first three
-    /// capsules are autograd cotangents. This is a single-use handoff, including
-    /// uncertain native failures.
-    #[pyo3(signature = (update_step, *, consumer_stream))]
-    fn backward_selected(
-        &self,
-        py: Python<'_>,
-        update_step: Py<PySemanticPreparedStep>,
-        consumer_stream: &Bound<'_, PyAny>,
-    ) -> PyResult<Py<PyTuple>> {
-        self.session.borrow(py).require_creator()?;
-        self.require_public_result(py)?;
-        let policy_step = match &self._parent {
-            ContentStepOwner::Prepared(step) => step,
-            ContentStepOwner::Published(_) => {
-                return Err(invalid(
-                    "device-selected policy backward requires an original prepared proposal",
-                ));
-            }
-        };
-        let expected = {
-            let session = self.session.borrow(py);
-            let owner = session.owner()?;
-            self.final_use_binding(py, &owner)?
-        };
-        if !self.training {
-            return Err(invalid(
-                "device-selected policy backward requires the original training use",
-            ));
-        }
-        self.published_observation()?;
-        let mut budget = 4096;
-        let consumer_stream = parse_witness_consumer_stream(consumer_stream, &mut budget)?;
-        {
-            let update = update_step.borrow(py);
-            if self.session.as_ptr() != update.session.as_ptr() {
-                return Err(invalid(
-                    "device-selected policy backward requires an Update from the same Session",
-                ));
-            }
-            let task_use = self._task_use.borrow(py);
-            update.require_task(py, &task_use)?;
-        }
-        self.start_final_use()?;
-        let session = self.session.borrow(py);
-        let mut owner = session.owner()?;
-        if self.final_use_binding(py, &owner)? != expected {
-            return Err(invalid(
-                "policy backward authority changed before resident objective use",
-            ));
-        }
-        let gradients = owner
-            .backward_selected_prepared_policy(
-                &policy_step.borrow(py).inner,
-                &update_step.borrow(py).inner,
-                self.rng,
-                consumer_stream,
-            )
-            .map_err(xlog_err)?;
-        let export_owner = || policy_step.clone_ref(py);
-        let capsules = gradients
-            .into_dlpack()
-            .map_err(xlog_err)?
-            .into_iter()
-            .map(|tensor| {
-                let tensor = retain_export_owner(tensor, export_owner(), session.owner_thread)?;
-                crate::dlpack_capsule_from_tensor(py, tensor)
-            })
-            .collect::<PyResult<Vec<_>>>()?;
-        Ok(PyTuple::new(py, capsules)?.unbind())
-    }
-
     /// Finish the original published or refused inference use after consumers are enqueued.
     ///
     /// ``consumer_stream`` must be the explicit CUDA stream containing those
@@ -19450,9 +19377,8 @@ impl PySemanticPolicyInvocation {
     /// finalization joins that stream without a host wait and retires only this
     /// invocation's retained policy tape. It does not release the parent.
     /// Published training invocations require ``backward`` or, after a completed
-    /// group Update, ``finish_recorded_training`` for a consumed tape or
-    /// ``finish_unselected_recorded_training`` for an unselected tape. Refused
-    /// training invocations require ``finish_refusal``. Final use is one-shot,
+    /// group Update, ``finish_unselected_recorded_training`` for a local tape.
+    /// Refused training invocations require ``finish_refusal``. Final use is one-shot,
     /// including uncertain native failures.
     #[pyo3(signature = (*, consumer_stream))]
     fn finish_inference(&self, py: Python<'_>, consumer_stream: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -19464,23 +19390,6 @@ impl PySemanticPolicyInvocation {
             ));
         }
         self.finish_final_use(py, consumer_stream)
-    }
-
-    /// Finish a published training invocation after its policy tape was already
-    /// consumed in the exact prepared Update. This is a terminal ownership
-    /// handoff only; it does not execute a second backward or policy VJP.
-    ///
-    /// Enqueue every final GraphTask/optimizer consumer on ``consumer_stream``
-    /// before this call. Native validation binds the Proposal, Update and
-    /// invocation to the same completed segment and exact recording identities.
-    #[pyo3(signature = (update_step, *, consumer_stream))]
-    fn finish_recorded_training(
-        &self,
-        py: Python<'_>,
-        update_step: Py<PySemanticPreparedStep>,
-        consumer_stream: &Bound<'_, PyAny>,
-    ) -> PyResult<()> {
-        self.finish_recorded_training_use(py, update_step, consumer_stream, false)
     }
 
     /// Finish a published local Proposal that was outside the exact frozen
@@ -19495,7 +19404,7 @@ impl PySemanticPolicyInvocation {
         update_step: Py<PySemanticPreparedStep>,
         consumer_stream: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
-        self.finish_recorded_training_use(py, update_step, consumer_stream, true)
+        self.finish_unselected_recorded_training_use(py, update_step, consumer_stream)
     }
 
     /// Finish an actual native refusal from inference or training without a VJP.
@@ -19503,7 +19412,7 @@ impl PySemanticPolicyInvocation {
     /// Enqueue final consumers on the explicit ``consumer_stream`` first.
     /// Stream 1 is allowed; 0 and 2 are refused. Published outcomes are not
     /// admitted here. This shares the one-shot final-use owner with ``backward``,
-    /// ``finish_recorded_training`` and ``finish_inference`` and retains the
+    /// ``finish_unselected_recorded_training`` and ``finish_inference`` and retains the
     /// parent for its later release.
     #[pyo3(signature = (*, consumer_stream))]
     fn finish_refusal(&self, py: Python<'_>, consumer_stream: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -19549,12 +19458,11 @@ impl PySemanticPolicyInvocation {
         })
     }
 
-    fn finish_recorded_training_use(
+    fn finish_unselected_recorded_training_use(
         &self,
         py: Python<'_>,
         update_step: Py<PySemanticPreparedStep>,
         consumer_stream: &Bound<'_, PyAny>,
-        unselected: bool,
     ) -> PyResult<()> {
         self.session.borrow(py).require_creator()?;
         self.require_public_result(py)?;
@@ -19597,22 +19505,14 @@ impl PySemanticPolicyInvocation {
                 "policy authority changed before recorded training completion",
             ));
         }
-        let result = if unselected {
-            owner.finish_unselected_recorded_training_policy_invocation(
+        owner
+            .finish_unselected_recorded_training_policy_invocation(
                 &policy_step.borrow(py).inner,
                 &update_step.borrow(py).inner,
                 self.rng,
                 consumer_stream,
             )
-        } else {
-            owner.finish_recorded_training_policy_invocation(
-                &policy_step.borrow(py).inner,
-                &update_step.borrow(py).inner,
-                self.rng,
-                consumer_stream,
-            )
-        };
-        result.map_err(xlog_err)
+            .map_err(xlog_err)
     }
     fn finish_final_use(&self, py: Python<'_>, consumer_stream: &Bound<'_, PyAny>) -> PyResult<()> {
         let expected = {
@@ -23417,6 +23317,9 @@ impl PySemanticTransitionController {
     /// checkpoint still requires the bounded resolver and authority refresh.
     /// Selected replay requires an explicit current inference/training operation
     /// and trusted application callbacks, not permissions inferred from archive.
+    /// Retained SOURCE imports require the original ``prepare_invocation``
+    /// callback and return a prepared import before numerical execution. Direct
+    /// unprepared imports never retain a policy or acquire Update final-use rights.
     ///
     /// restore_invocation(task_use, restored_parent, full_row, transition) returns
     /// (original_model_output, finalize_continuation, consumer_stream). The second
@@ -23500,6 +23403,11 @@ impl PySemanticTransitionController {
         prepare_invocation: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
         self.session.borrow(py).require_creator()?;
+        if retain_policy != prepare_invocation.is_some() {
+            return Err(invalid(
+                "retained SOURCE import requires its original preparation callback",
+            ));
+        }
         if prepare_invocation.is_some_and(|callback| !callback.is_callable()) {
             return Err(invalid(
                 "task import metadata preparation requires its original callable",
@@ -23991,7 +23899,6 @@ impl PySemanticTransitionController {
                 pending_delivery_receiver: Mutex::new(None),
             },
         )?;
-        let mut retained = None;
         #[cfg(feature = "semantic-policy")]
         if let Some(child) = session.private_replay_custody()? {
             child.retain_import_task(py, &task_use)?;
@@ -24037,34 +23944,20 @@ impl PySemanticTransitionController {
                 finish_invocation,
                 refresh_snapshot,
                 &import,
-                retain_policy,
                 #[cfg(feature = "semantic-policy")]
                 None,
             );
-            match replay {
-                Ok(member) => retained = member,
-                Err(error) => {
-                    if let Ok(mut state) = task_use.borrow(py).state() {
-                        state.phase = TaskUsePhase::Refused;
-                    }
-                    return Err(error);
+            if let Err(error) = replay {
+                if let Ok(mut state) = task_use.borrow(py).state() {
+                    state.phase = TaskUsePhase::Refused;
                 }
+                return Err(error);
             }
         }
         if prepare_invocation.is_some() {
             return Err(invalid(
                 "prepared import requires its original selected replay material",
             ));
-        }
-        if let Some(member) = retained {
-            #[cfg(feature = "semantic-policy")]
-            if let Some(child) = session.private_replay_custody()? {
-                child.retain_member(py, &member)?;
-            }
-            let result = (task_use, member).into_pyobject(py)?.unbind().into_any();
-            import.committed = true;
-            import.deferred = true;
-            return Ok(result);
         }
         import.committed = true;
         Ok(task_use.into_any())
@@ -28629,13 +28522,12 @@ impl PySemanticTransitionController {
         finish_invocation: &Bound<'_, PyAny>,
         refresh_snapshot: &Bound<'_, PyAny>,
         import: &ColdImportGuard<'_>,
-        retain_policy: bool,
         #[cfg(feature = "semantic-policy")] prepared: Option<
             &prepared_import::PySemanticPreparedTaskImport,
         >,
     ) -> PyResult<Option<Py<PySemanticRetainedReplayMember>>> {
         #[cfg(not(feature = "semantic-policy"))]
-        let _ = (retain_policy, &original_decisions);
+        let _ = &original_decisions;
         let issued = task_use.borrow(py);
         let replay_row = self.original_replay_import_row(py, &issued, ordinal, import)?;
         #[cfg(feature = "semantic-policy")]
@@ -28797,7 +28689,7 @@ impl PySemanticTransitionController {
                         .and_then(|_| {
                             self.verify_import_successor(py, &issued, &acquired, &material, import)
                         });
-                    if retain_policy {
+                    if let Some(prepared) = prepared {
                         comparison?;
                         let invocation = Py::new(py, invocation)?;
                         return Py::new(
@@ -28815,11 +28707,7 @@ impl PySemanticTransitionController {
                                 expected: expected.clone(),
                                 finish_invocation: finish_invocation.clone().unbind(),
                                 refresh_snapshot: refresh_snapshot.clone().unbind(),
-                                source_target: prepared
-                                    .map(|prepared| Arc::clone(&prepared.source_target))
-                                    .unwrap_or_else(|| {
-                                        Arc::new(Mutex::new(RetainedSourceTarget::new()))
-                                    }),
+                                source_target: Arc::clone(&prepared.source_target),
                                 final_use: Mutex::new(RetainedReplayFinalUse::default()),
                                 completed: AtomicBool::new(false),
                             },

@@ -1862,7 +1862,6 @@ impl PySemanticTransitionController {
                 prepared.finish_invocation.bind(py),
                 prepared.refresh_snapshot.bind(py),
                 &import,
-                true,
                 Some(&prepared),
             )?
             .ok_or_else(|| invalid("prepared retained import lost its genuine completed member"))?;
