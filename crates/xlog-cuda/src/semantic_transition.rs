@@ -3123,18 +3123,6 @@ impl SemanticNonterminalIntentBinding {
             .and_then(|bytes| bytes.checked_add(32 + 2 * size_of::<u64>() as u64))
             .ok_or_else(|| publication_input_error("nonterminal intent payload extent overflowed"))
     }
-
-    fn matches_payload(self, payload: &[u8]) -> bool {
-        self.payload_bytes().ok() == Some(payload.len() as u64)
-            && payload.get(..32) == Some(self.plan_digest.as_bytes().as_slice())
-            && payload.get(32..40) == Some(self.candidate_prefix_begin.to_le_bytes().as_slice())
-            && payload.get(40..48)
-                == Some(
-                    (self.candidate_prefix_end - self.candidate_prefix_begin)
-                        .to_le_bytes()
-                        .as_slice(),
-                )
-    }
 }
 
 /// Original finite reservation for acquired non-actor replay rows.
@@ -38814,9 +38802,6 @@ impl SemanticTransitionSession {
         lease: &SemanticPublishedLease,
     ) -> Result<(), SemanticTransitionError> {
         self.checked_reader(lease)?;
-        if lease.header.terminal == 0 {
-            return self.admit_nonterminal_intent_activation(lease);
-        }
         if lease.header.terminal != 2 {
             return Err(publication_input_error(
                 "external activation requires a genuinely published FINAL parent",
@@ -38930,53 +38915,6 @@ impl SemanticTransitionSession {
         }) {
             return Err(publication_input_error(
                 "FINAL publication has no unacknowledged delivery intent",
-            ));
-        }
-        Ok(())
-    }
-
-    fn admit_nonterminal_intent_activation(
-        &mut self,
-        lease: &SemanticPublishedLease,
-    ) -> Result<(), SemanticTransitionError> {
-        let storage = Arc::clone(
-            self.publication
-                .as_ref()
-                .ok_or(SemanticTransitionError::NotBound)?,
-        );
-        let binding = storage
-            .contract_value
-            .nonterminal_intent_binding()?
-            .ok_or_else(|| {
-                publication_input_error(
-                    "nonterminal external activation has no operator intent binding",
-                )
-            })?;
-        if lease.header.fuel == 0 || lease.header.prefix_extent < binding.candidate_prefix_end {
-            return Err(publication_input_error(
-                "nonterminal intent has no completed prefix or reserved acknowledgement fuel",
-            ));
-        }
-        let current = self.publication_read(storage.control.view())?[0];
-        if current.instance != lease.identity.instance || current.word != lease.identity.word {
-            return Err(publication_input_error(
-                "external activation requires the current acquired nonterminal parent",
-            ));
-        }
-        let entries = self.read_published_control_record(lease, 30)?;
-        let payload = self.read_published_control_record(lease, 31)?;
-        let acknowledgements = self.read_published_control_record(lease, 32)?;
-        let intents = output_intents_from_ranges(&entries, &payload)?;
-        let acknowledged =
-            acknowledgement_records(&acknowledgements.bytes, acknowledgements.capacity)?;
-        if !intents.iter().any(|intent| {
-            binding.matches_payload(&intent.payload)
-                && !acknowledged
-                    .iter()
-                    .any(|record| record.stable_identity == intent.stable_identity)
-        }) {
-            return Err(publication_input_error(
-                "nonterminal publication has no unacknowledged operator-bound prefix intent",
             ));
         }
         Ok(())
