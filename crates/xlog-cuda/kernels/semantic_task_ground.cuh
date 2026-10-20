@@ -23,7 +23,7 @@ struct Task {
     bool editable;
     __device__ const uint64_t* query(uint32_t index) const { return query_rows + uint64_t(index)*7; }
     __device__ const uint64_t* binding(uint32_t index) const { return binding_rows + uint64_t(index)*kBindingWords; }
-    __device__ const uint64_t* observation(uint32_t index) const { return observation_rows + uint64_t(index)*7; }
+    __device__ const uint64_t* observation(uint32_t index) const { return observation_rows + uint64_t(index)*8; }
     __device__ bool target(uint32_t query, uint64_t* truth) const {
         for(uint64_t index=0;index<goal_count;++index) {
             if(goals[index*3]==query) { *truth=goals[index*3+1];return true; }
@@ -34,15 +34,16 @@ struct Task {
         if(binding_index>=bindings || !editable)return false;
         const uint64_t* row=observation(binding_index);
         if(!(row[0]|row[1]|row[2]|row[3]) || row[4]>=program.predicate_count ||
-           row[5]>UINT32_MAX || row[6]>UINT32_MAX)return false;
-        *fact={uint32_t(row[4]),uint32_t(row[5]),uint32_t(row[6])};return true;
+           row[5]>UINT32_MAX || row[6]>UINT32_MAX || row[7]>UINT32_MAX)return false;
+        *fact={uint32_t(row[4]),uint32_t(row[5]),uint32_t(row[6]),uint32_t(row[7])};
+        return semantic_program::valid_fact(*fact,program);
     }
 };
 
 // One exact decoder for the native owner's variable-length task bank. No
 // consumer derives an extent from a public pointer or an unbounded sentinel.
 __device__ bool decode(const uint64_t* words,uint64_t count,Task* output) {
-    if(!words || !output || count<39 || words[0]!=8 || !words[1] ||
+    if(!words || !output || count<39 || words[0]!=9 || !words[1] ||
        !words[6] || words[6]>UINT32_MAX || words[7]>UINT32_MAX || words[8]>1 ||
        (words[8]==0 ? words[7]!=0 : words[7]==0) || words[10]>words[6] ||
        words[11]>words[6] || words[37]>1)return false;
@@ -58,7 +59,7 @@ __device__ bool decode(const uint64_t* words,uint64_t count,Task* output) {
     if(!take(task.queries,7,&task.query_rows) || !take(task.support_count,5,&task.supports) ||
        !take(task.level_count,1,&task.levels) || !take(task.goal_count,3,&task.goals) ||
        !take(task.bindings,kBindingWords,&task.binding_rows) ||
-       !take(task.bindings,7,&task.observation_rows) || offset==count)return false;
+       !take(task.bindings,8,&task.observation_rows) || offset==count)return false;
     const uint64_t requirement_words=words[offset++];
     if(requirement_words>count-offset)return false;
     if(task.coding) {
@@ -130,6 +131,8 @@ __device__ bool decode(const uint64_t* words,uint64_t count,Task* output) {
 }
 
 struct Query { uint64_t receipt[42],truth,attained; };
+// The first word is an origin tag: zero is absent, one is Action, two is Intent.
+// The historical action word group holds the origin identity for either tag.
 struct Observation { uint64_t present,truth,receipt[4],action[4],intent[4],support[4]; };
 static_assert(sizeof(Query)==352,"task query record ABI");
 static_assert(sizeof(Observation)==144,"task observation record ABI");
@@ -150,7 +153,7 @@ __device__ bool decode_plane(uint64_t address,uint64_t bytes,const Task& task,Pl
     const uint64_t capacity=task.editable ? semantic_program::kRuleCapacity-uint64_t(task.program.rule_count) : 0;
     const uint64_t query_offset=64+uint64_t(task.bindings)*sizeof(Observation);
     const uint64_t rule_offset=query_offset+3*uint64_t(task.queries)*sizeof(Query);
-    if(header[0]!=kMagic || header[1]!=2 || header[2]!=task.queries || header[3]!=task.bindings ||
+    if(header[0]!=kMagic || header[1]!=3 || header[2]!=task.queries || header[3]!=task.bindings ||
        header[4]!=kQueryWords || header[5]!=kObservationWords || header[6]>capacity || header[7]!=capacity ||
        bytes!=rule_offset+capacity*sizeof(semantic_program::Rule))return false;
     Plane plane{header,reinterpret_cast<Observation*>(address+64),
@@ -158,14 +161,20 @@ __device__ bool decode_plane(uint64_t address,uint64_t bytes,const Task& task,Pl
     for(uint32_t index=0;index<task.bindings;++index) {
         const auto& observation=plane.observations[index];
         const auto* words=reinterpret_cast<const uint64_t*>(&observation);
-        if(observation.present>1 || observation.truth>3)return false;
+        if(observation.present>2 || observation.truth>3)return false;
+        if(observation.present==2) {
+            // The plane unions real verifier truths; each signed support is
+            // authenticated separately with one truth bit before publication.
+            for(uint32_t word=0;word<4;++word)
+                if(observation.action[word]!=observation.intent[word])return false;
+        }
         if(!observation.present) {
             for(uint32_t field=0;field<18;++field)if(words[field])return false;
         } else for(uint32_t identity=0;identity<4;++identity)
             if(!(words[2+identity*4]|words[3+identity*4]|words[4+identity*4]|words[5+identity*4]))return false;
     }
     for(uint64_t index=0;index<header[6];++index)
-        if(!semantic_program::valid_rule(plane.selected_rules[index],task.program.predicate_count))return false;
+        if(!semantic_program::valid_rule(plane.selected_rules[index],task.program))return false;
     *output=plane;return true;
 }
 
@@ -177,13 +186,15 @@ struct Observations {
         semantic_program::Fact fact{};
         task.observation_fact(index,&fact);
         const auto& observation=plane.observations[index];
-        return {fact,observation.truth,observation.present};
+        // The generic program evaluator consumes presence, not an origin tag.
+        return {fact,observation.truth,uint64_t(observation.present!=0)};
     }
     __device__ bool protected_fact(semantic_program::Fact fact) const {
         for(uint32_t index=0;index<task.bindings;++index) {
             semantic_program::Fact target{};
             if(task.observation_fact(index,&target) && target.predicate==fact.predicate &&
-               target.first==fact.first && target.second==fact.second)return true;
+               target.arity==fact.arity && target.first==fact.first &&
+               (fact.arity==1 || target.second==fact.second))return true;
         }
         return false;
     }
@@ -207,10 +218,11 @@ __device__ bool attained(const Task& task,const Plane& plane,uint32_t slot,uint3
         ++*inspected;
         const uint32_t binding=uint32_t(row[3+row[1]+index]);
         const auto& observation=plane.observations[binding];
-        if(observation.present!=1 || observation.truth!=1 || fact_index==fact_count)return false;
+        if((observation.present!=1 && observation.present!=2) || observation.truth!=1 || fact_index==fact_count)return false;
         semantic_program::Fact observed{};task.observation_fact(binding,&observed);
-        if(observed.predicate!=query_fact.predicate || observed.first!=query_fact.first ||
-           observed.second!=query_fact.second)return false;
+        if(observed.predicate!=query_fact.predicate || observed.arity!=query_fact.arity ||
+           observed.first!=query_fact.first ||
+           (query_fact.arity==2 && observed.second!=query_fact.second))return false;
         const uint64_t sources=support.lineage[(uint64_t(fact_index)*2)*support.words+binding/64];
         if(!(sources&(uint64_t(1)<<(binding%64))))return false;
     }

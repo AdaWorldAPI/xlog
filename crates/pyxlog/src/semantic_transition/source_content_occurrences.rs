@@ -1,8 +1,9 @@
-//! Original frozen source content expressions and their immutable projections.
+//! Original frozen tensor-content descriptors and source occurrence projections.
 
 use super::prepared_import::PySemanticPreparedSourceContent;
 use super::*;
 use xlog_cuda::{
+    SemanticPreparedTensorContentBindings, SemanticPreparedTensorContentEvent,
     SemanticSourceAllocationDescriptor, SemanticSourceContentAllocation,
     SemanticSourceContentEvent, SemanticSourceContentFamily, SemanticSourceContentKind,
     SemanticSourceContentOccurrence, SemanticSourceContentPhase, SemanticSourceTensorDescriptor,
@@ -147,7 +148,7 @@ fn prepared_kind_name(
     }
 }
 
-pub(super) fn reserve_events(
+pub(super) fn reserve_events<E>(
     events: &Bound<'_, PyAny>,
     pool: &xlog_cuda::SemanticReplayMaterialBudget,
 ) -> PyResult<xlog_cuda::SemanticReplayMaterialReservation> {
@@ -155,9 +156,7 @@ pub(super) fn reserve_events(
     let rows = exact_tuple(events, None, &mut transport)?;
     let mut extent = rows
         .len()
-        .checked_mul(std::mem::size_of::<
-            SemanticSourceContentEvent<SemanticSourceContentAllocation>,
-        >())
+        .checked_mul(std::mem::size_of::<E>())
         .ok_or_else(|| invalid("source content input roster extent overflow"))?;
     for row in rows.iter() {
         let row = exact_tuple(&row, Some(5), &mut transport)?;
@@ -516,9 +515,152 @@ fn unsigned_array_from_tuple(value: &Bound<'_, PyAny>, budget: &mut usize) -> Py
     Ok(values)
 }
 
+pub(super) fn parse_tensor_descriptors(
+    value: &Bound<'_, PyAny>,
+    budget: &mut usize,
+) -> PyResult<Vec<SemanticSourceTensorDescriptor>> {
+    let rows = exact_tuple(value, None, budget)?;
+    let mut tensors = Vec::with_capacity(rows.len());
+    for tensor in rows.iter() {
+        let tensor = exact_tuple(&tensor, Some(7), budget)?;
+        let layout = exact_tuple(&tensor.get_item(0)?, Some(8), budget)?;
+        let mut fields = [0; 6];
+        for (index, value) in fields.iter_mut().enumerate() {
+            *value = unsigned(&layout.get_item(index)?)?;
+        }
+        tensors.push(SemanticSourceTensorDescriptor {
+            layout: tensor_layout_from_values(
+                fields,
+                unsigned_array_from_tuple(&layout.get_item(6)?, budget)?,
+                unsigned_array_from_tuple(&layout.get_item(7)?, budget)?,
+            ),
+            logical_begin: unsigned(&tensor.get_item(1)?)?,
+            logical_end: unsigned(&tensor.get_item(2)?)?,
+            storage_slot: unsigned(&tensor.get_item(3)?)?,
+            version_slot: optional_unsigned(&tensor.get_item(4)?)?,
+            allocation_slot: unsigned(&tensor.get_item(5)?)?,
+            byte_offset: unsigned(&tensor.get_item(6)?)?,
+        });
+    }
+    Ok(tensors)
+}
+
+pub(super) fn parse_allocation_descriptors(
+    value: &Bound<'_, PyAny>,
+    budget: &mut usize,
+) -> PyResult<Vec<SemanticSourceAllocationDescriptor<SemanticSourceContentAllocation>>> {
+    let rows = exact_tuple(value, None, budget)?;
+    let mut allocations = Vec::with_capacity(rows.len());
+    for allocation in rows.iter() {
+        let allocation = exact_tuple(&allocation, Some(3), budget)?;
+        let provenance = allocation.get_item(2)?;
+        allocations.push(SemanticSourceAllocationDescriptor {
+            slot: unsigned(&allocation.get_item(0)?)?,
+            span_bytes: unsigned(&allocation.get_item(1)?)?,
+            native_allocation: if provenance.is_none() {
+                None
+            } else if provenance
+                .is_instance_of::<source_content_geometry::PySemanticSourceGeometryAllocation>()
+            {
+                Some(SemanticSourceContentAllocation::Geometry(
+                    provenance
+                        .extract::<PyRef<
+                            '_,
+                            source_content_geometry::PySemanticSourceGeometryAllocation,
+                        >>()?
+                        .inner
+                        .clone(),
+                ))
+            } else {
+                Some(SemanticSourceContentAllocation::Native(
+                    provenance
+                        .extract::<PyRef<'_, PyNativeTensorAllocation>>()?
+                        .provenance
+                        .clone(),
+                ))
+            },
+        });
+    }
+    Ok(allocations)
+}
+
 pub(super) fn parse_events(
     events: &Bound<'_, PyAny>,
 ) -> PyResult<Vec<SemanticSourceContentEvent<SemanticSourceContentAllocation>>> {
+    parse_event_descriptors(
+        events,
+        |family, receiver_slot, output_slot, tensors, allocations| {
+            Ok(SemanticSourceContentEvent {
+                family: family
+                    .extract::<PyRef<'_, PySemanticSourceContentFamily>>()?
+                    .inner
+                    .clone(),
+                receiver_slot,
+                output_slot,
+                tensors,
+                allocations,
+            })
+        },
+    )
+}
+
+pub(super) fn parse_prepared_events(
+    events: &Bound<'_, PyAny>,
+) -> PyResult<Vec<SemanticPreparedTensorContentEvent>> {
+    parse_event_descriptors(
+        events,
+        |kind, receiver_slot, output_slot, tensors, allocations| {
+            if !kind.is_exact_instance_of::<PyString>() {
+                return Err(invalid(
+                    "prepared tensor content kind must be an exact string",
+                ));
+            }
+            let kind = match kind.extract::<&str>()? {
+                "capture" => SemanticSourceContentKind::Capture,
+                "verify" => SemanticSourceContentKind::Verify,
+                _ => {
+                    return Err(invalid(
+                        "prepared tensor content kind must be capture or verify",
+                    ))
+                }
+            };
+            Ok(SemanticPreparedTensorContentEvent {
+                kind,
+                receiver_slot,
+                output_slot,
+                tensors,
+                allocations,
+            })
+        },
+    )
+}
+
+pub(super) fn parse_prepared_bindings(
+    value: &Bound<'_, PyAny>,
+) -> PyResult<[SemanticPreparedTensorContentBindings; 2]> {
+    let mut budget = 128;
+    let banks = exact_tuple(value, Some(2), &mut budget)?;
+    let mut parse = |bank: usize| -> PyResult<SemanticPreparedTensorContentBindings> {
+        let row = exact_tuple(&banks.get_item(bank)?, Some(3), &mut budget)?;
+        Ok(SemanticPreparedTensorContentBindings {
+            policy_slot: optional_unsigned(&row.get_item(0)?)?,
+            continuation_slot: optional_unsigned(&row.get_item(1)?)?,
+            model_slot: optional_unsigned(&row.get_item(2)?)?,
+        })
+    };
+    Ok([parse(0)?, parse(1)?])
+}
+
+fn parse_event_descriptors<E>(
+    events: &Bound<'_, PyAny>,
+    mut event: impl FnMut(
+        &Bound<'_, PyAny>,
+        u64,
+        Option<u64>,
+        Vec<SemanticSourceTensorDescriptor>,
+        Vec<SemanticSourceAllocationDescriptor<SemanticSourceContentAllocation>>,
+    ) -> PyResult<E>,
+) -> PyResult<Vec<E>> {
     // Reuse the original cold-metadata transport bound; this is not a native
     // operation count, content price, remaining budget or numerical allowance.
     let mut budget = 16 * 1024 * 1024;
@@ -526,77 +668,12 @@ pub(super) fn parse_events(
     let mut result = Vec::with_capacity(rows.len());
     for row in rows.iter() {
         let row = exact_tuple(&row, Some(5), &mut budget)?;
-        let family = row
-            .get_item(0)?
-            .extract::<PyRef<'_, PySemanticSourceContentFamily>>()?
-            .inner
-            .clone();
+        let kind = row.get_item(0)?;
         let receiver = unsigned(&row.get_item(1)?)?;
         let output = optional_unsigned(&row.get_item(2)?)?;
-        let tensor_rows = exact_tuple(&row.get_item(3)?, None, &mut budget)?;
-        let mut tensors = Vec::with_capacity(tensor_rows.len());
-        for tensor in tensor_rows.iter() {
-            let tensor = exact_tuple(&tensor, Some(7), &mut budget)?;
-            let layout = exact_tuple(&tensor.get_item(0)?, Some(8), &mut budget)?;
-            let mut fields = [0; 6];
-            for (index, value) in fields.iter_mut().enumerate() {
-                *value = unsigned(&layout.get_item(index)?)?;
-            }
-            tensors.push(SemanticSourceTensorDescriptor {
-                layout: tensor_layout_from_values(
-                    fields,
-                    unsigned_array_from_tuple(&layout.get_item(6)?, &mut budget)?,
-                    unsigned_array_from_tuple(&layout.get_item(7)?, &mut budget)?,
-                ),
-                logical_begin: unsigned(&tensor.get_item(1)?)?,
-                logical_end: unsigned(&tensor.get_item(2)?)?,
-                storage_slot: unsigned(&tensor.get_item(3)?)?,
-                version_slot: optional_unsigned(&tensor.get_item(4)?)?,
-                allocation_slot: unsigned(&tensor.get_item(5)?)?,
-                byte_offset: unsigned(&tensor.get_item(6)?)?,
-            });
-        }
-        let allocation_rows = exact_tuple(&row.get_item(4)?, None, &mut budget)?;
-        let mut allocations = Vec::with_capacity(allocation_rows.len());
-        for allocation in allocation_rows.iter() {
-            let allocation = exact_tuple(&allocation, Some(3), &mut budget)?;
-            let provenance = allocation.get_item(2)?;
-            allocations.push(SemanticSourceAllocationDescriptor {
-                slot: unsigned(&allocation.get_item(0)?)?,
-                span_bytes: unsigned(&allocation.get_item(1)?)?,
-                native_allocation: if provenance.is_none() {
-                    None
-                } else if provenance
-                    .is_instance_of::<source_content_geometry::PySemanticSourceGeometryAllocation>()
-                {
-                    Some(
-                        SemanticSourceContentAllocation::Geometry(
-                            provenance
-                                .extract::<PyRef<
-                                    '_,
-                                    source_content_geometry::PySemanticSourceGeometryAllocation,
-                                >>()?
-                                .inner
-                                .clone(),
-                        ),
-                    )
-                } else {
-                    Some(SemanticSourceContentAllocation::Native(
-                        provenance
-                            .extract::<PyRef<'_, PyNativeTensorAllocation>>()?
-                            .provenance
-                            .clone(),
-                    ))
-                },
-            });
-        }
-        result.push(SemanticSourceContentEvent {
-            family,
-            receiver_slot: receiver,
-            output_slot: output,
-            tensors,
-            allocations,
-        });
+        let tensors = parse_tensor_descriptors(&row.get_item(3)?, &mut budget)?;
+        let allocations = parse_allocation_descriptors(&row.get_item(4)?, &mut budget)?;
+        result.push(event(&kind, receiver, output, tensors, allocations)?);
     }
     Ok(result)
 }

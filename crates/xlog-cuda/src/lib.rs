@@ -12,6 +12,7 @@ pub mod joint_solver;
 pub mod kernel_manifest_data;
 pub mod launch;
 pub mod memory;
+pub mod module_backing;
 pub mod multi_gpu_memory;
 pub mod provider;
 mod semantic_hypergraph;
@@ -63,7 +64,10 @@ pub use semantic_hypergraph::{
     SemanticSupportRecord, SemanticSupportRef, SemanticTruth, SemanticTypedRecord,
     SemanticVersionHandle, SemanticVersionIdentity, SemanticVersionRef, SemanticView,
 };
-pub use semantic_program::{SemanticProgramAdmission, SemanticProgramFact, SemanticProgramRule};
+pub use semantic_program::{
+    SemanticProgramAdmission, SemanticProgramAtom, SemanticProgramFact, SemanticProgramRule,
+    SemanticProgramTerm,
+};
 pub use semantic_training_view::{
     validate_training_view_layout, SemanticSelectedTrainingView, SemanticTrainingCanary,
     SemanticTrainingCanaryKind, SemanticTrainingCanaryRecord, SemanticTrainingCanaryRefusalReason,
@@ -88,10 +92,10 @@ pub use semantic_transition::{
     SemanticInitialSourceLayout, SemanticLearningCopyReset, SemanticLearningPhase,
     SemanticLearningPhaseAdmission, SemanticLearningPhaseRecord, SemanticLearningPhaseTransition,
     SemanticLoadedPublicationInputProjection, SemanticModelContext, SemanticModelContractLayout,
-    SemanticModelForwardWitness, SemanticModelMemory, SemanticModelStorage, SemanticModelView,
-    SemanticModelWorkBufferExport, SemanticModelWorkBufferPort, SemanticNonterminalIntentBinding,
-    SemanticObservedSource, SemanticOutputIntent, SemanticParentBinding, SemanticPolicyFieldLayout,
-    SemanticPolicyLayout, SemanticPreparedResidentModelMemory, SemanticPreparedSegmentCapture,
+    SemanticModelMemory, SemanticModelStorage, SemanticModelView, SemanticModelWorkBufferExport,
+    SemanticModelWorkBufferPort, SemanticNonterminalIntentBinding, SemanticObservedSource,
+    SemanticOutputIntent, SemanticParentBinding, SemanticPolicyFieldLayout, SemanticPolicyLayout,
+    SemanticPreparedResidentModelMemory, SemanticPreparedSegmentCapture,
     SemanticPreparedSegmentContinuation, SemanticPreparedSegmentNonSubmission,
     SemanticPreparedSegmentTransfers, SemanticPreparedStep, SemanticPreparedStepOutcome,
     SemanticPublicationInputProjection, SemanticPublicationReadbackLoan,
@@ -127,12 +131,17 @@ pub use semantic_transition::{
     SemanticCompletedLaneOutcomeMaterial, SemanticCompletedMaterialCapacity,
     SemanticCompletedModelCarrierMaterial, SemanticCompletedReplayMaterials,
     SemanticCompletedStepWitnessMaterial, SemanticCompletedTaskGroundMaterial,
-    SemanticCompletedTheoryDeltaMaterial, SemanticPolicyGradients,
-    SemanticPolicyNumericalDomainLayout, SemanticPreparedActorRefresh,
-    SemanticPreparedResidentModelRestoration, SemanticResidentModelRead,
-    SemanticSegmentInstructionAdmission, SemanticSelectedPolicyGradients,
-    SemanticTransitionSessionConstruction, SemanticUpdateCanaryMeasurement,
-    SemanticUpdateForwardReceipt, SemanticUpdateForwardReceiptMaterial, SemanticUpdateMeasurements,
+    SemanticCompletedTheoryDeltaMaterial, SemanticModelCanaryStream, SemanticModelCanaryWitness,
+    SemanticModelContextCheckpointAttachment, SemanticModelContextContinuation,
+    SemanticModelContextPrefillContentGeometry, SemanticModelContextPrefillRestoreDeclaration,
+    SemanticModelContextPrefillTensorGeometry, SemanticModelForwardStream,
+    SemanticModelForwardWitness, SemanticPolicyGradients, SemanticPolicyNumericalDomainLayout,
+    SemanticPreparedActorRefresh, SemanticPreparedResidentModelRestoration,
+    SemanticPrivateModelContextCheckpointOrigin, SemanticPrivateModelContextCheckpointSave,
+    SemanticResidentModelRead, SemanticRestoredModelContextPrefill,
+    SemanticSegmentInstructionAdmission, SemanticTransitionSessionConstruction,
+    SemanticUpdateCanaryMeasurement, SemanticUpdateForwardReceipt,
+    SemanticUpdateForwardReceiptMaterial, SemanticUpdateMeasurements,
 };
 #[cfg(feature = "semantic-policy")]
 pub use semantic_transition::{
@@ -154,10 +163,12 @@ pub use semantic_work::ModelWorkKind;
 pub use semantic_transition::{
     SemanticModelInputGenerationPort, SemanticPreparedSourceCache, SemanticPreparedSourceContent,
     SemanticPreparedSourceContentGeometry, SemanticPreparedSourceContentPorts,
-    SemanticSourceAllocationDescriptor, SemanticSourceContentAllocation,
-    SemanticSourceContentEvent, SemanticSourceContentFamily, SemanticSourceContentGeometryKind,
-    SemanticSourceContentGeometrySeed, SemanticSourceContentKind, SemanticSourceContentOccurrence,
-    SemanticSourceContentPhase, SemanticSourceContentRetirement, SemanticSourceGeometryAllocation,
+    SemanticPreparedTensorContentBindings, SemanticPreparedTensorContentEvent,
+    SemanticPreparedTensorContentReceiver, SemanticSourceAllocationDescriptor,
+    SemanticSourceContentAllocation, SemanticSourceContentEvent, SemanticSourceContentFamily,
+    SemanticSourceContentGeometryKind, SemanticSourceContentGeometrySeed,
+    SemanticSourceContentKind, SemanticSourceContentOccurrence, SemanticSourceContentPhase,
+    SemanticSourceContentRetirement, SemanticSourceGeometryAllocation,
     SemanticSourceGeometryTensor, SemanticSourceTensorDescriptor,
 };
 

@@ -152,15 +152,7 @@ impl SemanticTaskGround {
     }
 
     pub(super) fn requirement_workspace_bytes(&self) -> Result<u64, SemanticTransitionError> {
-        let words = self
-            .requirement_word_count()?
-            .checked_add(
-                self.requirements()
-                    .len()
-                    .checked_mul(2)
-                    .ok_or(SemanticTransitionError::GenerationExhausted)?,
-            )
-            .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        let words = self.device_requirement_word_count()?;
         // Device-bank staging and the containing task-word vector overlap.
         (words as u64)
             .checked_mul(2 * std::mem::size_of::<u64>() as u64)
@@ -201,19 +193,26 @@ impl SemanticTaskGround {
 
     /// Bounded device bank derived from the original graph. Offsets and the
     /// stable topological schedule are accelerators, never independent custody.
+    pub(super) fn device_requirement_word_count(&self) -> Result<usize, SemanticTransitionError> {
+        if self.requirements().is_empty() {
+            return Ok(0);
+        }
+        self.requirement_word_count()?
+            .checked_add(
+                self.requirements()
+                    .len()
+                    .checked_mul(2)
+                    .ok_or(SemanticTransitionError::GenerationExhausted)?,
+            )
+            .ok_or(SemanticTransitionError::GenerationExhausted)
+    }
+
     pub(super) fn device_requirement_words(&self) -> Result<Vec<u64>, SemanticTransitionError> {
         if self.requirements().is_empty() {
             return Ok(Vec::new());
         }
         let rows = self.requirements();
-        let count = self
-            .requirement_word_count()?
-            .checked_add(
-                rows.len()
-                    .checked_mul(2)
-                    .ok_or(SemanticTransitionError::GenerationExhausted)?,
-            )
-            .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        let count = self.device_requirement_word_count()?;
         let order = self.topological_queries()?;
         let mut words = Vec::with_capacity(count);
         words.push(rows.len() as u64);
@@ -384,7 +383,7 @@ impl SemanticTaskVerificationBinding {
 }
 
 pub(super) const TASK_GROUND_MAGIC: u64 = 0x584c4f4754475244;
-pub(super) const TASK_GROUND_VERSION: u64 = 2;
+pub(super) const TASK_GROUND_VERSION: u64 = 3;
 
 /// One result from the original numerical candidate/query invocation.
 #[repr(C)]
@@ -541,10 +540,11 @@ impl TaskGroundLayout {
         for observation in bytes[64..self.query_offset].chunks_exact(144) {
             let present = u64::from_le_bytes(observation[..8].try_into().expect("presence word"));
             let truth = u64::from_le_bytes(observation[8..16].try_into().expect("truth word"));
-            if present > 1
+            if present > 2
                 || (present == 0 && observation.iter().any(|byte| *byte != 0))
-                || (present == 1
+                || (present != 0
                     && (truth > 3
+                        || (present == 2 && observation[48..80] != observation[80..112])
                         || observation[16..]
                             .chunks_exact(32)
                             .any(|identity| identity.iter().all(|byte| *byte == 0))))

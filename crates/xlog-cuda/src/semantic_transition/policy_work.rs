@@ -36,6 +36,7 @@ pub(super) enum PolicyWorkKey {
     Imported(ImportedPolicyContributionKey),
     Critic,
     ModelScratch,
+    UpdateCanary,
 }
 
 #[derive(Clone)]

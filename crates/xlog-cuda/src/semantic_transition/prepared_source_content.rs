@@ -3,6 +3,9 @@
 use super::resident_model_memory::ResidentModelMemoryOwner;
 use super::*;
 
+#[path = "current_content_overlay.rs"]
+mod current_content_overlay;
+
 /// Original decoded inputs used by the same private-child constructor.
 /// None of these metadata values grants numerical access or a native allowance.
 pub struct SemanticSourceContentGeometrySeed {
@@ -18,10 +21,17 @@ pub struct SemanticSourceContentGeometrySeed {
     pub metadata: Arc<dyn Send + Sync>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SemanticSourceContentGeometryKind {
     Historical,
     Current,
+    CurrentDemonstration,
+}
+
+impl SemanticSourceContentGeometryKind {
+    pub(super) fn is_current(self) -> bool {
+        matches!(self, Self::Current | Self::CurrentDemonstration)
+    }
 }
 
 /// An immutable declaration owned by the original admitted instruction.
@@ -509,12 +519,14 @@ pub(super) struct SourceContentGeometryOwner {
     pub(super) publication: Arc<SourcePublicationGeometry>,
     scope: Arc<()>,
     pub(super) recipe: Mutex<Option<std::sync::Weak<PreparedSourceContentOwner>>>,
-    current: Mutex<Option<std::sync::Weak<actor_refresh::PreparedActorRefreshOwner>>>,
+    current: Mutex<Option<actor_refresh::ActorRefreshPreparationEntry>>,
     reader: Mutex<Option<(Arc<()>, u64)>>,
     pub(super) occurrences:
         Mutex<Option<Arc<super::source_content_occurrences::FrozenSourceContentOccurrences>>>,
     uniform: Mutex<Option<[SemanticPolicyNumericalDomainLayout; 3]>>,
     input_generation: Option<SemanticModelInputGenerationPort>,
+    overlays: Mutex<[Option<Arc<current_content_overlay::CurrentContentOverlay>>; 2]>,
+    overlay_instruction: Arc<current_content_overlay::ContentOverlayInstruction>,
     _reservation: Arc<SemanticReplayMaterialReservation>,
 }
 
@@ -535,6 +547,7 @@ enum SourceGeometryAllocationPort {
     Source,
     Feedback(usize),
     Uniform(usize),
+    ContentOverlay(usize),
 }
 
 /// Original physical allocation geometry, before any backing is allocated.
@@ -548,6 +561,7 @@ pub struct SemanticSourceGeometryAllocation {
 }
 
 /// An original typed view and its complete backing, without a device address.
+#[derive(Clone)]
 pub struct SemanticSourceGeometryTensor {
     pub layout: SemanticTensorLayout,
     pub logical_begin: u64,
@@ -557,6 +571,41 @@ pub struct SemanticSourceGeometryTensor {
 }
 
 impl SemanticSourceGeometryAllocation {
+    pub(super) fn belongs_to(&self, owner: &SourceContentGeometryOwner) -> bool {
+        owner.require_allocation(self, self.span_bytes).is_ok()
+    }
+    fn declared(
+        scope: &Arc<()>,
+        port: SourceGeometryAllocationPort,
+        prepared_section: Option<(SemanticTransitionKind, usize)>,
+        span_bytes: u64,
+    ) -> Self {
+        Self {
+            scope: Arc::clone(scope),
+            port,
+            prepared_section,
+            span_bytes,
+        }
+    }
+
+    pub(super) fn restored_prefill(
+        scope: &Arc<()>,
+        model: bool,
+        index: usize,
+        span_bytes: u64,
+    ) -> Self {
+        Self::declared(
+            scope,
+            if model {
+                SourceGeometryAllocationPort::Model(index)
+            } else {
+                SourceGeometryAllocationPort::Publication(index)
+            },
+            None,
+            span_bytes,
+        )
+    }
+
     pub fn span_bytes(&self) -> u64 {
         self.span_bytes
     }
@@ -576,7 +625,8 @@ impl SourceContentGeometryOwner {
         match (self.kind, section) {
             (SemanticSourceContentGeometryKind::Historical, None) => Ok(()),
             (
-                SemanticSourceContentGeometryKind::Current,
+                SemanticSourceContentGeometryKind::Current
+                | SemanticSourceContentGeometryKind::CurrentDemonstration,
                 Some((SemanticTransitionKind::Recompute | SemanticTransitionKind::Proposal, bank)),
             ) if bank < 2 => Ok(()),
             _ => Err(publication_input_error(
@@ -605,6 +655,7 @@ impl SourceContentGeometryOwner {
             | SourceGeometryAllocationPort::Feedback(_) => section.map(|(kind, _)| (kind, 0)),
             // Uniform outputs retain their exact native Proposal bank.
             SourceGeometryAllocationPort::Uniform(_) => section,
+            SourceGeometryAllocationPort::ContentOverlay(_) => None,
             SourceGeometryAllocationPort::Model(_) => unreachable!(),
         })
     }
@@ -616,12 +667,15 @@ impl SourceContentGeometryOwner {
     ) -> Result<(), SemanticTransitionError> {
         self.require_geometry_section(section)?;
         self.require_allocation(allocation, allocation.span_bytes)?;
+        if let SourceGeometryAllocationPort::ContentOverlay(index) = allocation.port {
+            return self.require_content_overlay_section(index, section);
+        }
         if allocation.prepared_section != self.allocation_section(allocation.port, section)? {
             return Err(publication_input_error(
                 "content allocation belongs to another original prepared child section",
             ));
         }
-        if self.kind == SemanticSourceContentGeometryKind::Current
+        if self.kind.is_current()
             && matches!(allocation.port, SourceGeometryAllocationPort::Uniform(_))
             && section.map(|(kind, _)| kind) != Some(SemanticTransitionKind::Proposal)
         {
@@ -711,6 +765,14 @@ impl SourceContentGeometryOwner {
         self.require_allocation_section(declared, Some(section))?;
         self.classify_tensor(declared, descriptor, Some(section))?;
         self.require_current_section(session, step, section)?;
+        if matches!(
+            declared.port,
+            SourceGeometryAllocationPort::ContentOverlay(_)
+        ) {
+            return self.require_prepared_content_overlay(
+                session, step, section, declared, descriptor, tensor,
+            );
+        }
         if matches!(declared.port, SourceGeometryAllocationPort::Model(_)) {
             let actual = tensor.native_allocation.as_ref().ok_or_else(|| {
                 publication_input_error(
@@ -806,6 +868,7 @@ impl SourceContentGeometryOwner {
                     .ok_or(SemanticTransitionError::ObservationMismatch)?
             }
             SourceGeometryAllocationPort::Model(_) => unreachable!(),
+            SourceGeometryAllocationPort::ContentOverlay(_) => unreachable!(),
         };
         let expected = view
             .allocation_provenance()
@@ -840,7 +903,8 @@ impl SourceContentGeometryOwner {
             .as_ref()
             .ok_or(SemanticTransitionError::NotBound)?;
         let actor = &staged.proof.inner;
-        if self.kind != SemanticSourceContentGeometryKind::Current
+        if !self.kind.is_current()
+            || self.kind != actor.kind
             || build.transitions
                 != [
                     SemanticTransitionKind::Recompute,
@@ -854,7 +918,7 @@ impl SourceContentGeometryOwner {
                     publication_input_error("original actor geometry custody is poisoned")
                 })?
                 .as_ref()
-                .and_then(std::sync::Weak::upgrade)
+                .and_then(|original| original.proof.upgrade())
                 .is_none_or(|original| !Arc::ptr_eq(&original, actor))
             || !Arc::ptr_eq(&build.actor_refresh_execution, &actor.execution)
             || !Arc::ptr_eq(&build.cancelled, &actor.cancelled)
@@ -903,7 +967,7 @@ impl SourceContentGeometryOwner {
         Ok(())
     }
 
-    fn classify_tensor(
+    pub(super) fn classify_tensor(
         &self,
         allocation: &SemanticSourceGeometryAllocation,
         descriptor: &super::source_content_occurrences::SemanticSourceTensorDescriptor,
@@ -929,6 +993,9 @@ impl SourceContentGeometryOwner {
                 && original.byte_offset == descriptor.byte_offset
         };
         match allocation.port {
+            SourceGeometryAllocationPort::ContentOverlay(_) => {
+                return self.classify_content_overlay_tensor(allocation, descriptor, section);
+            }
             SourceGeometryAllocationPort::Model(index) => {
                 let (memory, layouts) = self.model_geometry();
                 for view in &memory.views {
@@ -1113,6 +1180,9 @@ impl SourceContentGeometryOwner {
         allocation: &SemanticSourceGeometryAllocation,
         span: u64,
     ) -> Result<(), SemanticTransitionError> {
+        if let SourceGeometryAllocationPort::ContentOverlay(index) = allocation.port {
+            return self.require_content_overlay_allocation(index, allocation, span);
+        }
         let scope = if matches!(allocation.port, SourceGeometryAllocationPort::Model(_)) {
             self.model_scope()
         } else {
@@ -1131,6 +1201,14 @@ impl SourceContentGeometryOwner {
         allocation: &SemanticSourceGeometryAllocation,
     ) -> Result<Option<DeviceAllocationProvenance>, SemanticTransitionError> {
         self.require_allocation(allocation, allocation.span_bytes)?;
+        if matches!(
+            allocation.port,
+            SourceGeometryAllocationPort::ContentOverlay(_)
+        ) {
+            // The real backing is a foreign managed owner. It never acquires
+            // XLOG native provenance by being placed in an authenticated group.
+            return Ok(None);
+        }
         let recipe = self
             .recipe
             .lock()
@@ -1210,6 +1288,7 @@ impl SourceContentGeometryOwner {
                 .as_ref()
                 .and_then(|layouts| layouts.get(index))
                 .map(|layout| layout.allocation.clone()),
+            SourceGeometryAllocationPort::ContentOverlay(_) => unreachable!(),
         };
         if provenance
             .as_ref()
@@ -1274,6 +1353,11 @@ impl SourceContentGeometryOwner {
                     .ok_or(SemanticTransitionError::ObservationMismatch)?,
             )?)
             .map_err(|_| SemanticTransitionError::GenerationExhausted)?,
+            SourceGeometryAllocationPort::ContentOverlay(_) => {
+                return Err(publication_input_error(
+                    "content overlay tensors come from their complete original capture roster",
+                ));
+            }
         };
         if byte_offset
             .checked_add(bytes)
@@ -1288,16 +1372,16 @@ impl SourceContentGeometryOwner {
             logical_begin,
             logical_end,
             byte_offset,
-            allocation: SemanticSourceGeometryAllocation {
-                scope: Arc::clone(if matches!(port, SourceGeometryAllocationPort::Model(_)) {
+            allocation: SemanticSourceGeometryAllocation::declared(
+                if matches!(port, SourceGeometryAllocationPort::Model(_)) {
                     self.model_scope()
                 } else {
                     &self.scope
-                }),
+                },
                 port,
-                prepared_section: self.allocation_section(port, section)?,
+                self.allocation_section(port, section)?,
                 span_bytes,
-            },
+            ),
         })
     }
 }
@@ -1333,7 +1417,7 @@ impl SemanticPreparedSourceContentGeometry {
             .iter()
             .position(|token| *token == step.token)
             .ok_or(SemanticTransitionError::ObservationMismatch)?;
-        if self.owner.kind != SemanticSourceContentGeometryKind::Current
+        if !self.owner.kind.is_current()
             || self.owner.bank != Some(bank)
             || self.owner.step_index != step_index
             || self.owner.member.ordinal != member.ordinal
@@ -1342,6 +1426,8 @@ impl SemanticPreparedSourceContentGeometry {
             || self.owner.member.bytes_identity != member.bytes_identity
             || self.owner.member.content_identity != member.content_identity
             || self.owner.member.origin != member.origin
+            || self.owner.member.edit_demonstration_material_roots
+                != member.edit_demonstration_material_roots
             || !Arc::ptr_eq(&self.owner.instruction, instruction)
             || !Arc::ptr_eq(&self.owner.seed.material.owner, &material.owner)
             || target
@@ -1393,6 +1479,10 @@ impl SemanticPreparedSourceContentGeometry {
         &self,
         proof: &Arc<actor_refresh::PreparedActorRefreshOwner>,
     ) -> Result<(), SemanticTransitionError> {
+        if self.owner.kind != proof.kind {
+            return Err(SemanticTransitionError::ObservationMismatch);
+        }
+        self.owner.bind_content_overlay_actor_refresh(proof)?;
         let mut original =
             self.owner.current.lock().map_err(|_| {
                 publication_input_error("original actor geometry custody is poisoned")
@@ -1400,7 +1490,7 @@ impl SemanticPreparedSourceContentGeometry {
         if original.is_some() {
             return Err(SemanticTransitionError::ObservationMismatch);
         }
-        *original = Some(Arc::downgrade(proof));
+        *original = Some(actor_refresh::ActorRefreshPreparationEntry::new(proof));
         Ok(())
     }
 
@@ -1538,6 +1628,37 @@ impl SemanticPreparedSourceContentGeometry {
         Identity256::from_bytes(bytes)
     }
 
+    pub(super) fn require_original_codebook_material(
+        &self,
+        material: &SemanticCompletedStepWitnessMaterial,
+    ) -> Result<(), SemanticTransitionError> {
+        let original = &self.owner.seed.proof.owner;
+        let range = original
+            .directory
+            .iter()
+            .find(|range| range.role == 48 && range.index == 0)
+            .ok_or(SemanticTransitionError::ObservationMismatch)?;
+        let header_bytes = model_catalogue::HEADER_WORDS
+            .checked_mul(size_of::<u64>())
+            .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        if material.identity != self.codebook_identity(21)
+            || material.bytes.len() as u64 != range.length_bytes
+            || material.bytes.len() < header_bytes
+            || !material.bytes.len().is_multiple_of(size_of::<u64>())
+            || material.bytes[..header_bytes]
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .zip(original.codebook_header)
+                .any(|(bytes, word)| u64::from_le_bytes(*bytes) != word)
+        {
+            return Err(publication_input_error(
+                "demonstration codebook differs from its authenticated original source geometry",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn feedback_schema(&self) -> &SemanticFeedbackSchema {
         &self.owner.publication.feedback_schema
     }
@@ -1571,15 +1692,18 @@ impl SemanticPreparedSourceContentGeometry {
             (SemanticSourceContentGeometryKind::Historical, None) => {
                 Ok(SemanticSourceContentFamily::new(&self.owner, phase, kind))
             }
-            (SemanticSourceContentGeometryKind::Current, Some((operation, bank)))
-                if bank < 2
-                    && matches!(
-                        operation,
-                        SemanticTransitionKind::Recompute | SemanticTransitionKind::Proposal
-                    )
-                    && kind != SemanticSourceContentKind::BindModel
-                    && !(operation == SemanticTransitionKind::Recompute
-                        && phase == SemanticSourceContentPhase::PackPolicy) =>
+            (
+                SemanticSourceContentGeometryKind::Current
+                | SemanticSourceContentGeometryKind::CurrentDemonstration,
+                Some((operation, bank)),
+            ) if bank < 2
+                && matches!(
+                    operation,
+                    SemanticTransitionKind::Recompute | SemanticTransitionKind::Proposal
+                )
+                && kind != SemanticSourceContentKind::BindModel
+                && !(operation == SemanticTransitionKind::Recompute
+                    && phase == SemanticSourceContentPhase::PackPolicy) =>
             {
                 Ok(SemanticSourceContentFamily::for_prepared_section(
                     &self.owner,
@@ -1620,10 +1744,12 @@ impl SemanticPreparedSourceContentGeometry {
                 "original content occurrences freeze once before physical binding",
             ));
         }
+        let overlay_rosters = self.owner.prepare_content_overlay_rosters(&events)?;
         let frozen = super::source_content_occurrences::FrozenSourceContentOccurrences::new(
             &self.owner,
             events,
         )?;
+        self.owner.freeze_content_overlay_rosters(overlay_rosters)?;
         let handles = frozen.occurrence_handles();
         *original = Some(frozen);
         Ok(handles)
@@ -1646,7 +1772,8 @@ impl SemanticPreparedSourceContentGeometry {
     pub fn restore_material_mode(&self) -> Result<&'static str, SemanticTransitionError> {
         match self.owner.kind {
             SemanticSourceContentGeometryKind::Historical => Ok("checkpoint-model"),
-            SemanticSourceContentGeometryKind::Current => Err(publication_input_error(
+            SemanticSourceContentGeometryKind::Current
+            | SemanticSourceContentGeometryKind::CurrentDemonstration => Err(publication_input_error(
                 "current geometry uses its original native-bank adoption, not checkpoint restoration",
             )),
         }
@@ -1667,7 +1794,7 @@ impl SemanticPreparedSourceContentGeometry {
         ),
         SemanticTransitionError,
     > {
-        if self.owner.kind == SemanticSourceContentGeometryKind::Current {
+        if self.owner.kind.is_current() {
             return Err(publication_input_error(
                 "CURRENT model context belongs to its original future actor producer",
             ));
@@ -2038,7 +2165,7 @@ impl SemanticTransitionSession {
         let per_update = actors
             .len()
             .checked_mul(2)
-            .and_then(|count| count.checked_add(edits.len()))
+            .and_then(|count| count.checked_add(edits.len().checked_mul(3)?))
             .ok_or(SemanticTransitionError::GenerationExhausted)?;
         let count = updates
             .checked_mul(per_update)
@@ -2049,6 +2176,12 @@ impl SemanticTransitionSession {
                     + 4 * size_of::<usize>()
                     + 2 * size_of::<SemanticPreparedSourceContentGeometry>(),
             )
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    current_content_overlay::ContentOverlayInstruction::metadata_bytes(count)
+                        .ok()?,
+                )
+            })
             .and_then(|bytes| {
                 bytes.checked_add(seeds.len().checked_mul(
                     size_of::<SemanticSourceContentGeometrySeed>()
@@ -2091,6 +2224,7 @@ impl SemanticTransitionSession {
             projections.push(geometry);
         }
         let mut handles = Vec::with_capacity(count);
+        let overlay_instruction = current_content_overlay::ContentOverlayInstruction::new(count)?;
         for (step_index, step) in steps.iter().enumerate() {
             if step.kind != Some(SemanticTransitionKind::Update) {
                 continue;
@@ -2098,18 +2232,21 @@ impl SemanticTransitionSession {
             for (kind, members) in [
                 (SemanticSourceContentGeometryKind::Historical, edits),
                 (SemanticSourceContentGeometryKind::Current, actors),
+                (
+                    SemanticSourceContentGeometryKind::CurrentDemonstration,
+                    edits,
+                ),
             ] {
                 for member in members {
                     let index = original_seeds
                         .iter()
                         .position(|(ordinal, _)| *ordinal == member.ordinal)
                         .ok_or(SemanticTransitionError::ObservationMismatch)?;
-                    let banks: &[Option<usize>] =
-                        if kind == SemanticSourceContentGeometryKind::Current {
-                            &[Some(0), Some(1)]
-                        } else {
-                            &[None]
-                        };
+                    let banks: &[Option<usize>] = if kind.is_current() {
+                        &[Some(0), Some(1)]
+                    } else {
+                        &[None]
+                    };
                     for &bank in banks {
                         handles.push(SemanticPreparedSourceContentGeometry {
                             owner: Arc::new(SourceContentGeometryOwner {
@@ -2129,9 +2266,9 @@ impl SemanticTransitionSession {
                                 reader: Mutex::new(None),
                                 occurrences: Mutex::new(None),
                                 uniform: Mutex::new(None),
-                                input_generation: if kind
-                                    == SemanticSourceContentGeometryKind::Current
-                                {
+                                overlays: Mutex::new(std::array::from_fn(|_| None)),
+                                overlay_instruction: Arc::clone(&overlay_instruction),
+                                input_generation: if kind.is_current() {
                                     Some(input_generations.port(step_index)?)
                                 } else {
                                     None
@@ -2168,12 +2305,13 @@ impl SemanticTransitionSession {
 pub(super) struct SourcePublicationGeometry {
     proof: SemanticReplayStateMaterialProof,
     admission: Arc<SemanticReplayStateMaterialAdmission>,
-    storage: PublicationStorageGeometry,
+    pub(super) storage: PublicationStorageGeometry,
     inputs: Vec<StepInputPlan>,
     feedback_schema: SemanticFeedbackSchema,
     feedback_plan: FeedbackAllocationPlan,
     feedback_layouts: [SemanticTensorLayout; 6],
     pub(super) policy_layouts: [SemanticTensorLayout; 9],
+    pub(super) policy_producer_ceiling: [u64; 9],
     uniform_layouts: [SemanticTensorLayout; 3],
     policy_layout: SemanticPolicyLayout,
     support_layout: [std::ops::Range<usize>; COMPONENT_COUNT],
@@ -2348,6 +2486,14 @@ impl SourcePublicationGeometry {
         let (components, support_cells) =
             ActionCodebooks::component_geometry(&original.codebook_header, seed.program.is_some())?;
         let policy = SemanticPolicyLayout::from_components(&components)?;
+        let mut policy_producer_ceiling = native_work_bound::policy_uniform_native_work_ceiling(
+            &components,
+            policy.parameter_cells as u64,
+        )?;
+        native_work_bound::add_native_work_ceiling(
+            &mut policy_producer_ceiling,
+            [9, 0, 0, 0, 0, 0, 0, 0, 0],
+        )?;
         let mut support_layout = std::array::from_fn(|_| 0..0);
         for (component, span) in components.iter().zip(&mut support_layout) {
             let begin = usize::try_from(component.offset)
@@ -2361,6 +2507,11 @@ impl SourcePublicationGeometry {
         }
         let policy_layouts =
             policy_numerical_producer_layouts(support_cells, policy.parameter_cells)?;
+        for layout in &policy_layouts {
+            policy_producer_ceiling[8] = policy_producer_ceiling[8]
+                .checked_add(tensor_layout_bytes(layout)? as u64)
+                .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        }
         let uniform_layouts =
             policy_uniform_domain_tensor_layouts(support_cells, policy.parameter_cells)?;
         Ok(Self {
@@ -2372,6 +2523,7 @@ impl SourcePublicationGeometry {
             feedback_plan,
             feedback_layouts,
             policy_layouts,
+            policy_producer_ceiling,
             uniform_layouts,
             policy_layout: policy,
             support_layout,
@@ -2476,10 +2628,10 @@ pub(super) struct PreparedSourceContentOwner {
     pub(super) consumer_stream: u64,
     ports_issued: std::sync::atomic::AtomicBool,
     ports: Mutex<Option<SourceContentPortsState>>,
-    _metadata: Arc<SemanticReplayMaterialReservation>,
     destinations: Mutex<SourceDestinations>,
     pub(super) occurrences:
         Mutex<Option<Arc<super::source_content_occurrences::FrozenSourceContentOccurrences>>>,
+    _metadata: Arc<SemanticReplayMaterialReservation>,
 }
 
 struct SourceContentActivation {
@@ -2673,14 +2825,11 @@ pub(super) struct PendingSourceContent {
 }
 
 struct SourceDestinations {
-    banks: [Option<SourceDestination>; 2],
+    target: SourceDestination,
     sealed: bool,
 }
 
 pub(super) struct SourceDestination {
-    pub(super) preparation: std::sync::Weak<PreparedImportedEditDelivery>,
-    pub(super) issuer: Arc<()>,
-    pub(super) scope: Arc<()>,
     pub(super) step: u64,
     pub(super) instruction: Arc<[u8]>,
     pub(super) updates: Vec<u64>,
@@ -2796,19 +2945,12 @@ impl native_work_bound::FrozenColdSourceContent {
             let destinations = owner.destinations.lock().map_err(|_| {
                 publication_input_error("original SOURCE destinations are poisoned")
             })?;
-            if !destinations.sealed
-                || destinations.banks.iter().any(|bank| {
-                    bank.as_ref()
-                        .is_none_or(|bank| bank.preparation.upgrade().is_none())
-                })
-            {
+            if !destinations.sealed {
                 return Err(publication_input_error(
-                    "SOURCE union requires both original sealed TARGET preparation receipts",
+                    "SOURCE union requires its original sealed target roster",
                 ));
             }
-            let target = destinations.banks[0]
-                .as_ref()
-                .expect("sealed original destination");
+            let target = &destinations.target;
             if !Arc::ptr_eq(&target.instruction, instruction) {
                 return Err(publication_input_error(
                     "SOURCE union belongs to another original native instruction",
@@ -2911,6 +3053,10 @@ impl native_work_bound::FrozenColdSourceContent {
             let resident_ceiling = resident.native_guard_ceiling()?;
             let mut dma = snapshot;
             native_work_bound::add_native_work_ceiling(&mut dma, input_dma)?;
+            native_work_bound::add_native_work_ceiling(
+                &mut dma,
+                frozen.policy_binding_dma_ceiling()?,
+            )?;
             for producer in [
                 snapshot,
                 guard,
@@ -2940,9 +3086,7 @@ impl native_work_bound::FrozenColdSourceContent {
             let destinations = owners[0].destinations.lock().map_err(|_| {
                 publication_input_error("original SOURCE destinations are poisoned")
             })?;
-            let target = destinations.banks[0]
-                .as_ref()
-                .expect("sealed original destination");
+            let target = &destinations.target;
             if target.members.len() != owners.len()
                 || target.members.iter().zip(owners).any(|(member, owner)| {
                     member.ordinal != owner.ordinal || member.origin != owner.origin
@@ -2982,16 +3126,15 @@ pub(super) fn source_geometry_occurrence_native_work_ceiling<
 >(
     owner: &SourceContentGeometryOwner,
     event: &super::source_content_occurrences::SemanticSourceContentEvent<A>,
+    model: bool,
 ) -> Result<[u64; 9], SemanticTransitionError> {
     use super::source_content_occurrences::{SemanticSourceContentKind, SourceContentAllocation};
     let original = &owner.seed.proof.owner;
     let directory = &owner.publication.storage.bank_templates[0];
     let verify = event.family.kind() != SemanticSourceContentKind::Capture;
-    let model = verify
-        && event
-            .tensors
-            .iter()
-            .all(|tensor| matches!(tensor.layout.role, 18..=20));
+    if model && !verify {
+        return Err(SemanticTransitionError::ObservationMismatch);
+    }
     let mut ceiling = [0; 9];
     if model {
         model_content_ranges(
@@ -3709,6 +3852,35 @@ impl SemanticTransitionSession {
             .iter()
             .position(|&token| token == target_step.token)
             .ok_or(SemanticTransitionError::ObservationMismatch)?;
+        let target_build = target
+            .prepared_segment
+            .as_ref()
+            .ok_or(SemanticTransitionError::NotBound)?;
+        let target_updates = target_build
+            .tokens
+            .iter()
+            .zip(&target_build.transitions)
+            .filter(|(_, kind)| **kind == SemanticTransitionKind::Update)
+            .map(|(&token, _)| token);
+        let target_training =
+            |token: u64| -> Result<&SemanticSelectedTrainingView, SemanticTransitionError> {
+                target
+                    .steps
+                    .get(&token)
+                    .and_then(|step| step.prepared.as_ref())
+                    .and_then(|step| step.training_view.as_ref())
+                    .ok_or_else(|| {
+                        publication_input_error(
+                            "SOURCE requires every original target Update training view",
+                        )
+                    })
+            };
+        let target_members = target_training(target_step.token)?.edit_group_members();
+        let target_member_count = target_updates.clone().try_fold(0usize, |count, token| {
+            count
+                .checked_add(target_training(token)?.edit_group_members().len())
+                .ok_or(SemanticTransitionError::GenerationExhausted)
+        })?;
         let declared = &geometry.owner;
         if declared.kind != SemanticSourceContentGeometryKind::Historical
             || declared.bank.is_some()
@@ -3764,6 +3936,18 @@ impl SemanticTransitionSession {
         if declared.member.origin != origin {
             return Err(publication_input_error(
                 "SOURCE recipe changed its native frozen member origin",
+            ));
+        }
+        if !target_members.iter().any(|member| {
+            member.ordinal == ordinal
+                && member.origin == origin
+                && member.identity == declared.member.identity
+                && member.source_identity == declared.member.source_identity
+                && member.bytes_identity == declared.member.bytes_identity
+                && member.content_identity == declared.member.content_identity
+        }) {
+            return Err(publication_input_error(
+                "SOURCE changed its original frozen target Edit member",
             ));
         }
         let (material_identity, _) = self.verify_replay_source_material(lease, material)?;
@@ -3878,6 +4062,29 @@ impl SemanticTransitionSession {
                     size_of::<SemanticReplayMaterialReservation>() + 2 * size_of::<usize>(),
                 )
             })
+            .and_then(|bytes| {
+                target_updates
+                    .clone()
+                    .count()
+                    .checked_mul(
+                        size_of::<u64>()
+                            + size_of::<(
+                                u64,
+                                Vec<crate::semantic_training_view::FrozenPolicyGroupMember>,
+                            )>(),
+                    )
+                    .and_then(|roster| bytes.checked_add(roster))
+            })
+            .and_then(|bytes| {
+                target_member_count
+                    .checked_add(target_members.len())
+                    .and_then(|count| {
+                        count.checked_mul(size_of::<
+                            crate::semantic_training_view::FrozenPolicyGroupMember,
+                        >())
+                    })
+                    .and_then(|members| bytes.checked_add(members))
+            })
             .ok_or(SemanticTransitionError::GenerationExhausted)?;
         let owner_metadata = Arc::new(
             declared.seed.proof.owner.budget.reserve_auxiliary(
@@ -3886,6 +4093,19 @@ impl SemanticTransitionSession {
             )?,
         );
         let feedback_geometry = feedback.content.tensors.clone();
+        let mut updates = Vec::with_capacity(target_updates.clone().count());
+        let mut all_members = Vec::with_capacity(target_updates.clone().count());
+        for token in target_updates {
+            updates.push(token);
+            all_members.push((token, target_training(token)?.edit_group_members().to_vec()));
+        }
+        let destination = SourceDestination {
+            step: target_step.token,
+            instruction: Arc::clone(&target_instruction),
+            updates,
+            members: target_members.to_vec(),
+            all_members,
+        };
         step.feedback.push(feedback);
         let owner = Arc::new(PreparedSourceContentOwner {
             geometry: Arc::clone(declared),
@@ -3915,7 +4135,7 @@ impl SemanticTransitionSession {
             ports: Mutex::new(None),
             _metadata: owner_metadata,
             destinations: Mutex::new(SourceDestinations {
-                banks: std::array::from_fn(|_| None),
+                target: destination,
                 sealed: false,
             }),
             occurrences: Mutex::new(Some(occurrence_owner)),
@@ -3981,93 +4201,6 @@ impl SemanticTransitionSession {
         Ok(())
     }
 
-    pub(super) fn retain_source_content_destination(
-        &self,
-        lease: &SemanticPublishedLease,
-        preparation: Arc<PreparedImportedEditDelivery>,
-        instruction: Arc<[u8]>,
-        updates: Vec<u64>,
-        members: Vec<crate::semantic_training_view::FrozenPolicyGroupMember>,
-        all_members: Vec<(
-            u64,
-            Vec<crate::semantic_training_view::FrozenPolicyGroupMember>,
-        )>,
-    ) -> Result<(), SemanticTransitionError> {
-        let owner = self
-            .steps
-            .get(&lease.token)
-            .and_then(|step| step.source_content.as_ref())
-            .ok_or_else(|| {
-                publication_input_error("future Edit lost its original SOURCE recipe")
-            })?;
-        if preparation.bank > 1
-            || !Arc::ptr_eq(&owner.target.issuer, &preparation.issuer)
-            || !Arc::ptr_eq(&owner.target.scope, &preparation.scope)
-            || owner.target.token != preparation.step
-            || !Arc::ptr_eq(&owner.target_instruction, &instruction)
-            || !Arc::ptr_eq(&owner.issuer, &preparation.source_issuer)
-            || owner.token != preparation.source_token
-            || owner.identity != preparation.source_identity
-            || owner.ordinal != preparation.member_ordinal
-            || owner.material != preparation.material
-            || owner.origin != preparation.origin
-            || !updates.contains(&preparation.step)
-            || !members
-                .iter()
-                .any(|member| member.ordinal == owner.ordinal && member.origin == owner.origin)
-            || all_members
-                .iter()
-                .map(|(step, _)| *step)
-                .collect::<Vec<_>>()
-                != updates
-        {
-            return Err(publication_input_error(
-                "future Edit changed its original SOURCE recipe",
-            ));
-        }
-        let mut destinations = owner.destinations.lock().map_err(|_| {
-            publication_input_error("original SOURCE destination roster is poisoned")
-        })?;
-        let bank = preparation.bank;
-        if destinations.sealed || destinations.banks[bank].is_some() {
-            return Err(publication_input_error(
-                "original SOURCE destination was already retained",
-            ));
-        }
-        if let Some(other) = &destinations.banks[1 - bank] {
-            if !Arc::ptr_eq(&other.issuer, &preparation.issuer)
-                || !Arc::ptr_eq(&other.scope, &preparation.scope)
-                || other.step != preparation.step
-                || !Arc::ptr_eq(&other.instruction, &instruction)
-                || other.updates != updates
-                || other.members.len() != members.len()
-                || other.members.iter().zip(&members).any(|(left, right)| {
-                    left.ordinal != right.ordinal
-                        || left.origin != right.origin
-                        || left.identity != right.identity
-                        || left.source_identity != right.source_identity
-                        || left.bytes_identity != right.bytes_identity
-                        || left.content_identity != right.content_identity
-                })
-            {
-                return Err(publication_input_error(
-                    "SOURCE banks changed their original target or frozen roster",
-                ));
-            }
-        }
-        destinations.banks[bank] = Some(SourceDestination {
-            preparation: Arc::downgrade(&preparation),
-            issuer: Arc::clone(&preparation.issuer),
-            scope: Arc::clone(&preparation.scope),
-            step: preparation.step,
-            instruction,
-            updates,
-            members,
-            all_members,
-        });
-        Ok(())
-    }
-
     /// Seal only the complete structural roster; no numerical witness is issued.
     pub fn seal_prepared_source_content(
         &self,
@@ -4079,14 +4212,9 @@ impl SemanticTransitionSession {
         let mut destinations = owner.destinations.lock().map_err(|_| {
             publication_input_error("original SOURCE destination roster is poisoned")
         })?;
-        if !owner.ports_issued.load(Ordering::Acquire)
-            || destinations.banks.iter().any(|bank| {
-                bank.as_ref()
-                    .is_none_or(|bank| bank.preparation.upgrade().is_none())
-            })
-        {
+        if !owner.ports_issued.load(Ordering::Acquire) {
             return Err(publication_input_error(
-                "SOURCE preparation lacks its original ports and both TARGET banks",
+                "SOURCE preparation lacks its original ports",
             ));
         }
         destinations.sealed = true;

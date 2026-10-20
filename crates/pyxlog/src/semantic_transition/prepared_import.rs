@@ -785,13 +785,10 @@ impl PySemanticPreparedSourceContent {
     }
 }
 
-/// Immutable metadata and the actual Python producer of an original tensor port.
+/// Retained allocation provenance and Python producer of an original SOURCE port.
 pub(super) struct OriginalImportTensorPort {
-    layout: SemanticTensorLayout,
-    logical_begin: u64,
-    logical_end: u64,
-    native_allocation: Option<DeviceAllocationProvenance>,
-    producer: Py<PyAny>,
+    _native_allocation: Option<DeviceAllocationProvenance>,
+    _producer: Py<PyAny>,
 }
 
 impl OriginalImportTensorPort {
@@ -823,46 +820,9 @@ impl OriginalImportTensorPort {
         producer: &Py<PyAny>,
     ) -> Self {
         Self {
-            layout: geometry.0,
-            logical_begin: geometry.1,
-            logical_end: geometry.2,
-            native_allocation: geometry.3.clone(),
-            producer: producer.clone_ref(py),
+            _native_allocation: geometry.3.clone(),
+            _producer: producer.clone_ref(py),
         }
-    }
-
-    fn clone_ref(&self, py: Python<'_>) -> Self {
-        Self {
-            layout: self.layout,
-            logical_begin: self.logical_begin,
-            logical_end: self.logical_end,
-            native_allocation: self.native_allocation.clone(),
-            producer: self.producer.clone_ref(py),
-        }
-    }
-
-    fn export(
-        &self,
-        py: Python<'_>,
-        device: usize,
-        stream: u64,
-        check: &dyn Fn() -> PyResult<()>,
-    ) -> PyResult<SemanticTensorInput> {
-        let producer = self.producer.bind(py);
-        validate_producer_device_guarded(producer, device, check)?;
-        let tensor = crate::dlpack_from_py_for_stream_guarded(
-            producer,
-            i64::try_from(stream)
-                .map_err(|_| invalid("consumer stream exceeds DLPack address space"))?,
-            check,
-        )?;
-        Ok(SemanticTensorInput {
-            layout: self.layout,
-            logical_begin: self.logical_begin,
-            logical_end: self.logical_end,
-            tensor,
-            native_allocation: self.native_allocation.clone(),
-        })
     }
 }
 
@@ -893,7 +853,7 @@ pub(crate) struct PySemanticPreparedTaskImport {
     source_content: Mutex<Option<Py<PySemanticPreparedSourceContent>>>,
     #[cfg(feature = "semantic-policy")]
     source_content_handoff: Mutex<Option<OriginalSourceContentHandoff>>,
-    pub(super) group_use: Arc<Mutex<RetainedGroupUse>>,
+    pub(super) source_target: Arc<Mutex<RetainedSourceTarget>>,
 }
 
 impl PySemanticPreparedTaskImport {
@@ -945,7 +905,7 @@ impl PySemanticPreparedTaskImport {
                 source_content: Mutex::new(None),
                 #[cfg(feature = "semantic-policy")]
                 source_content_handoff: Mutex::new(None),
-                group_use: Arc::new(Mutex::new(RetainedGroupUse::new())),
+                source_target: Arc::new(Mutex::new(RetainedSourceTarget::new())),
             },
         )?;
         {
@@ -1142,42 +1102,16 @@ impl PySemanticPreparedTaskImport {
             invalid("unexecuted cancellation lost its original instruction child")
         })?;
         let cancellation = child.cancelled_prepared_import_proof(py, self)?;
-        let deliveries = {
-            let group = self
-                .group_use
-                .lock()
-                .map_err(|_| invalid("prepared import group use is poisoned"))?;
-            if group.completion.is_some() || group.banks != [false; 2] {
-                return Err(invalid(
-                    "unexecuted cancellation cannot replace an actual target contribution",
-                ));
-            }
-            group
-                .deliveries
-                .iter()
-                .flatten()
-                .map(|delivery| delivery.clone_ref(py))
-                .collect::<Vec<_>>()
-        };
-        for delivery in &deliveries {
-            let delivery = delivery.borrow(py);
-            delivery.require_removed_hooks()?;
-            if delivery.activated_once.load(Ordering::Acquire)
-                || delivery
-                    .handles
-                    .lock()
-                    .map_err(|_| invalid("cancelled gradient hook custody is poisoned"))?
-                    .is_some()
-                || !delivery
-                    .restores
-                    .lock()
-                    .map_err(|_| invalid("cancelled gradient restoration custody is poisoned"))?
-                    .is_empty()
-            {
-                return Err(invalid(
-                    "unexecuted cancellation still owns active original gradient delivery",
-                ));
-            }
+        if self
+            .source_target
+            .lock()
+            .map_err(|_| invalid("prepared SOURCE target custody is poisoned"))?
+            .completion
+            .is_some()
+        {
+            return Err(invalid(
+                "unexecuted cancellation cannot replace actual target completion",
+            ));
         }
         let mut progress = self
             .cancelled_final_use
@@ -1262,24 +1196,20 @@ impl PySemanticPreparedTaskImport {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(progress);
         if result.is_ok() {
             import.committed = true;
-            let retired_group = {
+            let retired_target = {
                 let mut group = self
-                    .group_use
+                    .source_target
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                (
-                    group.update.take(),
-                    group.target.take(),
-                    std::mem::replace(&mut group.deliveries, std::array::from_fn(|_| None)),
-                )
+                (group.session.take(), group.target.take())
             };
-            self.retire_source_port_custody(py, &retired_group.2);
+            self.retire_source_port_custody();
             *self
                 .stage
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) =
                 ImportPreparationStage::Cancelled;
-            drop(retired_group);
+            drop(retired_target);
         }
         result
     }
@@ -1313,44 +1243,17 @@ impl PySemanticPreparedTaskImport {
                 "historical replay preparation requires its complete original SOURCE model ports and witness",
             ));
         }
-        let group = self
-            .group_use
-            .lock()
-            .map_err(|_| invalid("prepared import group use is poisoned"))?;
-        if group.gradient_banks != [true; 2]
-            || group.edit_only != Some(true)
-            || group.banks != [false; 2]
-            || group.target.is_none()
         {
-            return Err(invalid(
-                "historical replay requires both original future Edit bank destinations before any effect",
-            ));
-        }
-        let target = group.target.as_ref().expect("validated original target");
-        for (bank, delivery) in group.deliveries.iter().enumerate() {
-            let delivery = delivery
-                .as_ref()
-                .ok_or_else(|| invalid("future Edit roster lost its original bank delivery"))?
-                .borrow(py);
-            let original = delivery
-                .future_import
-                .as_ref()
-                .ok_or_else(|| invalid("future Edit bank requires its original prepared import"))?;
-            let (_, actual, actual_bank) = delivery
-                .future_target
-                .as_ref()
-                .ok_or_else(|| invalid("future Edit bank lost its original target"))?;
-            if !std::ptr::eq(self, &*original.borrow(py))
-                || *actual_bank != bank
-                || !actual.same_handle(target)
-                || delivery.activated_once.load(Ordering::Acquire)
-            {
+            let target = self
+                .source_target
+                .lock()
+                .map_err(|_| invalid("prepared SOURCE target custody is poisoned"))?;
+            if target.session.is_none() || target.target.is_none() || target.completion.is_some() {
                 return Err(invalid(
-                    "future Edit roster changed its original import, Update or bank",
+                    "historical SOURCE preparation lost its original uncompleted target",
                 ));
             }
         }
-        drop(group);
         #[cfg(feature = "semantic-policy")]
         {
             let source = source_content.borrow(py);
@@ -1358,7 +1261,7 @@ impl PySemanticPreparedTaskImport {
                 || source.task_use.as_ptr() != self.task_use.as_ptr()
                 || source.parent.as_ptr() != self.parent.as_ptr()
             {
-                return Err(invalid("future roster changed its original SOURCE recipe"));
+                return Err(invalid("SOURCE preparation changed its original recipe"));
             }
             let session = self.session.borrow(py);
             let owner = session.owner()?;
@@ -1386,51 +1289,6 @@ impl PySemanticPreparedTaskImport {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .is_some_and(|original| std::ptr::eq(member, &*original.borrow(py)))
-    }
-
-    pub(super) fn require_future_consumer(
-        &self,
-        py: Python<'_>,
-        step: &PySemanticPreparedStep,
-    ) -> PyResult<()> {
-        let session = self.session.borrow(py);
-        session.require_creator()?;
-        if !session.importing.load(Ordering::Acquire)
-            || step.session.as_ptr() == self.session.as_ptr()
-            || *self
-                .stage
-                .lock()
-                .map_err(|_| invalid("prepared import stage is poisoned"))?
-                != ImportPreparationStage::Prepared
-        {
-            return Err(invalid(
-                "future Edit delivery requires the original unexecuted distinct SOURCE import",
-            ));
-        }
-        let retained = session
-            .prepared_task_import
-            .lock()
-            .map_err(|_| invalid("prepared import custody is poisoned"))?;
-        if retained
-            .as_ref()
-            .is_none_or(|original| !std::ptr::eq(self, &*original.borrow(py)))
-        {
-            return Err(invalid(
-                "future Edit delivery changed its retained original import owner",
-            ));
-        }
-        drop(retained);
-        let child = session.private_replay_custody()?.ok_or_else(|| {
-            invalid("future Edit delivery requires its original instruction-bound SOURCE import")
-        })?;
-        child.require_future_import_structure(py)?;
-        child.require_target(py, step)?;
-        let owner = session.owner()?;
-        self.task_use.borrow(py).require_original_identity(&owner)?;
-        owner
-            .published_identity(&*self.parent.borrow(py).lease()?)
-            .map_err(xlog_err)?;
-        Ok(())
     }
 
     pub(super) fn require_source_port_owner(
@@ -1515,236 +1373,6 @@ impl PySemanticPreparedTaskImport {
         Ok(())
     }
 
-    fn complete_future_deliveries(
-        &self,
-        py: Python<'_>,
-        member: &PySemanticRetainedReplayMember,
-        check: &dyn Fn() -> PyResult<()>,
-    ) -> PyResult<()> {
-        let deliveries = self
-            .group_use
-            .lock()
-            .map_err(|_| invalid("prepared import group use is poisoned"))?
-            .deliveries
-            .iter()
-            .flatten()
-            .map(|delivery| delivery.clone_ref(py))
-            .collect::<Vec<_>>();
-        if deliveries.is_empty() {
-            return Ok(());
-        }
-        let _witness = self
-            .source_witness
-            .lock()
-            .map_err(|_| invalid("SOURCE model witness is poisoned"))?
-            .as_ref()
-            .map(|witness| witness.clone_ref(py))
-            .ok_or_else(|| {
-                invalid("future Edit completion lacks its original authenticated SOURCE witness")
-            })?;
-        let ports = self
-            .source_ports
-            .lock()
-            .map_err(|_| invalid("SOURCE model ports are poisoned"))?
-            .as_ref()
-            .ok_or_else(|| invalid("future Edit completion lost its original SOURCE ports"))?
-            .iter()
-            .map(|port| port.clone_ref(py))
-            .collect::<Vec<_>>();
-        let leaves = deliveries
-            .iter()
-            .map(|delivery| {
-                let delivery = delivery.borrow(py);
-                let leaves = delivery
-                    .future_leaves
-                    .lock()
-                    .map_err(|_| invalid("future Edit physical leaf custody is poisoned"))?;
-                Ok(leaves
-                    .iter()
-                    .map(|leaf| leaf.clone_ref(py))
-                    .collect::<Vec<_>>())
-            })
-            .collect::<PyResult<Vec<_>>>()?;
-        // Capture each shared physical leaf's restored slot once, including
-        // frozen leaves with no AccumulateGrad hook. Both banks use this same
-        // snapshot; SOURCE layout/provenance comes only from its real witness.
-        let mut snapshots = BTreeMap::<usize, (SemanticTensorLayout, Py<PyAny>)>::new();
-        let mut original_leaves = None;
-        for leaves in &leaves {
-            let mut bank_leaves = BTreeSet::new();
-            for leaf in leaves {
-                let key = leaf.producer.as_ptr() as usize;
-                if !bank_leaves.insert(key)
-                    || !ports.iter().any(|port| {
-                        port.layout == leaf.layout
-                            && port.producer.as_ptr() == leaf.producer.as_ptr()
-                    })
-                {
-                    return Err(invalid(
-                        "future Edit leaf is not its original authenticated SOURCE producer",
-                    ));
-                }
-                if let Some((layout, _)) = snapshots.get(&key) {
-                    if *layout != leaf.layout {
-                        return Err(invalid(
-                            "future Edit banks changed the original physical leaf metadata",
-                        ));
-                    }
-                    continue;
-                }
-                check()?;
-                let gradient = leaf.producer.bind(py).getattr("grad")?.unbind();
-                check()?;
-                snapshots.insert(key, (leaf.layout, gradient));
-            }
-            if original_leaves
-                .as_ref()
-                .is_some_and(|original| original != &bank_leaves)
-            {
-                return Err(invalid(
-                    "future Edit banks changed the full original physical leaf roster",
-                ));
-            }
-            original_leaves = Some(bank_leaves);
-        }
-        let device = self.session.borrow(py).device_ordinal;
-        let mut restored_rosters = TensorHandoff(Vec::with_capacity(deliveries.len()));
-        for (delivery, leaves) in deliveries.iter().zip(&leaves) {
-            let delivery = delivery.borrow(py);
-            let mut slots = Vec::with_capacity(leaves.len());
-            for leaf in leaves {
-                let gradient = &snapshots
-                    .get(&(leaf.producer.as_ptr() as usize))
-                    .expect("captured original physical leaf")
-                    .1;
-                let restored = if gradient.bind(py).is_none() {
-                    None
-                } else {
-                    let port = ports.iter().find(|port| port.layout.role == SemanticStateRole::Gradients as u64
-                        && port.producer.as_ptr() == gradient.as_ptr())
-                        .ok_or_else(|| invalid("restored SOURCE gradient is not its original authenticated witness producer"))?;
-                    Some(port.export(py, device, delivery.future_stream, check)?)
-                };
-                slots.push((
-                    leaf.export(py, device, delivery.future_stream, check)?,
-                    restored,
-                ));
-            }
-            restored_rosters.0.push(slots);
-        }
-        check()?;
-        let source = self.session.borrow(py);
-        let source_owner = source.owner()?;
-        let parent = self.parent.borrow(py);
-        let lease = parent.lease()?;
-        let invocation = member.invocation.borrow(py);
-        for (delivery, slots) in deliveries.iter().zip(restored_rosters.into_native()) {
-            let delivery = delivery.borrow(py);
-            let original = delivery
-                .future_import
-                .as_ref()
-                .ok_or_else(|| invalid("future delivery lost its original prepared import"))?;
-            if !std::ptr::eq(self, &*original.borrow(py)) {
-                return Err(invalid(
-                    "future delivery completion changed its original import owner",
-                ));
-            }
-            let (target, step, bank) = delivery
-                .future_target
-                .as_ref()
-                .ok_or_else(|| invalid("future delivery lost its original target bank"))?;
-            let target = target.borrow(py);
-            target.require_creator()?;
-            target
-                .owner()?
-                .complete_imported_edit_gradient_delivery(
-                    step,
-                    *bank,
-                    &source_owner,
-                    &lease,
-                    &self.material,
-                    invocation.rng,
-                    self.ordinal as u64,
-                    &self.replay_row,
-                    &delivery._binding,
-                    slots,
-                )
-                .map_err(xlog_err)?;
-        }
-        drop(invocation);
-        drop(lease);
-        drop(parent);
-        drop(source_owner);
-        drop(source);
-        // Authenticate the same original edges before changing either bank's
-        // saved restoration intent. No slot, destination or hook is replaced.
-        for delivery in &deliveries {
-            let delivery = delivery.borrow(py);
-            let entries = delivery
-                .deferred_hooks
-                .lock()
-                .map_err(|_| invalid("gradient-delivery hook roster is poisoned"))?
-                .as_ref()
-                .ok_or_else(|| invalid("future Edit hooks entered before SOURCE completion"))?
-                .iter()
-                .map(|entry| (entry.node.clone_ref(py), entry.effective.clone_ref(py)))
-                .collect::<Vec<_>>();
-            for (node, effective) in entries {
-                check()?;
-                if !node.bind(py).getattr("variable")?.is(effective.bind(py))
-                    || !snapshots.contains_key(&(effective.as_ptr() as usize))
-                {
-                    return Err(invalid(
-                        "SOURCE restoration changed its original AccumulateGrad leaf",
-                    ));
-                }
-                check()?;
-            }
-        }
-        // Revalidate identity without replacing the once-captured snapshot.
-        // A metadata callback cannot turn a later arbitrary slot mutation into
-        // the authentic numerical restore transition.
-        let mut checked = BTreeSet::new();
-        for leaves in &leaves {
-            for leaf in leaves {
-                let key = leaf.producer.as_ptr() as usize;
-                if checked.insert(key) {
-                    check()?;
-                    let current = leaf.producer.bind(py).getattr("grad")?;
-                    check()?;
-                    if !current.is(snapshots
-                        .get(&key)
-                        .expect("captured original physical leaf")
-                        .1
-                        .bind(py))
-                    {
-                        return Err(invalid(
-                            "SOURCE gradient slot changed after its original restored snapshot",
-                        ));
-                    }
-                }
-            }
-        }
-        for delivery in &deliveries {
-            let delivery = delivery.borrow(py);
-            let mut hooks = delivery
-                .deferred_hooks
-                .lock()
-                .map_err(|_| invalid("gradient-delivery hook roster is poisoned"))?;
-            for entry in hooks
-                .as_mut()
-                .ok_or_else(|| invalid("future Edit hooks lost their original deferred roster"))?
-            {
-                entry.original_grad = snapshots
-                    .get(&(entry.effective.as_ptr() as usize))
-                    .expect("authenticated original AccumulateGrad leaf")
-                    .1
-                    .clone_ref(py);
-            }
-        }
-        Ok(())
-    }
-
     pub(super) fn retire_source_witness(&self, py: Python<'_>) -> PyResult<()> {
         #[cfg(feature = "semantic-policy")]
         let recipe = self
@@ -1781,11 +1409,7 @@ impl PySemanticPreparedTaskImport {
     /// Called only after original Runtime cleanup and native reader releases.
     /// Executed imports additionally require final use, full comparison and
     /// TaskUse completion; unexecuted cancellation grants no import rights.
-    pub(super) fn retire_source_port_custody(
-        &self,
-        py: Python<'_>,
-        deliveries: &[Option<Py<PySemanticGradientDelivery>>; 2],
-    ) {
+    pub(super) fn retire_source_port_custody(&self) {
         let ports = self
             .source_ports
             .lock()
@@ -1796,26 +1420,8 @@ impl PySemanticPreparedTaskImport {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
-        let mut leaves = Vec::new();
-        for delivery in deliveries.iter().flatten() {
-            let delivery = delivery.borrow(py);
-            if delivery
-                .future_import
-                .as_ref()
-                .is_some_and(|original| std::ptr::eq(self, &*original.borrow(py)))
-            {
-                let roster = std::mem::take(
-                    &mut *delivery
-                        .future_leaves
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner),
-                );
-                leaves.push(roster);
-            }
-        }
         // All retained owners leave on the creator thread without a Session,
         // group-use, final-use or roster mutex held. Cached results remain.
-        drop(leaves);
         drop(ports);
         drop(witness);
     }
@@ -1894,6 +1500,28 @@ impl PySemanticPreparedTaskImport {
         }
         let target = target_session.borrow(py);
         target.require_creator()?;
+        {
+            let mut original = self
+                .source_target
+                .lock()
+                .map_err(|_| invalid("prepared SOURCE target custody is poisoned"))?;
+            if original
+                .session
+                .as_ref()
+                .is_some_and(|session| session.as_ptr() != target_session.as_ptr())
+                || original
+                    .target
+                    .as_ref()
+                    .is_some_and(|step| !step.same_handle(&target_step))
+                || original.completion.is_some()
+            {
+                return Err(invalid("SOURCE preparation changed its original target"));
+            }
+            if original.session.is_none() {
+                original.session = Some(target_session.clone_ref(py));
+                original.target = Some(target_step.clone());
+            }
+        }
         // Authenticate and drain before any handoff or native owner lock. A
         // producer's final Python decref may reenter this original import.
         drop(target.owner()?);
@@ -2092,117 +1720,6 @@ impl PySemanticPreparedTaskImport {
         self.require_cancelled_ack(py)
     }
 
-    /// Project the same original outputs without completing or executing SOURCE.
-    #[pyo3(signature = (update_step, bank, *, consumer_stream, edit_only=false))]
-    fn group_update_vjp_layouts(
-        &self,
-        py: Python<'_>,
-        update_step: Py<PySemanticPreparedStep>,
-        bank: &Bound<'_, PyAny>,
-        consumer_stream: &Bound<'_, PyAny>,
-        edit_only: bool,
-    ) -> PyResult<Py<PyTuple>> {
-        let completed = *self
-            .stage
-            .lock()
-            .map_err(|_| invalid("prepared import stage is poisoned"))?
-            == ImportPreparationStage::Complete;
-        if completed {
-            let member = self
-                .member
-                .lock()
-                .map_err(|_| invalid("prepared import member is poisoned"))?
-                .as_ref()
-                .map(|member| member.clone_ref(py))
-                .ok_or_else(|| invalid("prepared import lost its genuine completed member"))?;
-            let result = member.borrow(py).group_update_vjp_layouts(
-                py,
-                update_step,
-                bank,
-                consumer_stream,
-                edit_only,
-            );
-            return result;
-        }
-        let update = update_step.borrow(py);
-        self.require_future_consumer(py, &update)?;
-        if !edit_only {
-            return Err(invalid(
-                "future SOURCE output geometry requires its original Edit-only contribution",
-            ));
-        }
-        let bank = usize::try_from(ColdValue::read(bank, &mut 128, 0)?.unsigned()?)
-            .map_err(|_| invalid("group Update bank exceeds native address space"))?;
-        let stream = parse_witness_consumer_stream(consumer_stream, &mut 128)?;
-        let source_session = self.session.borrow(py);
-        let target_session = update.session.borrow(py);
-        target_session.require_creator()?;
-        update.require_task(py, &update.task_use.borrow(py))?;
-        {
-            let state = self
-                .group_use
-                .lock()
-                .map_err(|_| invalid("prepared import group use is poisoned"))?;
-            if bank > 1
-                || !state.gradient_banks[bank]
-                || state.deliveries[bank].is_none()
-                || state.edit_only != Some(true)
-                || state.banks[bank]
-                || state
-                    .target
-                    .as_ref()
-                    .is_none_or(|target| !target.same_handle(&update.inner))
-            {
-                return Err(invalid(
-                    "future output geometry changed its original Update contribution",
-                ));
-            }
-        }
-        let target = target_session.owner()?;
-        let source = source_session.owner()?;
-        let parent = self.parent.borrow(py);
-        let lease = parent.lease()?;
-        let layouts = target
-            .prepared_imported_edit_policy_vjp_layouts(
-                &update.inner,
-                bank,
-                &source,
-                &lease,
-                &self.material,
-                self.ordinal as u64,
-                &self.replay_row,
-                stream,
-            )
-            .map_err(xlog_err)?;
-        drop(source);
-        drop(target);
-        policy_output_layout_rows(py, layouts)
-    }
-
-    #[pyo3(signature = (update_step, bank, *, consumer_stream, edit_only=false))]
-    fn group_update_vjp(
-        &self,
-        py: Python<'_>,
-        update_step: Py<PySemanticPreparedStep>,
-        bank: &Bound<'_, PyAny>,
-        consumer_stream: &Bound<'_, PyAny>,
-        edit_only: bool,
-    ) -> PyResult<Py<PyTuple>> {
-        self.require_completed()?;
-        let member = self
-            .member
-            .lock()
-            .map_err(|_| invalid("prepared import member is poisoned"))?
-            .as_ref()
-            .map(|member| member.clone_ref(py))
-            .ok_or_else(|| invalid("prepared import lost its genuine completed member"))?;
-        let result =
-            member
-                .borrow(py)
-                .group_update_vjp(py, update_step, bank, consumer_stream, edit_only);
-        result
-    }
-
     fn source_model_contract_metadata(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
         self.require_metadata(py)?;
         let (bytes, layout) = self
@@ -2345,7 +1862,6 @@ impl PySemanticTransitionController {
                 prepared.finish_invocation.bind(py),
                 prepared.refresh_snapshot.bind(py),
                 &import,
-                true,
                 Some(&prepared),
             )?
             .ok_or_else(|| invalid("prepared retained import lost its genuine completed member"))?;
@@ -2357,15 +1873,6 @@ impl PySemanticTransitionController {
         if let Some(child) = &child {
             child.retain_member(py, &member)?;
         }
-        prepared.complete_future_deliveries(py, &member.borrow(py), &|| {
-            self.check_import_callback(
-                py,
-                &issued,
-                &prepared.parent.borrow(py),
-                &import,
-                &prepared.expected,
-            )
-        })?;
         let result = (prepared.task_use.clone_ref(py), member)
             .into_pyobject(py)?
             .unbind()

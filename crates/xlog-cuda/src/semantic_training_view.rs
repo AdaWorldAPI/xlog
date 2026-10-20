@@ -210,6 +210,9 @@ pub struct SemanticTrainingViewRow<B = Vec<u8>> {
     /// equal the native task content executed during this cold binding.
     pub task_content: Option<SemanticTaskContentIdentity>,
     pub origin: Option<SemanticTrainingViewOrigin>,
+    /// Byte hashes of the admitted original action, codebook, solving witness,
+    /// and task ground. These travel with the same immutable replay row.
+    pub edit_demonstration_material_roots: Option<[Identity256; 4]>,
     pub bytes: B,
 }
 
@@ -730,6 +733,7 @@ pub(crate) struct FrozenPolicyGroupMember {
     pub bytes_identity: Identity256,
     pub content_identity: [u64; 4],
     pub origin: SemanticTrainingViewOriginRecord,
+    pub edit_demonstration_material_roots: Option<[Identity256; 4]>,
 }
 
 /// Fixed device port of the native-selected complete training roster.
@@ -855,6 +859,8 @@ impl SemanticSelectedTrainingView {
                     && member.bytes_identity == row.bytes_identity
                     && member.content_identity == descriptor.content_identity
                     && member.origin == descriptor.origin
+                    && member.edit_demonstration_material_roots
+                        == row.edit_demonstration_material_roots
             })
             .ok_or_else(|| input_error("original replay is not an exact frozen actor group member"))
     }
@@ -879,6 +885,7 @@ impl SemanticSelectedTrainingView {
                 && member.bytes_identity == row.bytes_identity
                 && member.content_identity == descriptor.content_identity
                 && member.origin == descriptor.origin
+                && member.edit_demonstration_material_roots == row.edit_demonstration_material_roots
         }))
     }
 
@@ -900,6 +907,10 @@ impl SemanticSelectedTrainingView {
     #[cfg(feature = "semantic-policy")]
     pub(crate) fn canaries(&self) -> DeviceMemoryView<SemanticTrainingCanaryRecord> {
         self.arena.canaries.view()
+    }
+
+    pub(crate) fn canary_rows(&self) -> [u64; 5] {
+        self.arena.canary_rows
     }
 
     #[cfg(feature = "semantic-policy")]
@@ -1270,6 +1281,7 @@ pub(crate) struct PreparedOriginalTrainingRoster {
     pub groups: Vec<SemanticTrainingObjectiveGroupRecord>,
     pub group_members: Vec<u64>,
     pub canaries: Vec<SemanticTrainingCanaryRecord>,
+    canary_rows: [u64; 5],
     pub protected_members: Vec<u64>,
     #[cfg(feature = "semantic-policy")]
     actor_group_member_count: u64,
@@ -1318,6 +1330,7 @@ pub(crate) struct SemanticTrainingViewArena {
     groups: TrackedCudaSlice<SemanticTrainingObjectiveGroupRecord>,
     group_members: TrackedCudaSlice<u64>,
     canaries: TrackedCudaSlice<SemanticTrainingCanaryRecord>,
+    canary_rows: [u64; 5],
     #[cfg(feature = "semantic-policy")]
     protected_members: TrackedCudaSlice<u64>,
     #[cfg(feature = "semantic-policy")]
@@ -1557,6 +1570,7 @@ impl SemanticTrainingViewArena {
         self.initial_row_count = prepared.initial_row_count;
         self.materialized = true;
         self.protected_member_count = prepared.protected_member_count;
+        self.canary_rows = prepared.canary_rows;
         self.prefix_identity = prepared.prefix_identity;
         #[cfg(feature = "semantic-policy")]
         {
@@ -1870,7 +1884,7 @@ impl SemanticTrainingViewArena {
                     .checked_mul(2)
                     .and_then(|proposals| cells.checked_add(proposals))
             })
-            .and_then(|cells| cells.checked_add(1))
+            .and_then(|cells| cells.checked_add(2))
             .ok_or(SemanticTransitionError::GenerationExhausted)
     }
 
@@ -2038,7 +2052,7 @@ impl SemanticTrainingViewArena {
         for (ordinal, row) in rows.into_iter().enumerate() {
             let descriptor = validate_row(ordinal, &row, raw.len(), training_domain)?;
             #[cfg(feature = "semantic-policy")]
-            row_bytes_identities.push(row.bytes_identity);
+            row_bytes_identities.push((row.bytes_identity, row.edit_demonstration_material_roots));
             raw.extend_from_slice(row.bytes.as_ref());
             descriptors.push(descriptor);
         }
@@ -2103,7 +2117,8 @@ impl SemanticTrainingViewArena {
                         ordinal,
                         identity: row.identity,
                         source_identity: row.source_identity,
-                        bytes_identity: row_bytes_identities[ordinal as usize],
+                        bytes_identity: row_bytes_identities[ordinal as usize].0,
+                        edit_demonstration_material_roots: row_bytes_identities[ordinal as usize].1,
                         content_identity: row.content_identity,
                         origin: row.origin,
                     }
@@ -2123,6 +2138,14 @@ impl SemanticTrainingViewArena {
                 .map_err(|_| SemanticTransitionError::GenerationExhausted)?;
             let count = usize::try_from(group.member_count)
                 .map_err(|_| SemanticTransitionError::GenerationExhausted)?;
+            if group_members[start..start + count]
+                .iter()
+                .any(|&ordinal| row_bytes_identities[ordinal as usize].1.is_none())
+            {
+                return Err(input_error(
+                    "every supervised-edit row requires its admitted original witness byte roots",
+                ));
+            }
             group_members[start..start + count]
                 .iter()
                 .map(|&ordinal| {
@@ -2131,7 +2154,8 @@ impl SemanticTrainingViewArena {
                         ordinal,
                         identity: row.identity,
                         source_identity: row.source_identity,
-                        bytes_identity: row_bytes_identities[ordinal as usize],
+                        bytes_identity: row_bytes_identities[ordinal as usize].0,
+                        edit_demonstration_material_roots: row_bytes_identities[ordinal as usize].1,
                         content_identity: row.content_identity,
                         origin: row.origin,
                     }
@@ -2212,6 +2236,7 @@ impl SemanticTrainingViewArena {
         group_members.resize(member_capacity, 0);
         groups.resize(8, SemanticTrainingObjectiveGroupRecord::default());
         canaries.resize(5, SemanticTrainingCanaryRecord::default());
+        let canary_rows = std::array::from_fn(|index| canaries[index].row_ordinal);
         protected_members.resize(protected_capacity, 0);
         descriptors.resize(
             replay_capacity.row_capacity,
@@ -2227,6 +2252,7 @@ impl SemanticTrainingViewArena {
             groups,
             group_members,
             canaries,
+            canary_rows,
             protected_members,
             #[cfg(feature = "semantic-policy")]
             actor_group_member_count,
@@ -2321,6 +2347,7 @@ impl SemanticTrainingViewArena {
             groups,
             group_members,
             canaries,
+            canary_rows,
             protected_members,
             #[cfg(feature = "semantic-policy")]
             actor_group_member_count,
@@ -2437,6 +2464,7 @@ impl SemanticTrainingViewArena {
             groups: device_groups,
             group_members: device_group_members,
             canaries: device_canaries,
+            canary_rows,
             #[cfg(feature = "semantic-policy")]
             protected_members: device_protected_members,
             #[cfg(feature = "semantic-policy")]

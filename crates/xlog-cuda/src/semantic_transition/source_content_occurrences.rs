@@ -93,6 +93,1265 @@ pub struct SemanticSourceContentEvent<A = DeviceAllocationProvenance> {
     pub allocations: Vec<SemanticSourceAllocationDescriptor<A>>,
 }
 
+/// One original prepared capture or verification, before any numerical effect.
+#[derive(Clone)]
+pub struct SemanticPreparedTensorContentEvent {
+    pub kind: SemanticSourceContentKind,
+    pub receiver_slot: u64,
+    pub output_slot: Option<u64>,
+    pub tensors: Vec<SemanticSourceTensorDescriptor>,
+    pub allocations: Vec<SemanticSourceAllocationDescriptor<SemanticSourceContentAllocation>>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SemanticPreparedTensorContentBindings {
+    pub policy_slot: Option<u64>,
+    pub continuation_slot: Option<u64>,
+    pub model_slot: Option<u64>,
+}
+
+/// An original prepared receiver issued by its native source owner.
+#[derive(Clone)]
+pub struct SemanticPreparedTensorContentReceiver {
+    step: SemanticPreparedStep,
+    bank: usize,
+    slot: u64,
+    plan: Arc<PreparedTensorContentPlan>,
+    index: usize,
+    model: bool,
+    lineage: Option<(Arc<actor_refresh::PreparedActorRefreshOwner>, usize)>,
+}
+
+struct PreparedContentRetainedOwner {
+    _tensors: Vec<PreparedSemanticTensor>,
+    _verification_inputs: Vec<PreparedSemanticTensor>,
+    _seals: TensorContentSeals,
+}
+
+fn same_prepared_content_descriptors(
+    a: &SemanticPreparedTensorContentEvent,
+    b: &SemanticPreparedTensorContentEvent,
+) -> bool {
+    a.tensors == b.tensors
+        && a.allocations.len() == b.allocations.len()
+        && a.allocations.iter().all(|allocation| {
+            b.allocations.iter().any(|other| {
+                allocation.slot == other.slot
+                    && allocation.span_bytes == other.span_bytes
+                    && match (&allocation.native_allocation, &other.native_allocation) {
+                        (None, None) => true,
+                        (
+                            Some(SemanticSourceContentAllocation::Native(a)),
+                            Some(SemanticSourceContentAllocation::Native(b)),
+                        ) => a.same_allocation(b),
+                        (
+                            Some(SemanticSourceContentAllocation::Geometry(a)),
+                            Some(SemanticSourceContentAllocation::Geometry(b)),
+                        ) => a.same_handle(b),
+                        _ => false,
+                    }
+            })
+        })
+}
+
+impl SemanticPreparedTensorContentReceiver {
+    fn require_target(
+        &self,
+        step: &SemanticPreparedStep,
+        bank: usize,
+    ) -> Result<(), SemanticTransitionError> {
+        if Arc::ptr_eq(&self.step.issuer, &step.issuer)
+            && Arc::ptr_eq(&self.step.scope, &step.scope)
+        {
+            return Ok(());
+        }
+        if self.lineage.as_ref().is_none_or(|(original, target_bank)| {
+            !Arc::ptr_eq(&original.issuer, &step.issuer)
+                || !Arc::ptr_eq(&original.scope, &step.scope)
+                || original.step != step.token
+                || *target_bank != bank
+        }) {
+            return Err(publication_input_error(
+                "prepared content receiver belongs to another original contribution lineage",
+            ));
+        }
+        Ok(())
+    }
+
+    fn authenticate(
+        &self,
+        witness: &SemanticTensorContentWitness,
+        content: &TensorContentBuffers,
+    ) -> Result<(), SemanticTransitionError> {
+        if witness.reader_token != self.step.token
+            || !Arc::ptr_eq(&witness.issuer, &self.step.issuer)
+        {
+            return Err(publication_input_error(
+                "prepared content changed its frozen source receiver owner",
+            ));
+        }
+        let plan = &self.plan.banks[self.bank];
+        let state = plan.state.lock().map_err(|_| {
+            publication_input_error("original content receiver custody is poisoned")
+        })?;
+        let event = &plan.events[self.index];
+        if state.cursor <= self.index
+            || state
+                .witnesses
+                .get(&self.slot)
+                .is_none_or(|original| !original.matches(witness))
+            || !same_source_tensor_geometry(&event.tensors, &content.tensors)
+            || content.native_work_ceiling(true)? != plan.verify_ceilings[self.index]
+            || matches!(&content.seals, TensorContentSeals::Model(_)) != self.model
+        {
+            return Err(publication_input_error(
+                "prepared content lost its authentic frozen source witness",
+            ));
+        }
+        for (descriptor, tensor) in event.tensors.iter().zip(&content.tensors) {
+            let (base, span, native) = state
+                .allocations
+                .get(&descriptor.allocation_slot)
+                .ok_or(SemanticTransitionError::ObservationMismatch)?;
+            if base.checked_add(descriptor.byte_offset) != Some(tensor.data)
+                || event
+                    .allocations
+                    .iter()
+                    .find(|allocation| allocation.slot == descriptor.allocation_slot)
+                    .is_none_or(|allocation| allocation.span_bytes != *span)
+                || match (native, &tensor.native_allocation) {
+                    (None, None) => false,
+                    (Some(a), Some(b)) => {
+                        !a.same_allocation(b) || a.allocation_bytes() != b.allocation_bytes()
+                    }
+                    _ => true,
+                }
+            {
+                return Err(publication_input_error(
+                    "prepared content changed its authenticated original backing allocation",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum PreparedContentBindingKind {
+    Policy,
+    Continuation,
+    Model,
+}
+
+struct PreparedContentBank {
+    events: Vec<SemanticPreparedTensorContentEvent>,
+    owners: Vec<u64>,
+    ceilings: Vec<[u64; 9]>,
+    verify_ceilings: Vec<[u64; 9]>,
+    receivers: Vec<Option<SemanticPreparedTensorContentReceiver>>,
+    ceiling: [u64; 9],
+    bindings: SemanticPreparedTensorContentBindings,
+    state: Mutex<PreparedContentState>,
+}
+
+#[derive(Default)]
+struct PreparedContentState {
+    cursor: usize,
+    pending: bool,
+    receiver: Option<(u64, SemanticPreparedStep)>,
+    witnesses: BTreeMap<u64, SourceWitnessIdentity>,
+    allocations: BTreeMap<u64, (u64, u64, Option<DeviceAllocationProvenance>)>,
+    storage: BTreeMap<u64, u64>,
+    retained: Vec<PreparedContentRetainedOwner>,
+}
+
+pub(super) struct PreparedTensorContentPlan {
+    banks: [PreparedContentBank; 2],
+    _reservation: SemanticReplayMaterialReservation,
+}
+
+impl PreparedTensorContentPlan {
+    pub(super) fn new(
+        session: &SemanticTransitionSession,
+        step: &SemanticPreparedStep,
+        events: &[Vec<SemanticPreparedTensorContentEvent>; 2],
+        bindings: &[SemanticPreparedTensorContentBindings; 2],
+        links: &[SemanticPreparedTensorContentReceiver],
+        capture_owner: impl Fn(
+            usize,
+            u64,
+        ) -> Result<
+            Option<SemanticPreparedTensorContentReceiver>,
+            SemanticTransitionError,
+        >,
+    ) -> Result<Self, SemanticTransitionError> {
+        // Charge the copied descriptors and all construction-custody maps to
+        // the original material owner before cloning any caller roster.
+        let node = OwnedPublicationMaterial::tree_node_bound(
+            size_of::<(u64, (u64, u64, Option<DeviceAllocationProvenance>))>().max(size_of::<(
+                u64,
+                SourceWitnessIdentity,
+            )>(
+            )),
+            0,
+        )?;
+        let mut bytes =
+            size_of::<Self>() + 2 * size_of::<PreparedContentBank>() + 4 * size_of::<usize>();
+        for event in events.iter().flatten() {
+            bytes = bytes
+                .checked_add(
+                    size_of::<SemanticPreparedTensorContentEvent>()
+                        + size_of::<[u64; 9]>()
+                        + size_of::<u64>()
+                        + size_of::<[u64; 9]>()
+                        + size_of::<Option<SemanticPreparedTensorContentReceiver>>()
+                        + size_of::<PreparedContentRetainedOwner>(),
+                )
+                .and_then(|bytes| bytes.checked_add(4 * node))
+                .and_then(|bytes| {
+                    bytes.checked_add(event.tensors.len().checked_mul(
+                        size_of::<SemanticSourceTensorDescriptor>()
+                            + 4 * node
+                            + 2 * size_of::<PreparedSemanticTensor>()
+                            + size_of::<CapturedTensorDigest>(),
+                    )?)
+                })
+                .and_then(|bytes| {
+                    bytes.checked_add(event.allocations.len().checked_mul(
+                        size_of::<
+                            SemanticSourceAllocationDescriptor<SemanticSourceContentAllocation>,
+                        >() + 2 * node,
+                    )?)
+                })
+                .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        }
+        let reservation = session
+            .replay_material_budget
+            .as_ref()
+            .ok_or_else(|| {
+                publication_input_error(
+                    "prepared content requires its original material metadata pool",
+                )
+            })?
+            .reserve_auxiliary(
+                u64::try_from(bytes).map_err(|_| SemanticTransitionError::GenerationExhausted)?,
+            )?;
+        let mut banks = Vec::with_capacity(2);
+        for (bank, events) in events.iter().enumerate() {
+            let mut outputs = BTreeMap::new();
+            let mut witness_slots = BTreeSet::new();
+            let mut spans = BTreeMap::new();
+            let mut storage = BTreeMap::new();
+            let mut ceilings = Vec::with_capacity(events.len());
+            let mut verify_ceilings = Vec::with_capacity(events.len());
+            let mut receivers = Vec::with_capacity(events.len());
+            let mut owners = Vec::with_capacity(events.len());
+            let mut ceiling = [0; 9];
+            for event in events {
+                if event.tensors.is_empty()
+                    || !matches!(
+                        (event.kind, event.output_slot),
+                        (SemanticSourceContentKind::Capture, Some(_))
+                            | (SemanticSourceContentKind::Verify, None)
+                    )
+                {
+                    return Err(publication_input_error(
+                        "prepared content requires its complete typed capture/verify roster",
+                    ));
+                }
+                validate_content_coordinates(
+                    event
+                        .tensors
+                        .iter()
+                        .map(|tensor| (tensor.layout.role, tensor.layout.index)),
+                )?;
+                if let Some(output) = event.output_slot {
+                    if output == event.receiver_slot
+                        || !witness_slots.insert(output)
+                        || outputs.insert(output, event).is_some()
+                    {
+                        return Err(publication_input_error(
+                            "prepared content capture requires a unique original witness slot",
+                        ));
+                    }
+                } else {
+                    witness_slots.insert(event.receiver_slot);
+                    if outputs
+                        .get(&event.receiver_slot)
+                        .is_some_and(|original| !same_prepared_content_descriptors(original, event))
+                    {
+                        return Err(publication_input_error(
+                            "prepared verification changed its original capture geometry",
+                        ));
+                    }
+                }
+                let mut used = BTreeSet::new();
+                let mut allocations = BTreeMap::new();
+                for allocation in &event.allocations {
+                    if allocations
+                        .insert(allocation.slot, allocation.span_bytes)
+                        .is_some()
+                        || spans
+                            .insert(allocation.slot, allocation.span_bytes)
+                            .is_some_and(|original| original != allocation.span_bytes)
+                    {
+                        return Err(publication_input_error(
+                            "prepared content allocation slot changed its original complete span",
+                        ));
+                    }
+                    if let Some(native) = allocation
+                        .native_allocation
+                        .as_ref()
+                        .and_then(SourceContentAllocation::native_provenance)
+                    {
+                        if native.allocation_bytes() != allocation.span_bytes {
+                            return Err(publication_input_error(
+                                "prepared content native allocation has a different original span",
+                            ));
+                        }
+                    }
+                }
+                for tensor in &event.tensors {
+                    let bytes = tensor_layout_bytes(&tensor.layout)?;
+                    tensor_content_range(
+                        &tensor.layout,
+                        tensor.logical_begin,
+                        tensor.logical_end,
+                        bytes,
+                    )?;
+                    if allocations.get(&tensor.allocation_slot).is_none_or(|span| {
+                        tensor
+                            .byte_offset
+                            .checked_add(bytes as u64)
+                            .is_none_or(|end| end > *span)
+                    }) || storage
+                        .insert(tensor.storage_slot, tensor.allocation_slot)
+                        .is_some_and(|original| original != tensor.allocation_slot)
+                    {
+                        return Err(publication_input_error(
+                            "prepared content typed view changed its complete backing allocation",
+                        ));
+                    }
+                    used.insert(tensor.allocation_slot);
+                }
+                if used.len() != allocations.len() {
+                    return Err(publication_input_error(
+                        "prepared content has an unused allocation descriptor",
+                    ));
+                }
+                let verify = event.kind == SemanticSourceContentKind::Verify;
+                let mut receiver = if verify {
+                    capture_owner(bank, event.receiver_slot)?
+                } else {
+                    None
+                };
+                if verify
+                    && receiver.is_none()
+                    && !outputs.contains_key(&event.receiver_slot)
+                    && bindings[bank].model_slot != Some(event.receiver_slot)
+                {
+                    let mut matching = links.iter().filter(|link| {
+                        link.slot == event.receiver_slot && link.require_target(step, bank).is_ok()
+                    });
+                    receiver = matching.next().cloned();
+                    if matching.next().is_some() {
+                        return Err(publication_input_error(
+                            "prepared receiver has multiple original source links",
+                        ));
+                    }
+                    if receiver.is_none() {
+                        return Err(publication_input_error("prepared verification requires its original predeclared receiver owner"));
+                    }
+                }
+                let verification = if let Some(original) = &receiver {
+                    original.require_target(step, bank)?;
+                    if !same_prepared_content_descriptors(
+                        event,
+                        &original.plan.banks[original.bank].events[original.index],
+                    ) {
+                        return Err(publication_input_error("prepared verification changed its original source descriptors or allocation provenance"));
+                    }
+                    original.plan.banks[original.bank].verify_ceilings[original.index]
+                } else {
+                    session.prepared_content_event_native_work_ceiling(
+                        step,
+                        bank,
+                        event,
+                        true,
+                        verify && bindings[bank].model_slot == Some(event.receiver_slot),
+                    )?
+                };
+                let bound = if verify {
+                    verification
+                } else {
+                    session.prepared_content_event_native_work_ceiling(
+                        step, bank, event, false, false,
+                    )?
+                };
+                native_work_bound::add_native_work_ceiling(&mut ceiling, bound)?;
+                ceilings.push(bound);
+                owners.push(
+                    receiver
+                        .as_ref()
+                        .map_or(step.token, |original| original.step.token),
+                );
+                verify_ceilings.push(verification);
+                receivers.push(receiver);
+            }
+            let binding = bindings[bank];
+            let kind = session.prepared_transition_kind(step)?;
+            let storage = session
+                .publication
+                .as_ref()
+                .ok_or(SemanticTransitionError::NotBound)?;
+            if binding.policy_slot.is_some() != (kind == SemanticTransitionKind::Proposal)
+                || binding.continuation_slot.is_some() != (kind != SemanticTransitionKind::Drain)
+                || binding.model_slot.is_some() != (kind != SemanticTransitionKind::Drain)
+            {
+                return Err(publication_input_error(
+                    "prepared content bindings changed their original step services",
+                ));
+            }
+            for (slot, copies) in [(binding.policy_slot, 1), (binding.continuation_slot, 2)] {
+                if let Some(slot) = slot {
+                    let event = events
+                        .iter()
+                        .find(|event| event.output_slot == Some(slot))
+                        .ok_or_else(|| {
+                            publication_input_error(
+                                "prepared intrinsic binding has no original capture witness slot",
+                            )
+                        })?;
+                    let guard = session.prepared_content_event_native_work_ceiling(
+                        step, bank, event, true, false,
+                    )?;
+                    for _ in 0..copies {
+                        native_work_bound::add_native_work_ceiling(&mut ceiling, guard)?;
+                    }
+                }
+            }
+            if binding.model_slot.is_some_and(|slot| {
+                events.iter().any(|event| event.output_slot == Some(slot))
+                    || !events.iter().any(|event| {
+                        event.kind == SemanticSourceContentKind::Verify
+                            && event.receiver_slot == slot
+                    })
+            }) {
+                return Err(publication_input_error(
+                    "prepared block binding has no original model verification witness slot",
+                ));
+            }
+            if kind == SemanticTransitionKind::Proposal
+                && storage.physical_parameter_roster.is_some()
+            {
+                native_work_bound::add_native_work_ceiling(
+                    &mut ceiling,
+                    native_work_bound::numerical_block_snapshot_native_work_ceiling(
+                        storage
+                            .physical_parameter_roster
+                            .as_ref()
+                            .expect("declared proposal block roster")
+                            .len(),
+                    )?,
+                )?;
+            }
+            banks.push(PreparedContentBank {
+                events: events.clone(),
+                owners,
+                ceilings,
+                verify_ceilings,
+                receivers,
+                ceiling,
+                bindings: binding,
+                state: Mutex::new(PreparedContentState {
+                    retained: Vec::with_capacity(events.len()),
+                    ..PreparedContentState::default()
+                }),
+            });
+        }
+        Ok(Self {
+            banks: banks
+                .try_into()
+                .map_err(|_| SemanticTransitionError::ObservationMismatch)?,
+            _reservation: reservation,
+        })
+    }
+
+    pub(super) fn native_work_ceiling(&self, bank: usize) -> [u64; 9] {
+        self.banks[bank].ceiling
+    }
+
+    pub(super) fn require_binding(
+        &self,
+        bank: usize,
+        kind: PreparedContentBindingKind,
+        witness: &SemanticTensorContentWitness,
+    ) -> Result<(), SemanticTransitionError> {
+        let plan = &self.banks[bank];
+        let slot = match kind {
+            PreparedContentBindingKind::Policy => plan.bindings.policy_slot,
+            PreparedContentBindingKind::Continuation => plan.bindings.continuation_slot,
+            PreparedContentBindingKind::Model => plan.bindings.model_slot,
+        }
+        .ok_or_else(|| {
+            publication_input_error(
+                "prepared intrinsic consumer has no original declared witness slot",
+            )
+        })?;
+        let state = plan
+            .state
+            .lock()
+            .map_err(|_| publication_input_error("prepared content custody is poisoned"))?;
+        if state.pending
+            || state
+                .witnesses
+                .get(&slot)
+                .is_none_or(|original| !original.matches(witness))
+        {
+            return Err(publication_input_error(
+                "prepared intrinsic consumer changed its original bound witness",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn claim(
+        &self,
+        session: &SemanticTransitionSession,
+        step: &SemanticPreparedStep,
+        bank: usize,
+        witness: &SemanticTensorContentWitness,
+        verify: bool,
+        content: &TensorContentBuffers,
+        verification_inputs: Option<Vec<PreparedSemanticTensor>>,
+    ) -> Result<(), SemanticTransitionError> {
+        let plan = &self.banks[bank];
+        let mut state = plan
+            .state
+            .lock()
+            .map_err(|_| publication_input_error("prepared content custody is poisoned"))?;
+        let event = plan.events.get(state.cursor).ok_or_else(|| {
+            publication_input_error(
+                "prepared content exceeds its original frozen occurrence roster",
+            )
+        })?;
+        if witness.reader_token != plan.owners[state.cursor]
+            || plan.receivers[state.cursor].is_none() && !Arc::ptr_eq(&witness.issuer, &step.issuer)
+        {
+            return Err(publication_input_error(
+                "prepared capture belongs to another original recorder",
+            ));
+        }
+        if state.pending
+            || verify != (event.kind == SemanticSourceContentKind::Verify)
+            || !same_source_tensor_geometry(&event.tensors, &content.tensors)
+            || verification_inputs.as_ref().is_some_and(|inputs| {
+                plan.receivers[state.cursor].is_none() || inputs.len() != event.tensors.len()
+            })
+            || content.native_work_ceiling(verify)? != plan.ceilings[state.cursor]
+            || matches!(&content.seals, TensorContentSeals::Model(model)
+                if model.prepared.as_ref().is_some_and(|original| original.bank ==
+                    plan.receivers[state.cursor].as_ref().map_or(bank, |receiver| receiver.bank)))
+                != (verify
+                    && plan.receivers[state.cursor].as_ref().map_or(
+                        plan.bindings.model_slot == Some(event.receiver_slot),
+                        |original| original.model,
+                    ))
+        {
+            return Err(publication_input_error(
+                "prepared content changed its next original typed occurrence or native producer",
+            ));
+        }
+        // A claim has no rollback after its first retained owner or custody
+        // mutation. A failed authentication must keep this original occurrence
+        // pending, rather than admit another owner against the same reservation.
+        state.pending = true;
+        if let Some(original) = &plan.receivers[state.cursor] {
+            state.retained.push(PreparedContentRetainedOwner {
+                _tensors: content.tensors.clone(),
+                _verification_inputs: verification_inputs.unwrap_or_default(),
+                _seals: content.seals.clone(),
+            });
+            original.authenticate(witness, content)?;
+        }
+        if verify {
+            if let Some(original) = state.witnesses.get(&event.receiver_slot) {
+                if !original.matches(witness) {
+                    return Err(publication_input_error(
+                        "prepared verification changed its original witness receiver",
+                    ));
+                }
+            } else {
+                // A retained genuine witness can precede this step's plan.
+                // The caller has already authenticated its native owner and
+                // exact captured tensor roster, not fabricated a new witness.
+                if state
+                    .witnesses
+                    .values()
+                    .any(|original| original.matches(witness))
+                {
+                    return Err(publication_input_error(
+                        "prepared witness slots changed their original alias partition",
+                    ));
+                }
+                state.witnesses.insert(
+                    event.receiver_slot,
+                    SourceWitnessIdentity::from_witness(witness),
+                );
+            }
+        } else {
+            if state
+                .witnesses
+                .values()
+                .any(|original| original.matches(witness))
+            {
+                return Err(publication_input_error(
+                    "prepared capture reused an earlier native witness output",
+                ));
+            }
+            if state.receiver.as_ref().is_some_and(|(slot, original)| {
+                *slot != event.receiver_slot || !original.same_handle(step)
+            }) {
+                return Err(publication_input_error(
+                    "prepared capture changed its original Step receiver",
+                ));
+            }
+            state.receiver = Some((event.receiver_slot, step.clone()));
+        }
+        for (descriptor, tensor) in event.tensors.iter().zip(&content.tensors) {
+            let allocation = event
+                .allocations
+                .iter()
+                .find(|allocation| allocation.slot == descriptor.allocation_slot)
+                .expect("validated original descriptor");
+            if plan.receivers[state.cursor].is_none() {
+                session.require_prepared_content_allocation(
+                    step, bank, allocation, descriptor, tensor,
+                )?;
+            }
+            let base = tensor
+                .data
+                .checked_sub(descriptor.byte_offset)
+                .ok_or(SemanticTransitionError::ObservationMismatch)?;
+            if allocation.span_bytes != 0 {
+                cuda_backing_allocation(
+                    base,
+                    usize::try_from(allocation.span_bytes)
+                        .map_err(|_| SemanticTransitionError::GenerationExhausted)?,
+                )?;
+            }
+            for (&slot, (original_base, original_span, original_native)) in &state.allocations {
+                if slot == allocation.slot
+                    && (*original_base, *original_span) != (base, allocation.span_bytes)
+                    || slot != allocation.slot
+                        && allocation.span_bytes != 0
+                        && (*original_base, *original_span) == (base, allocation.span_bytes)
+                    || original_native
+                        .as_ref()
+                        .zip(tensor.native_allocation.as_ref())
+                        .is_some_and(|(original, actual)| {
+                            original.same_allocation(actual) != (slot == allocation.slot)
+                        })
+                {
+                    return Err(publication_input_error(
+                        "prepared content changed its original backing alias partition",
+                    ));
+                }
+            }
+            state.allocations.insert(
+                allocation.slot,
+                (
+                    base,
+                    allocation.span_bytes,
+                    tensor.native_allocation.clone(),
+                ),
+            );
+            if state
+                .storage
+                .insert(descriptor.storage_slot, allocation.slot)
+                .is_some_and(|original| original != allocation.slot)
+            {
+                return Err(publication_input_error(
+                    "prepared content storage changed its original allocation",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn complete(
+        &self,
+        bank: usize,
+        witness: &SemanticTensorContentWitness,
+    ) -> Result<(), SemanticTransitionError> {
+        let plan = &self.banks[bank];
+        let mut state = plan
+            .state
+            .lock()
+            .map_err(|_| publication_input_error("prepared content custody is poisoned"))?;
+        if !state.pending {
+            return Err(SemanticTransitionError::ObservationMismatch);
+        }
+        let event = &plan.events[state.cursor];
+        if let Some(output) = event.output_slot {
+            state
+                .witnesses
+                .insert(output, SourceWitnessIdentity::from_witness(witness));
+        }
+        state.pending = false;
+        state.cursor += 1;
+        Ok(())
+    }
+
+    pub(super) fn require_complete(&self, bank: usize) -> Result<(), SemanticTransitionError> {
+        let plan = &self.banks[bank];
+        let state = plan
+            .state
+            .lock()
+            .map_err(|_| publication_input_error("prepared content custody is poisoned"))?;
+        if state.pending || state.cursor != plan.events.len() {
+            return Err(publication_input_error(
+                "prepared branch omitted an original content occurrence",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl SemanticTransitionSession {
+    /// Return receiver pins only after every still-owned original step has
+    /// joined its final consumers and the original graph has retired. Drop the
+    /// returned owners outside the Session lock, before releasing producers.
+    pub fn take_prepared_tensor_content_receivers_for_retirement(
+        &mut self,
+        step: &SemanticPreparedStep,
+    ) -> Result<impl Send + 'static, SemanticTransitionError> {
+        self.ensure_quiescent()?;
+        let build = self
+            .prepared_segment
+            .as_ref()
+            .ok_or(SemanticTransitionError::NotCaptured)?;
+        build.check_retained(step, &self.publication_issuer)?;
+        for token in &build.tokens {
+            if self.steps.contains_key(token) {
+                self.retained_prepared_step_final_consumers(&SemanticPreparedStep {
+                    issuer: Arc::clone(&build.issuer),
+                    scope: Arc::clone(&build.scope),
+                    token: *token,
+                })?;
+            }
+        }
+        if build.cancelled.load(Ordering::Acquire) {
+            if build.completed || (build.submitted && !build.has_never_graph_called_proof()) {
+                return Err(SemanticTransitionError::ObservationMismatch);
+            }
+            self.require_original_prepared_graph_retirement()?;
+        } else {
+            self.require_completed_prepared_graph_retirement()?;
+        }
+        Ok(self
+            .steps
+            .get_mut(&step.token)
+            .and_then(|owner| owner.prepared.as_mut())
+            .and_then(|prepared| prepared.content_plan.take()))
+    }
+
+    pub fn verify_prepared_tensor_content_in_recording_step(
+        &mut self,
+        recording_step: &SemanticPreparedStep,
+        original_step: &SemanticPreparedStep,
+        witness: &SemanticTensorContentWitness,
+        tensors: Vec<SemanticTensorInput>,
+        consumer_stream: u64,
+        occurrence: Option<&SemanticSourceContentOccurrence>,
+    ) -> Result<(), SemanticTransitionError> {
+        let mut pending = RetainedTensorAdmission {
+            inputs: Some(tensors),
+            stream: Arc::clone(&self.stream),
+            consumer_stream: Some(consumer_stream),
+            ready: false,
+        };
+        self.require_prepared_tensor_content_recorder(recording_step)?;
+        self.verify_prepared_tensor_content(
+            original_step,
+            witness,
+            pending
+                .inputs
+                .take()
+                .expect("retained original producer roster"),
+            consumer_stream,
+            occurrence,
+        )
+    }
+
+    pub fn verify_prepared_foreign_tensor_content(
+        &mut self,
+        recording_step: &SemanticPreparedStep,
+        source: &mut SemanticTransitionSession,
+        original_step: &SemanticPreparedStep,
+        witness: &SemanticTensorContentWitness,
+        tensors: Vec<SemanticTensorInput>,
+        consumer_stream: u64,
+    ) -> Result<(), SemanticTransitionError> {
+        let pending = RetainedTensorAdmission {
+            inputs: Some(tensors),
+            stream: Arc::clone(&self.stream),
+            consumer_stream: Some(consumer_stream),
+            ready: false,
+        };
+        let bank = self.require_prepared_tensor_content_recorder(recording_step)?;
+        self.check_prepared_content_stream(recording_step, consumer_stream)?;
+        source.checked_prepared_content_witness(original_step, witness)?;
+        let staged = source.actor_refresh.as_ref().ok_or_else(|| {
+            publication_input_error(
+                "foreign prepared content requires its original contribution lineage",
+            )
+        })?;
+        if !Arc::ptr_eq(&staged.proof.inner.issuer, &recording_step.issuer)
+            || !Arc::ptr_eq(&staged.proof.inner.scope, &recording_step.scope)
+            || staged.proof.inner.step != recording_step.token
+            || staged.target_bank != bank
+            || !Arc::ptr_eq(&self.provider, &source.provider)
+            || self
+                .replay_material_budget
+                .as_ref()
+                .zip(source.replay_material_budget.as_ref())
+                .is_none_or(|(target, original)| !target.same_pool(original))
+        {
+            return Err(publication_input_error(
+                "foreign content changed its original Update, bank, provider or material owner",
+            ));
+        }
+        let actual = prepare_retained_semantic_tensors(&self.provider, pending)?;
+        let content = &source.steps[&original_step.token].content[witness.index];
+        if content.tensors.len() != actual.len()
+            || content
+                .tensors
+                .iter()
+                .zip(&actual)
+                .any(|(original, actual)| !same_tensor_content_owner(original, actual))
+        {
+            self.poisoned = true;
+            return Err(publication_input_error(
+                "foreign content verification changed its exact original tensor owners",
+            ));
+        }
+        let plan = self.steps[&recording_step.token]
+            .prepared
+            .as_ref()
+            .and_then(|prepared| prepared.content_plan.as_ref())
+            .ok_or(SemanticTransitionError::ObservationMismatch)?;
+        plan.claim(
+            self,
+            recording_step,
+            bank,
+            witness,
+            true,
+            content,
+            Some(actual),
+        )?;
+        let work = self.prepared_policy_work_counter(
+            recording_step,
+            bank,
+            policy_work::PolicyWorkKey::ModelScratch,
+            &self.publication_issuer,
+            recording_step.token,
+        )?;
+        let execute = source.steps[&original_step.token]
+            .prepared
+            .as_ref()
+            .expect("original prepared witness kernel")
+            .witness
+            .clone();
+        let content = &source.steps[&original_step.token].content[witness.index];
+        content.enqueue_with_custody(
+            &self.domain,
+            &mut self.poisoned,
+            &execute,
+            true,
+            None,
+            false,
+            Some(&work),
+            true,
+            None,
+        )?;
+        plan.complete(bank, witness)
+    }
+
+    pub fn require_prepared_tensor_content_recorder(
+        &self,
+        step: &SemanticPreparedStep,
+    ) -> Result<usize, SemanticTransitionError> {
+        let (original, bank) = self.current_prepared_content_recorder()?;
+        if !original.same_handle(step) {
+            return Err(publication_input_error(
+                "prepared content replaced its original active recording Step",
+            ));
+        }
+        Ok(bank)
+    }
+    pub fn prepared_tensor_content_receiver(
+        &self,
+        step: &SemanticPreparedStep,
+        bank: usize,
+        slot: u64,
+    ) -> Result<SemanticPreparedTensorContentReceiver, SemanticTransitionError> {
+        self.checked_prepared_step(step, false)?;
+        if bank > 1 {
+            return Err(publication_input_error(
+                "prepared content source bank must be zero or one",
+            ));
+        }
+        let plan = self.steps[&step.token]
+            .prepared
+            .as_ref()
+            .and_then(|prepared| prepared.content_plan.as_ref())
+            .ok_or_else(|| {
+                publication_input_error(
+                    "prepared receiver requires its source's original finalized content plan",
+                )
+            })?;
+        let model = plan.banks[bank].bindings.model_slot == Some(slot);
+        let index = plan.banks[bank]
+            .events
+            .iter()
+            .position(|event| {
+                if model {
+                    event.kind == SemanticSourceContentKind::Verify && event.receiver_slot == slot
+                } else {
+                    event.output_slot == Some(slot)
+                }
+            })
+            .ok_or_else(|| {
+                publication_input_error(
+                    "prepared receiver has no authentic original capture or model witness slot",
+                )
+            })?;
+        Ok(SemanticPreparedTensorContentReceiver {
+            step: step.clone(),
+            bank,
+            slot,
+            plan: Arc::clone(plan),
+            index,
+            model,
+            lineage: self
+                .actor_refresh
+                .as_ref()
+                .map(|staged| (Arc::clone(&staged.proof.inner), staged.target_bank)),
+        })
+    }
+
+    pub(super) fn require_prepared_content_binding(
+        &self,
+        step: &SemanticPreparedStep,
+        bank: usize,
+        kind: PreparedContentBindingKind,
+        witness: &SemanticTensorContentWitness,
+    ) -> Result<(), SemanticTransitionError> {
+        self.steps
+            .get(&step.token)
+            .and_then(|owner| owner.prepared.as_ref())
+            .and_then(|prepared| prepared.content_plan.as_ref())
+            .ok_or_else(|| {
+                publication_input_error("prepared intrinsic consumer has no original content plan")
+            })?
+            .require_binding(bank, kind, witness)
+    }
+
+    pub(super) fn current_prepared_content_recorder(
+        &self,
+    ) -> Result<(SemanticPreparedStep, usize), SemanticTransitionError> {
+        let build = self
+            .prepared_segment
+            .as_ref()
+            .ok_or(SemanticTransitionError::NotCaptured)?;
+        let mut active = build.tokens.iter().filter_map(|token| {
+            self.steps
+                .get(token)
+                .and_then(|owner| owner.prepared.as_ref())
+                .and_then(|prepared| prepared.model_work.as_ref())
+                .and_then(|work| work.capture_bank.map(|bank| (*token, bank)))
+        });
+        let (token, bank) = active.next().ok_or_else(|| {
+            publication_input_error("prepared content has no original active recording bank")
+        })?;
+        if active.next().is_some() {
+            return Err(SemanticTransitionError::ObservationMismatch);
+        }
+        let step = SemanticPreparedStep {
+            issuer: Arc::clone(&build.issuer),
+            scope: Arc::clone(&build.scope),
+            token,
+        };
+        self.checked_prepared_step(&step, true)?;
+        Ok((step, bank))
+    }
+    fn prepared_content_geometry_owner(
+        &self,
+        allocation: &prepared_source_content::SemanticSourceGeometryAllocation,
+    ) -> Result<&Arc<prepared_source_content::SourceContentGeometryOwner>, SemanticTransitionError>
+    {
+        self.actor_refresh
+            .as_ref()
+            .and_then(|staged| {
+                staged
+                    .proof
+                    .inner
+                    .content_geometry
+                    .get(staged.target_bank)
+                    .map(|geometry| &geometry.owner)
+                    .filter(|owner| allocation.belongs_to(owner))
+            })
+            .ok_or_else(|| {
+                publication_input_error(
+                    "prepared content geometry belongs to another original child",
+                )
+            })
+    }
+
+    fn require_prepared_content_allocation(
+        &self,
+        step: &SemanticPreparedStep,
+        bank: usize,
+        allocation: &SemanticSourceAllocationDescriptor<SemanticSourceContentAllocation>,
+        descriptor: &SemanticSourceTensorDescriptor,
+        tensor: &PreparedSemanticTensor,
+    ) -> Result<(), SemanticTransitionError> {
+        match &allocation.native_allocation {
+            Some(SemanticSourceContentAllocation::Geometry(original)) => {
+                let owner = self.prepared_content_geometry_owner(original)?;
+                owner.require_allocation(original, allocation.span_bytes)?;
+                owner.require_content_overlay_stream(
+                    (self.prepared_transition_kind(step)?, bank),
+                    self.stream.cu_stream() as u64,
+                )?;
+                owner.require_prepared_allocation(
+                    self,
+                    step,
+                    (self.prepared_transition_kind(step)?, bank),
+                    original,
+                    descriptor,
+                    tensor,
+                )
+            }
+            Some(SemanticSourceContentAllocation::Native(original)) => {
+                if tensor.native_allocation.as_ref().is_none_or(|actual| {
+                    !original.same_allocation(actual)
+                        || actual.allocation_bytes() != allocation.span_bytes
+                }) {
+                    return Err(publication_input_error(
+                        "prepared content changed its original native allocation or byte offset",
+                    ));
+                }
+                Ok(())
+            }
+            None if tensor.native_allocation.is_none() => Ok(()),
+            None => Err(publication_input_error(
+                "prepared native content has no original allocation descriptor",
+            )),
+        }
+    }
+
+    fn prepared_content_native_classification(
+        &self,
+        step: &SemanticPreparedStep,
+        bank: usize,
+        descriptor: &SemanticSourceTensorDescriptor,
+        native: &DeviceAllocationProvenance,
+    ) -> Result<(bool, bool), SemanticTransitionError> {
+        let owner = &self.steps[&step.token];
+        let inputs = owner
+            .inputs
+            .as_ref()
+            .ok_or(SemanticTransitionError::NotBound)?;
+        let bytes = tensor_layout_bytes(&descriptor.layout)?;
+        let classify =
+            |view: DeviceMemoryView<u8>| -> Result<Option<(bool, bool)>, SemanticTransitionError> {
+                let Some(provenance) = view.allocation_provenance() else {
+                    return Ok(None);
+                };
+                if !native.same_allocation(&provenance) {
+                    return Ok(None);
+                }
+                let Some(offset) = descriptor.byte_offset.checked_sub(provenance.byte_offset())
+                else {
+                    return Ok(None);
+                };
+                let offset = usize::try_from(offset)
+                    .map_err(|_| SemanticTransitionError::GenerationExhausted)?;
+                let end = offset
+                    .checked_add(bytes)
+                    .ok_or(SemanticTransitionError::GenerationExhausted)?;
+                let Some(source) = view.try_slice(offset..end) else {
+                    return Ok(None);
+                };
+                let tensor = PreparedSemanticTensor {
+                    layout: descriptor.layout,
+                    logical_begin: descriptor.logical_begin,
+                    logical_end: descriptor.logical_end,
+                    data: *source.device_ptr(),
+                    source: Some(source),
+                    native_allocation: Some(native.clone()),
+                    _empty_owner: None,
+                };
+                if self.owns_pending_model_tensor(step, &tensor)? {
+                    return Ok(Some((false, false)));
+                }
+                if owner.feedback_origin_digest(&tensor)?.is_some() {
+                    return Ok(Some((false, true)));
+                }
+                if inputs.owns_tensor(&tensor)? {
+                    return Ok(Some((true, false)));
+                }
+                Ok(None)
+            };
+        for field in [
+            PublicationBankField::Source,
+            PublicationBankField::PrefixExtent,
+            PublicationBankField::RingHead,
+            PublicationBankField::Terminal,
+        ] {
+            if let Some(classification) = classify(inputs.field_view(field)?)? {
+                return Ok(classification);
+            }
+        }
+        for bank in &inputs.views {
+            for view in bank.values() {
+                if let Some(classification) = classify(view.clone())? {
+                    return Ok(classification);
+                }
+            }
+        }
+        for allocation in &inputs.storage.allocations {
+            if let Some(classification) = classify(allocation.slice()?.view())? {
+                return Ok(classification);
+            }
+        }
+        for allocation in &inputs.private {
+            if let Some(classification) = classify(allocation.view())? {
+                return Ok(classification);
+            }
+        }
+        for feedback in &owner.feedback {
+            for tensor in &feedback.content.tensors {
+                if let Some(view) = &tensor.source {
+                    if let Some(classification) = classify(view.clone())? {
+                        return Ok(classification);
+                    }
+                }
+            }
+        }
+        let branch = &owner
+            .prepared
+            .as_ref()
+            .ok_or(SemanticTransitionError::NotBound)?
+            .branches[bank];
+        if let Some(buffers) = branch
+            .policy_buffers
+            .as_ref()
+            .or_else(|| branch.policy.as_ref().map(|policy| &policy.buffers))
+        {
+            for domain in policy_uniform_domain_layouts(buffers, self.codebooks.input_cells)? {
+                let mut layout = domain.layout;
+                layout.index = descriptor.layout.index;
+                if native.same_allocation(&domain.allocation)
+                    && descriptor.layout == layout
+                    && descriptor.byte_offset == domain.allocation.byte_offset()
+                    && (descriptor.logical_begin, descriptor.logical_end) == (0, 0)
+                {
+                    return Ok((false, false));
+                }
+            }
+        }
+        Err(publication_input_error(
+            "prepared content native allocation has no original typed producer",
+        ))
+    }
+
+    fn prepared_content_event_native_work_ceiling(
+        &self,
+        step: &SemanticPreparedStep,
+        bank: usize,
+        event: &SemanticPreparedTensorContentEvent,
+        verify: bool,
+        model: bool,
+    ) -> Result<[u64; 9], SemanticTransitionError> {
+        let owner = &self.steps[&step.token];
+        let inputs = owner
+            .inputs
+            .as_ref()
+            .ok_or(SemanticTransitionError::NotBound)?;
+        if model
+            && (!verify
+                || !owner.content.iter().any(|content| {
+                    matches!(&content.seals, TensorContentSeals::Model(model)
+                if model.prepared.as_ref().is_some_and(|original| original.bank == bank))
+                        && same_source_tensor_geometry(&event.tensors, &content.tensors)
+                }))
+        {
+            return Err(publication_input_error(
+                "prepared model verification changed its original admitted bank roster",
+            ));
+        }
+        let mut ceiling = [0; 9];
+        if model {
+            let contract = inputs.storage.bank_templates[bank]
+                .iter()
+                .find(|range| (range.role, range.index) == (44, 0))
+                .ok_or(SemanticTransitionError::ObservationMismatch)?;
+            native_work_bound::add_native_work_ceiling(
+                &mut ceiling,
+                native_work_bound::content_digest_ceiling(contract.length_bytes, 21, false)?,
+            )?;
+        }
+        let mut input_guard = false;
+        for descriptor in &event.tensors {
+            let allocation = event
+                .allocations
+                .iter()
+                .find(|allocation| allocation.slot == descriptor.allocation_slot)
+                .ok_or(SemanticTransitionError::ObservationMismatch)?;
+            let (native_input, sealed) = match &allocation.native_allocation {
+                Some(SemanticSourceContentAllocation::Geometry(original)) => {
+                    let geometry = self.prepared_content_geometry_owner(original)?;
+                    geometry.require_allocation(original, allocation.span_bytes)?;
+                    geometry.classify_tensor(
+                        original,
+                        descriptor,
+                        Some((self.prepared_transition_kind(step)?, bank)),
+                    )?
+                }
+                Some(SemanticSourceContentAllocation::Native(native)) => {
+                    self.prepared_content_native_classification(step, bank, descriptor, native)?
+                }
+                None => (false, false),
+            };
+            if !model && native_input {
+                if !input_guard {
+                    native_work_bound::add_native_work_ceiling(
+                        &mut ceiling,
+                        inputs.native_work_ceiling()?,
+                    )?;
+                    input_guard = true;
+                }
+            } else {
+                native_work_bound::add_native_work_ceiling(
+                    &mut ceiling,
+                    native_work_bound::tensor_layout_native_work_ceiling(
+                        &descriptor.layout,
+                        descriptor.logical_begin,
+                        descriptor.logical_end,
+                        tensor_layout_bytes(&descriptor.layout)?,
+                        verify || sealed,
+                    )?,
+                )?;
+            }
+        }
+        native_work_bound::native_work_ceiling_units(ceiling)?;
+        Ok(ceiling)
+    }
+}
+
 #[derive(Clone)]
 pub enum SemanticSourceContentAllocation {
     Native(DeviceAllocationProvenance),
@@ -311,6 +1570,22 @@ pub(super) struct FrozenSourceContentOccurrences {
 }
 
 impl FrozenSourceContentOccurrences {
+    pub(super) fn policy_binding_dma_ceiling(&self) -> Result<[u64; 9], SemanticTransitionError> {
+        if !self
+            .native_guards
+            .contains_key(&SourceNativeContentGuard::PolicyBinding)
+        {
+            return Ok([0; 9]);
+        }
+        let geometry = self
+            .geometry
+            .upgrade()
+            .ok_or(SemanticTransitionError::ObservationMismatch)?;
+        let mut ceiling = [0; 9];
+        ceiling[0] = 9;
+        ceiling[8] = geometry.publication.policy_producer_ceiling[8];
+        Ok(ceiling)
+    }
     pub(super) fn require_original_occurrence(
         self: &Arc<Self>,
         occurrence: &SemanticSourceContentOccurrence,
@@ -382,8 +1657,7 @@ impl FrozenSourceContentOccurrences {
         let reservation = recipe.seed.proof.owner.budget.reserve_auxiliary(
             u64::try_from(bytes).map_err(|_| SemanticTransitionError::GenerationExhausted)?,
         )?;
-        let current =
-            recipe.kind == prepared_source_content::SemanticSourceContentGeometryKind::Current;
+        let current = recipe.kind.is_current();
         let mut outputs: [BTreeMap<u64, Vec<SemanticSourceTensorDescriptor>>; 4] =
             std::array::from_fn(|_| BTreeMap::new());
         let mut baselines = [None; 4];
@@ -614,7 +1888,11 @@ impl FrozenSourceContentOccurrences {
             }
             let event_ceiling =
                 prepared_source_content::source_geometry_occurrence_native_work_ceiling(
-                    recipe, &event,
+                    recipe,
+                    &event,
+                    event.family.kind == SemanticSourceContentKind::BindModel
+                        || (event.family.kind == SemanticSourceContentKind::Verify
+                            && Some(event.receiver_slot) == *baseline),
                 )?;
             if !current {
                 native_work_bound::add_native_work_ceiling(&mut ceiling, event_ceiling)?;
@@ -657,7 +1935,44 @@ impl FrozenSourceContentOccurrences {
                 } else {
                     false
                 };
+                if continuation {
+                    let original = &recipe.seed.proof.owner;
+                    let storage = &recipe.publication.storage;
+                    if let Some(blocks) = blocks {
+                        native_work_bound::add_native_work_ceiling(
+                            &mut ceiling,
+                            native_work_bound::numerical_block_snapshot_native_work_ceiling(
+                                blocks,
+                            )?,
+                        )?;
+                    }
+                    native_work_bound::add_native_work_ceiling(
+                        &mut ceiling,
+                        native_work_bound::continuation_preparation_geometry_native_work_ceiling(
+                            &original.contract,
+                            &storage.bank_templates[0],
+                            storage.continuation_templates.len(),
+                            original.layouts.len(),
+                            storage.allocation_bytes.len(),
+                            native_work_bound::continuation_copy_capacity_native_work_ceiling(
+                                &storage.continuation_templates,
+                                |slot| {
+                                    storage
+                                        .allocation_bytes
+                                        .get(slot)
+                                        .copied()
+                                        .map(|bytes| bytes as u64)
+                                        .ok_or(SemanticTransitionError::ObservationMismatch)
+                                },
+                            )?,
+                        )?,
+                    )?;
+                }
                 let kinds: &[SourceNativeContentGuard] = if policy {
+                    native_work_bound::add_native_work_ceiling(
+                        &mut ceiling,
+                        recipe.publication.policy_producer_ceiling,
+                    )?;
                     &[
                         SourceNativeContentGuard::PolicyBinding,
                         SourceNativeContentGuard::PolicyAttach,
@@ -692,6 +2007,7 @@ impl FrozenSourceContentOccurrences {
                         prepared_source_content::source_geometry_occurrence_native_work_ceiling(
                             recipe,
                             &verification,
+                            false,
                         )?;
                     for &kind in kinds {
                         if native_guards
@@ -847,6 +2163,7 @@ impl FrozenSourceContentOccurrences {
             .upgrade()
             .ok_or(SemanticTransitionError::ObservationMismatch)?;
         geometry.require_current_section(session, step, section)?;
+        geometry.require_content_overlay_stream(section, session.stream.cu_stream() as u64)?;
         for (descriptor, tensor) in occurrence.geometry().tensors.iter().zip(tensors) {
             if let Some(declared) = self.declared_allocations[occurrence.geometry().section]
                 .get(&descriptor.allocation_slot)

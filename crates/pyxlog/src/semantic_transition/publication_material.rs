@@ -22,7 +22,7 @@ const FIELD_NAMES: [&str; 15] = [
     "cache",
 ];
 
-const ORIGIN_KEYS: [&str; 11] = [
+const ORIGIN_KEYS: [&str; 12] = [
     "source_slot",
     "logical_position",
     "token",
@@ -32,6 +32,7 @@ const ORIGIN_KEYS: [&str; 11] = [
     "authority_generation",
     "action_receipt_digest",
     "origin_logical_digest",
+    "successor_logical_digest",
     "authority_closure_digest",
     "record_digest",
 ];
@@ -157,7 +158,7 @@ fn projection_metadata_extent(
     add_extent(&mut extent, python_metadata_tuple_extent(py, count)?)?;
     let origin = dictionary_extent(py, &ORIGIN_KEYS)?
         .checked_add(repeated_extent(integer, 7)?)
-        .and_then(|bytes| bytes.checked_add(identity.checked_mul(4)?))
+        .and_then(|bytes| bytes.checked_add(identity.checked_mul(5)?))
         .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Bound<'_, PyDict>>()))
         .ok_or_else(|| invalid("publication provenance extent overflow"))?;
     add_extent(&mut extent, repeated_extent(origin, count)?)?;
@@ -218,6 +219,7 @@ pub(super) fn inspect(
         for (name, identity) in [
             ("action_receipt_digest", record.action_receipt_digest),
             ("origin_logical_digest", record.origin_logical_digest),
+            ("successor_logical_digest", record.successor_logical_digest),
             ("authority_closure_digest", record.authority_closure_digest),
             ("record_digest", record.record_digest),
         ] {

@@ -455,6 +455,12 @@ __device__ uint32_t rotate_right(uint32_t value, uint32_t count) {
     return (value >> count) | (value << (32 - count));
 }
 
+__device__ bool sha256_block_count(uint64_t length,uint64_t* blocks) {
+    if(!blocks || length>UINT64_MAX/8 || length>UINT64_MAX-72)return false;
+    *blocks=(length+72)/64;
+    return true;
+}
+
 template<class Bytes>
 __device__ void sha256(Bytes input, uint64_t length, uint64_t *output, NativeWorkTally *work = nullptr) {
     constexpr uint32_t constants[64] = {
@@ -470,7 +476,11 @@ __device__ void sha256(Bytes input, uint64_t length, uint64_t *output, NativeWor
         0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
         0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
     };
-    const uint64_t block_count = (length + 9 + 63) / 64;
+    uint64_t block_count=0;
+    if(!sha256_block_count(length,&block_count)) {
+        if(work)work->overflow=1;
+        return;
+    }
     const uint64_t bit_length = static_cast<uint64_t>(length) * 8;
     const uint64_t length_offset = block_count * 64 - 8;
     uint32_t state[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,

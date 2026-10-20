@@ -329,7 +329,7 @@ fn write_semantic_transition_catalogue(out_dir: &Path) {
                 ));
             }
             ["domain", name] => {
-                assert_eq!(*name, "xlog.semantic-action-catalogue.v1");
+                assert_eq!(*name, "xlog.semantic-action-catalogue.v2");
             }
             [kind @ ("action" | "opcode"), value, name, signature @ ..] => {
                 assert!(!signature.is_empty());
@@ -523,6 +523,16 @@ fn catalogue_sha256(bytes: &[u8]) -> [u8; 32] {
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    // OUT_DIR survives build-script reruns. Replace only our generated kernel
+    // files so packaging and embedded hashes cannot retain obsolete artifacts.
+    for entry in fs::read_dir(&out_dir).expect("read kernel output directory") {
+        let entry = entry.expect("read kernel output entry");
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.ends_with(".cubin") || name.ends_with(".portable.ptx") {
+            fs::remove_file(entry.path()).expect("remove previous generated kernel artifact");
+        }
+    }
     write_semantic_transition_catalogue(&out_dir);
     let semantic_policy = prepare_semantic_policy_header(&out_dir);
     let manifest_dir =
@@ -554,11 +564,23 @@ fn main() {
     );
     println!(
         "cargo:rerun-if-changed={}",
+        kernels_dir
+            .join("semantic_conditional_policy.cuh")
+            .display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
         kernels_dir.join("semantic_policy_binding.cuh").display()
     );
     println!(
         "cargo:rerun-if-changed={}",
         kernels_dir.join("semantic_policy_domains.cuh").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        kernels_dir
+            .join("semantic_model_forward_stream.cuh")
+            .display()
     );
     println!(
         "cargo:rerun-if-changed={}",

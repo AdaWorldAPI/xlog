@@ -669,9 +669,9 @@ static void unbounded_policy_refusal_preserves_acquired_publication() {
 
 static void backward_completion_rejects_every_error_status() {
     uint64_t status=0;
-    semantic_policy_backward_status_guard(reinterpret_cast<uint64_t>(&status));
+    semantic_policy_backward_status_guard(reinterpret_cast<uint64_t>(&status),0);
     for(uint64_t failure : {uint64_t(1),uint64_t(2),uint64_t(3),UINT64_MAX}) {
-        require_content_trap([&] { status=failure;semantic_policy_backward_status_guard(reinterpret_cast<uint64_t>(&status)); },
+        require_content_trap([&] { status=failure;semantic_policy_backward_status_guard(reinterpret_cast<uint64_t>(&status),0); },
             "backward completion accepted a mutated device error status");
     }
 }
@@ -1438,7 +1438,7 @@ static void recompute_execution_preserves_proposal_state(bool drain_required) {
     PublicationStepResult result{};
     semantic_publication_step_result(reinterpret_cast<uint64_t>(&fixture.control),
         reinterpret_cast<uint64_t>(&fixture.lease),reinterpret_cast<uint64_t>(&result),
-        reinterpret_cast<uint64_t>(&parent),0);
+        reinterpret_cast<uint64_t>(&parent),0,0,0,0);
     require(result.abi==1 && result.advanced==1 && result.word==fixture.control.word && !result.refusal,
         "recompute completion lost its actual publication outcome");
     semantic_publication_step_release(reinterpret_cast<uint64_t>(&fixture.control),reinterpret_cast<uint64_t>(&fixture.lease));
@@ -1454,7 +1454,7 @@ static void captured_model_seals_follow_actual_reader() {
     const auto capture=[&] {
         semantic_publication_model_seals(reinterpret_cast<uint64_t>(&fixture.control),
             reinterpret_cast<uint64_t>(&fixture.lease),reinterpret_cast<uint64_t>(roster.data()),roster.size(),
-            reinterpret_cast<uint64_t>(retained.data()),reinterpret_cast<uint64_t>(contract_bytes.data()),contract_bytes.size());
+            reinterpret_cast<uint64_t>(retained.data()),reinterpret_cast<uint64_t>(contract_bytes.data()),contract_bytes.size(),0);
     };
     for(uint64_t invocation=0;invocation<3;++invocation) {
         if(invocation)fixture.publish();
@@ -1477,7 +1477,7 @@ static void captured_model_seals_follow_actual_reader() {
     require_content_trap([&] {
         semantic_publication_model_seals(reinterpret_cast<uint64_t>(&fixture.control),
             reinterpret_cast<uint64_t>(&fixture.lease),reinterpret_cast<uint64_t>(roster.data()),roster.size(),
-            reinterpret_cast<uint64_t>(retained.data()),reinterpret_cast<uint64_t>(contract_bytes.data()),contract_bytes.size()-1);
+            reinterpret_cast<uint64_t>(retained.data()),reinterpret_cast<uint64_t>(contract_bytes.data()),contract_bytes.size()-1,0);
     },"captured model accepted a truncated original contract allocation");
     require(publication_release(fixture.control,fixture.lease)==0,"captured model reader release failed");
     require_content_trap(capture,"captured model reused a released publication reader");
@@ -1492,7 +1492,7 @@ static void completed_step_result_survives_publication_bank_reuse() {
     require(publication_acquire(fixture.control,original)==0,"completion result fixture reader refused");
     fixture.publish();
     semantic_publication_step_result(reinterpret_cast<uint64_t>(&fixture.control),reinterpret_cast<uint64_t>(&original),
-        reinterpret_cast<uint64_t>(&result),reinterpret_cast<uint64_t>(&fixture.banks[original.bank].header),0);
+        reinterpret_cast<uint64_t>(&result),reinterpret_cast<uint64_t>(&fixture.banks[original.bank].header),0,0,0,0);
     require(result.abi==1 && !result.refusal && result.word==fixture.control.word &&
         std::memcmp(&result.header,&fixture.banks[result.word&1].header,sizeof(PublicationHeader))==0,
         "step result did not preserve the actual post-transition publication header");
@@ -1503,11 +1503,11 @@ static void completed_step_result_survives_publication_bank_reuse() {
         "step result changed after physical publication bank reuse");
     require_content_trap([&] {
         semantic_publication_step_result(reinterpret_cast<uint64_t>(&fixture.control),reinterpret_cast<uint64_t>(&original),
-            reinterpret_cast<uint64_t>(&result),reinterpret_cast<uint64_t>(&fixture.banks[original.bank].header),0);
+            reinterpret_cast<uint64_t>(&result),reinterpret_cast<uint64_t>(&fixture.banks[original.bank].header),0,0,0,0);
     },"step result accepted a released publication reader");
     fixture.control.refusal=5;
     semantic_publication_step_result(reinterpret_cast<uint64_t>(&fixture.control),reinterpret_cast<uint64_t>(&fixture.lease),
-        reinterpret_cast<uint64_t>(&result),reinterpret_cast<uint64_t>(&fixture.banks[fixture.lease.bank].header),0);
+        reinterpret_cast<uint64_t>(&result),reinterpret_cast<uint64_t>(&fixture.banks[fixture.lease.bank].header),0,0,0,0);
     require(result.abi==1 && result.refusal==5 && result.word==fixture.lease.word,
         "step result lost an actual non-publishing refusal");
 }
@@ -1515,7 +1515,7 @@ static void completed_step_result_survives_publication_bank_reuse() {
 static void next_step_stops_after_actual_nonpublication() {
     StepPublicationFixture fixture;PublicationStepResult result{};PublicationLease next{};uint64_t conditional=1;
     semantic_publication_step_result(reinterpret_cast<uint64_t>(&fixture.control),reinterpret_cast<uint64_t>(&fixture.lease),
-        reinterpret_cast<uint64_t>(&result),reinterpret_cast<uint64_t>(&fixture.banks[fixture.lease.bank].header),0);
+        reinterpret_cast<uint64_t>(&result),reinterpret_cast<uint64_t>(&fixture.banks[fixture.lease.bank].header),0,0,0,0);
     const auto readers=fixture.control.reader_counts[fixture.lease.bank];
     semantic_publication_step_admit(reinterpret_cast<uint64_t>(&fixture.control),reinterpret_cast<uint64_t>(&next),1,
         reinterpret_cast<uint64_t>(&conditional),reinterpret_cast<uint64_t>(&result));
@@ -1541,7 +1541,7 @@ static void next_step_stops_after_actual_nonpublication() {
     PublicationLease previous{};require(publication_acquire(progressing.control,previous)==0,"advance fixture reader refused");
     progressing.publish();
     semantic_publication_step_result(reinterpret_cast<uint64_t>(&progressing.control),reinterpret_cast<uint64_t>(&previous),
-        reinterpret_cast<uint64_t>(&result),reinterpret_cast<uint64_t>(&progressing.banks[previous.bank].header),0);
+        reinterpret_cast<uint64_t>(&result),reinterpret_cast<uint64_t>(&progressing.banks[previous.bank].header),0,0,0,0);
     require(publication_release(progressing.control,previous)==0,"advance fixture reader release refused");
     semantic_publication_step_admit(reinterpret_cast<uint64_t>(&progressing.control),reinterpret_cast<uint64_t>(&next),1,
         reinterpret_cast<uint64_t>(&conditional),reinterpret_cast<uint64_t>(&result));

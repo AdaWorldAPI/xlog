@@ -5,9 +5,25 @@ use serde_json::{Map, Value};
 
 const RECEIPT_DOMAIN: &[u8] = b"dlm-new.tool-verification.receipt.v1\0";
 const EFFECT_DOMAIN: &[u8] = b"dlm-new.local-tool.v1\0";
+const TOOL_RESULT_DOMAIN: &[u8] = b"dlm-new.tool-result.receipt.v1\0";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum OriginalObservationOrigin {
+    Action(Identity256),
+    Intent,
+}
+
+pub(super) struct AuthenticatedVerificationReceipt {
+    pub identity: Identity256,
+    pub outcome: &'static str,
+}
 
 pub(super) struct AuthenticatedTaskResults {
     pub observations: Vec<[u64; 18]>,
+    pub receipts: Vec<AuthenticatedVerificationReceipt>,
+    pub canonical_payload_identity: Identity256,
+    pub file_roster_identity: Identity256,
+    pub result_capacity_bytes: u64,
     pub disposition: u64,
     pub allocation_owner: Option<Arc<SemanticReplayMaterialReservation>>,
 }
@@ -166,9 +182,11 @@ fn hex_bytes(value: &Value) -> Result<Vec<u8>, SemanticTransitionError> {
         b'a'..=b'f' => Ok(value - b'a' + 10),
         _ => Err(invalid_receipt()),
     };
-    text.chunks_exact(2)
-        .map(|pair| Ok(nibble(pair[0])? * 16 + nibble(pair[1])?))
-        .collect()
+    let mut bytes = Vec::with_capacity(text.len() / 2);
+    for pair in text.chunks_exact(2) {
+        bytes.push(nibble(pair[0])? * 16 + nibble(pair[1])?);
+    }
+    Ok(bytes)
 }
 
 fn identity(value: &Value) -> Result<Identity256, SemanticTransitionError> {
@@ -381,7 +399,7 @@ fn verify_outcome(
     acceptance: &Value,
     binding: &SemanticTaskVerificationBinding,
     budget: Option<&SemanticReplayMaterialBudget>,
-) -> Result<(u64, bool), SemanticTransitionError> {
+) -> Result<(u64, bool, &'static str), SemanticTransitionError> {
     let exit = require_retired(record, budget)?;
     let output_bytes = (string(&record["stdout_hex"])?.len() / 2)
         .checked_add(string(&record["stderr_hex"])?.len() / 2)
@@ -496,19 +514,22 @@ fn verify_outcome(
     if string(&record["outcome"])? != outcome {
         return Err(invalid_receipt());
     }
-    Ok((truth, rejected))
+    Ok((truth, rejected, outcome))
 }
 
-pub(super) fn verify_acquired_receipts<B: AsRef<[u8]>>(
+pub(super) fn verify_acquired_receipts<'a, I>(
     ground: &SemanticTaskGround,
-    materials: &[(Identity256, B, B)],
+    materials: I,
     stable_intent: Identity256,
     original_effect: &[u8],
     original_native_payload: &[u8],
-    original_action_identity: Identity256,
+    origin: OriginalObservationOrigin,
     key: &[u8; 32],
     budget: Option<&SemanticReplayMaterialBudget>,
-) -> Result<AuthenticatedTaskResults, SemanticTransitionError> {
+) -> Result<AuthenticatedTaskResults, SemanticTransitionError>
+where
+    I: Clone + ExactSizeIterator<Item = (Identity256, &'a [u8], Option<&'a [u8]>)>,
+{
     let SemanticTaskGround::Coding {
         bindings,
         requirements,
@@ -517,7 +538,8 @@ pub(super) fn verify_acquired_receipts<B: AsRef<[u8]>>(
         return Err(invalid_receipt());
     };
     if materials.len() != bindings.len()
-        || materials.is_empty()
+        || bindings.is_empty()
+        || stable_intent == Identity256::default()
         || original_native_payload.len() < 48
         || original_effect.len() != EFFECT_DOMAIN.len() + 64
         || !original_effect.starts_with(EFFECT_DOMAIN)
@@ -525,6 +547,17 @@ pub(super) fn verify_acquired_receipts<B: AsRef<[u8]>>(
     {
         return Err(invalid_receipt());
     }
+    let (origin_kind, origin_identity, support_domain): (u64, _, &[u8]) = match origin {
+        OriginalObservationOrigin::Action(identity) if identity != Identity256::default() => {
+            (1, identity, b"xlog.authenticated-task-observation.v1\0")
+        }
+        OriginalObservationOrigin::Intent => (
+            2,
+            stable_intent,
+            b"xlog.authenticated-intent-observation.v1\0",
+        ),
+        _ => return Err(invalid_receipt()),
+    };
     let mut owned_bytes = (3 * size_of::<Value>() + "coding".len()) as u64;
     for row in requirements {
         let nodes = 6usize
@@ -555,7 +588,13 @@ pub(super) fn verify_acquired_receipts<B: AsRef<[u8]>>(
                     .checked_mul(2)
                     .ok_or(SemanticTransitionError::GenerationExhausted)?,
             )
-            .and_then(|n| n.checked_add((size_of::<Value>() + size_of::<[u64; 18]>()) as u64))
+            .and_then(|n| {
+                n.checked_add(
+                    (size_of::<Value>()
+                        + size_of::<[u64; 18]>()
+                        + size_of::<AuthenticatedVerificationReceipt>()) as u64,
+                )
+            })
             .and_then(|n| {
                 n.checked_add(
                     OwnedPublicationMaterial::tree_node_bound(size_of::<[u8; 32]>(), 0).ok()?
@@ -602,20 +641,21 @@ pub(super) fn verify_acquired_receipts<B: AsRef<[u8]>>(
         ),
     ]);
     let mut observations = Vec::with_capacity(bindings.len());
+    let mut receipts = Vec::with_capacity(bindings.len());
     let mut receipt_identities = BTreeSet::new();
     let mut candidate_identity = None;
+    let mut result_capacity_bytes = None;
     let mut disposition = 1;
-    let total_material_bytes = materials.iter().try_fold(0_u64, |sum, (_, material, _)| {
-        sum.checked_add(material.as_ref().len() as u64)
+    let total_material_bytes = materials.clone().try_fold(0_u64, |sum, (_, material, _)| {
+        sum.checked_add(material.len() as u64)
             .ok_or_else(invalid_receipt)
     })?;
     for (ordinal, (binding, (receipt_identity, material, receipt_metadata))) in
         bindings.iter().zip(materials).enumerate()
     {
-        let material = material.as_ref();
-        let receipt_metadata = receipt_metadata.as_ref();
-        if !receipt_identities.insert(*receipt_identity.as_bytes())
-            || Identity256::from_bytes(Sha256::digest(material).into()) != *receipt_identity
+        if (matches!(origin, OriginalObservationOrigin::Action(_)) && receipt_metadata.is_none())
+            || !receipt_identities.insert(*receipt_identity.as_bytes())
+            || Identity256::from_bytes(Sha256::digest(material).into()) != receipt_identity
             || material.len() <= RECEIPT_DOMAIN.len() + 32
             || !material.starts_with(RECEIPT_DOMAIN)
         {
@@ -702,6 +742,13 @@ pub(super) fn verify_acquired_receipts<B: AsRef<[u8]>>(
         {
             return Err(invalid_receipt());
         }
+        let capacity = integer(&plan["max_result_bytes"])?;
+        if result_capacity_bytes
+            .replace(capacity)
+            .is_some_and(|previous| previous != capacity)
+        {
+            return Err(invalid_receipt());
+        }
         let count = bindings.len();
         let commands = roster(plan.get("commands").ok_or_else(invalid_receipt)?, count)?;
         let verifiers = roster(plan.get("verifiers").ok_or_else(invalid_receipt)?, count)?;
@@ -747,7 +794,9 @@ pub(super) fn verify_acquired_receipts<B: AsRef<[u8]>>(
                 .map_err(|_| invalid_receipt())?,
         );
         if begin != wire_begin
-            || end.checked_sub(begin) != Some(wire_count)
+            || end
+                .checked_sub(begin)
+                .is_none_or(|capacity| wire_count > capacity)
             || wire_count
                 .checked_mul(8)
                 .and_then(|size| size.checked_add(48))
@@ -858,32 +907,34 @@ pub(super) fn verify_acquired_receipts<B: AsRef<[u8]>>(
         }
         identity(&verifier["executable_sha256"])?;
         identity(&verifier["environment_sha256"])?;
-        let (truth, rejected) =
+        let (truth, rejected, outcome) =
             verify_outcome(record, command, &acceptances[ordinal], binding, budget)?;
-        verify_receipt_metadata(
-            receipt_metadata,
-            *receipt_identity,
-            binding,
-            &record["outcome"],
-            budget,
-        )?;
+        if let Some(receipt_metadata) = receipt_metadata {
+            verify_receipt_metadata(
+                receipt_metadata,
+                receipt_identity,
+                binding,
+                &record["outcome"],
+                budget,
+            )?;
+        }
         if rejected {
             disposition = 2;
         }
         let mut digest = Sha256::new();
-        digest.update(b"xlog.authenticated-task-observation.v1\0");
-        digest.update(original_action_identity.as_bytes());
+        digest.update(support_domain);
+        digest.update(origin_identity.as_bytes());
         digest.update(stable_intent.as_bytes());
         digest.update((ordinal as u64).to_le_bytes());
         digest.update(json_bytes(&record["binding"])?);
         digest.update(receipt_identity.as_bytes());
         let support_identity = Identity256::from_bytes(digest.finalize().into());
         let mut words = [0; 18];
-        words[0] = 1;
+        words[0] = origin_kind;
         words[1] = truth;
         for (offset, identity) in [
-            (2, *receipt_identity),
-            (6, original_action_identity),
+            (2, receipt_identity),
+            (6, origin_identity),
             (10, stable_intent),
             (14, support_identity),
         ] {
@@ -895,10 +946,183 @@ pub(super) fn verify_acquired_receipts<B: AsRef<[u8]>>(
             }
         }
         observations.push(words);
+        receipts.push(AuthenticatedVerificationReceipt {
+            identity: receipt_identity,
+            outcome,
+        });
     }
+    let (canonical_payload_identity, file_roster_identity) =
+        candidate_identity.ok_or_else(invalid_receipt)?;
     Ok(AuthenticatedTaskResults {
         observations,
+        receipts,
+        canonical_payload_identity,
+        file_roster_identity,
+        result_capacity_bytes: result_capacity_bytes.ok_or_else(invalid_receipt)?,
         disposition,
         allocation_owner,
     })
+}
+
+/// Authenticate the receiver's complete original result without an action row.
+///
+/// The signed wrapper carries the actual verification material bytes. Its items
+/// are not reconstructed episode receipts: the same verifier authenticates each
+/// original signed record against the frozen native task before the wrapper's
+/// redundant metadata is compared with those verified facts.
+pub(super) fn verify_completed_tool_result(
+    ground: &SemanticTaskGround,
+    result: &[u8],
+    stable_intent: Identity256,
+    recipient: Identity256,
+    original_effect: &[u8],
+    original_native_payload: &[u8],
+    key: &[u8; 32],
+    budget: Option<&SemanticReplayMaterialBudget>,
+) -> Result<AuthenticatedTaskResults, SemanticTransitionError> {
+    let bindings = ground.bindings();
+    let header_bytes = TOOL_RESULT_DOMAIN.len() + 4 * 32 + size_of::<u64>();
+    if result.len() <= header_bytes + 32
+        || !result.starts_with(TOOL_RESULT_DOMAIN)
+        || original_effect.len() != EFFECT_DOMAIN.len() + 64
+        || !original_effect.starts_with(EFFECT_DOMAIN)
+    {
+        return Err(invalid_receipt());
+    }
+    let mac_offset = result.len() - 32;
+    let encoded = &result[header_bytes..mac_offset];
+    if u64::from_le_bytes(
+        result[header_bytes - 8..header_bytes]
+            .try_into()
+            .map_err(|_| invalid_receipt())?,
+    ) != encoded.len() as u64
+        || !super::late_replay::receiver_mac_matches(
+            &result[..mac_offset],
+            &result[mac_offset..],
+            key,
+        )
+    {
+        return Err(invalid_receipt());
+    }
+    for (actual, expected) in result[TOOL_RESULT_DOMAIN.len()..header_bytes - 8]
+        .chunks_exact(32)
+        .zip([
+            stable_intent,
+            recipient,
+            Identity256::from_bytes(Sha256::digest(original_effect).into()),
+            Identity256::from_bytes(Sha256::digest(original_native_payload).into()),
+        ])
+    {
+        if actual != expected.as_bytes() {
+            return Err(invalid_receipt());
+        }
+    }
+    let _json_owner = budget
+        .map(|budget| {
+            budget.reserve_auxiliary(
+                SemanticReplayMaterialBudget::json_allocation_bound_with_field_copies(encoded, 2)?,
+            )
+        })
+        .transpose()?;
+    let value: Value = serde_json::from_slice(encoded).map_err(|_| invalid_receipt())?;
+    if json_bytes(&value)? != encoded {
+        return Err(invalid_receipt());
+    }
+    let wrapper = object(
+        &value,
+        &[
+            "kind",
+            "plan_sha256",
+            "receipts",
+            "file_identities",
+            "canonical_payload_sha256",
+        ],
+    )?;
+    if wrapper["kind"] != "dlm-new.tool-result/1"
+        || identity(&wrapper["plan_sha256"])?.as_bytes()
+            != &original_effect[original_effect.len() - 32..]
+    {
+        return Err(invalid_receipt());
+    }
+    let items = roster(&wrapper["receipts"], bindings.len())?;
+    let material_bytes = items.iter().try_fold(0u64, |sum, item| {
+        let item = object(
+            item,
+            &[
+                "kind",
+                "identity",
+                "outcome",
+                "material_hex",
+                "measurement_law_identities",
+            ],
+        )?;
+        let extent = string(&item["material_hex"])?.len();
+        if extent == 0 || extent % 2 != 0 {
+            return Err(invalid_receipt());
+        }
+        sum.checked_add((extent / 2) as u64)
+            .ok_or(SemanticTransitionError::GenerationExhausted)
+    })?;
+    let material_bytes = material_bytes
+        .checked_add(
+            (items.len() as u64)
+                .checked_mul(size_of::<(Identity256, Vec<u8>)>() as u64)
+                .ok_or(SemanticTransitionError::GenerationExhausted)?,
+        )
+        .ok_or(SemanticTransitionError::GenerationExhausted)?;
+    let _material_owner = budget
+        .map(|budget| budget.reserve_auxiliary(material_bytes))
+        .transpose()?;
+    let mut materials = Vec::with_capacity(items.len());
+    for (binding, item) in bindings.iter().zip(items) {
+        let item = item.as_object().ok_or_else(invalid_receipt)?;
+        if string(&item["kind"])? != binding.receipt_family.name() {
+            return Err(invalid_receipt());
+        }
+        if let Some(measurement) = &binding.measurement {
+            for (actual, expected) in roster(&item["measurement_law_identities"], 3)?.iter().zip([
+                measurement.comparator_identity,
+                measurement.metric_identity,
+                measurement.tolerance_identity,
+            ]) {
+                if identity(actual)? != expected {
+                    return Err(invalid_receipt());
+                }
+            }
+        } else if !item["measurement_law_identities"].is_null() {
+            return Err(invalid_receipt());
+        }
+        materials.push((
+            identity(&item["identity"])?,
+            hex_bytes(&item["material_hex"])?,
+        ));
+    }
+    let authenticated = verify_acquired_receipts(
+        ground,
+        materials
+            .iter()
+            .map(|(identity, material)| (*identity, material.as_slice(), None)),
+        stable_intent,
+        original_effect,
+        original_native_payload,
+        OriginalObservationOrigin::Intent,
+        key,
+        budget,
+    )?;
+    if result.len() as u64 > authenticated.result_capacity_bytes
+        || identity(&wrapper["canonical_payload_sha256"])?
+            != authenticated.canonical_payload_identity
+        || json_identity(&wrapper["file_identities"])? != authenticated.file_roster_identity
+    {
+        return Err(invalid_receipt());
+    }
+    for (item, receipt) in items.iter().zip(&authenticated.receipts) {
+        let item = item.as_object().ok_or_else(invalid_receipt)?;
+        if identity(&item["identity"])? != receipt.identity
+            || string(&item["outcome"])? != receipt.outcome
+        {
+            return Err(invalid_receipt());
+        }
+    }
+    Ok(authenticated)
 }

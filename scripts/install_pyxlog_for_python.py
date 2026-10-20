@@ -34,7 +34,7 @@ print(f"pyxlog kernels: {kernels_dir}")
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Stage CUDA kernels, run `maturin build` for one explicit Python "
+            "Run `maturin build` with its generated CUDA kernels for one explicit Python "
             "interpreter, install the resulting pyxlog wheel into that same "
             "interpreter, and verify the installed package contains kernels."
         ),
@@ -79,11 +79,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--no-deps",
         action="store_true",
         help="Pass --no-deps to pip install.",
-    )
-    parser.add_argument(
-        "--skip-stage",
-        action="store_true",
-        help="Do not restage kernels before building the wheel.",
     )
     parser.add_argument(
         "--skip-import-check",
@@ -155,12 +150,6 @@ def main(argv: list[str] | None = None) -> int:
     wheel_placeholder = wheel_dir / "pyxlog-<built>.whl"
 
     run([args.python, "-c", "import sys; print(sys.executable)"], dry_run=args.dry_run)
-
-    if not args.skip_stage:
-        stage_cmd = ["bash", "scripts/stage_pyxlog_kernels.sh"]
-        if args.features and "semantic-policy" in args.features.replace(",", " ").split():
-            stage_cmd.extend(["--features", "semantic-policy"])
-        run(stage_cmd, dry_run=args.dry_run)
 
     prune_existing_pyxlog_wheels(wheel_dir, dry_run=args.dry_run)
 

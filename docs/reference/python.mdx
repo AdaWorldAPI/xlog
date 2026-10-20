@@ -279,8 +279,9 @@ The target retains its complete frozen roster and original objective for the
 Update. Other retained rows keep their own authenticated task identities; they
 need not describe the selected source task.
 
-For a whole instruction, pass `prepare_invocation=` to the same retained
-`import_task(..., retain_policy=True)` call. Its callback receives the original
+Every retained SOURCE import requires `prepare_invocation=` in the same
+`import_task(..., retain_policy=True)` call. Direct unprepared imports do not
+retain policy or Update final-use rights. Its callback receives the original
 `(task_use, parent)` and returns `None`, retaining the source model and all
 exports in the original invocation lifetime without running its forward.
 The result is a `SemanticPreparedTaskImport`, not an imported task or a policy
@@ -432,6 +433,34 @@ Other sections are neither replayed nor marked complete. Unknown retains the
 original physical custody; known joined child retirement releases its physical
 aliases without changing the immutable frozen proof.
 
+Before freezing these sections, the two genuine CURRENT geometries of the same
+original Update and member may declare one content overlay for each prepared
+kind. Call `bank0.content_overlay(bank1, prepared_kind="recompute" | "proposal",
+allocation_layouts=alternatives)`, where `alternatives` is four ordered tuples of
+`(original_allocation_slot, full_span_bytes, alignment_bytes)`. Their order is
+outer bank zero / child bank zero, zero / one, one / zero, one / one. The result
+is `(allocation, placements)` with one existing geometry-allocation handle and
+four corresponding tuples of `(original_allocation_slot, byte_offset,
+full_span_bytes)`. Lower these placements into the same original descriptors
+before their sole freeze; preserve within-allocation offsets and the genuine
+storage/version partitions. Only owned Capture outputs and their later Verify
+uses are eligible, never borrowed input roots or model bindings. A permitted
+tensor role or a Capture event alone does not establish output ownership.
+
+Inside the original private allocation scope, create one contiguous CUDA UInt8
+backing from that same memory pool and call
+`bank0.bind_content_overlay(bank1, prepared_kind=..., backing=...,
+consumer_stream=...)` before recording. The stream must be the original native
+import and capture stream. The genuine foreign DLPack owner stays foreign; this
+method grants no native allocation provenance. Write the producer's original
+outputs directly into their typed destinations, without retaining a second full
+clone. Native authenticates the four conditional alternatives and their complete
+rosters; Recompute and Proposal, different members and different Updates remain
+disjoint. The original instruction retains physical claims through retirement,
+and unknown completion retains the managed backing and its accounting owner.
+This does not create an allocator, permit sequential reuse or prove whole-peak
+fit within the original memory limit.
+
 Pass the original Historical geometry tuple retained by the plan, in its original
 order, as `source_content` to the same `original_work.admit_plan(...)` that admits
 model work. Native resolves each geometry through its existing once-only recipe
@@ -517,11 +546,10 @@ before sole evaluation admission. The later witness getter retains its existing
 numerical admission and terminal-proof requirements; metadata cannot authorize
 bind, capture, numerical verification or a different private child.
 
-Bind future historical deliveries with
-`step.register_gradient_delivery(..., group_member=prepared_import, edit_only=True)`
-before the whole instruction freezes. This requires the original replay child,
-source parameter allocations and target gradient destinations; it grants no
-current-policy result. The single `build_segment` call takes
+Historical SOURCE preparation retains its authentic instruction-bound target
+Update, complete model ports and source-content witness before the whole
+instruction freezes. It does not register historical policy gradients or issue
+a CURRENT actor or demonstration result. The single `build_segment` call takes
 `execute_prepared_imports=`. After all outer and CURRENT resources and successors
 exist in the original allocation scope, it freezes the complete import roster
 and invokes this callback once. Freeze the single complete numerical plan there,
@@ -534,14 +562,12 @@ entry, or SOURCE execution before every initializer genuinely completes. Call
 Update/replay order. Each call performs its retained restore, pack and finalize
 once and returns `(same_task_use, genuine_retained_member)`; successful repeats
 return the cached pair. An unknown invocation cannot be rerun or skipped.
-Completion authenticates every original physical Parameter and restored SOURCE
-gradient slot against that same completed model witness, preserving its slot as
-the deferred delivery's restoration intent. It does not replace leaves or edges.
-The prepared owner's `group_update_vjp` delegates only to that genuine completed
-member. Its `group_update_vjp_layouts(update_step, bank, consumer_stream=...,
-edit_only=True)` is available earlier, after that same future physical delivery
-is registered. It does not execute or complete the SOURCE import. Retain the
-same owner, model, aliases and graph through actual final use.
+Completion retains the genuine SOURCE model witness without substituting leaves
+or edges. Historical SOURCE owners have no group-policy derivative or VJP port;
+CURRENT actors and edit demonstrations use their distinct native refresh owners.
+Retain the same SOURCE owner, model, aliases and graph through actual target
+completion and native final use. Removing historical gradient delivery does not
+infer completion of either target bank or authorize early source retirement.
 If the target is genuinely cancelled before this import executes, native retires
 the same prepared source and invokes its original cleanup once. The prepared
 owner's `finish_cancelled_private_segment()` only acknowledges that cached
@@ -613,21 +639,32 @@ allocation. This is distinct from the full model-content witness, which also
 retains buffers. Buffers do not gain fabricated gradient, presence or phase-mask
 leaves; all genuine parameter destinations must still be present exactly once.
 
-An Update with a fresh actor execution and an overlapping historical Edit row
-retains two independent contributions for the same original ordinal and bank.
-The issued actor owner provides
+An Update retains independent CURRENT actor and CURRENT Edit-demonstration
+contributions, including when both use the same original ordinal and bank.
+`update.prepare_edit_demonstration(member_ordinal, refresh_snapshot=...,
+content_geometry=(bank0, bank1))` returns the same native
+`SemanticPreparedActorRefresh` owner with `is_demonstration=True`. It uses the
+original row's full ordered choice tuple and causal prefix with CURRENT logits,
+parameters and legal support. It scores the genuine solving witness without a
+draw, RNG advance, world execution or Proposal publication. Unsupported choices
+refuse the whole Update; all original Edit rows and denominators remain.
+
+Both issued roles provide
 `refresh.require_current_target_basis(template_task_use, bank, child_step)`
 for an ordinary producer to authenticate its exact target task and original
 issued child before binding the model realization. This checks retained native
 CURRENT model owners and the original child scope; it does not execute a graph,
 read device storage, or infer CURRENT ownership from equal tensor contents.
 Inside that child's original one-shot `prepared.finish_segment()` callback,
-`refresh.retirement_observation(bank, task_use, prepared, steps)` returns exactly
-`"observed"`, `"cancelled"` or `"initializer_refused"`. It authenticates the same
+`refresh.retirement_observation(bank, task_use, prepared, steps)` authenticates the same
 retained child objects and the ordered step tuple actually delivered to the
 producer, or an empty tuple if preparation stopped before that handoff. It is
 available only after native graph retirement and final-use quiescence; it
-returns no R/P outcomes and starts no numerical work.
+starts no numerical work. Actor completion remains `"observed"`. Demonstration
+completion is `"scored"` or `"score_refused"`; `"score_skipped"` means the original
+Recompute refused and the scoring branch was genuinely unentered. Both roles
+retain `"cancelled"` and `"initializer_refused"` for those original outcomes.
+These scoring outcomes do not create an action or episode.
 The callback window closes on every return or error. An uncertain callback
 retains the original owners and cannot be repeated as another cleanup attempt.
 Inside that same genuine final callback, each original
@@ -638,22 +675,21 @@ reader, performs no numerical work and releases no storage. An earlier cleanup,
 Python retirement flag or unknown completion cannot expose this receipt. Release
 the compiler's corresponding counter alias before the native producer storage is
 retired; a surviving imported alias still retains its original allocation.
-Register the fresh actor's delivery with `actor_refresh=refresh`. Register the
-historical demonstration with `group_member=member, edit_only=True`, and pass
-the same `edit_only=True` to `member.group_update_vjp(...)`. The native owner
-freezes each source's exact Session, Proposal or invocation, and delivery role;
-the two deliveries cannot replace each other. Record the fresh actor VJP before
-the overlapping historical Edit VJP. Both original roots, together with the
-other critic and supervised roots, belong to the same single backward. Each
-contribution retains its original group denominator, model realization and
-demonstration prefix. Without a fresh actor overlap, the default
-`edit_only=False` preserves the existing native actor/Edit membership dispatch.
+Register either role's delivery through
+`update.register_gradient_delivery(..., actor_refresh=original_owner)`; a CURRENT
+demonstration does not use `group_member` or `edit_only`. The original owner
+provides `group_update_vjp_layouts(...)` and `group_update_vjp(...)` and freezes
+its exact Session, native phase, tape and delivery role. The two roles cannot
+replace each other. Record actor VJPs before demonstration VJPs in the same
+single backward with the other critic and supervised roots. Demonstrations use
+only the genuine solving Edit components and no critic contribution, while
+retaining the full choice tuple as conditions. Historical SOURCE read/text
+custody for other protected objectives remains independent of this CURRENT
+scoring and derivative path.
 
 Before numerical recording, query
 `refresh.group_update_vjp_layouts(update_step, bank, consumer_stream=...)` for
-the original CURRENT child, or
-`member.group_update_vjp_layouts(update_step, bank, consumer_stream=...,
-edit_only=...)` for the original historical owner. Each returns nine ordered
+the original CURRENT actor or demonstration child. Each returns nine ordered
 `(NativeTensorAllocation, shape, element_strides, dlpack_dtype)` rows from the
 same temporal adjoints subsequently exported by `group_update_vjp`: FP32
 parameter `[P]`, text `[32,V]`, baseline `[1,C]`; FP64 envelopes `[P,2]`,
@@ -862,6 +898,12 @@ The support is either `("admitted", record_index)` or
 `("authenticated", binding_ordinal, original_observation_words)`; the latter
 retains all eighteen original signed-reference words, not a replacement admitted
 support index. These metadata grant no publication or execution authority.
+The first word distinguishes an absent record (`0`), an authenticated Action
+origin (`1`) and an authenticated Intent origin (`2`). An Intent-origin record
+binds its origin identity to the same stable intent and retains a real verifier
+truth; the program evaluator consumes boolean presence, not this origin tag.
+A receiver refusal is a signed acknowledgement event, not a failed verifier
+observation for a command that did not execute.
 
 During replay, `restore_invocation(task_use, restored_parent, full_row,
 transition)` returns `(original_model_output, finalize_continuation,
@@ -933,11 +975,15 @@ not compatible with the new shapes.
 ### Semantic runtime checkpoints
 
 The fresh parent's `acknowledgement_payload_capacity_bytes` reserves the full
-receipt bytes for every possible native intent. With `N = intent_entry_capacity`,
-`P = intent_payload_capacity_bytes`, and `E = len(intent_effect)`, it must be at
-least `169*N + P + (N-1)*E`. The native initializer checks this bound and owns
-the acknowledgement queue; callers cannot supply role 32 records. Proposal and
-Drain each reserve a continuation and a delivery-acknowledgement fuel unit.
+delivery and receiver-outcome bytes for every possible native intent. With
+`N = intent_entry_capacity`, `P = intent_payload_capacity_bytes`,
+`E = len(intent_effect)` and the original admitted completed-result content
+bound `R`, it covers `169*N + P + (N-1)*E + N*max(265+R, 4361)`.
+The queue backing additionally contains its 72-byte header and `N` 176-byte
+entries. These are original finite reservations, not reached-work charges or
+permission to invent an outcome. Native owns the queue; callers cannot supply
+role 32 records. Proposal and Drain retain their original continuation and
+delivery-acknowledgement fuel reservations.
 
 For an external effect, the trusted application binds its live receiver once
 with `controller.bind_delivery_receiver(task_use, recipient_id=bytes32,
@@ -960,7 +1006,10 @@ actual FINAL intent, then appends it through the native publication CAS. It
 returns the new `(instance, word, logical_digest, state_digest)`; the caller
 must acquire that new parent and save a new checkpoint. The CAS does no model
 step and preserves the selected model allocation, text, theory, cache and RNG.
-The old parent cannot acknowledge again. After a cold restore, bind the same
+An identical retry on the original parent joins the retained acknowledgement
+and returns the same result; it does not deliver or publish again. This ordinary
+receipt-only API rejects a coding frame, whose result requires the paired
+operation below. After a cold restore, bind the same
 trusted receiver to the newly issued task use before invoking
 `controller.checkpoint_pending_output_intents(task_use, checkpoint)`. That
 projection verifies both sealed queues and every stored receipt MAC, returning
@@ -973,24 +1022,54 @@ do not identify an execution. The older
 a delivery queue. An exhausted FINAL parent cannot start an unacknowledged
 delivery; an already acknowledged terminal intent cannot be activated again.
 
-An operator can instead bind one nonterminal file-request interval before the
-first publication. The optional parent metadata `nonterminal_intent` is an
+An operator can bind one complete file-request frame before the first
+publication. The optional parent metadata `nonterminal_intent` is an
 exact dictionary with `plan_digest` (32 nonzero bytes),
 `candidate_prefix_begin` and `candidate_prefix_end` (exact `u64` values with
-`begin < end`). The native publisher emits it once, on the first nonterminal
-publication that crosses `end`, after authenticating the committed prefix.
-Its payload is `plan_digest || LE64(begin) || LE64(end-begin) || tokens`, where
+`begin < end`). The end is a capacity upper bound, never completion evidence.
+Only the original Drain into FINAL emits the frame after a proven terminal
+token: its interval is `[begin, terminal_position)`, excluding only that actual
+terminal token. Crossing the capacity bound without a terminal token does not
+emit, crop or complete a request. An ordinary Recompute does not emit one.
+Its payload is `plan_digest || LE64(begin) || LE64(token_count) || tokens`, where
 each original token ID occupies eight little-endian bytes. This is not a byte
 file or an instruction to execute: the trusted application must retain the
 original payload and apply its separately admitted, bounded file projection.
-FINAL output and its acknowledgement-only operation remain unchanged.
+Activation requires the actual current FINAL parent. The coding-frame result
+uses the paired acknowledgement below, including when no Proposal contributed.
 
-After durable checkpoint and actual external execution,
+After durable checkpoint and a signed terminal receiver outcome,
 `controller.acknowledge_replay_delivery(task_use, parent=..., snapshot=...,
-delivery_receipt=..., result_receipt=..., replay_row=..., material_source=...)` accepts one complete
-original episode transport row, including every original material and native
-publication evidence. It rejects actor rows and checkpoint-only referents.
-The result receipt is HMAC-SHA256 under the bound receiver key over
+delivery_receipt=..., receiver_outcome=..., proposals=..., result_receipts=...,
+replay_rows=..., material_source=...)` accepts the complete original contributor
+batch in one operation. `proposals` is the complete immutable original Proposal
+roster, not a caller-selected subset. Obtain contributor indices with
+`controller.coding_intent_contributors(task_use, parent=..., stable_intent=...,
+proposals=..., material_source=...)`; pass the same roster to acknowledgement.
+Native proves contribution from the actual delivered tokens and their original
+provenance, not a repeated token value, selected score or Python eligibility flag.
+
+The required `receiver_outcome` is the exact signed durable record:
+`b"xlog.receiver.outcome.v1\0" || stable_identity || recipient_id ||
+SHA256(effect) || SHA256(payload) || SHA256(delivery_receipt) || checkpoint_digest ||
+LE64(status) || LE64(content_length) || content || mac`.
+The checkpoint digest identifies the original durable checkpoint; the MAC is
+HMAC-SHA256 over all preceding bytes under the same bound receiver key.
+`status=1` means COMPLETED and preserves the full original signed result and
+verification materials. `status=2` means REFUSED before the actual worker
+started, with a nonempty UTF-8 cause of at most 4096 bytes. An exception after
+worker entry is unknown, never a fabricated refusal or completion.
+
+For COMPLETED, `result_receipts` and `replay_rows` are exact tuples in the
+native-proven contributor order, including an authentic empty tuple pair when
+there are no contributors. Each row retains every original material and native
+publication evidence; actor rows and checkpoint-only referents are rejected.
+For REFUSED both tuples are empty even if the proven contributor roster is
+nonempty. Refusal archives the signed outcome but creates no replay row,
+training count or task-observation fact. The complete Proposal roster is still
+authenticated before acknowledgement or an identical retry.
+
+Each result receipt is HMAC-SHA256 under the bound receiver key over
 `b"xlog.replay.result.v2\0"` followed by seven 32-byte fields:
 stable intent, SHA256 of the complete delivery receipt, original action base
 logical identity, original action successor logical identity, the original
@@ -1004,8 +1083,10 @@ Measurement retains its frozen comparator, metric and tolerance identities.
 The delivery receipt alone
 does not attest an execution result or replace the record's result materials.
 
-One original publication CAS commits both the acknowledgement and full result
-archive. An eligible row additionally requires current training rights and
+One original publication CAS commits the delivery/outcome pair and the entire
+result batch. The original 176-byte entry binds both complete signed records;
+neither may be omitted or reconstructed from a digest after restore. An eligible
+row additionally requires current training rights and
 becomes visible to later selection only after that CAS. A `REJECTED` measurement
 retains every original material and signed result but writes no arena slot and
 does not advance the eligible-row count. Both dispositions consume the original
@@ -1022,8 +1103,11 @@ returned identity. Do not submit the acknowledgement again while it is pending.
 Checkpoint restoration reconstitutes the original committed raw slots, but
 their hashes alone do not authorize Training. Before selecting restored append
 rows, call the existing `bind_delivery_receiver` with the current trusted
-receiver. It parses the full archived rows with current live rights and verifies
-their original delivery/result receipts, raw content, dispositions and action coordinates.
+receiver. It authenticates every archived delivery/outcome pair, including
+COMPLETED outcomes with zero rows and REFUSED outcomes, before enabling restored
+training rows. Complete rows retain their original live-rights, result-receipt,
+raw-content, disposition and action-coordinate checks. No digest-only outcome or
+missing zero-row acknowledgement can substitute for the stored signed records.
 Each archived row uses the same per-acquisition metadata, material and evidence
 limits as its original admission; the complete archive retains its separate
 frozen native payload capacity.
@@ -2524,10 +2608,17 @@ still required before this can be the full operation expense.
 
 The returned native-issued `SemanticLearningPhaseTransition` retains both
 owners privately. A fast successor resumes inference; consolidation resumes
-training, subject to its original rights. A later fast training segment requires
-`current-request-fast-adaptation` grants, while consolidation requires
-`durable-slow-consolidation` grants. Phase adoption does not issue those rights
-or make the resident fast Update a durable consolidation commit.
+training, subject to its original rights. Training purpose follows the admitted
+data, independently of the phase's trainable parameter set. Original
+`durable-slow-consolidation` grants permit compatible train/development data in
+alignment, fast learning and consolidation. Original
+`current-request-fast-adaptation` grants permit only fast learning on immutable
+request-local replay; they never authorize alignment, consolidation or a durable
+phase successor. Before the first admitted phase transition, the native phase
+is alignment. Every use still checks the complete original grant coverage,
+data partition, replay scope, live authority, expiry and revocation. Phase
+adoption and checkpoint restoration neither change those fields nor issue new
+rights, and a resident fast Update is not a durable consolidation commit.
 The original Session blocks further import, execution and abort until resolution.
 `controller.pending_learning_phase_transition()` recovers that same retained
 object if the application loses its reference.
@@ -2804,8 +2895,48 @@ retries the callback.
 The sole complete pre-effect plan derives all original capture-row counts and
 the maximum event count across the two banks of each step. Its original producer
 calls `controller.finalize_segment_layout(task_use, layouts=...)` with the exact
-ordered tuple `(original_step, capture_rows, bank_event_capacity)` for every step.
-Native seals these counts as a child of the same admission, without rewriting
+ordered tuple `(original_step, capture_rows, bank_event_capacity,
+(bank0_content, bank1_content), (bank0_bindings, bank1_bindings))` for every step.
+Each binding record is `(policy_witness_slot_or_None,
+continuation_witness_slot_or_None, model_witness_slot_or_None)`, taken from the
+original binder arguments and continuation tail in the same plan. The model slot
+identifies the original model-baseline witness of every Recompute, Proposal and
+Update, independently of whether a Proposal continuation binder takes that
+witness. An absent role is `None`, including a Drain without a continuation;
+slot zero is not an absence marker. Native checks that the actual binder uses
+that original witness and derives its additional intrinsic guards before freezing, rather than
+identifying a binding by equal tensor layouts. These intrinsic guards do not
+advance the public Capture/Verify cursor. Each bank contains the original
+ordered `(kind, receiver_slot, output_slot_or_None, tensors, allocations)` events;
+`kind` is `"capture"` or `"verify"`. Tensor and allocation descriptors use the same
+typed layout, logical interval, storage/version partitions, complete backing span,
+byte offset and native provenance described above. A Verify names its genuine
+witness receiver even when that witness was captured outside the current step.
+Preserve the original body/tail interleaving, rather than appending all tails
+after all bodies. The immutable plan retains the original native backing owners.
+Finalize child sessions before their receiving parent. For each receiver issued
+by another prepared session in that same complete plan, supply
+`receiver_links=((receiver_slot, original_step, original_bank), ...)` to the same
+`finalize_segment_layout` call. The original step and bank issue an immutable
+native proof of the witness category, complete descriptor and retained physical
+custody; a numeric slot or equal geometry alone is not that proof. Receivers
+within one session are resolved from its complete original roster instead.
+During recording, call the same witness's
+`verify(tensors=..., consumer_stream=..., recording_step=current_step)` with the
+genuine current recorder step. The original session authenticates the content;
+the current session authenticates its active step and bank and the original
+child-to-parent Update custody, then consumes its own descriptor and counter.
+The witness owner is not replaced. Cold verification outside recording omits
+`recording_step`; a retained cold continuation cannot accept that argument.
+Every Capture/Verify belongs to this common roster, including SOURCE and CURRENT
+events with an occurrence handle. Every actual native call consumes its next
+original typed descriptor; a SOURCE call additionally verifies its original
+handle. There are no independent cursors that could reorder ordinary and SOURCE
+events. The common roster supplies each work ceiling once; a SOURCE handle does
+not add that same ceiling again. Both paths debit each actual hash once to the
+original selected bank's ModelScratch; a host construction cursor is not a work
+counter. Native derives exact work ceilings before the same freeze and seals these
+counts and descriptors as a child of the same admission, without rewriting
 program bytes, and reserves the whole late native allocation claim before
 allocating digest/event buffers. The original initialization engine retains the
 reset commands; finalization itself does not submit them. A failed physical or
@@ -2952,6 +3083,57 @@ and `segment_transfers` in `execution_measurements`. Native adoption validates
 the exact immutable tuple structure and compares every value with the original
 native observation; caller-authored measurements cannot replace it.
 
+### Streamed model forward producers
+
+Prepare each Update bank's full forwards with
+`step.prepare_model_forward_stream(bank, role, vocabulary=...,
+scalar_type=5, block_positions=64)`, where `role` is `"baseline"` or
+`"candidate"`. The returned `SemanticModelForwardStream` derives the complete
+row and position extents from that original native training view. No dense
+row-by-position-by-vocabulary tensor is required or accepted as a replacement
+for the stream.
+
+Inside the original recording, call `forward.begin(consumer_stream=...)`, then
+`forward.record_block(row=..., position_begin=..., count=..., logits=...,
+logits_layout=..., consumer_stream=...)` for every row and position in original
+row-major order. Each logits block contains all vocabulary columns, including
+reserved columns and positions outside an objective's active mask. Use one
+fixed contiguous block backing per forward, handing each actual block to native
+before overwriting it. A shorter final block uses the same backing. These
+producer copies and their model work remain actual recorded operations.
+
+`forward.finish(allocation_witness=..., consumer_stream=...)` returns the issued
+`SemanticModelForwardWitness`; it is not a host-authored receipt or a new model
+invocation. Baseline finish has no allocation witness. Candidate finish requires
+the exact original output-content witness, captured after the output writes and
+before finish. Native scans every value and authenticates complete coverage,
+generation and the original owners. Final completion incorporates full-finite
+status; unsupported or incomplete producers cannot authorize an Update.
+
+Prepare the original paired comparison cold with
+`step.prepare_model_canary_stream(bank, baseline_stream=...,
+candidate_stream=...)`. Its `canary_rows` is the five-row native roster, not a
+caller-selected sample. Inside the same recording, call `begin` only after both
+full forwards have finished, then
+`record_block(canary_index=..., position_begin=..., count=...,
+baseline_logits=..., candidate_logits=..., logits_layout=...,
+consumer_stream=...)` for every original canary row and position, and `finish`.
+The paired producer recomputes those original rows from the same immutable
+baseline and candidate generations, using separate fixed block backings. It
+does not reuse overwritten full-forward logits. Its issued
+`SemanticModelCanaryWitness` is required as `canary_comparison` when binding the
+original Update output.
+
+For cold compiler controls, a forward exposes readonly `source_owner`,
+`geometry=(rows, positions, vocabulary, scalar_type, block_positions)`, `role`
+and `bank`; a canary exposes its original `source_owner`, `baseline_stream`,
+`candidate_stream` and `canary_rows`. These getters issue no tensors, numerical
+work, device reads or execution authority. Native reset, hashing, coverage and
+comparison work uses the original native counters and admission ceilings; it
+must not be replaced by invented Python work records. All producer backings,
+private counters and witnesses remain retained through uncertain completion and
+the original final-use boundary.
+
 ### Original Update measurements
 
 Before retirement, read `step.update_measurements` on the original completed
@@ -2995,17 +3177,19 @@ availability; the existing segment-row format is unchanged.
 
 `forward_receipts` contains the original baseline and candidate records in that
 order. Each has `role` (0 or 1), the same availability vocabulary, and `material`
-(`None` if no complete receipt was obtained). Obtained material contains `role`,
-the **actual receipt's** `generation`, `work_sequence`, `scalar_type`, `dimensions`,
-`strides_bytes`, `model_geometry_digest`, `model_numerical_digest`, `logits_digest`,
-`identity`, and `canonical_bytes`. Native code validates the original logits
-owner/layout, receipt SHA-256, baseline binding, receipt order, and published
-candidate binding when present. The candidate generation is read from its receipt,
-not reconstructed as acquired generation plus one. Canonical bytes are the exact
-232-byte little-endian private receipt: ten scalar words, three stride words,
-then four 32-byte digests (geometry, numerics, logits, identity). The last digest
-seals the preceding 200 bytes. The original pointer word is inert evidence, not a
-CUDA alias or a replay capability. All returned dictionaries, tuples and bytes
+(`None` if no complete receipt was obtained). Obtained material contains `abi`,
+`availability`, `role`, the **actual receipt's** `generation`, `work_sequence`,
+`stream_state`, `scalar_type`, `row_count`, `capacity`, `vocabulary`,
+`block_positions`, `row_seals`, `finite`, `model_geometry_digest`,
+`model_numerical_digest`, `logits_digest`, `identity`, and `canonical_bytes`.
+Native code validates the original stream owner and geometry, receipt SHA-256,
+baseline binding, receipt order, and published candidate binding when present.
+The candidate generation is read from its receipt, not reconstructed as acquired
+generation plus one. Canonical bytes are the exact 232-byte little-endian ABI2
+private receipt: thirteen scalar words, then four 32-byte digests (geometry,
+numerics, logits, identity). The last digest seals the preceding 200 bytes.
+The original `stream_state` and `row_seals` pointer words are inert evidence,
+not CUDA aliases or replay capabilities. All returned dictionaries, tuples and bytes
 are host-owned and may outlive retirement; the getter itself may not.
 
 This port does not change the six native `execute_segment` row fields, objective
@@ -3166,7 +3350,16 @@ recomputed, provenance_record)`. `token_provenance` preserves the complete nativ
 ledger in original order. Its dictionaries retain `source_slot`,
 `logical_position`, `token`, `base_word`, `proposal`, `ordinal`,
 `authority_generation`, `action_receipt_digest`, `origin_logical_digest`,
-`authority_closure_digest`, and `record_digest`. Filled rows must resolve to their
+`authority_closure_digest`, `successor_logical_digest`, and `record_digest`.
+Each complete native record occupies 216 bytes. Original SOURCE records leave
+`successor_logical_digest` zero; newly generated Proposal records retain the
+logical identity of the actual publishing successor. Record identities and the
+publication's logical identity normalize this successor field to zero, avoiding
+a self-reference. The full state identity retains this successor field; its
+other provenance normalization is identical during publication and cold
+restoration. Only newly appended records
+receive the successor identity, and their raw material is resealed before
+publication; earlier records are not rewritten. Filled rows must resolve to their
 original token and position. SOURCE and GENERATED remain distinct; generated
 origins are not rewritten as admitted observations.
 
@@ -3415,6 +3608,19 @@ binding rejects any different pair for the actual bound task. The completed
 terminal ground; slot-zero work is zero, while candidate raw work is exactly
 `edit_commands + added_supports + defined_truth_changes`.
 
+Execution accounting is separate from this structural selection cost. It retains
+the actual model work once and every reached native event, including canaries,
+publication seals, copies, resource checks and the selector compare-and-swap.
+The publisher derives the remaining seal cost from finite retained geometry in
+scratch, charging that metadata walk separately. It executes each payload hash
+and copy once, checks the actual counters against the derived suffix and all
+original resource limits, then attempts one joint publication. The successful
+bank binds the complete cost, including the check and publication tail. A
+mismatch, overflow, resource refusal or failed compare-and-swap publishes
+nothing and retains the reached failure cost. Predictions never replace actual
+counters; the structural-cost cap, training loss and admitted budgets do not
+change.
+
 Learned attempted requests are not duplicated in the ground. Read them from the
 same projection's lane `decoded_text_actions` and `decoded_edit_actions`. The
 optional `edit_solution` is present only for the lowest-numbered admitted lane
@@ -3425,14 +3631,14 @@ truths, catalogue, and device-forward component materials. Its half-open edit
 component interval is `32..68` for lane 1 or `100..136` for lane 2; policy winner
 and score do not determine membership.
 
-For an authenticated episode row in the supervised-edit objective,
-`temporal_update_vjp(...)` derives that same minimal decisive lane on device from
-the original completed Proposal state and bound goal closure. Its direct edit
+For an authenticated episode row in the supervised-edit objective, the native
+CURRENT edit-demonstration owner derives that same minimal decisive lane from
+the original solving witness and current source content. Its direct edit
 cotangent covers only the selected lane's 36 edit components. Text components
 and the other lane receive zero direct edit cotangent; the native backward still
 walks the complete original edit recurrence and original categorical choices,
 masks, catalogue, and decode-bound tape. It does not resample, consume a
-historical score array, or invoke the model a second time.
+historical score array, or publish another Proposal.
 
 The projection also contains the admitted slot-zero record, learned lane slots 1
 and 2 with their native admission or refusal, exact non-NULL text actions and
@@ -5165,6 +5371,21 @@ content witness before capture. Then call
 The callback uses the existing model content scope on the same parent and the
 existing numerical/work registrar on the evaluation's `consumer_stream`; it
 retains the original output tensors and returns `None`.
+Before preparing or admitting that evaluation's original cold report, prepare
+its complete forward with
+`evaluation.prepare_model_forward_stream(vocabulary=..., scalar_type=5,
+block_positions=64)`. It returns the same `SemanticModelForwardStream` type;
+its native role is `"evaluation"`, `source_owner` is that exact evaluation and
+`bank` is `None`, not a fabricated Update bank. The callback records `begin`, all
+original row-major blocks and `forward.finish(consumer_stream=...)` before
+returning. Evaluation forward finish requires `allocation_witness=None`
+(normally omitted): the existing capture wrapper then seals the original losses,
+admissibility and slab exactly once and binds that output to the retained
+completed stream. The
+ordinary evaluation `capture` and `finish(output_witness, consumer_streams=...)`
+signatures do not change. Native completion requires its original finished
+stream, full coverage and finite checks as well as that exact captured output;
+there is no dense or missing-stream fallback.
 Capture returns `(work_bound, operation_count, model_calls)` and freezes the
 original graph without launching it. A failed capture finalization cannot be
 launched, and ports or recording geometry cannot be rebound after capture.

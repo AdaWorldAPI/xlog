@@ -2,7 +2,7 @@
 
 use super::*;
 
-const SUCCESSOR_CUSTODY_ROLES: [u64; 9] = [14, 27, 28, 30, 31, 32, 33, 39, 48];
+const SUCCESSOR_CUSTODY_ROLES: [u64; 10] = [2, 14, 27, 28, 30, 31, 32, 33, 39, 48];
 
 /// Canonical replay roots belonging to one original completed Proposal.
 #[cfg(feature = "semantic-policy")]
@@ -368,6 +368,32 @@ impl PreparedReplayCustody {
             .ok_or(SemanticTransitionError::GenerationExhausted)
     }
 
+    #[cfg(feature = "semantic-policy")]
+    pub(super) fn parent_metadata_native_work_ceiling(
+        &self,
+    ) -> Result<[u64; 9], SemanticTransitionError> {
+        let mut ceiling = native_work_bound::replay_metadata_native_work_ceiling(
+            self.parent.plan.len() as u64,
+            self.parent.directory.len() as u64,
+        )?;
+        // One parent-copy command and the acquired lease/bank identity checks.
+        ceiling[0] = 1;
+        ceiling[1] = ceiling[1]
+            .checked_add(8)
+            .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        Ok(ceiling)
+    }
+
+    #[cfg(feature = "semantic-policy")]
+    pub(super) fn successor_metadata_native_work_ceiling(
+        &self,
+    ) -> Result<[u64; 9], SemanticTransitionError> {
+        native_work_bound::replay_metadata_native_work_ceiling(
+            self.successor.plan.len() as u64,
+            self.successor.directory.len() as u64,
+        )
+    }
+
     pub(super) fn record(&self, recorder: &mut LaunchRecorder) {
         self.parent.record(recorder);
         self.successor.record(recorder);
@@ -451,11 +477,17 @@ impl PreparedReplayCustody {
         storage: &PublicationStorage,
         lease: &TrackedCudaSlice<PublicationLease>,
         graph: &SemanticHypergraph,
+        native_work: Option<[DeviceMemoryView<u64>; 2]>,
     ) -> Result<(), SemanticTransitionError> {
         let mut recorder = domain.new_strict_recorder();
         storage.record(&mut recorder);
         graph.record_transition(&mut recorder);
         recorder.read(lease);
+        if let Some(work) = &native_work {
+            for counter in work {
+                recorder.read_write(counter);
+            }
+        }
         self.parent.record(&mut recorder);
         enqueue_recorded(domain, poisoned, recorder, |enqueue| {
             // SAFETY: source publication/arena and every private destination are
@@ -474,6 +506,8 @@ impl PreparedReplayCustody {
                         lease.device_ptr_value(),
                         *graph.transition_arena_view().device_ptr(),
                         self.parent.descriptor(),
+                        native_work.as_ref().map_or(0, |work| *work[0].device_ptr()),
+                        native_work.as_ref().map_or(0, |work| *work[1].device_ptr()),
                     ),
                 )
             }
