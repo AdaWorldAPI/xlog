@@ -148,7 +148,7 @@ use crate::semantic_hypergraph::{
 #[cfg(feature = "semantic-policy")]
 use crate::semantic_training_view::SemanticTrainingCanaryRefusalReason;
 use crate::semantic_training_view::{
-    frozen_training_coefficients, SemanticSelectedTrainingView,
+    frozen_training_coefficients, SemanticSelectedTrainingView, SemanticTrainingCanaryRecord,
     SemanticTrainingCanaryRefusalRecord, SemanticTrainingCanaryResultRecord,
     SemanticTrainingDomain, SemanticTrainingObjective, SemanticTrainingViewArena,
     SemanticTrainingViewBasis, SemanticTrainingViewOrigin, SemanticTrainingViewOriginRecord,
@@ -1137,9 +1137,7 @@ impl TaskEvaluationBinding {
         }
         if let Some(editable) = self.spec.program.editable_program() {
             hash.update(b"xlog.semantic.editable-program.v1\0");
-            for word in editable.words() {
-                hash.update(word.to_le_bytes());
-            }
+            editable.visit_words(|word| hash.update(word.to_le_bytes()));
         }
         for statement in &self.statements {
             hash.update(statement.identity().as_bytes());
@@ -1268,19 +1266,71 @@ impl TaskEvaluationBinding {
         &self.spec.priority_levels
     }
 
+    fn word_count(&self) -> Result<usize, SemanticTransitionError> {
+        let mut count = 39usize;
+        for (rows, width) in [
+            (self.statements.len(), 7usize),
+            (self.allowed_supports.len(), 5),
+            (self.spec.priority_levels.len(), 1),
+            (self.spec.task_ground.bindings().len(), 36),
+            (self.observation_statements.len(), 8),
+        ] {
+            count = rows
+                .checked_mul(width)
+                .and_then(|words| count.checked_add(words))
+                .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        }
+        for level in &self.spec.priority_levels {
+            count = level
+                .goals
+                .len()
+                .checked_mul(3)
+                .and_then(|words| count.checked_add(words))
+                .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        }
+        count = count
+            .checked_add(self.spec.task_ground.device_requirement_word_count()?)
+            .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        if let Some(program) = self.spec.program.editable_program() {
+            count = program
+                .word_count()
+                .and_then(|words| count.checked_add(words))
+                .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        }
+        Ok(count)
+    }
+
+    /// The exact-capacity result plus its original requirement encoder and
+    /// topological workspaces. Identity/program hashing uses no temporary bank.
+    pub(super) fn words_allocation_bytes(&self) -> Result<u64, SemanticTransitionError> {
+        self.word_count()?
+            .checked_add(self.spec.task_ground.device_requirement_word_count()?)
+            .and_then(|words| words.checked_mul(size_of::<u64>()))
+            .and_then(|bytes| {
+                self.spec
+                    .task_ground
+                    .requirements()
+                    .len()
+                    .checked_mul(size_of::<u32>() + size_of::<bool>())
+                    .and_then(|workspace| bytes.checked_add(workspace))
+            })
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or(SemanticTransitionError::GenerationExhausted)
+    }
+
     pub(crate) fn words(&self, owner: u64) -> Vec<u64> {
-        let program = self
-            .spec
-            .program
-            .editable_program()
-            .map(|program| program.words());
+        let count = self
+            .word_count()
+            .expect("immutable task binding retains its finite canonical encoding");
+        let program = self.spec.program.editable_program();
         let goal_count = self
             .spec
             .priority_levels
             .iter()
             .map(|level| level.goals.len())
             .sum::<usize>();
-        let mut words = vec![9, owner];
+        let mut words = Vec::with_capacity(count);
+        words.extend([9, owner]);
         words.extend(identity_words(*self.identity().as_bytes()));
         words.extend([
             self.statements.len() as u64,
@@ -1289,7 +1339,11 @@ impl TaskEvaluationBinding {
             self.allowed_supports.len() as u64,
             self.spec.priority_levels.len() as u64,
             goal_count as u64,
-            program.as_ref().map_or(0, |words| words.len() as u64),
+            program.map_or(0, |program| {
+                program
+                    .word_count()
+                    .expect("validated program retains its finite encoding") as u64
+            }),
         ]);
         words.extend(self.spec.scoring.words());
         if let Some(witness) = self.goal_witness {
@@ -1347,8 +1401,9 @@ impl TaskEvaluationBinding {
         words.push(requirements.len() as u64);
         words.extend(requirements);
         if let Some(program) = program {
-            words.extend(program);
+            program.visit_words(|word| words.push(word));
         }
+        debug_assert_eq!(words.len(), count);
         words
     }
 }
@@ -1700,9 +1755,7 @@ impl ActionCodebooks {
     fn program_binding(program: &crate::SemanticProgramAdmission) -> Identity256 {
         let mut hash = Sha256::new();
         hash.update(b"xlog.semantic.rule-codebook.program.v2\0");
-        for word in program.words() {
-            hash.update(word.to_le_bytes());
-        }
+        program.visit_words(|word| hash.update(word.to_le_bytes()));
         Identity256::from_bytes(hash.finalize().into())
     }
 
@@ -2157,9 +2210,6 @@ impl ActionCodebooks {
         words[8] = words.len() as u64 * 8;
         words[9] = bytes.len() as u64;
         words[10..14].copy_from_slice(&identity_words(*admission.schema_generation().as_bytes()));
-        words[14] = owner;
-        words[15] = admission.base().slot() as u64;
-        words[16] = admission.base().generation();
         words[17..21].copy_from_slice(&identity_words(
             *admission.base_snapshot().digest().as_bytes(),
         ));
@@ -2171,10 +2221,6 @@ impl ActionCodebooks {
                 .iter()
                 .map(|v| u64::from_le_bytes(*v)),
         );
-        let mut hash = Sha256::new();
-        hash.update(b"xlog.semantic.action-binding.v5\0");
-        hash.update(CATALOGUE_DIGEST);
-        hash.update(admission.identity().as_bytes());
         let program_binding = program.map(Self::program_binding);
         for (range, count) in [1, 3, 5, 7].into_iter().enumerate() {
             words[29 + 2 * range] = 1;
@@ -2182,14 +2228,7 @@ impl ActionCodebooks {
         }
         words[38] = u64::from(program.is_some());
         words[39] = u64::from(program.is_some());
-        if let Some(identity) = program_binding {
-            hash.update(identity.as_bytes());
-        }
-        for &word in &words {
-            hash.update(word.to_le_bytes());
-        }
-        let digest = Identity256::from_bytes(hash.finalize().into());
-        words[21..25].copy_from_slice(&identity_words(*digest.as_bytes()));
+        let binding = Self::bind_admission_words(admission, owner, program_binding, &mut words)?;
         let (components, input_cells) = Self::component_geometry(&words, program.is_some())?;
         let components = components.into_iter().collect();
         Ok(Self {
@@ -2199,10 +2238,7 @@ impl ActionCodebooks {
             qualifiers: qualifier_views,
             leaves: leaf_views,
             components,
-            binding: SemanticCatalogueBinding {
-                generation: CATALOGUE_GENERATION,
-                digest,
-            },
+            binding,
             program_binding,
             input_cells,
             model_catalogue: None,
@@ -4477,6 +4513,7 @@ impl TextBindingStorage {
             model_update_admissibility: model_update.admissibility,
             model_update_refusal: model_update.refusal,
             model_update_canary_results: model_update.canary_results,
+            model_update_canaries: model_update.canaries,
         }
     }
 }
@@ -4966,7 +5003,7 @@ fn tensor_copy_plan(
     let (first_outer, chunk, count) = tensor_copy_plan_geometry(source, destination)?;
     let mut result = Vec::new();
     result
-        .try_reserve(count)
+        .try_reserve_exact(count)
         .map_err(|error| runtime_error("copy plan allocation", error))?;
     for mut linear in 0..count as u64 {
         let (mut source_offset, mut destination_offset) = (0u64, 0u64);
@@ -5588,6 +5625,7 @@ struct PendingContinuation {
     model_update_admissibility: u64,
     model_update_refusal: u64,
     model_update_canary_results: u64,
+    model_update_canaries: u64,
     numerical_blocks: u64,
     physical_blocks: u64,
     model_schema_digest: Identity256,
@@ -5609,6 +5647,7 @@ struct ContinuationInputs {
     model_update_admissibility: u64,
     model_update_refusal: u64,
     model_update_canary_results: u64,
+    model_update_canaries: u64,
     numerical_blocks: u64,
     physical_blocks: u64,
     model_schema_digest: Identity256,
@@ -5624,6 +5663,7 @@ struct ModelUpdateContinuationInputs {
     admissibility: u64,
     refusal: u64,
     canary_results: u64,
+    canaries: u64,
 }
 
 #[repr(C)]
@@ -5783,6 +5823,7 @@ struct ModelForwardReceiptInputs {
     vocabulary_stride_bytes: u64,
     logits_digest: u64,
     receipt: u64,
+    native_work: u64,
 }
 
 #[repr(C)]
@@ -6437,7 +6478,7 @@ const _: () = assert!(size_of::<ModelUpdateBinding>() == 32);
 const _: () = assert!(size_of::<ModelUpdateEvidenceSource>() == 48);
 const _: () = assert!(size_of::<ModelForwardSealInput>() == 32);
 const _: () = assert!(size_of::<ModelForwardReceipt>() == 232);
-const _: () = assert!(size_of::<ModelForwardReceiptInputs>() == 128);
+const _: () = assert!(size_of::<ModelForwardReceiptInputs>() == 136);
 const _: () = assert!(size_of::<PublicationCommand>() == 32);
 const _: () = assert!(size_of::<PublicationDeliveryInput>() == 88);
 const _: () = assert!(size_of::<PublicationLease>() == 88);
@@ -12956,10 +12997,14 @@ impl PreparedContinuation {
         &self,
         domain: &ResidentExecutionDomain,
         poisoned: &mut bool,
+        native_work: Option<DeviceMemoryView<u64>>,
     ) -> Result<(), SemanticTransitionError> {
         let mut recorder = domain.new_strict_recorder();
         self.storage.record(&mut recorder);
         recorder.read(&self.reader);
+        if let Some(work) = &native_work {
+            recorder.read_write(work);
+        }
         self.text_binding.record(&mut recorder);
         if let Some(selection) = &self.training_selection {
             recorder.read(selection);
@@ -12969,10 +13014,23 @@ impl PreparedContinuation {
                 recorder.read(source);
             }
         }
+        let copied_bytes = self.copies.iter().try_fold(0u64, |total, (_, _, bytes)| {
+            total
+                .checked_add(
+                    u64::try_from(*bytes)
+                        .map_err(|_| SemanticTransitionError::GenerationExhausted)?,
+                )
+                .ok_or(SemanticTransitionError::GenerationExhausted)
+        })?;
+        let copy_commands = u64::try_from(self.copies.len())
+            .map_err(|_| SemanticTransitionError::GenerationExhausted)?;
         let arguments = (
             self.storage.control.device_ptr_value(),
             *self.reader.device_ptr(),
             self.inputs,
+            native_work.as_ref().map_or(0, |work| *work.device_ptr()),
+            copied_bytes,
+            copy_commands,
         );
         enqueue_recorded(domain, poisoned, recorder, |enqueue| {
             for &(source, destination, bytes) in &self.copies {
@@ -15425,6 +15483,7 @@ struct PreparedBranchStorage {
 }
 
 struct PreparedModelUpdate {
+    canaries: Option<DeviceMemoryView<SemanticTrainingCanaryRecord>>,
     pending_slots: Vec<usize>,
     _model_owners: Vec<Arc<ModelGenerationOwner>>,
     bindings: TrackedCudaSlice<ModelUpdateBinding>,
@@ -15432,6 +15491,7 @@ struct PreparedModelUpdate {
     evidence_owners: Arc<Vec<ModelUpdateEvidenceOwner>>,
     forward_seals: TrackedCudaSlice<ModelForwardSealInput>,
     forward_receipts: TrackedCudaSlice<ModelForwardReceipt>,
+    forward_native_work: TrackedCudaSlice<u64>,
     admissibility: TrackedCudaSlice<u8>,
     canary_results: TrackedCudaSlice<SemanticTrainingCanaryResultRecord>,
     refusal: TrackedCudaSlice<SemanticTrainingCanaryRefusalRecord>,
@@ -15479,10 +15539,14 @@ impl PreparedModelUpdate {
             admissibility: self.admissibility.device_ptr_value(),
             refusal: self.refusal.device_ptr_value(),
             canary_results: self.canary_results.device_ptr_value(),
+            canaries: self.canaries.as_ref().map_or(0, |view| *view.device_ptr()),
         }
     }
 
     fn record(&self, recorder: &mut LaunchRecorder) {
+        if let Some(canaries) = &self.canaries {
+            recorder.read(canaries);
+        }
         recorder.read(&self.bindings);
         recorder.read(self.evidence.as_ref());
         for evidence in self.evidence_owners.iter() {
@@ -15495,9 +15559,10 @@ impl PreparedModelUpdate {
         }
         recorder.read(&self.forward_seals);
         recorder.read_write(&self.forward_receipts);
+        recorder.read(&self.forward_native_work);
         recorder.read_write(&self.admissibility);
         recorder.read_write(&self.refusal);
-        recorder.read(&self.canary_results);
+        recorder.read_write(&self.canary_results);
         if let Some(output) = &self.output {
             for allocation in &output.allocations {
                 if let Some(source) = &allocation.source {
@@ -15535,6 +15600,7 @@ impl PreparedModelUpdate {
         model_work: &PreparedModelWork,
         bank: usize,
         native_resident_bytes: u64,
+        native_work: DeviceMemoryView<u64>,
     ) -> Result<(), SemanticTransitionError> {
         let output = self.output.as_ref().ok_or_else(|| {
             publication_input_error("prepared update has no original model output binding")
@@ -15562,6 +15628,7 @@ impl PreparedModelUpdate {
         recorder.write(&self.canary_results);
         recorder.write(&self.admissibility);
         recorder.write(&self.refusal);
+        recorder.write(&native_work);
         let admissibility_source = output.admissibility.data;
         let canary_results = self.canary_results.device_ptr_value();
         let admissibility_destination = self.admissibility.device_ptr_value();
@@ -15610,6 +15677,8 @@ impl PreparedModelUpdate {
             results: canary_results,
             admissibility_destination,
             refusal_destination,
+            native_work: *native_work.device_ptr(),
+            forward_native_work: self.forward_native_work.device_ptr_value(),
         };
         enqueue_recorded(domain, poisoned, recorder, |enqueue| {
             // SAFETY: the producer gate was checked by the same captured
@@ -15690,9 +15759,11 @@ struct ModelUpdateCanaryInputs {
     results: u64,
     admissibility_destination: u64,
     refusal_destination: u64,
+    native_work: u64,
+    forward_native_work: u64,
 }
 
-const _: () = assert!(size_of::<ModelUpdateCanaryInputs>() == 280);
+const _: () = assert!(size_of::<ModelUpdateCanaryInputs>() == 296);
 
 struct ModelForwardReceiptInputsParam(ModelForwardReceiptInputs);
 
@@ -20270,8 +20341,8 @@ content_kernel_parameter!(learning_phase::FoldDeviceAssignment);
 #[cfg(feature = "semantic-policy")]
 content_kernel_parameter!(PolicyUniformDescriptor);
 
-const _: () = assert!(size_of::<PendingContinuation>() == 344);
-const _: () = assert!(size_of::<ContinuationInputs>() == 208);
+const _: () = assert!(size_of::<PendingContinuation>() == 352);
+const _: () = assert!(size_of::<ContinuationInputs>() == 216);
 const _: () = assert!(size_of::<SemanticTransitionReceipt>() == 296);
 const _: () = assert!(size_of::<DeviceTaskFacts>() == 40);
 const _: () = assert!(size_of::<DeviceTaskEvaluation>() == 160);
@@ -23248,6 +23319,7 @@ struct UnreleasedPublicationOwners {
     _task_ground: Option<task_ground::TaskGroundStorage>,
     _readers: BTreeMap<u64, PublishedReader>,
     _steps: BTreeMap<u64, StepContentStorage>,
+    _initial_prefill: Option<InitialPrefillStage>,
     _initial_prefill_content: Option<RetainedInitialPrefillContent>,
     _prepared_resources: Vec<Arc<dyn Send + Sync>>,
     _pending_replay_delivery: Option<PendingReplayDelivery>,
@@ -23425,6 +23497,24 @@ impl Drop for SemanticTransitionSession {
         });
         #[cfg(not(feature = "semantic-policy"))]
         let embedded_pending = false;
+        // A dormant restored target can submit prefill before it has a reader,
+        // prepared step, or activation flag. Retain that original command too.
+        #[cfg(feature = "semantic-policy")]
+        let context_pending = self
+            .model_context_continuation
+            .as_ref()
+            .is_some_and(|owner| {
+                if Arc::ptr_eq(&self.publication_issuer, &owner.target_issuer) {
+                    self.model_context_continuation_pending(&SemanticModelContextContinuation {
+                        inner: Arc::clone(owner),
+                    })
+                    .unwrap_or(true)
+                } else {
+                    owner.pending()
+                }
+            });
+        #[cfg(not(feature = "semantic-policy"))]
+        let context_pending = false;
         if self.imported_task_release == ImportedTaskReleaseState::Joining
             || self.pending_replay_delivery.is_some()
             || self
@@ -23437,6 +23527,7 @@ impl Drop for SemanticTransitionSession {
             || self.has_pending_state_restoration_except(None, None)
             || self.retired_preparation.is_some()
             || embedded_pending
+            || context_pending
             || self.pending_training_materialization.is_some()
             || !self.readers.is_empty()
             || !self.steps.is_empty()
@@ -23460,6 +23551,7 @@ impl Drop for SemanticTransitionSession {
                     _readers: std::mem::take(&mut self.readers),
                     _events: std::mem::take(&mut self.release_events),
                     _steps: std::mem::take(&mut self.steps),
+                    _initial_prefill: self.initial_prefill.take(),
                     _initial_prefill_content: self.retained_initial_prefill.take(),
                     _text_binding: self.text_binding.take(),
                     _prepared_resources: std::mem::take(&mut self.prepared_resources),
@@ -24732,7 +24824,22 @@ impl SemanticTransitionSession {
                 .actual
                 .len()
                 / 3;
-            let ceiling = native_work_bound::model_scratch_native_work_ceiling(capacity, false)?;
+            let mut ceiling =
+                native_work_bound::model_scratch_native_work_ceiling(capacity, false)?;
+            native_work_bound::add_native_work_ceiling(
+                &mut ceiling,
+                native_work_bound::continuation_preparation_native_work_ceiling(
+                    self.publication
+                        .as_ref()
+                        .ok_or(SemanticTransitionError::NotBound)?,
+                )?,
+            )?;
+            if let Some(custody) = &prepared.replay_custody {
+                native_work_bound::add_native_work_ceiling(
+                    &mut ceiling,
+                    custody.parent_metadata_native_work_ceiling()?,
+                )?;
+            }
             for bank in 0..2 {
                 work.register(
                     bank,
@@ -25270,7 +25377,8 @@ impl SemanticTransitionSession {
                 bytes.checked_add(
                     1 + 5 * size_of::<SemanticTrainingCanaryResultRecord>()
                         + size_of::<SemanticTrainingCanaryRefusalRecord>()
-                        + 2 * size_of::<ModelForwardReceipt>(),
+                        + 2 * size_of::<ModelForwardReceipt>()
+                        + 11 * size_of::<u64>(),
                 )
             })
             .ok_or(SemanticTransitionError::GenerationExhausted)?;
@@ -25572,6 +25680,9 @@ impl SemanticTransitionSession {
                             .map_err(|error| {
                                 runtime_error("model forward receipt allocation", error)
                             })?;
+                    let forward_native_work = reservation
+                        .alloc::<u64>(11)
+                        .map_err(|error| runtime_error("model forward work allocation", error))?;
                     writes.push(state_restoration::OriginalDeviceWrite::new(
                         &self.stream,
                         &[ModelForwardReceipt::default(); 2],
@@ -25608,6 +25719,7 @@ impl SemanticTransitionSession {
                         false,
                     )?);
                     Ok(Some(PreparedModelUpdate {
+                        canaries: None,
                         pending_slots: pending_generations[update_ordinal].clone(),
                         _model_owners: pending_generations[update_ordinal]
                             .iter()
@@ -25630,6 +25742,7 @@ impl SemanticTransitionSession {
                         ),
                         forward_seals,
                         forward_receipts,
+                        forward_native_work,
                         admissibility,
                         canary_results,
                         refusal,
@@ -31680,7 +31793,7 @@ impl SemanticTransitionSession {
         let training_selection_pointer = training_selection
             .as_ref()
             .map_or(0, |selection| *selection.device_ptr());
-        let model_update = owner
+        let mut model_update = owner
             .prepared
             .as_ref()
             .expect("prepared model update owner")
@@ -31689,6 +31802,17 @@ impl SemanticTransitionSession {
             .as_ref()
             .map(PreparedModelUpdate::descriptor)
             .unwrap_or_default();
+        #[cfg(feature = "semantic-policy")]
+        let training_canaries = owner
+            .prepared
+            .as_ref()
+            .and_then(|prepared| prepared.training_view.as_ref())
+            .map(SemanticSelectedTrainingView::canaries);
+        #[cfg(not(feature = "semantic-policy"))]
+        let training_canaries: Option<DeviceMemoryView<SemanticTrainingCanaryRecord>> = None;
+        model_update.canaries = training_canaries
+            .as_ref()
+            .map_or(0, |view| *view.device_ptr());
         let continuation = PreparedContinuation::prepare(
             &self.provider,
             storage,
@@ -31709,6 +31833,14 @@ impl SemanticTransitionSession {
             &uploads,
             &layouts,
         )?;
+        if let Some(update) = self
+            .steps
+            .get_mut(&step.token)
+            .and_then(|owner| owner.prepared.as_mut())
+            .and_then(|prepared| prepared.branches[bank].model_update.as_mut())
+        {
+            update.canaries = training_canaries;
+        }
         self.steps
             .get_mut(&step.token)
             .expect("checked prepared step")
@@ -31854,6 +31986,7 @@ impl SemanticTransitionSession {
             vocabulary_stride_bytes: layout.strides_bytes[2],
             logits_digest,
             receipt,
+            native_work: update.forward_native_work.device_ptr_value(),
         };
         let mut recorder = self.domain.new_strict_recorder();
         storage.record(&mut recorder);
@@ -31861,6 +31994,7 @@ impl SemanticTransitionSession {
         recorder.read(&update.forward_seals);
         recorder.read(digest_cells.as_ref());
         recorder.write(&update.forward_receipts);
+        recorder.read_write(&update.forward_native_work);
         let result = enqueue_recorded(&self.domain, &mut self.poisoned, recorder, |enqueue| {
             // SAFETY: all pointers name retained native or producer-owned storage;
             // the launch is captured immediately after the actual forward.
@@ -32258,6 +32392,30 @@ impl SemanticTransitionSession {
         } else {
             slab_allocation_bytes
         };
+        #[cfg(feature = "semantic-policy")]
+        self.steps
+            .get_mut(&step.token)
+            .and_then(|owner| owner.prepared.as_mut())
+            .and_then(|prepared| prepared.policy_work.as_mut())
+            .ok_or(SemanticTransitionError::NotBound)?
+            .register_update_canary(
+                bank,
+                Arc::clone(&self.publication_issuer),
+                step.token,
+                native_work_bound::update_canary_native_work_ceiling(
+                    &storage,
+                    capacity,
+                    baseline_logits.layout.dimensions[2],
+                    forward_seal_values.len() as u64,
+                    self.task
+                        .as_ref()
+                        .ok_or(SemanticTransitionError::NotBound)?
+                        .0
+                        .spec
+                        .statement_records
+                        .len() as u64,
+                )?,
+            )?;
         let prepared = self
             .steps
             .get_mut(&step.token)
@@ -32484,6 +32642,34 @@ impl SemanticTransitionSession {
         // codebook, causal, or numerical consumers can read any parent value.
         let keys = self.prepared_range_keys(step)?;
         self.guard_prepared_content(step, &keys, self.stream.cu_stream() as usize as u64)?;
+        #[cfg(feature = "semantic-policy")]
+        let replay_work = if self.steps[&step.token]
+            .prepared
+            .as_ref()
+            .and_then(|prepared| prepared.policy_work.as_ref())
+            .is_some()
+        {
+            Some([
+                self.prepared_policy_work_counter(
+                    step,
+                    0,
+                    policy_work::PolicyWorkKey::ModelScratch,
+                    &self.publication_issuer,
+                    step.token,
+                )?,
+                self.prepared_policy_work_counter(
+                    step,
+                    1,
+                    policy_work::PolicyWorkKey::ModelScratch,
+                    &self.publication_issuer,
+                    step.token,
+                )?,
+            ])
+        } else {
+            None
+        };
+        #[cfg(not(feature = "semantic-policy"))]
+        let replay_work: Option<[DeviceMemoryView<u64>; 2]> = None;
         let owner = &self.steps[&step.token];
         let descriptor = self.descriptor();
         owner
@@ -32503,6 +32689,7 @@ impl SemanticTransitionSession {
                 self.publication.as_ref().expect("prepared publication"),
                 &owner.prepared.as_ref().expect("prepared owner").reader,
                 &self.graph,
+                replay_work,
             )?;
         }
         owner.feedback[0].enqueue(
@@ -42259,6 +42446,10 @@ impl SemanticTransitionSession {
         // sources, original witness/services, destination storage and the lease.
         self.publication_uploads = uploads;
         self.text_binding = Some(Arc::clone(&text_binding));
+        #[cfg(feature = "semantic-policy")]
+        let native_work = self.cold_native_work(lease.token)?;
+        #[cfg(not(feature = "semantic-policy"))]
+        let native_work: Option<DeviceMemoryView<u64>> = None;
         let result = (|| {
             for (slot, payload) in &self.publication_uploads {
                 if let PublicationPayload::Metadata(bytes) = payload {
@@ -42275,7 +42466,7 @@ impl SemanticTransitionSession {
                     }
                 }
             }
-            prepared.enqueue(&self.domain, &mut self.poisoned)
+            prepared.enqueue(&self.domain, &mut self.poisoned, native_work)
         })();
         if let Err(error) = result {
             self.poisoned = true;
@@ -43662,51 +43853,7 @@ impl SemanticTransitionSession {
                 "goal authority can be bound only once",
             ));
         }
-        let program_words = binding
-            .spec
-            .program
-            .editable_program()
-            .map(|program| {
-                program
-                    .queries
-                    .len()
-                    .checked_add(program.initial_facts.len())
-                    .and_then(|facts| facts.checked_mul(3))
-                    .and_then(|facts| {
-                        program
-                            .initial_rules
-                            .len()
-                            .checked_mul(10)
-                            .and_then(|rules| facts.checked_add(rules))
-                    })
-                    .and_then(|words| words.checked_add(4))
-                    .ok_or(SemanticTransitionError::GenerationExhausted)
-            })
-            .transpose()?
-            .unwrap_or(0);
-        // A growing vector can retain its old allocation alongside its new
-        // capacity: three logical extents bound that overlap. The serialized
-        // program also survives while the bank is built and its identity hashes
-        // one further program vector. These are this task's actual word rosters.
-        let program_capacity = program_words
-            .checked_mul(2)
-            .ok_or(SemanticTransitionError::GenerationExhausted)?;
-        let bank_peak = device
-            .len()
-            .checked_mul(3)
-            .and_then(|words| words.checked_add(program_capacity))
-            .ok_or(SemanticTransitionError::GenerationExhausted)?;
-        let identity_peak = program_words
-            .checked_mul(5)
-            .and_then(|words| words.checked_add(2))
-            .ok_or(SemanticTransitionError::GenerationExhausted)?;
-        let word_bytes = bank_peak
-            .max(identity_peak)
-            .checked_mul(size_of::<u64>())
-            .ok_or(SemanticTransitionError::GenerationExhausted)?;
-        let word_allocation = budget.reserve_auxiliary(
-            u64::try_from(word_bytes).map_err(|_| SemanticTransitionError::GenerationExhausted)?,
-        )?;
+        let word_allocation = budget.reserve_auxiliary(binding.words_allocation_bytes()?)?;
         binding.goal_witness = Some(witness);
         let identity = binding.identity();
         let words = binding.words(self.graph.transition_arena()[1]);
@@ -45595,6 +45742,24 @@ impl SemanticTransitionSession {
             None,
         )?;
         let result = (|| {
+            let continuation_work = self.prepared_policy_work_counter(
+                step,
+                bank,
+                policy_work::PolicyWorkKey::ModelScratch,
+                &self.publication_issuer,
+                step.token,
+            )?;
+            let canary_work = if kind == SemanticTransitionKind::Update {
+                Some(self.prepared_policy_work_counter(
+                    step,
+                    bank,
+                    policy_work::PolicyWorkKey::UpdateCanary,
+                    &self.publication_issuer,
+                    step.token,
+                )?)
+            } else {
+                None
+            };
             let prepared = self.steps[&step.token]
                 .prepared
                 .as_ref()
@@ -45604,7 +45769,7 @@ impl SemanticTransitionSession {
                 .continuation
                 .as_ref()
                 .expect("checked original continuation")
-                .enqueue(&self.domain, &mut self.poisoned)?;
+                .enqueue(&self.domain, &mut self.poisoned, Some(continuation_work))?;
             if let Some(update) = &branch.model_update {
                 let training_view = prepared.training_view.as_ref().ok_or_else(|| {
                     publication_input_error("prepared update has no native training view")
@@ -45622,6 +45787,7 @@ impl SemanticTransitionSession {
                         .expect("prepared model work frozen above"),
                     bank,
                     self.provider.memory().allocated_bytes(),
+                    canary_work.expect("original Update canary counter"),
                 )?;
             }
             let io = self.prepared_kernel_io(step, bank)?;

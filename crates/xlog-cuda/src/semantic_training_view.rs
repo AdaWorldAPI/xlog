@@ -1870,7 +1870,7 @@ impl SemanticTrainingViewArena {
                     .checked_mul(2)
                     .and_then(|proposals| cells.checked_add(proposals))
             })
-            .and_then(|cells| cells.checked_add(1))
+            .and_then(|cells| cells.checked_add(2))
             .ok_or(SemanticTransitionError::GenerationExhausted)
     }
 
