@@ -83,9 +83,10 @@ mod source_content_occurrences;
 #[cfg(feature = "semantic-policy")]
 pub use source_content_occurrences::{
     SemanticPreparedTensorContentBindings, SemanticPreparedTensorContentEvent,
-    SemanticSourceAllocationDescriptor, SemanticSourceContentAllocation,
-    SemanticSourceContentEvent, SemanticSourceContentFamily, SemanticSourceContentKind,
-    SemanticSourceContentOccurrence, SemanticSourceContentPhase, SemanticSourceTensorDescriptor,
+    SemanticPreparedTensorContentReceiver, SemanticSourceAllocationDescriptor,
+    SemanticSourceContentAllocation, SemanticSourceContentEvent, SemanticSourceContentFamily,
+    SemanticSourceContentKind, SemanticSourceContentOccurrence, SemanticSourceContentPhase,
+    SemanticSourceTensorDescriptor,
 };
 pub(crate) mod state_restoration;
 #[cfg(feature = "semantic-policy")]
@@ -15357,7 +15358,7 @@ struct PreparedStepStorage {
     next_digest: usize,
     model_work: Option<PreparedModelWork>,
     #[cfg(feature = "semantic-policy")]
-    content_plan: Option<source_content_occurrences::PreparedTensorContentPlan>,
+    content_plan: Option<Arc<source_content_occurrences::PreparedTensorContentPlan>>,
     admit: CudaFunction,
     kind_gate: CudaFunction,
     kind_bank_gate: CudaFunction,
@@ -16269,14 +16270,16 @@ struct TensorContentBuffers {
     original_cold: Mutex<Option<native_work_bound::OriginalContentBatch>>,
 }
 
+#[derive(Clone)]
 enum TensorContentSeals {
     Captured(Vec<CapturedTensorDigest>),
     // Original device seals and contract bytes, not a later bank directory or
     // a replacement baseline computed from the live numerical producer.
-    Model(ModelContentSeals),
+    Model(Arc<ModelContentSeals>),
 }
 
 struct ModelContentSeals {
+    _owner_reservation: Option<SemanticReplayMaterialReservation>,
     ranges: TrackedCudaSlice<PublicationRange>,
     contract: TrackedCudaSlice<u8>,
     guard: CudaFunction,
@@ -16383,6 +16386,20 @@ fn model_content_copy_plan(
 }
 
 impl ModelContentSeals {
+    fn retain(
+        mut self,
+        budget: Option<&SemanticReplayMaterialBudget>,
+    ) -> Result<Arc<Self>, SemanticTransitionError> {
+        self._owner_reservation = budget
+            .map(|budget| {
+                budget.reserve_auxiliary(
+                    u64::try_from(size_of::<Self>() + 2 * size_of::<usize>())
+                        .map_err(|_| SemanticTransitionError::GenerationExhausted)?,
+                )
+            })
+            .transpose()?;
+        Ok(Arc::new(self))
+    }
     fn allocate(
         provider: &CudaKernelProvider,
         plan: &ModelContentCopyPlan,
@@ -16426,6 +16443,7 @@ impl ModelContentSeals {
                 runtime_error("kernel lookup", "retained model contract guard unavailable")
             })?;
         Ok(Self {
+            _owner_reservation: None,
             ranges,
             contract,
             guard,
@@ -16742,6 +16760,7 @@ impl ModelContentSeals {
     }
 }
 
+#[derive(Clone)]
 enum CapturedTensorDigest {
     Tensor {
         cells: Arc<TrackedCudaSlice<u64>>,
@@ -26444,6 +26463,7 @@ impl SemanticTransitionSession {
             [Vec<SemanticPreparedTensorContentEvent>; 2],
             [SemanticPreparedTensorContentBindings; 2],
         )],
+        receivers: &[SemanticPreparedTensorContentReceiver],
     ) -> Result<(), SemanticTransitionError> {
         self.ensure_quiescent()?;
         self.require_original_prepared_structure()?;
@@ -26497,6 +26517,7 @@ impl SemanticTransitionSession {
                 step,
                 content,
                 bindings,
+                receivers,
                 |bank, slot| {
                     let mut owners = rows.iter().filter_map(|(producer, _, _, roster, _)| {
                         roster[bank]
@@ -26510,7 +26531,10 @@ impl SemanticTransitionSession {
                             "prepared witness output slot has multiple original producers",
                         ));
                     }
-                    Ok(original)
+                    original
+                        .filter(|original| original.token != step.token)
+                        .map(|original| self.prepared_tensor_content_receiver(original, bank, slot))
+                        .transpose()
                 },
             )?;
             self.steps
@@ -26519,7 +26543,7 @@ impl SemanticTransitionSession {
                 .prepared
                 .as_mut()
                 .expect("original prepared storage")
-                .content_plan = Some(plan);
+                .content_plan = Some(Arc::new(plan));
         }
         // Seal before physical admission: a known refusal preserves the same
         // child and does not authorize another plan, count, or allocation owner.
@@ -30811,7 +30835,7 @@ impl SemanticTransitionSession {
         let index = owner.content.len();
         owner.content.push(TensorContentBuffers {
             tensors: original,
-            seals: TensorContentSeals::Model(seals),
+            seals: TensorContentSeals::Model(seals.retain(self.replay_material_budget.as_ref())?),
             verification_inputs: Vec::new(),
             #[cfg(feature = "semantic-policy")]
             original_cold: Mutex::new(None),
@@ -31339,7 +31363,15 @@ impl SemanticTransitionSession {
                         "prepared content has no original frozen typed occurrence roster",
                     )
                 })?
-                .claim(self, target, *bank, witness, verify)?;
+                .claim(
+                    self,
+                    target,
+                    *bank,
+                    witness,
+                    verify,
+                    &owner.content[witness.index],
+                    None,
+                )?;
         }
         #[cfg(feature = "semantic-policy")]
         let selected_work = recording
@@ -37259,7 +37291,10 @@ impl SemanticTransitionSession {
             None
         };
         let seals = if let Some(plan) = &model_plan {
-            TensorContentSeals::Model(ModelContentSeals::allocate(&self.provider, plan)?)
+            TensorContentSeals::Model(
+                ModelContentSeals::allocate(&self.provider, plan)?
+                    .retain(self.replay_material_budget.as_ref())?,
+            )
         } else {
             let mut digests = Vec::with_capacity(content.tensors.len());
             for (tensor, native) in content.tensors.iter().zip(native_origins) {
