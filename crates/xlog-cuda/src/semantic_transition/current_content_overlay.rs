@@ -833,6 +833,15 @@ impl SourceContentGeometryOwner {
             .get(&step.token)
             .and_then(|step| step.inputs.as_ref())
             .ok_or(SemanticTransitionError::NotBound)?;
+        // Use the canonical complete input-owner check, including private
+        // headers, ranges, bindings, digest buffers and backing padding.
+        if staged.proof.inner.inputs.owns_tensor(&backing.tensor)?
+            || inputs.owns_tensor(&backing.tensor)?
+        {
+            return Err(publication_input_error(
+                "content overlay backing aliases its original native input owner",
+            ));
+        }
         for original in staged
             .proof
             .inner
