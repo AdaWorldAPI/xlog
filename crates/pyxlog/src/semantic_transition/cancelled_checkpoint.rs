@@ -12,6 +12,7 @@ pyo3::create_exception!(
 pub(super) struct OriginalCancelledCheckpointCustody {
     material: xlog_cuda::SemanticReplayLoadedMaterial,
     native: Mutex<xlog_cuda::SemanticReplayLoadedMaterial>,
+    source: OriginalCancelledCheckpointSource,
     seed: TaskCheckpointSeed,
     snapshot: AuthoritySnapshot,
     phase: CheckpointTaskPhase,
@@ -24,6 +25,11 @@ pub(super) struct OriginalCancelledCheckpointCustody {
     completion: Mutex<CancelledCheckpointCompletion>,
     budget: xlog_cuda::SemanticReplayMaterialBudget,
     _metadata: xlog_cuda::SemanticReplayMaterialReservation,
+}
+
+enum OriginalCancelledCheckpointSource {
+    Ordinary,
+    ModelContext(xlog_cuda::SemanticModelContextContinuation),
 }
 
 #[derive(Default)]
@@ -124,6 +130,23 @@ fn require_session_checkpoint_custody(
 }
 
 impl OriginalCancelledCheckpointCustody {
+    pub(super) fn require_original_material(&self, checkpoint: &Bound<'_, PyAny>) -> PyResult<()> {
+        if !checkpoint.is_exact_instance_of::<material_bytes::PySemanticMaterialBytes>() {
+            return Err(invalid(
+                "cancelled checkpoint custody requires original guarded material",
+            ));
+        }
+        let carrier = checkpoint
+            .cast::<material_bytes::PySemanticMaterialBytes>()?
+            .borrow();
+        if !std::ptr::eq(carrier.as_bytes(), self.material.as_bytes()) {
+            return Err(invalid(
+                "instruction cannot replace its original checkpoint material",
+            ));
+        }
+        Ok(())
+    }
+
     /// Validate the pre-request capsule before the instruction can charge or hand off.
     pub(super) fn prepare(
         py: Python<'_>,
@@ -139,6 +162,28 @@ impl OriginalCancelledCheckpointCustody {
                 "cancelled checkpoint custody requires original guarded material",
             ));
         }
+        let source = {
+            let state = task.state()?;
+            if let TaskUsePhase::ContextActivated { scope, .. } = &state.phase {
+                let prepared = session
+                    .prepared_segment
+                    .lock()
+                    .map_err(|_| invalid("activated checkpoint lost its prepared owner"))?;
+                let prepared = prepared
+                    .as_ref()
+                    .filter(|prepared| Arc::ptr_eq(scope, &prepared.scope))
+                    .ok_or_else(|| {
+                        invalid("activated checkpoint changed its original frozen scope")
+                    })?;
+                OriginalCancelledCheckpointSource::ModelContext(
+                    prepared.model_context.clone().ok_or_else(|| {
+                        invalid("activated checkpoint lost its original continuation")
+                    })?,
+                )
+            } else {
+                OriginalCancelledCheckpointSource::Ordinary
+            }
+        };
         let registry = Arc::clone(&task.checkpoint.material_sources);
         let budget = registry.native_budget()?;
         let metadata = budget
@@ -200,9 +245,14 @@ impl OriginalCancelledCheckpointCustody {
         // The original restore owner, not Python digest equivalence, authenticates
         // a saved instance when the selected parent was created by fresh restore.
         let lease = parent.lease()?;
-        let (source_material_digest, restored_from_exact_source) = owner
-            .verify_checkpoint_loaded_source_material(&lease, &mut native)
-            .map_err(xlog_err)?;
+        let (source_material_digest, restored_from_exact_source) = match &source {
+            OriginalCancelledCheckpointSource::Ordinary => {
+                owner.verify_checkpoint_loaded_source_material(&lease, &mut native)
+            }
+            OriginalCancelledCheckpointSource::ModelContext(continuation) => owner
+                .verify_model_context_checkpoint_loaded_source(continuation, &lease, &mut native),
+        }
+        .map_err(xlog_err)?;
         if binding.epoch != current_binding.epoch && !restored_from_exact_source {
             return Err(invalid(
                 "cancelled checkpoint has another original native task epoch",
@@ -234,6 +284,7 @@ impl OriginalCancelledCheckpointCustody {
         Ok(Self {
             material,
             native: Mutex::new(native),
+            source,
             seed,
             snapshot,
             phase,
@@ -269,19 +320,32 @@ impl OriginalCancelledCheckpointCustody {
                 .ok_or_else(|| {
                     invalid("cancelled checkpoint lost its original native source assignments")
                 })?;
-        owner
-            .bind_segment_loaded_checkpoint_source(
-                admission,
-                parent,
-                &mut *self
-                    .native
-                    .lock()
-                    .map_err(|_| invalid("cancelled checkpoint native custody is poisoned"))?,
-                self.source_checkpoint_digest,
-                source_expense.spent,
-                source_assignments,
-            )
-            .map_err(xlog_err)
+        let mut native = self
+            .native
+            .lock()
+            .map_err(|_| invalid("cancelled checkpoint native custody is poisoned"))?;
+        match &self.source {
+            OriginalCancelledCheckpointSource::Ordinary => owner
+                .bind_segment_loaded_checkpoint_source(
+                    admission,
+                    parent,
+                    &mut native,
+                    self.source_checkpoint_digest,
+                    source_expense.spent,
+                    source_assignments,
+                ),
+            OriginalCancelledCheckpointSource::ModelContext(continuation) => owner
+                .bind_model_context_checkpoint_loaded_source(
+                    continuation,
+                    admission,
+                    parent,
+                    &mut native,
+                    self.source_checkpoint_digest,
+                    source_expense.spent,
+                    source_assignments,
+                ),
+        }
+        .map_err(xlog_err)
     }
 
     /// Freeze only after the original native cancellation and all final-use reports.

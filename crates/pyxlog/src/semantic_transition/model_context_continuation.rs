@@ -176,6 +176,7 @@ struct ContinuationState {
     callback_returned: bool,
     callback_complete: bool,
     callback_error: Option<PyErr>,
+    instruction_checkpoint: Option<Arc<cancelled_checkpoint::OriginalCancelledCheckpointCustody>>,
     instruction_native: Option<SemanticSegmentInstructionAdmission>,
     instruction_custody: Option<Arc<SegmentInstructionCustody>>,
     instruction: Option<Py<PySemanticSegmentInstructionAdmission>>,
@@ -2565,11 +2566,13 @@ impl PySemanticModelContextContinuation {
         Ok(parent)
     }
 
+    #[pyo3(signature = (parent, instruction_bytes, *, checkpoint))]
     fn admit_instruction(
         slf: Py<Self>,
         py: Python<'_>,
         parent: Py<PySemanticPublishedParent>,
         instruction_bytes: &Bound<'_, PyAny>,
+        checkpoint: &Bound<'_, PyAny>,
     ) -> PyResult<Py<PySemanticSegmentInstructionAdmission>> {
         let context = slf.borrow(py);
         let parent_matches = {
@@ -2596,6 +2599,33 @@ impl PySemanticModelContextContinuation {
                 "live target instruction differs from the original frozen mapping",
             ));
         }
+        let target = context.target_task.borrow(py);
+        let session = target.session.borrow(py);
+        session.require_creator()?;
+        let retained_checkpoint = context
+            .state()?
+            .instruction_checkpoint
+            .as_ref()
+            .map(Arc::clone);
+        let cancelled_checkpoint = match retained_checkpoint {
+            Some(original) => {
+                original.require_original_material(checkpoint)?;
+                original
+            }
+            None => {
+                let original = Arc::new(
+                    cancelled_checkpoint::OriginalCancelledCheckpointCustody::prepare(
+                        py,
+                        &session,
+                        &target,
+                        &parent.borrow(py),
+                        checkpoint,
+                    )?,
+                );
+                context.state()?.instruction_checkpoint = Some(Arc::clone(&original));
+                original
+            }
+        };
         let original = context
             .state()?
             .instruction
@@ -2605,8 +2635,6 @@ impl PySemanticModelContextContinuation {
             context.handoff_target_parent(py, &original.borrow(py), &slf)?;
             return Ok(original);
         }
-        let target = context.target_task.borrow(py);
-        let session = target.session.borrow(py);
         if context.state()?.instruction_native.is_none() {
             let inner = session
                 .owner()?
@@ -2642,7 +2670,7 @@ impl PySemanticModelContextContinuation {
                 transitions,
                 cold_capacity,
                 replay_model_backings: Arc::new(xlog_cuda::SemanticReplayModelBackings::default()),
-                cancelled_checkpoint: None,
+                cancelled_checkpoint: Some(cancelled_checkpoint),
                 preparation: Mutex::new(SegmentInstructionPreparation {
                     scope: state.scope.as_ref().map(Arc::clone),
                     native_steps: state.steps.clone(),
@@ -2672,6 +2700,15 @@ impl PySemanticModelContextContinuation {
             .as_mut()
             .ok_or_else(|| invalid("activated target lost its original captured segment"))?
             .instruction = Some(Arc::clone(&custody));
+        custody
+            .cancelled_checkpoint
+            .as_ref()
+            .expect("original target checkpoint custody retained")
+            .bind_source(
+                &mut *session.owner()?,
+                &custody.inner,
+                &*custody.parent.borrow(py).lease()?,
+            )?;
         let admission = Py::new(py, PySemanticSegmentInstructionAdmission { inner: custody })?;
         context.state()?.instruction = Some(admission.clone_ref(py));
         context.handoff_target_parent(py, &admission.borrow(py), &slf)?;
