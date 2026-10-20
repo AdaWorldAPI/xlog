@@ -754,6 +754,7 @@ impl SourceContentGeometryOwner {
     pub(super) fn require_prepared_content_overlay(
         &self,
         session: &SemanticTransitionSession,
+        step: &SemanticPreparedStep,
         section: (SemanticTransitionKind, usize),
         allocation: &SemanticSourceGeometryAllocation,
         descriptor: &SemanticSourceTensorDescriptor,
@@ -800,6 +801,11 @@ impl SourceContentGeometryOwner {
             .actor_refresh
             .as_ref()
             .ok_or(SemanticTransitionError::NotBound)?;
+        let inputs = session
+            .steps
+            .get(&step.token)
+            .and_then(|step| step.inputs.as_ref())
+            .ok_or(SemanticTransitionError::NotBound)?;
         for original in staged
             .proof
             .inner
@@ -807,6 +813,13 @@ impl SourceContentGeometryOwner {
             .allocations
             .iter()
             .chain(&staged.proof.inner.inputs.storage.allocations)
+            .chain(
+                session
+                    .publication
+                    .iter()
+                    .flat_map(|storage| &storage.allocations),
+            )
+            .chain(&inputs.storage.allocations)
         {
             if step_input_overlap(
                 backing.tensor.data,
@@ -823,6 +836,7 @@ impl SourceContentGeometryOwner {
             .inputs
             .views
             .iter()
+            .chain(&inputs.views)
             .flat_map(|views| views.values())
         {
             if step_input_overlap(
