@@ -828,11 +828,20 @@ impl SemanticTransitionSession {
         consumer_stream: u64,
         occurrence: Option<&SemanticSourceContentOccurrence>,
     ) -> Result<(), SemanticTransitionError> {
+        let mut pending = RetainedTensorAdmission {
+            inputs: Some(tensors),
+            stream: Arc::clone(&self.stream),
+            consumer_stream: Some(consumer_stream),
+            ready: false,
+        };
         self.require_prepared_tensor_content_recorder(recording_step)?;
         self.verify_prepared_tensor_content(
             original_step,
             witness,
-            tensors,
+            pending
+                .inputs
+                .take()
+                .expect("retained original producer roster"),
             consumer_stream,
             occurrence,
         )
@@ -847,6 +856,12 @@ impl SemanticTransitionSession {
         tensors: Vec<SemanticTensorInput>,
         consumer_stream: u64,
     ) -> Result<(), SemanticTransitionError> {
+        let pending = RetainedTensorAdmission {
+            inputs: Some(tensors),
+            stream: Arc::clone(&self.stream),
+            consumer_stream: Some(consumer_stream),
+            ready: false,
+        };
         let bank = self.require_prepared_tensor_content_recorder(recording_step)?;
         self.check_prepared_content_stream(recording_step, consumer_stream)?;
         source.checked_prepared_content_witness(original_step, witness)?;
@@ -870,7 +885,7 @@ impl SemanticTransitionSession {
                 "foreign content changed its original Update, bank, provider or material owner",
             ));
         }
-        let actual = prepare_semantic_tensors(&self.provider, tensors)?;
+        let actual = prepare_retained_semantic_tensors(&self.provider, pending)?;
         let content = &source.steps[&original_step.token].content[witness.index];
         if content.tensors.len() != actual.len()
             || content
