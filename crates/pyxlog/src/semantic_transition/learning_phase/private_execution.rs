@@ -4326,7 +4326,9 @@ impl PySemanticLearningPhaseTransition {
             }
             let (transition, skipped, bank, refusal) = match observation.inner.outcome() {
                 xlog_cuda::SemanticPreparedStepOutcome::PolicyScore { .. } => {
-                    return Err(invalid("a demonstration score is not a private world-transition receipt"));
+                    return Err(invalid(
+                        "a demonstration score is not a private world-transition receipt",
+                    ));
                 }
                 xlog_cuda::SemanticPreparedStepOutcome::Skipped { .. } => (None, true, None, None),
                 xlog_cuda::SemanticPreparedStepOutcome::Completed {

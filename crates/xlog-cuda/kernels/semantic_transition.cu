@@ -2778,8 +2778,8 @@ extern "C" __global__ void semantic_publication_prepare_model_update_admissibili
     if(!publication_pointer_span(inputs.native_work,sizeof(semantic_graph::NativeWorkTally),
             alignof(semantic_graph::NativeWorkTally))) { semantic_content_integrity_trap();return; }
     auto* native_work=reinterpret_cast<semantic_graph::NativeWorkTally*>(inputs.native_work);
-    // The original model scratch already owns preparation and binding work.
-    // This gate extends that same replay's tally; resetting it loses reached work.
+    // The original canary counter retains this replay's reached work. Binding
+    // work remains in its original model scratch and joins at final publication.
     semantic_graph::charge_native(native_work,semantic_graph::NativeWorkEvent::Command,1);
     ExecutionWork work{};
     execution_work_merge_native(work,*native_work);

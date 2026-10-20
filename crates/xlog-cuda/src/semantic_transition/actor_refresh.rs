@@ -13,8 +13,11 @@ impl SemanticPreparedActorRefresh {
     }
 
     pub(super) fn contribution_kind(&self) -> ImportedPolicyContributionKind {
-        if self.is_demonstration() { ImportedPolicyContributionKind::CurrentDemonstration }
-        else { ImportedPolicyContributionKind::CurrentActor }
+        if self.is_demonstration() {
+            ImportedPolicyContributionKind::CurrentDemonstration
+        } else {
+            ImportedPolicyContributionKind::CurrentActor
+        }
     }
 
     pub(super) fn material_reservation(&self) -> Arc<SemanticReplayMaterialReservation> {
@@ -22,15 +25,22 @@ impl SemanticPreparedActorRefresh {
     }
 
     pub(super) fn require_frozen_member<B: AsRef<[u8]>>(
-        &self, training: &SemanticSelectedTrainingView, row: &SemanticTrainingViewRow<B>,
+        &self,
+        training: &SemanticSelectedTrainingView,
+        row: &SemanticTrainingViewRow<B>,
     ) -> Result<Option<usize>, SemanticTransitionError> {
         if self.is_demonstration() {
-            if training.edit_group_member_index(self.inner.member.ordinal, row)?.is_none() {
+            if training
+                .edit_group_member_index(self.inner.member.ordinal, row)?
+                .is_none()
+            {
                 return Err(SemanticTransitionError::ObservationMismatch);
             }
             Ok(None)
         } else {
-            training.actor_group_member_index(self.inner.member.ordinal, row).map(Some)
+            training
+                .actor_group_member_index(self.inner.member.ordinal, row)
+                .map(Some)
         }
     }
 }
@@ -51,17 +61,24 @@ impl OriginalEditDemonstration {
         ground: &SemanticCompletedStepWitnessMaterial,
     ) -> Result<Self, SemanticTransitionError> {
         let (origin, _) = initial_episode_actor(material, batch_identity, batch_bytes)?;
-        let completed_action::OriginalCompletedAction { predecessor, successor, bank, state, receipts } =
-            completed_action::decode(&action.bytes)?;
+        let completed_action::OriginalCompletedAction {
+            predecessor,
+            successor,
+            bank,
+            state,
+            receipts,
+        } = completed_action::decode(&action.bytes)?;
         if predecessor != material.predecessor_identity()
             || successor != material.evidence.successor
             || bank != (predecessor.word & 1)
         {
             return Err(SemanticTransitionError::ObservationMismatch);
         }
-        if state.status != 0 || state.blocks != COMPONENT_COUNT as u64
+        if state.status != 0
+            || state.blocks != COMPONENT_COUNT as u64
             || u64::from(state.model_generation) != origin.model_generation
-            || u64::from(state.family_id) != origin.family_id || state.stream_serial != origin.stream_serial
+            || u64::from(state.family_id) != origin.family_id
+            || state.stream_serial != origin.stream_serial
             || state.proposal != origin.proposal
             || origin.proposal.checked_add(1) != Some(state.next_proposal)
             || publication_abi_bytes(&[state.action_batch]) != batch_bytes
@@ -69,11 +86,14 @@ impl OriginalEditDemonstration {
             || state.action_batch.actor_eligible != state.actor_eligible
             || state.action_batch.winner != state.task_evaluation.winner
             || state.action_batch.total_return_bits != state.task_evaluation.return_value as u64
-            || publication_semantic_receipts_digest(&state.semantic_receipts) != state.action_batch.semantic_receipts_digest
-            || publication_action_receipts_digest_bytes(&codebook.bytes, &receipts)? != state.action_batch.component_receipts_digest
+            || publication_semantic_receipts_digest(&state.semantic_receipts)
+                != state.action_batch.semantic_receipts_digest
+            || publication_action_receipts_digest_bytes(&codebook.bytes, &receipts)?
+                != state.action_batch.component_receipts_digest
             || codebook.identity != state.binding_digest
             || receipts.iter().enumerate().any(|(ordinal, receipt)| {
-                receipt.ordinal as usize != ordinal || receipt.proposal != state.proposal
+                receipt.ordinal as usize != ordinal
+                    || receipt.proposal != state.proposal
                     || receipt.catalogue_generation != state.catalogue_generation
                     || receipt.catalogue_digest != state.catalogue_digest
                     || receipt.admission_binding != state.binding_digest
@@ -81,18 +101,31 @@ impl OriginalEditDemonstration {
         {
             return Err(SemanticTransitionError::ObservationMismatch);
         }
-        let base_solves = state.task_evaluation.facts[0].eligible == 1
-            && state.task_evaluation.facts[0].p == 1;
-        let lane = (0..2).find(|&lane| {
-            let facts = &state.task_evaluation.facts[lane + 1];
-            !base_solves && state.task_evaluation.lane_refusal[lane] == 0
-                && state.semantic_receipts[3 + lane * 3][0] == 0
-                && state.work[lane].added_supports > 0 && facts.eligible == 1 && facts.p == 1
-        }).ok_or_else(|| publication_input_error("supervised edit requires its original genuinely solving native lane"))?;
-        let payload = completed_child_payload(solution, action.identity, b"edit-solution", lane as u64)?;
+        let base_solves =
+            state.task_evaluation.facts[0].eligible == 1 && state.task_evaluation.facts[0].p == 1;
+        let lane = (0..2)
+            .find(|&lane| {
+                let facts = &state.task_evaluation.facts[lane + 1];
+                !base_solves
+                    && state.task_evaluation.lane_refusal[lane] == 0
+                    && state.semantic_receipts[3 + lane * 3][0] == 0
+                    && state.work[lane].added_supports > 0
+                    && facts.eligible == 1
+                    && facts.p == 1
+            })
+            .ok_or_else(|| {
+                publication_input_error(
+                    "supervised edit requires its original genuinely solving native lane",
+                )
+            })?;
+        let payload =
+            completed_child_payload(solution, action.identity, b"edit-solution", lane as u64)?;
         let mut reader = SemanticMaterialReader::new(payload);
         let magic = b"XLOG-COMPLETED-EDIT-SOLUTION\0";
-        if reader.take(magic.len()).map_err(SemanticTransitionError::Semantic)? != magic
+        if reader
+            .take(magic.len())
+            .map_err(SemanticTransitionError::Semantic)?
+            != magic
             || reader.u64().map_err(SemanticTransitionError::Semantic)? != 1
         {
             return Err(SemanticTransitionError::ObservationMismatch);
@@ -105,48 +138,87 @@ impl OriginalEditDemonstration {
         {
             return Err(SemanticTransitionError::ObservationMismatch);
         }
-        for value in [state.work[lane].edit_commands, state.work[lane].added_supports,
-            state.work[lane].defined_truth_changes] {
+        for value in [
+            state.work[lane].edit_commands,
+            state.work[lane].added_supports,
+            state.work[lane].defined_truth_changes,
+        ] {
             if reader.u64().map_err(SemanticTransitionError::Semantic)? != value {
                 return Err(SemanticTransitionError::ObservationMismatch);
             }
         }
-        require_completed_child_binding(&mut reader, &completed_receipt_material(
-            action.identity, b"lane-admission", lane as u64, &state.semantic_receipts[3 + lane * 3]))?;
+        require_completed_child_binding(
+            &mut reader,
+            &completed_receipt_material(
+                action.identity,
+                b"lane-admission",
+                lane as u64,
+                &state.semantic_receipts[3 + lane * 3],
+            ),
+        )?;
         for slot in 0..2 {
-            require_completed_child_binding(&mut reader, &completed_receipt_material(
-                action.identity, b"hard-decode-receipt", (lane * 2 + slot) as u64,
-                &state.semantic_receipts[1 + lane * 3 + slot]))?;
+            require_completed_child_binding(
+                &mut reader,
+                &completed_receipt_material(
+                    action.identity,
+                    b"hard-decode-receipt",
+                    (lane * 2 + slot) as u64,
+                    &state.semantic_receipts[1 + lane * 3 + slot],
+                ),
+            )?;
         }
         for ordinal in lane * 68..(lane + 1) * 68 {
             let mut payload = Vec::with_capacity(COMPLETED_COMPONENT_RECEIPT_BYTES);
             encode_completed_component_receipt(&mut payload, receipts[ordinal]);
-            require_completed_child_binding(&mut reader, &completed_action_child_material(
-                action.identity, b"component-receipt", ordinal as u64, &payload))?;
+            require_completed_child_binding(
+                &mut reader,
+                &completed_action_child_material(
+                    action.identity,
+                    b"component-receipt",
+                    ordinal as u64,
+                    &payload,
+                ),
+            )?;
             // Historical masks, cells and pullbacks remain original evidence;
             // current scoring computes all four anew on the demonstrated prefix.
-            reader.take(4 * 64).map_err(SemanticTransitionError::Semantic)?;
+            reader
+                .take(4 * 64)
+                .map_err(SemanticTransitionError::Semantic)?;
         }
         reader.finish().map_err(SemanticTransitionError::Semantic)?;
         let payload = completed_child_payload(ground, action.identity, b"task-ground", 0)?;
         let mut reader = SemanticMaterialReader::new(payload);
         let magic = b"XLOG-COMPLETED-TASK-GROUND\0";
-        if reader.take(magic.len()).map_err(SemanticTransitionError::Semantic)? != magic
+        if reader
+            .take(magic.len())
+            .map_err(SemanticTransitionError::Semantic)?
+            != magic
             || reader.u64().map_err(SemanticTransitionError::Semantic)? != 5
         {
             return Err(SemanticTransitionError::ObservationMismatch);
         }
-        reader.take(32 + 8 + 4 * 32).map_err(SemanticTransitionError::Semantic)?;
+        reader
+            .take(32 + 8 + 4 * 32)
+            .map_err(SemanticTransitionError::Semantic)?;
         for _ in 0..4 {
-            if reader.take(32).map_err(SemanticTransitionError::Semantic)?.iter().all(|&byte| byte == 0) {
+            if reader
+                .take(32)
+                .map_err(SemanticTransitionError::Semantic)?
+                .iter()
+                .all(|&byte| byte == 0)
+            {
                 return Err(SemanticTransitionError::ObservationMismatch);
             }
         }
         if reader.u64().map_err(SemanticTransitionError::Semantic)? == 0
-            || reader.u64().map_err(SemanticTransitionError::Semantic)? == 0 {
+            || reader.u64().map_err(SemanticTransitionError::Semantic)? == 0
+        {
             return Err(SemanticTransitionError::ObservationMismatch);
         }
-        Ok(Self { lane: lane as u64 + 1, choices: receipts.map(|receipt| u64::from(receipt.choice)) })
+        Ok(Self {
+            lane: lane as u64 + 1,
+            choices: receipts.map(|receipt| u64::from(receipt.choice)),
+        })
     }
 }
 
@@ -158,17 +230,26 @@ fn completed_child_payload<'a>(
 ) -> Result<&'a [u8], SemanticTransitionError> {
     let mut reader = SemanticMaterialReader::new(&material.bytes);
     let magic = b"XLOG-COMPLETED-ACTION-CHILD\0";
-    if reader.take(magic.len()).map_err(SemanticTransitionError::Semantic)? != magic
+    if reader
+        .take(magic.len())
+        .map_err(SemanticTransitionError::Semantic)?
+        != magic
         || reader.u64().map_err(SemanticTransitionError::Semantic)? != 1
         || reader.take(32).map_err(SemanticTransitionError::Semantic)? != owner.as_bytes()
         || reader.u64().map_err(SemanticTransitionError::Semantic)? != kind.len() as u64
-        || reader.take(kind.len()).map_err(SemanticTransitionError::Semantic)? != kind
-        || reader.u64().map_err(SemanticTransitionError::Semantic)? != ordinal {
+        || reader
+            .take(kind.len())
+            .map_err(SemanticTransitionError::Semantic)?
+            != kind
+        || reader.u64().map_err(SemanticTransitionError::Semantic)? != ordinal
+    {
         return Err(SemanticTransitionError::ObservationMismatch);
     }
     let count = usize::try_from(reader.u64().map_err(SemanticTransitionError::Semantic)?)
         .map_err(|_| SemanticTransitionError::GenerationExhausted)?;
-    let payload = reader.take(count).map_err(SemanticTransitionError::Semantic)?;
+    let payload = reader
+        .take(count)
+        .map_err(SemanticTransitionError::Semantic)?;
     reader.finish().map_err(SemanticTransitionError::Semantic)?;
     if completed_action_child_identity(owner, kind, ordinal) != material.identity {
         return Err(SemanticTransitionError::ObservationMismatch);
@@ -181,7 +262,9 @@ fn require_completed_child_binding(
     material: &SemanticCompletedStepWitnessMaterial,
 ) -> Result<(), SemanticTransitionError> {
     if reader.take(32).map_err(SemanticTransitionError::Semantic)? != material.identity.as_bytes()
-        || reader.take(32).map_err(SemanticTransitionError::Semantic)? != Sha256::digest(&material.bytes).as_slice() {
+        || reader.take(32).map_err(SemanticTransitionError::Semantic)?
+            != Sha256::digest(&material.bytes).as_slice()
+    {
         return Err(SemanticTransitionError::ObservationMismatch);
     }
     Ok(())
@@ -463,8 +546,12 @@ impl ActorRefreshObservedComponent {
         marker: PreparedActorRefreshDevice,
         native_work: &[u64],
     ) -> Result<(), SemanticTransitionError> {
-        if marker.abi != 1 || marker.status != 2 || marker.member_ordinal != self.member_ordinal
-            || marker.role != u64::from(self.kind == SemanticSourceContentGeometryKind::CurrentDemonstration) {
+        if marker.abi != 1
+            || marker.status != 2
+            || marker.member_ordinal != self.member_ordinal
+            || marker.role
+                != u64::from(self.kind == SemanticSourceContentGeometryKind::CurrentDemonstration)
+        {
             return Err(SemanticTransitionError::ObservationMismatch);
         }
         let observation = ActorRefreshInitializerObservation {
@@ -473,9 +560,14 @@ impl ActorRefreshObservedComponent {
                 .try_into()
                 .map_err(|_| SemanticTransitionError::ObservationMismatch)?,
         };
-        let mut original = self.initializer_observation.as_ref().0.lock().map_err(|_| {
-            publication_input_error("original actor refusal observation lock is poisoned")
-        })?;
+        let mut original = self
+            .initializer_observation
+            .as_ref()
+            .0
+            .lock()
+            .map_err(|_| {
+                publication_input_error("original actor refusal observation lock is poisoned")
+            })?;
         if original.is_some_and(|original| original != observation) {
             return Err(SemanticTransitionError::ObservationMismatch);
         }
@@ -1009,9 +1101,16 @@ impl SemanticTransitionSession {
         content_geometry: [SemanticPreparedSourceContentGeometry; 2],
     ) -> Result<SemanticPreparedActorRefresh, SemanticTransitionError> {
         self.prepare_policy_refresh(
-            step, released_parent, program_ordinal, member_ordinal, material,
-            batch_identity, batch_bytes, content_geometry,
-            SemanticSourceContentGeometryKind::Current, None,
+            step,
+            released_parent,
+            program_ordinal,
+            member_ordinal,
+            material,
+            batch_identity,
+            batch_bytes,
+            content_geometry,
+            SemanticSourceContentGeometryKind::Current,
+            None,
         )
     }
 
@@ -1034,10 +1133,22 @@ impl SemanticTransitionSession {
         content_geometry: [SemanticPreparedSourceContentGeometry; 2],
     ) -> Result<SemanticPreparedActorRefresh, SemanticTransitionError> {
         self.require_prepared_replay_parent(step, released_parent)?;
-        let member = self.checked_prepared_step(step, false)?
-            .prepared.as_ref().and_then(|prepared| prepared.training_view.as_ref())
-            .and_then(|training| training.edit_group_members().iter().find(|member| member.ordinal == member_ordinal))
-            .ok_or_else(|| publication_input_error("demonstration row is outside the frozen supervised-edit group"))?;
+        let member = self
+            .checked_prepared_step(step, false)?
+            .prepared
+            .as_ref()
+            .and_then(|prepared| prepared.training_view.as_ref())
+            .and_then(|training| {
+                training
+                    .edit_group_members()
+                    .iter()
+                    .find(|member| member.ordinal == member_ordinal)
+            })
+            .ok_or_else(|| {
+                publication_input_error(
+                    "demonstration row is outside the frozen supervised-edit group",
+                )
+            })?;
         let roots = member.edit_demonstration_material_roots.ok_or_else(|| {
             publication_input_error("supervised edit lacks its original frozen material byte roots")
         })?;
@@ -1054,19 +1165,36 @@ impl SemanticTransitionSession {
         let maximum_payload = COMPLETED_COMPONENT_RECEIPT_BYTES.max(42 * size_of::<u64>());
         let maximum_kind = b"component-receipt".len().max(b"hard-decode-receipt".len());
         let workspace = completed_material_extent(&[
-            maximum_payload, maximum_payload,
-            b"XLOG-COMPLETED-ACTION-CHILD\0".len(), 4 * size_of::<u64>(), 32, maximum_kind,
+            maximum_payload,
+            maximum_payload,
+            b"XLOG-COMPLETED-ACTION-CHILD\0".len(),
+            4 * size_of::<u64>(),
+            32,
+            maximum_kind,
         ])?;
         let _workspace = content_geometry[0].material_budget().reserve_auxiliary(
             u64::try_from(workspace).map_err(|_| SemanticTransitionError::GenerationExhausted)?,
         )?;
         let demonstration = OriginalEditDemonstration::decode(
-            material, batch_identity, batch_bytes, action, codebook, solution, ground,
+            material,
+            batch_identity,
+            batch_bytes,
+            action,
+            codebook,
+            solution,
+            ground,
         )?;
         self.prepare_policy_refresh(
-            step, released_parent, program_ordinal, member_ordinal, material,
-            batch_identity, batch_bytes, content_geometry,
-            SemanticSourceContentGeometryKind::CurrentDemonstration, Some(demonstration),
+            step,
+            released_parent,
+            program_ordinal,
+            member_ordinal,
+            material,
+            batch_identity,
+            batch_bytes,
+            content_geometry,
+            SemanticSourceContentGeometryKind::CurrentDemonstration,
+            Some(demonstration),
         )
     }
 
@@ -1159,9 +1287,13 @@ impl SemanticTransitionSession {
             .and_then(|bytes| bytes.checked_mul(2))
             .and_then(|bytes| bytes.checked_add(marker_read_bytes.checked_mul(3)?))
             .ok_or(SemanticTransitionError::GenerationExhausted)?;
-        let metadata_bytes = training.actor_group_members().len()
+        let metadata_bytes = training
+            .actor_group_members()
+            .len()
             .checked_add(training.edit_group_members().len())
-            .and_then(|count| count.checked_mul(size_of::<(SemanticSourceContentGeometryKind, u64)>()))
+            .and_then(|count| {
+                count.checked_mul(size_of::<(SemanticSourceContentGeometryKind, u64)>())
+            })
             .and_then(|bytes| {
                 bytes.checked_add(
                     inputs
@@ -1171,27 +1303,41 @@ impl SemanticTransitionSession {
                 )
             })
             .and_then(|bytes| {
-                bytes.checked_add(size_of::<PreparedActorRefreshOwner>() + 8 * size_of::<usize>() + preparation_node)
+                bytes.checked_add(
+                    size_of::<PreparedActorRefreshOwner>()
+                        + 8 * size_of::<usize>()
+                        + preparation_node,
+                )
             })
             .and_then(|bytes| bytes.checked_add(observation_bytes))
-            .and_then(|bytes| bytes.checked_add(size_of::<SemanticReplayMaterialReservation>() + 2 * size_of::<usize>()))
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    size_of::<SemanticReplayMaterialReservation>() + 2 * size_of::<usize>(),
+                )
+            })
             .ok_or(SemanticTransitionError::GenerationExhausted)?;
-        let material_reservation = Arc::new(content_geometry[0].material_budget().reserve_auxiliary(
-            u64::try_from(metadata_bytes)
-                .map_err(|_| SemanticTransitionError::GenerationExhausted)?,
-        )?);
+        let material_reservation = Arc::new(
+            content_geometry[0].material_budget().reserve_auxiliary(
+                u64::try_from(metadata_bytes)
+                    .map_err(|_| SemanticTransitionError::GenerationExhausted)?,
+            )?,
+        );
         let policy_members = training
             .actor_group_members()
             .iter()
             .map(|member| (SemanticSourceContentGeometryKind::Current, member.ordinal))
             .chain(training.edit_group_members().iter().map(|member| {
-                (SemanticSourceContentGeometryKind::CurrentDemonstration, member.ordinal)
+                (
+                    SemanticSourceContentGeometryKind::CurrentDemonstration,
+                    member.ordinal,
+                )
             }))
             .collect::<Vec<_>>();
         let (actual_origin, actor) = initial_episode_actor(material, batch_identity, batch_bytes)?;
         if (kind == SemanticSourceContentGeometryKind::Current && !actor)
             || actual_origin != member.origin
-            || demonstration.is_some() != (kind == SemanticSourceContentGeometryKind::CurrentDemonstration)
+            || demonstration.is_some()
+                != (kind == SemanticSourceContentGeometryKind::CurrentDemonstration)
         {
             return Err(SemanticTransitionError::ObservationMismatch);
         }
@@ -1216,74 +1362,77 @@ impl SemanticTransitionSession {
         let rng = if kind == SemanticSourceContentGeometryKind::CurrentDemonstration {
             material.predecessor.bank.header.rng_binding()?
         } else {
-        let original = self.actor_refresh_initial.as_ref().ok_or_else(|| {
-            publication_input_error("actor refresh lacks the complete initial actor roster")
-        })?;
+            let original = self.actor_refresh_initial.as_ref().ok_or_else(|| {
+                publication_input_error("actor refresh lacks the complete initial actor roster")
+            })?;
+            let program = self
+                .actor_refresh_program
+                .as_ref()
+                .ok_or(SemanticTransitionError::NotBound)?;
+            let initial_count = u64::try_from(original.actors.len())
+                .map_err(|_| SemanticTransitionError::GenerationExhausted)?;
+            let actor_slot = if let Some(index) = original
+                .actors
+                .iter()
+                .position(|origin| *origin == member.origin)
+            {
+                if !original
+                    .episodes
+                    .iter()
+                    .any(|(origin, batch)| *origin == member.origin && *batch == batch_identity)
+                {
+                    return Err(SemanticTransitionError::ObservationMismatch);
+                }
+                index as u64
+            } else {
+                initial_count
+                    .checked_add(
+                        program
+                            .main_origins
+                            .iter()
+                            .find(|assignment| {
+                                assignment.origin == member.origin
+                                    && assignment.batch == batch_identity
+                                    && assignment.batch_bytes == batch_bytes
+                            })
+                            .map(|assignment| assignment.slot)
+                            .ok_or_else(|| {
+                                publication_input_error(
+                                    "actor origin has no authenticated original program assignment",
+                                )
+                            })?,
+                    )
+                    .ok_or(SemanticTransitionError::GenerationExhausted)?
+            };
+            let stride = initial_count
+                .checked_add(program.proposals)
+                .ok_or(SemanticTransitionError::GenerationExhausted)?;
+            if actor_slot >= stride || logical_update >= program.logical_updates {
+                return Err(SemanticTransitionError::ObservationMismatch);
+            }
+            let mut rng = program
+                .original_rng
+                .ok_or(SemanticTransitionError::NotBound)?;
+            let end = program
+                .logical_updates
+                .checked_mul(stride)
+                .and_then(|span| rng.stream_serial.checked_add(span))
+                .filter(|end| *end < 1u64 << 56)
+                .ok_or(SemanticTransitionError::GenerationExhausted)?;
+            rng.stream_serial = logical_update
+                .checked_mul(stride)
+                .and_then(|offset| offset.checked_add(actor_slot))
+                .and_then(|offset| rng.stream_serial.checked_add(offset))
+                .and_then(|serial| serial.checked_add(1))
+                .filter(|serial| *serial <= end)
+                .ok_or(SemanticTransitionError::GenerationExhausted)?;
+            rng.proposal = 0;
+            rng
+        };
         let program = self
             .actor_refresh_program
             .as_ref()
             .ok_or(SemanticTransitionError::NotBound)?;
-        let initial_count = u64::try_from(original.actors.len())
-            .map_err(|_| SemanticTransitionError::GenerationExhausted)?;
-        let actor_slot = if let Some(index) = original
-            .actors
-            .iter()
-            .position(|origin| *origin == member.origin)
-        {
-            if !original
-                .episodes
-                .iter()
-                .any(|(origin, batch)| *origin == member.origin && *batch == batch_identity)
-            {
-                return Err(SemanticTransitionError::ObservationMismatch);
-            }
-            index as u64
-        } else {
-            initial_count
-                .checked_add(
-                    program
-                        .main_origins
-                        .iter()
-                        .find(|assignment| {
-                            assignment.origin == member.origin
-                                && assignment.batch == batch_identity
-                                && assignment.batch_bytes == batch_bytes
-                        })
-                        .map(|assignment| assignment.slot)
-                        .ok_or_else(|| {
-                            publication_input_error(
-                                "actor origin has no authenticated original program assignment",
-                            )
-                        })?,
-                )
-                .ok_or(SemanticTransitionError::GenerationExhausted)?
-        };
-        let stride = initial_count
-            .checked_add(program.proposals)
-            .ok_or(SemanticTransitionError::GenerationExhausted)?;
-        if actor_slot >= stride || logical_update >= program.logical_updates {
-            return Err(SemanticTransitionError::ObservationMismatch);
-        }
-        let mut rng = program
-            .original_rng
-            .ok_or(SemanticTransitionError::NotBound)?;
-        let end = program
-            .logical_updates
-            .checked_mul(stride)
-            .and_then(|span| rng.stream_serial.checked_add(span))
-            .filter(|end| *end < 1u64 << 56)
-            .ok_or(SemanticTransitionError::GenerationExhausted)?;
-        rng.stream_serial = logical_update
-            .checked_mul(stride)
-            .and_then(|offset| offset.checked_add(actor_slot))
-            .and_then(|offset| rng.stream_serial.checked_add(offset))
-            .and_then(|serial| serial.checked_add(1))
-            .filter(|serial| *serial <= end)
-            .ok_or(SemanticTransitionError::GenerationExhausted)?;
-        rng.proposal = 0;
-        rng
-        };
-        let program = self.actor_refresh_program.as_ref().ok_or(SemanticTransitionError::NotBound)?;
         let work = if let Some(original) = self.actor_refresh_work.get(&step.token) {
             if original.members != policy_members {
                 return Err(SemanticTransitionError::ObservationMismatch);
@@ -1353,22 +1502,24 @@ impl SemanticTransitionSession {
             geometry.bind_original_actor_refresh(&proof.inner)?;
         }
         if kind == SemanticSourceContentGeometryKind::Current {
-        if let Some(assignment) = self.actor_refresh_program.as_mut().and_then(|program| {
-            program
-                .main_origins
-                .iter_mut()
-                .find(|assignment| assignment.origin == member.origin)
-        }) {
-            match assignment.replay {
-                actor_refresh_program::AssignmentReplayProof::Unresolved => {
-                    assignment.replay = actor_refresh_program::AssignmentReplayProof::Joined;
+            if let Some(assignment) = self.actor_refresh_program.as_mut().and_then(|program| {
+                program
+                    .main_origins
+                    .iter_mut()
+                    .find(|assignment| assignment.origin == member.origin)
+            }) {
+                match assignment.replay {
+                    actor_refresh_program::AssignmentReplayProof::Unresolved => {
+                        assignment.replay = actor_refresh_program::AssignmentReplayProof::Joined;
+                    }
+                    actor_refresh_program::AssignmentReplayProof::Joined => (),
                 }
-                actor_refresh_program::AssignmentReplayProof::Joined => (),
             }
         }
-        }
-        self.actor_refresh_preparations
-            .insert((step.token, kind, member_ordinal), ActorRefreshPreparationEntry::new(&proof.inner));
+        self.actor_refresh_preparations.insert(
+            (step.token, kind, member_ordinal),
+            ActorRefreshPreparationEntry::new(&proof.inner),
+        );
         Ok(proof)
     }
 
@@ -1875,8 +2026,16 @@ impl SemanticTransitionSession {
                 model_geometry_digest: Identity256::default(),
                 model_numerical_digest: Identity256::default(),
                 role: u64::from(proof.is_demonstration()),
-                demonstrated_lane: proof.inner.demonstration.as_ref().map_or(0, |original| original.lane),
-                demonstrated_choices: proof.inner.demonstration.as_ref().map_or([0; COMPONENT_COUNT], |original| original.choices),
+                demonstrated_lane: proof
+                    .inner
+                    .demonstration
+                    .as_ref()
+                    .map_or(0, |original| original.lane),
+                demonstrated_choices: proof
+                    .inner
+                    .demonstration
+                    .as_ref()
+                    .map_or([0; COMPONENT_COUNT], |original| original.choices),
             };
             retained.marker = Some(
                 crate::device::RetainedDeviceWrite::new(&self.stream, &[marker], device.view())
@@ -3009,9 +3168,18 @@ impl SemanticTransitionSession {
             || marker.program != proof.program
             || marker.phase != proof.phase
             || marker.original_origin != proof.member.origin
-            || marker.role != u64::from(proof.kind == SemanticSourceContentGeometryKind::CurrentDemonstration)
-            || marker.demonstrated_lane != proof.demonstration.as_ref().map_or(0, |original| original.lane)
-            || marker.demonstrated_choices != proof.demonstration.as_ref().map_or([0; COMPONENT_COUNT], |original| original.choices)
+            || marker.role
+                != u64::from(proof.kind == SemanticSourceContentGeometryKind::CurrentDemonstration)
+            || marker.demonstrated_lane
+                != proof
+                    .demonstration
+                    .as_ref()
+                    .map_or(0, |original| original.lane)
+            || marker.demonstrated_choices
+                != proof
+                    .demonstration
+                    .as_ref()
+                    .map_or([0; COMPONENT_COUNT], |original| original.choices)
             || observation.native_work[10] != 0
             || observation.native_work[1..10]
                 .iter()
@@ -3030,9 +3198,15 @@ impl SemanticTransitionSession {
         if children[staged.target_bank]
             .as_ref()
             .is_none_or(|issuer| !Arc::ptr_eq(issuer, &self.publication_issuer))
-            || *staged.initializer_observation.as_ref().0.lock().map_err(|_| {
-                publication_input_error("original actor refusal observation lock is poisoned")
-            })? != Some(*observation)
+            || *staged
+                .initializer_observation
+                .as_ref()
+                .0
+                .lock()
+                .map_err(|_| {
+                    publication_input_error("original actor refusal observation lock is poisoned")
+                })?
+                != Some(*observation)
         {
             return Err(SemanticTransitionError::ObservationMismatch);
         }
@@ -3049,7 +3223,8 @@ impl SemanticTransitionSession {
             .ok_or(SemanticTransitionError::NotBound)?;
         let observation = staged
             .initializer_observation
-            .as_ref().0
+            .as_ref()
+            .0
             .lock()
             .map_err(|_| {
                 publication_input_error("original actor refusal observation lock is poisoned")
