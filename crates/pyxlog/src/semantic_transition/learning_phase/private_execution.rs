@@ -862,16 +862,6 @@ impl PrivateReplayChildCustody {
         ))
     }
 
-    pub(in crate::semantic_transition) fn require_future_import_structure(
-        &self,
-        py: Python<'_>,
-    ) -> PyResult<()> {
-        self.instruction
-            .upgrade()
-            .ok_or_else(|| invalid("future import lost its original instruction owner"))?
-            .require_future_import_structure(py, self)
-    }
-
     pub(in crate::semantic_transition) fn begin_original_import_execution(
         &self,
         py: Python<'_>,
@@ -1447,44 +1437,43 @@ impl PrivateReplayChildCustody {
         let member = member.expect("original completed replay member");
         let member = member.borrow(py);
         if member.completed.load(Ordering::Acquire) {
-            let mode = member
-                .final_use
-                .try_lock()
-                .map_err(|_| invalid("original source final use is already active or poisoned"))?
-                .mode
-                .ok_or_else(|| invalid("original final-use acknowledgment has no disposition"))?;
+            let (mode, target) = {
+                let original = member.final_use.try_lock().map_err(|_| {
+                    invalid("original source final use is already active or poisoned")
+                })?;
+                (
+                    original.mode.ok_or_else(|| {
+                        invalid("original final-use acknowledgment has no disposition")
+                    })?,
+                    original.target.clone(),
+                )
+            };
             if (mode == RetainedFinalUseMode::Cancelled) != cancelled {
                 return Err(invalid(
                     "original source final use changed its cancellation disposition",
                 ));
             }
-            return member.require_final_use_ack(py, mode, None);
+            return member.require_final_use_ack(py, mode, target.as_ref());
         }
         if cancelled {
             return member.finish_cancelled_private_segment(py);
         }
-        let unpublished = {
+        let mode = {
             let state = member
-                .group_use
+                .source_target
                 .lock()
                 .map_err(|_| invalid("original retained target use is poisoned"))?;
             match state.completion {
-                Some(RetainedTargetCompletion::Published) => None,
-                Some(RetainedTargetCompletion::Unpublished) => Some(
-                    state
-                        .update
-                        .as_ref()
-                        .ok_or_else(|| invalid("original unpublished target has no Update"))?
-                        .clone_ref(py),
-                ),
+                Some(RetainedTargetCompletion::Published) => RetainedFinalUseMode::Published,
+                Some(RetainedTargetCompletion::Unpublished) => RetainedFinalUseMode::Unpublished,
                 None => {
                     return Err(invalid(
                         "source final use requires its actual original target outcome",
-                    ))
+                    ));
                 }
             }
         };
-        member.finish_retained_import(py, unpublished)
+        member.finish_retained_import(py, mode, None)
     }
 
     pub(in crate::semantic_transition) fn release_session(&self, py: Python<'_>) -> PyResult<()> {

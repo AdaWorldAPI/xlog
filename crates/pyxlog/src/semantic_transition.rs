@@ -4877,30 +4877,6 @@ impl SegmentInstructionCustody {
         Ok(())
     }
 
-    fn require_future_import_structure(
-        &self,
-        py: Python<'_>,
-        child: &learning_phase::PrivateReplayChildCustody,
-    ) -> PyResult<()> {
-        self.require_owner(py)?;
-        let original = self.preparation()?;
-        if !original.build_entered
-            || original.scope.is_none()
-            || original.imports_roster_frozen
-            || original.handoff_entered
-            || original.callback_failed
-            || !original
-                .replay_children
-                .iter()
-                .any(|retained| std::ptr::eq(child, retained.as_ref()))
-        {
-            return Err(invalid(
-                "future gradient bindings require their original unfrozen whole instruction roster",
-            ));
-        }
-        Ok(())
-    }
-
     fn require_structural_mutation(&self) -> PyResult<()> {
         let original = self.preparation()?;
         if !original.build_entered
@@ -15767,14 +15743,6 @@ pub(crate) struct PySemanticGradientDelivery {
     deferred_hooks: Mutex<Option<Vec<GradientHookEntry>>>,
     activated_once: AtomicBool,
     shared_reset: bool,
-    #[cfg(feature = "semantic-policy")]
-    future_import: Option<Py<prepared_import::PySemanticPreparedTaskImport>>,
-    #[cfg(feature = "semantic-policy")]
-    future_target: Option<(Py<PySemanticTransitionSession>, SemanticPreparedStep, usize)>,
-    #[cfg(feature = "semantic-policy")]
-    future_leaves: Mutex<Vec<prepared_import::OriginalImportTensorPort>>,
-    #[cfg(feature = "semantic-policy")]
-    future_stream: u64,
     restores: Mutex<Vec<GradientSlotRestore>>,
     hook_cleanup: Mutex<GradientHookCleanup>,
 }
@@ -15860,10 +15828,6 @@ impl PySemanticGradientDelivery {
     /// Temporarily route original physical nodes to their authenticated pending
     /// destinations for this bank's single backward, then restore source slots.
     fn activate_pending(&self, py: Python<'_>) -> PyResult<()> {
-        #[cfg(feature = "semantic-policy")]
-        if let Some(original) = &self.future_import {
-            original.borrow(py).require_completed()?;
-        }
         self.require_active_hooks()?;
         if self.activated_once.load(Ordering::Acquire) {
             return Err(invalid("gradient delivery was already activated"));
@@ -16997,9 +16961,7 @@ impl PySemanticPreparedStep {
     /// ``leaves`` are ``(GradientEdge_or_None, effective_input,
     /// gradient_input_or_None, presence_input, phase_mask_input)`` in the
     /// original physical parameter order.
-    /// ``edit_only`` freezes the historical demonstration's distinct delivery;
-    /// it cannot select or replace a CURRENT actor source.
-    #[pyo3(signature = (bank, phase, accumulation, leaves, *, consumer_stream, group_member=None, actor_refresh=None, edit_only=false))]
+    #[pyo3(signature = (bank, phase, accumulation, leaves, *, consumer_stream, actor_refresh=None))]
     fn register_gradient_delivery(
         &self,
         bank: &Bound<'_, PyAny>,
@@ -17007,9 +16969,7 @@ impl PySemanticPreparedStep {
         accumulation: &Bound<'_, PyAny>,
         leaves: &Bound<'_, PyAny>,
         consumer_stream: &Bound<'_, PyAny>,
-        group_member: Option<&Bound<'_, PyAny>>,
         actor_refresh: Option<&Bound<'_, PyAny>>,
-        edit_only: bool,
     ) -> PyResult<Py<PySemanticGradientDelivery>> {
         let py = bank.py();
         let session = self.session.borrow(py);
@@ -17019,35 +16979,6 @@ impl PySemanticPreparedStep {
         if bank > 1 {
             return Err(invalid("gradient delivery requires bank zero or one"));
         }
-        if group_member.is_some() && actor_refresh.is_some() {
-            return Err(invalid(
-                "gradient delivery must name one original historical or CURRENT member",
-            ));
-        }
-        if edit_only && group_member.is_none() {
-            return Err(invalid(
-                "edit-only delivery requires its original historical replay member",
-            ));
-        }
-        let historical = group_member.is_some();
-        #[cfg(feature = "semantic-policy")]
-        let (group_member, prepared_import) = match group_member {
-            Some(original) => {
-                if let Ok(member) = original.extract::<Py<PySemanticRetainedReplayMember>>() {
-                    (Some(member), None)
-                } else {
-                    let prepared =
-                        original.extract::<Py<prepared_import::PySemanticPreparedTaskImport>>()?;
-                    if !edit_only {
-                        return Err(invalid(
-                            "future historical delivery requires its original Edit consumer",
-                        ));
-                    }
-                    (None, Some(prepared))
-                }
-            }
-            None => (None, None),
-        };
         #[cfg(feature = "semantic-policy")]
         let actor_refresh = actor_refresh
             .map(|owner| {
@@ -17057,12 +16988,12 @@ impl PySemanticPreparedStep {
             })
             .transpose()?;
         #[cfg(not(feature = "semantic-policy"))]
-        if group_member.is_some() || actor_refresh.is_some() {
+        if actor_refresh.is_some() {
             return Err(invalid(
                 "group gradient delivery requires a semantic-policy build",
             ));
         }
-        if !historical && actor_refresh.is_none() {
+        if actor_refresh.is_none() {
             let owners = self
                 .gradient_deliveries
                 .lock()
@@ -17073,81 +17004,12 @@ impl PySemanticPreparedStep {
                 ));
             }
         }
-        #[cfg(feature = "semantic-policy")]
-        if let Some(prepared) = &prepared_import {
-            let prepared = prepared.borrow(py);
-            prepared.require_future_consumer(py, self)?;
-            let group = prepared
-                .group_use
-                .lock()
-                .map_err(|_| invalid("prepared import group use is poisoned"))?;
-            if group.gradient_banks[bank]
-                || group
-                    .edit_only
-                    .is_some_and(|original| original != edit_only)
-                || group
-                    .target
-                    .as_ref()
-                    .is_some_and(|target| !target.same_handle(&self.inner))
-            {
-                return Err(invalid(
-                    "prepared import already names this bank or another original Update",
-                ));
-            }
-        }
-        #[cfg(feature = "semantic-policy")]
-        if let Some(member) = &group_member {
-            let member = member.borrow(py);
-            let source = member.session.borrow(py);
-            source.require_creator()?;
-            if let Some(child) = source.private_replay_custody()? {
-                child.require_target(py, self)?;
-            }
-            if member.completed.load(Ordering::Acquire)
-                || !source.importing.load(Ordering::Acquire)
-                || self.session.as_ptr() == member.session.as_ptr()
-            {
-                return Err(invalid(
-                    "group gradient delivery requires an open distinct original replay",
-                ));
-            }
-            let group = member
-                .group_use
-                .lock()
-                .map_err(|_| PyRuntimeError::new_err("retained group use is poisoned"))?;
-            if group.gradient_banks[bank]
-                || group
-                    .edit_only
-                    .is_some_and(|original| original != edit_only)
-                || group
-                    .target
-                    .as_ref()
-                    .is_some_and(|owner| !owner.same_handle(&self.inner))
-            {
-                return Err(invalid(
-                    "original replay already has gradient delivery for this bank or another Update",
-                ));
-            }
-        }
         let consumer_stream = parse_witness_consumer_stream(consumer_stream, &mut 128)?;
         let check = || {
             self.require_task(py, &self.task_use.borrow(py))?;
             #[cfg(feature = "semantic-policy")]
             if let Some(actor) = &actor_refresh {
                 actor.require_update(py, self, bank)?;
-            }
-            #[cfg(feature = "semantic-policy")]
-            if let Some(prepared) = &prepared_import {
-                prepared.borrow(py).require_future_consumer(py, self)?;
-            }
-            #[cfg(feature = "semantic-policy")]
-            if let Some(member) = &group_member {
-                let member = member.borrow(py);
-                if member.completed.load(Ordering::Acquire)
-                    || !member.session.borrow(py).importing.load(Ordering::Acquire)
-                {
-                    return Err(invalid("original replay closed during gradient handoff"));
-                }
             }
             Ok(())
         };
@@ -17268,69 +17130,10 @@ impl PySemanticPreparedStep {
         }
         let mut owner = session.owner()?;
         self.content_binding_with_owner(py, &owner)?;
-        #[cfg(feature = "semantic-policy")]
-        let future_leaves = if prepared_import.is_some() {
-            leaf_rows
-                .iter()
-                .map(|leaf| {
-                    prepared_import::OriginalImportTensorPort::retain(
-                        py,
-                        &parsed.handoff.0[leaf.effective],
-                        &parsed.producers[leaf.effective],
-                    )
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
         let inputs = parsed.handoff.into_native();
         #[cfg(feature = "semantic-policy")]
         let binding = if let Some(actor) = &actor_refresh {
             actor.bind_delivery(py, self, bank, &mut owner, inputs, consumer_stream)
-        } else if let Some(prepared) = &prepared_import {
-            let prepared = prepared.borrow(py);
-            let source = prepared.session.borrow(py);
-            let source_owner = source.owner()?;
-            let parent = prepared.parent.borrow(py);
-            let lease = parent.lease()?;
-            owner
-                .prepare_imported_edit_gradient_delivery(
-                    &self.inner,
-                    bank,
-                    &source_owner,
-                    &lease,
-                    &prepared.material,
-                    prepared.ordinal as u64,
-                    &prepared.replay_row,
-                    inputs,
-                    consumer_stream,
-                )
-                .map_err(xlog_err)
-        } else if let Some(member) = &group_member {
-            let member = member.borrow(py);
-            let source = member.session.borrow(py);
-            let source_owner = source.owner()?;
-            let parent = member.parent.borrow(py);
-            let lease = parent.lease()?;
-            let invocation = member.invocation.borrow(py);
-            let bind = if edit_only {
-                SemanticTransitionSession::bind_imported_edit_gradient_delivery
-            } else {
-                SemanticTransitionSession::bind_imported_group_gradient_delivery
-            };
-            bind(
-                &mut owner,
-                &self.inner,
-                bank,
-                &source_owner,
-                &lease,
-                invocation.rng,
-                member.replay_ordinal,
-                &member.replay_row,
-                inputs,
-                consumer_stream,
-            )
-            .map_err(xlog_err)
         } else {
             owner
                 .bind_prepared_gradient_delivery(&self.inner, bank, inputs, consumer_stream)
@@ -17436,17 +17239,7 @@ impl PySemanticPreparedStep {
                 handles: Mutex::new(None),
                 deferred_hooks: Mutex::new(deferred_hooks),
                 activated_once: AtomicBool::new(false),
-                shared_reset: historical || actor_refresh.is_some(),
-                #[cfg(feature = "semantic-policy")]
-                future_import: prepared_import.as_ref().map(|owner| owner.clone_ref(py)),
-                #[cfg(feature = "semantic-policy")]
-                future_target: prepared_import
-                    .as_ref()
-                    .map(|_| (self.session.clone_ref(py), self.inner.clone(), bank)),
-                #[cfg(feature = "semantic-policy")]
-                future_leaves: Mutex::new(future_leaves),
-                #[cfg(feature = "semantic-policy")]
-                future_stream: consumer_stream,
+                shared_reset: actor_refresh.is_some(),
                 restores: Mutex::new(Vec::new()),
                 hook_cleanup: Mutex::new(GradientHookCleanup::Ready),
             },
@@ -17455,7 +17248,7 @@ impl PySemanticPreparedStep {
             .gradient_deliveries
             .lock()
             .map_err(|_| PyRuntimeError::new_err("gradient-delivery roster is poisoned"))?;
-        if !historical && actor_refresh.is_none() && owners[bank].is_some() {
+        if actor_refresh.is_none() && owners[bank].is_some() {
             return Err(invalid(
                 "gradient delivery was already registered for this bank",
             ));
@@ -17469,173 +17262,8 @@ impl PySemanticPreparedStep {
                 .push(delivery.clone_ref(py));
             return Ok(delivery);
         }
-        #[cfg(feature = "semantic-policy")]
-        if historical {
-            let original_group = if let Some(member) = &group_member {
-                Arc::clone(&member.borrow(py).group_use)
-            } else {
-                Arc::clone(
-                    &prepared_import
-                        .as_ref()
-                        .expect("original prepared import")
-                        .borrow(py)
-                        .group_use,
-                )
-            };
-            let mut group = original_group
-                .lock()
-                .map_err(|_| PyRuntimeError::new_err("retained group use is poisoned"))?;
-            if group.gradient_banks[bank]
-                || group
-                    .edit_only
-                    .is_some_and(|original| original != edit_only)
-                || group
-                    .target
-                    .as_ref()
-                    .is_some_and(|owner| !owner.same_handle(&self.inner))
-            {
-                return Err(invalid(
-                    "original group gradient delivery changed before registration",
-                ));
-            }
-            self.group_gradient_deliveries.lock().map_err(|_| {
-                PyRuntimeError::new_err("group gradient-delivery roster is poisoned")
-            })?[bank]
-                .push(delivery.clone_ref(py));
-            group.gradient_banks[bank] = true;
-            group.edit_only = Some(edit_only);
-            group.deliveries[bank] = Some(delivery.clone_ref(py));
-            if group.target.is_none() {
-                group.target = Some(self.inner.clone());
-            }
-            return Ok(delivery);
-        }
         owners[bank] = Some(delivery.clone_ref(py));
         Ok(delivery)
-    }
-
-    /// Record this proposal tape's complete Update-policy VJP. Actor, critic
-    /// and cost terms use the frozen selected episode; supervised edit uses
-    /// the exact genuine demonstration origin. When both name this tape their
-    /// selected-score cotangents are summed before one native VJP. Returned
-    /// parameter, full MASK and baseline roots remain device-resident.
-    #[cfg(feature = "semantic-policy")]
-    #[pyo3(signature = (update_step, bank, *, consumer_stream))]
-    fn temporal_update_vjp(
-        &self,
-        py: Python<'_>,
-        update_step: Py<PySemanticPreparedStep>,
-        bank: &Bound<'_, PyAny>,
-        consumer_stream: &Bound<'_, PyAny>,
-    ) -> PyResult<Py<PyTuple>> {
-        self.session.borrow(py).require_creator()?;
-        let bank = usize::try_from(ColdValue::read(bank, &mut 128, 0)?.unsigned()?)
-            .map_err(|_| invalid("prepared policy bank exceeds native address space"))?;
-        let consumer_stream = parse_witness_consumer_stream(consumer_stream, &mut 128)?;
-        {
-            let update = update_step.borrow(py);
-            if self.session.as_ptr() != update.session.as_ptr()
-                || !Arc::ptr_eq(&self.scope, &update.scope)
-            {
-                return Err(invalid(
-                    "temporal policy backward requires an Update from the same prepared segment",
-                ));
-            }
-            let task_use = self.task_use.borrow(py);
-            update.require_task(py, &task_use)?;
-        }
-        let session = self.session.borrow(py);
-        let mut owner = session.owner()?;
-        self.content_binding_with_owner(py, &owner)?;
-        let gradients = owner
-            .record_prepared_update_policy_vjp(
-                &self.inner,
-                bank,
-                &update_step.borrow(py).inner,
-                consumer_stream,
-            )
-            .map_err(xlog_err)?;
-        let capsules = gradients
-            .into_dlpack()
-            .map_err(xlog_err)?
-            .into_iter()
-            .map(|tensor| {
-                let tensor =
-                    retain_export_owner(tensor, self.session.clone_ref(py), session.owner_thread)?;
-                crate::dlpack_capsule_from_tensor(py, tensor)
-            })
-            .collect::<PyResult<Vec<_>>>()?;
-        Ok(PyTuple::new(py, capsules)?.unbind())
-    }
-
-    /// Return parameter, full MASK and baseline adjoints for this exact
-    /// prepared Proposal's frozen actor or edit row in a recording Update bank.
-    /// Native membership determines the numerical path; the caller cannot
-    /// reclassify a row or omit the other required group members.
-    /// Nine capsules are returned: the three FP32 adjoints, then their three
-    /// FP64 ordinary/underflow envelopes, then their three FP64
-    /// magnitude/ordinary/underflow bounds. These are selected late outputs,
-    /// not the paired actor/full domains required before a draw.
-    #[cfg(feature = "semantic-policy")]
-    #[pyo3(signature = (update_step, bank, member_ordinal, *, consumer_stream))]
-    fn group_update_vjp(
-        &self,
-        py: Python<'_>,
-        update_step: Py<PySemanticPreparedStep>,
-        bank: &Bound<'_, PyAny>,
-        member_ordinal: &Bound<'_, PyAny>,
-        consumer_stream: &Bound<'_, PyAny>,
-    ) -> PyResult<Py<PyTuple>> {
-        self.session.borrow(py).require_creator()?;
-        let bank = usize::try_from(ColdValue::read(bank, &mut 128, 0)?.unsigned()?)
-            .map_err(|_| invalid("prepared policy bank exceeds native address space"))?;
-        let ordinal = ColdValue::read(member_ordinal, &mut 128, 0)?.unsigned()?;
-        let ordinal_index = usize::try_from(ordinal)
-            .map_err(|_| invalid("frozen group ordinal exceeds native address space"))?;
-        let consumer_stream = parse_witness_consumer_stream(consumer_stream, &mut 128)?;
-        {
-            let update = update_step.borrow(py);
-            if self.session.as_ptr() != update.session.as_ptr()
-                || !Arc::ptr_eq(&self.scope, &update.scope)
-            {
-                return Err(invalid(
-                    "group policy backward requires an Update from the same prepared segment",
-                ));
-            }
-            update.require_task(py, &self.task_use.borrow(py))?;
-        }
-        let row = self
-            .task_use
-            .borrow(py)
-            .authority
-            .replay
-            .get(ordinal_index)
-            .ok_or_else(|| invalid("group policy row is absent from the admitted replay"))?
-            .training_view_row()?;
-        let session = self.session.borrow(py);
-        let mut owner = session.owner()?;
-        self.content_binding_with_owner(py, &owner)?;
-        let gradients = owner
-            .record_prepared_policy_group_vjp(
-                &self.inner,
-                bank,
-                &update_step.borrow(py).inner,
-                ordinal,
-                &row,
-                consumer_stream,
-            )
-            .map_err(xlog_err)?;
-        let capsules = gradients
-            .into_dlpack()
-            .map_err(xlog_err)?
-            .into_iter()
-            .map(|tensor| {
-                let tensor =
-                    retain_export_owner(tensor, self.session.clone_ref(py), session.owner_thread)?;
-                crate::dlpack_capsule_from_tensor(py, tensor)
-            })
-            .collect::<PyResult<Vec<_>>>()?;
-        Ok(PyTuple::new(py, capsules)?.unbind())
     }
 
     /// Project the original critic destination without recording its reduction.
@@ -18993,7 +18621,7 @@ pub(crate) struct PySemanticRetainedReplayMember {
     finish_invocation: Py<PyAny>,
     refresh_snapshot: Py<PyAny>,
     #[cfg(feature = "semantic-policy")]
-    group_use: Arc<Mutex<RetainedGroupUse>>,
+    source_target: Arc<Mutex<RetainedSourceTarget>>,
     #[cfg(feature = "semantic-policy")]
     final_use: Mutex<RetainedReplayFinalUse>,
     completed: AtomicBool,
@@ -19033,27 +18661,20 @@ struct ReplayImportFinalization {
 }
 
 #[cfg(feature = "semantic-policy")]
-struct RetainedGroupUse {
-    update: Option<Py<PySemanticPreparedStep>>,
+/// Original SOURCE target retained through native completion and reader release.
+struct RetainedSourceTarget {
+    session: Option<Py<PySemanticTransitionSession>>,
     target: Option<SemanticPreparedStep>,
     completion: Option<RetainedTargetCompletion>,
-    banks: [bool; 2],
-    gradient_banks: [bool; 2],
-    edit_only: Option<bool>,
-    deliveries: [Option<Py<PySemanticGradientDelivery>>; 2],
 }
 
 #[cfg(feature = "semantic-policy")]
-impl RetainedGroupUse {
+impl RetainedSourceTarget {
     fn new() -> Self {
         Self {
-            update: None,
+            session: None,
             target: None,
             completion: None,
-            banks: [false; 2],
-            gradient_banks: [false; 2],
-            edit_only: None,
-            deliveries: std::array::from_fn(|_| None),
         }
     }
 }
@@ -19109,199 +18730,6 @@ impl Drop for PySemanticRetainedReplayMember {
 #[cfg(feature = "semantic-policy")]
 #[pymethods]
 impl PySemanticRetainedReplayMember {
-    /// Project this original retained contribution's outputs before recording.
-    #[pyo3(signature = (update_step, bank, *, consumer_stream, edit_only=false))]
-    fn group_update_vjp_layouts(
-        &self,
-        py: Python<'_>,
-        update_step: Py<PySemanticPreparedStep>,
-        bank: &Bound<'_, PyAny>,
-        consumer_stream: &Bound<'_, PyAny>,
-        edit_only: bool,
-    ) -> PyResult<Py<PyTuple>> {
-        let bank = usize::try_from(ColdValue::read(bank, &mut 128, 0)?.unsigned()?)
-            .map_err(|_| invalid("group Update bank exceeds native address space"))?;
-        if bank > 1 || self.completed.load(Ordering::Acquire) {
-            return Err(invalid("retained replay has no open group Update bank"));
-        }
-        let stream = parse_witness_consumer_stream(consumer_stream, &mut 128)?;
-        let source_session = self.session.borrow(py);
-        source_session.require_creator()?;
-        if !source_session.importing.load(Ordering::Acquire) {
-            return Err(invalid(
-                "original replay is no longer retained for group backward",
-            ));
-        }
-        let update = update_step.borrow(py);
-        if self.session.as_ptr() == update.session.as_ptr() {
-            return Err(invalid(
-                "historical group member requires a distinct target Session",
-            ));
-        }
-        let target_session = update.session.borrow(py);
-        target_session.require_creator()?;
-        update.require_task(py, &update.task_use.borrow(py))?;
-        if let Some(child) = source_session.private_replay_custody()? {
-            child.require_target(py, &update)?;
-        }
-        {
-            let state = self
-                .group_use
-                .lock()
-                .map_err(|_| PyRuntimeError::new_err("retained group use is poisoned"))?;
-            if !state.gradient_banks[bank]
-                || state.deliveries[bank].is_none()
-                || state.edit_only != Some(edit_only)
-                || state.banks[bank]
-                || state
-                    .target
-                    .as_ref()
-                    .is_none_or(|target| !target.same_handle(&update.inner))
-            {
-                return Err(invalid(
-                    "retained output geometry changed its original Update contribution",
-                ));
-            }
-        }
-        let target = target_session.owner()?;
-        let source = source_session.owner()?;
-        let parent = self.parent.borrow(py);
-        let lease = parent.lease()?;
-        let layouts = target
-            .imported_policy_vjp_layouts(
-                &update.inner,
-                bank,
-                &source,
-                &lease,
-                self.invocation.borrow(py).rng,
-                self.replay_ordinal,
-                &self.replay_row,
-                edit_only,
-                stream,
-            )
-            .map_err(xlog_err)?;
-        drop(source);
-        drop(target);
-        policy_output_layout_rows(py, layouts)
-    }
-
-    /// Record this original replay's single actor or edit contribution to the
-    /// target Update graph. The original model output, published reader and
-    /// tape stay owned by this handle through both mutually exclusive banks.
-    /// ``edit_only`` must match the role frozen by gradient registration.
-    #[pyo3(signature = (update_step, bank, *, consumer_stream, edit_only=false))]
-    fn group_update_vjp(
-        &self,
-        py: Python<'_>,
-        update_step: Py<PySemanticPreparedStep>,
-        bank: &Bound<'_, PyAny>,
-        consumer_stream: &Bound<'_, PyAny>,
-        edit_only: bool,
-    ) -> PyResult<Py<PyTuple>> {
-        let bank = usize::try_from(ColdValue::read(bank, &mut 128, 0)?.unsigned()?)
-            .map_err(|_| invalid("group Update bank exceeds native address space"))?;
-        if bank > 1 || self.completed.load(Ordering::Acquire) {
-            return Err(invalid("retained replay has no open group Update bank"));
-        }
-        let stream = parse_witness_consumer_stream(consumer_stream, &mut 128)?;
-        let source_session = self.session.borrow(py);
-        source_session.require_creator()?;
-        if !source_session.importing.load(Ordering::Acquire) {
-            return Err(invalid(
-                "original replay is no longer retained for group backward",
-            ));
-        }
-        let update = update_step.borrow(py);
-        if self.session.as_ptr() == update.session.as_ptr() {
-            return Err(invalid(
-                "historical group member requires a distinct target Session",
-            ));
-        }
-        let target_session = update.session.borrow(py);
-        target_session.require_creator()?;
-        update.require_task(py, &update.task_use.borrow(py))?;
-        if let Some(child) = source_session.private_replay_custody()? {
-            child.require_target(py, &update)?;
-        }
-        let mut use_state = self
-            .group_use
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("retained group use is poisoned"))?;
-        let delivery = use_state.deliveries[bank]
-            .as_ref()
-            .ok_or_else(|| invalid("original group gradient delivery is absent"))?
-            .borrow(py);
-        delivery.require_active_hooks()?;
-        if !delivery.activated_once.load(Ordering::Acquire)
-            || delivery
-                .handles
-                .lock()
-                .map_err(|_| PyRuntimeError::new_err("group gradient-delivery owner is poisoned"))?
-                .is_none()
-        {
-            return Err(invalid(
-                "original group gradient delivery must be active during this bank's VJP",
-            ));
-        }
-        drop(delivery);
-        if !use_state.gradient_banks[bank]
-            || use_state.edit_only != Some(edit_only)
-            || use_state.banks[bank]
-            || use_state
-                .target
-                .as_ref()
-                .is_some_and(|bound| !bound.same_handle(&update.inner))
-        {
-            return Err(invalid(
-                "retained replay already served this bank or another Update",
-            ));
-        }
-        let mut target_owner = target_session.owner()?;
-        update.content_binding_with_owner(py, &target_owner)?;
-        let mut source_owner = source_session.owner()?;
-        let parent = self.parent.borrow(py);
-        let lease = parent.lease()?;
-        let invocation = self.invocation.borrow(py);
-        let record = if edit_only {
-            SemanticTransitionSession::record_imported_edit_member_policy_vjp
-        } else {
-            SemanticTransitionSession::record_imported_policy_group_vjp
-        };
-        let gradients = record(
-            &mut target_owner,
-            &update.inner,
-            bank,
-            &mut source_owner,
-            &lease,
-            invocation.rng,
-            self.replay_ordinal,
-            &self.replay_row,
-            stream,
-        )
-        .map_err(xlog_err)?;
-        let capsules = gradients
-            .into_dlpack()
-            .map_err(xlog_err)?
-            .into_iter()
-            .map(|tensor| {
-                let tensor = retain_export_owner(
-                    tensor,
-                    self.session.clone_ref(py),
-                    source_session.owner_thread,
-                )?;
-                crate::dlpack_capsule_from_tensor(py, tensor)
-            })
-            .collect::<PyResult<Vec<_>>>()?;
-        use_state.banks[bank] = true;
-        if use_state.update.is_none() {
-            use_state.update = Some(update_step.clone_ref(py));
-        }
-        if use_state.target.is_none() {
-            use_state.target = Some(update.inner.clone());
-        }
-        Ok(PyTuple::new(py, capsules)?.unbind())
-    }
-
     /// Record completed execution of the published target Update. This does
     /// not release the source: its allocations remain alive until the target
     /// executable and all of its step owners have retired.
@@ -19322,7 +18750,7 @@ impl PySemanticRetainedReplayMember {
     /// Retire the retained original after target segment retirement. The
     /// normal import authority refresh and reader release still run once.
     fn finish(&self, py: Python<'_>) -> PyResult<()> {
-        self.finish_retained_import(py, None)
+        self.finish_retained_import(py, RetainedFinalUseMode::Published, None)
     }
 
     /// Retire a retained original after its nonpublishing target has retired.
@@ -19331,7 +18759,7 @@ impl PySemanticRetainedReplayMember {
         py: Python<'_>,
         update_step: Py<PySemanticPreparedStep>,
     ) -> PyResult<()> {
-        self.finish_retained_import(py, Some(update_step))
+        self.finish_retained_import(py, RetainedFinalUseMode::Unpublished, Some(update_step))
     }
 
     /// Finish this original replay after genuine whole-target cancellation.
@@ -19354,50 +18782,17 @@ impl PySemanticRetainedReplayMember {
             invalid("cancelled replay requires its original early native custody")
         })?;
         child.require_cancelled_final_use(py, self)?;
-        let deliveries = {
-            let state = self
-                .group_use
-                .lock()
-                .map_err(|_| invalid("retained replay group use is poisoned"))?;
-            if state.completion.is_some() {
-                return Err(invalid(
-                    "cancelled replay cannot replace actual target completion",
-                ));
-            }
-            state
-                .deliveries
-                .iter()
-                .flatten()
-                .map(|delivery| delivery.clone_ref(py))
-                .collect::<Vec<_>>()
-        };
-        for delivery in &deliveries {
-            let delivery = delivery.borrow(py);
-            delivery.require_removed_hooks()?;
-            if delivery
-                .handles
-                .lock()
-                .map_err(|_| invalid("cancelled gradient hook custody is poisoned"))?
-                .is_some()
-                || !delivery
-                    .restores
-                    .lock()
-                    .map_err(|_| invalid("cancelled gradient restoration custody is poisoned"))?
-                    .is_empty()
-            {
-                return Err(invalid(
-                    "cancelled replay still owns active original gradient delivery",
-                ));
-            }
+        if self
+            .source_target
+            .lock()
+            .map_err(|_| invalid("retained SOURCE target custody is poisoned"))?
+            .completion
+            .is_some()
+        {
+            return Err(invalid(
+                "cancelled replay cannot replace actual target completion",
+            ));
         }
-        let retained = {
-            let mut state = self
-                .group_use
-                .lock()
-                .map_err(|_| invalid("retained replay group use is poisoned"))?;
-            std::mem::replace(&mut state.deliveries, std::array::from_fn(|_| None))
-        };
-        drop((retained, deliveries));
         self.finish_original_import(py, RetainedFinalUseMode::Cancelled, None)
     }
 }
@@ -19413,78 +18808,47 @@ impl PySemanticRetainedReplayMember {
             return Err(invalid("retained replay member has already finished"));
         }
         let mut use_state = self
-            .group_use
+            .source_target
             .lock()
-            .map_err(|_| PyRuntimeError::new_err("retained group use is poisoned"))?;
+            .map_err(|_| invalid("retained SOURCE target custody is poisoned"))?;
         if use_state.completion.is_some() {
             return Err(invalid(
                 "retained target completion has already been confirmed",
             ));
         }
-        let (update, completion) = if let Some(update) = unpublished_update {
-            let changed_target = {
-                let target = update.borrow(py);
-                use_state
-                    .target
-                    .as_ref()
-                    .is_some_and(|bound| !bound.same_handle(&target.inner))
-            };
-            if changed_target
-                || use_state
-                    .update
-                    .as_ref()
-                    .is_some_and(|bound| !bound.is(&update))
-            {
-                return Err(invalid(
-                    "unpublished Update differs from the retained member's bound target",
-                ));
-            }
-            (update, RetainedTargetCompletion::Unpublished)
-        } else {
-            if use_state.banks != [true, true] || use_state.gradient_banks != [true, true] {
-                return Err(invalid("retained replay requires both Update banks and original physical gradient deliveries"));
-            }
-            (
-                use_state
-                    .update
-                    .as_ref()
-                    .ok_or_else(|| invalid("retained replay has no original Update owner"))?
-                    .clone_ref(py),
-                RetainedTargetCompletion::Published,
-            )
-        };
-        for delivery in use_state.deliveries.iter().flatten() {
-            let delivery = delivery.borrow(py);
-            if delivery.activated_once.load(Ordering::Acquire)
-                && delivery
-                    .handles
-                    .lock()
-                    .map_err(|_| {
-                        PyRuntimeError::new_err("group gradient-delivery owner is poisoned")
-                    })?
-                    .is_some()
-            {
-                return Err(invalid(
-                    "retained gradient delivery is still active during target completion",
-                ));
-            }
-        }
-        {
+        let session = use_state
+            .session
+            .as_ref()
+            .ok_or_else(|| invalid("retained SOURCE lost its original target Session"))?;
+        let target = use_state
+            .target
+            .as_ref()
+            .ok_or_else(|| invalid("retained SOURCE lost its original target Update"))?;
+        let completion = if let Some(update) = &unpublished_update {
             let update = update.borrow(py);
-            let target_session = update.session.borrow(py);
-            target_session.require_creator()?;
-            let target_owner = target_session.owner()?;
+            if update.session.as_ptr() != session.as_ptr() || !target.same_handle(&update.inner) {
+                return Err(invalid(
+                    "unpublished Update differs from the retained SOURCE target",
+                ));
+            }
+            update.require_task(py, &update.task_use.borrow(py))?;
+            RetainedTargetCompletion::Unpublished
+        } else {
+            RetainedTargetCompletion::Published
+        };
+        {
+            let session = session.borrow(py);
+            session.require_creator()?;
+            let owner = session.owner()?;
             match completion {
-                RetainedTargetCompletion::Published => target_owner
-                    .require_recorded_group_critic(&update.inner)
+                RetainedTargetCompletion::Published => owner
+                    .require_recorded_group_critic(target)
                     .map_err(xlog_err)?,
-                RetainedTargetCompletion::Unpublished => target_owner
-                    .require_completed_unpublished_group_update(&update.inner)
+                RetainedTargetCompletion::Unpublished => owner
+                    .require_completed_unpublished_group_update(target)
                     .map_err(xlog_err)?,
             }
-            use_state.target = Some(update.inner.clone());
         }
-        use_state.update = Some(update);
         use_state.completion = Some(completion);
         Ok(())
     }
@@ -19492,58 +18856,67 @@ impl PySemanticRetainedReplayMember {
     fn finish_retained_import(
         &self,
         py: Python<'_>,
+        mode: RetainedFinalUseMode,
         unpublished_update: Option<Py<PySemanticPreparedStep>>,
     ) -> PyResult<()> {
-        let mode = if unpublished_update.is_some() {
-            RetainedFinalUseMode::Unpublished
-        } else {
-            RetainedFinalUseMode::Published
+        let expected_completion = match mode {
+            RetainedFinalUseMode::Published => RetainedTargetCompletion::Published,
+            RetainedFinalUseMode::Unpublished => RetainedTargetCompletion::Unpublished,
+            RetainedFinalUseMode::Cancelled => {
+                return Err(invalid(
+                    "cancelled SOURCE requires its original cancellation proof",
+                ));
+            }
         };
         if self.completed.load(Ordering::Acquire) {
-            let target = unpublished_update
-                .as_ref()
-                .map(|update| update.borrow(py).inner.clone());
+            let target = match &unpublished_update {
+                Some(update) => Some(update.borrow(py).inner.clone()),
+                None => self
+                    .final_use
+                    .try_lock()
+                    .map_err(|_| invalid("original final use is already active or poisoned"))?
+                    .target
+                    .clone(),
+            };
             return self.require_final_use_ack(py, mode, target.as_ref());
         }
-        let update = {
+        let (session, target) = {
             let use_state = self
-                .group_use
+                .source_target
                 .lock()
-                .map_err(|_| PyRuntimeError::new_err("retained group use is poisoned"))?;
-            let expected_completion = if unpublished_update.is_some() {
-                RetainedTargetCompletion::Unpublished
-            } else {
-                RetainedTargetCompletion::Published
-            };
+                .map_err(|_| invalid("retained SOURCE target custody is poisoned"))?;
             if use_state.completion != Some(expected_completion) {
                 return Err(invalid(
                     "retained target completion must be confirmed before source retirement",
                 ));
             }
-            let update = use_state
-                .update
+            let session = use_state
+                .session
                 .as_ref()
-                .ok_or_else(|| invalid("retained replay has no original Update owner"))?;
-            if unpublished_update
+                .ok_or_else(|| invalid("retained SOURCE lost its original target Session"))?;
+            let target = use_state
+                .target
                 .as_ref()
-                .is_some_and(|given| !given.is(update))
-            {
-                return Err(invalid(
-                    "unpublished Update differs from the confirmed target",
-                ));
+                .ok_or_else(|| invalid("retained SOURCE lost its original target Update"))?;
+            if let Some(update) = &unpublished_update {
+                let update = update.borrow(py);
+                if update.session.as_ptr() != session.as_ptr() || !target.same_handle(&update.inner)
+                {
+                    return Err(invalid(
+                        "unpublished Update differs from the confirmed SOURCE target",
+                    ));
+                }
             }
-            update.clone_ref(py)
+            (session.clone_ref(py), target.clone())
         };
         {
-            let update = update.borrow(py);
-            let target_session = update.session.borrow(py);
-            target_session.require_creator()?;
-            let target_owner = target_session.owner()?;
-            target_owner
-                .require_prepared_step_final_use(&update.inner)
+            let session = session.borrow(py);
+            session.require_creator()?;
+            session
+                .owner()?
+                .require_prepared_step_final_use(&target)
                 .map_err(xlog_err)?;
         }
-        let target = update.borrow(py).inner.clone();
         self.finish_original_import(py, mode, Some(target))
     }
 
@@ -19559,16 +18932,20 @@ impl PySemanticRetainedReplayMember {
             .final_use
             .try_lock()
             .map_err(|_| invalid("original final use is already active or poisoned"))?;
+        let same_target = match (mode, target, original.target.as_ref()) {
+            (RetainedFinalUseMode::Cancelled, None, None) => true,
+            (
+                RetainedFinalUseMode::Published | RetainedFinalUseMode::Unpublished,
+                Some(target),
+                Some(stored),
+            ) => stored.same_handle(target),
+            _ => false,
+        };
         if !self.completed.load(Ordering::Acquire)
             || original.active
             || original.mode != Some(mode)
             || !original.completion.state_finished
-            || target.is_some_and(|target| {
-                original
-                    .target
-                    .as_ref()
-                    .is_none_or(|stored| !stored.same_handle(target))
-            })
+            || !same_target
         {
             return Err(invalid(
                 "final-use acknowledgment changed its original source, target or disposition",
@@ -19702,16 +19079,12 @@ impl PySemanticRetainedReplayMember {
         drop(original);
         if result.is_ok() {
             import.committed = true;
-            let retired_group = {
+            let retired_target = {
                 let mut use_state = self
-                    .group_use
+                    .source_target
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                (
-                    use_state.update.take(),
-                    use_state.target.take(),
-                    std::mem::replace(&mut use_state.deliveries, std::array::from_fn(|_| None)),
-                )
+                (use_state.session.take(), use_state.target.take())
             };
             self.completed.store(true, Ordering::Release);
             let prepared = {
@@ -19725,9 +19098,7 @@ impl PySemanticRetainedReplayMember {
                     .map(|original| original.clone_ref(py))
             };
             if let Some(prepared) = &prepared {
-                prepared
-                    .borrow(py)
-                    .retire_source_port_custody(py, &retired_group.2);
+                prepared.borrow(py).retire_source_port_custody();
             }
             let retired_prepared = {
                 let mut retained = session
@@ -19744,7 +19115,7 @@ impl PySemanticRetainedReplayMember {
                     None
                 }
             };
-            drop(retired_group);
+            drop(retired_target);
             drop(retired_prepared);
         } else if !import.native_pending.get() {
             if let Ok(mut state) = issued.state() {
@@ -19999,89 +19370,6 @@ impl PySemanticPolicyInvocation {
         Ok(PyTuple::new(py, capsules)?.unbind())
     }
 
-    /// Consume this prepared proposal's exact retained tape against the
-    /// prepared Update step's resident actor/critic/cost objective. The caller
-    /// invokes this method for every proposal invocation in the frozen segment
-    /// and joins every returned root into one GraphTask. Native selection makes
-    /// unselected invocations graph-connected zeros; Python never reads the
-    /// selected ordinal, reconstructs selected scores, or runs a second primal.
-    ///
-    /// Returns FP32 parameter, full MASK and component-baseline adjoints,
-    /// then their three full FP64 E[...,2] ordinary/underflow envelopes and
-    /// three contiguous FP64 D[2,...,4] bounds in actor/full and (M,O,U,I)
-    /// order. E and D.full.O/U come from the same coherent result. These are
-    /// selected-tape bounds, not pre-draw support/prefix coverage. Only the first three
-    /// capsules are autograd cotangents. This is a single-use handoff, including
-    /// uncertain native failures.
-    #[pyo3(signature = (update_step, *, consumer_stream))]
-    fn backward_selected(
-        &self,
-        py: Python<'_>,
-        update_step: Py<PySemanticPreparedStep>,
-        consumer_stream: &Bound<'_, PyAny>,
-    ) -> PyResult<Py<PyTuple>> {
-        self.session.borrow(py).require_creator()?;
-        self.require_public_result(py)?;
-        let policy_step = match &self._parent {
-            ContentStepOwner::Prepared(step) => step,
-            ContentStepOwner::Published(_) => {
-                return Err(invalid(
-                    "device-selected policy backward requires an original prepared proposal",
-                ));
-            }
-        };
-        let expected = {
-            let session = self.session.borrow(py);
-            let owner = session.owner()?;
-            self.final_use_binding(py, &owner)?
-        };
-        if !self.training {
-            return Err(invalid(
-                "device-selected policy backward requires the original training use",
-            ));
-        }
-        self.published_observation()?;
-        let mut budget = 4096;
-        let consumer_stream = parse_witness_consumer_stream(consumer_stream, &mut budget)?;
-        {
-            let update = update_step.borrow(py);
-            if self.session.as_ptr() != update.session.as_ptr() {
-                return Err(invalid(
-                    "device-selected policy backward requires an Update from the same Session",
-                ));
-            }
-            let task_use = self._task_use.borrow(py);
-            update.require_task(py, &task_use)?;
-        }
-        self.start_final_use()?;
-        let session = self.session.borrow(py);
-        let mut owner = session.owner()?;
-        if self.final_use_binding(py, &owner)? != expected {
-            return Err(invalid(
-                "policy backward authority changed before resident objective use",
-            ));
-        }
-        let gradients = owner
-            .backward_selected_prepared_policy(
-                &policy_step.borrow(py).inner,
-                &update_step.borrow(py).inner,
-                self.rng,
-                consumer_stream,
-            )
-            .map_err(xlog_err)?;
-        let export_owner = || policy_step.clone_ref(py);
-        let capsules = gradients
-            .into_dlpack()
-            .map_err(xlog_err)?
-            .into_iter()
-            .map(|tensor| {
-                let tensor = retain_export_owner(tensor, export_owner(), session.owner_thread)?;
-                crate::dlpack_capsule_from_tensor(py, tensor)
-            })
-            .collect::<PyResult<Vec<_>>>()?;
-        Ok(PyTuple::new(py, capsules)?.unbind())
-    }
-
     /// Finish the original published or refused inference use after consumers are enqueued.
     ///
     /// ``consumer_stream`` must be the explicit CUDA stream containing those
@@ -20089,9 +19377,8 @@ impl PySemanticPolicyInvocation {
     /// finalization joins that stream without a host wait and retires only this
     /// invocation's retained policy tape. It does not release the parent.
     /// Published training invocations require ``backward`` or, after a completed
-    /// group Update, ``finish_recorded_training`` for a consumed tape or
-    /// ``finish_unselected_recorded_training`` for an unselected tape. Refused
-    /// training invocations require ``finish_refusal``. Final use is one-shot,
+    /// group Update, ``finish_unselected_recorded_training`` for a local tape.
+    /// Refused training invocations require ``finish_refusal``. Final use is one-shot,
     /// including uncertain native failures.
     #[pyo3(signature = (*, consumer_stream))]
     fn finish_inference(&self, py: Python<'_>, consumer_stream: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -20103,24 +19390,6 @@ impl PySemanticPolicyInvocation {
             ));
         }
         self.finish_final_use(py, consumer_stream)
-    }
-
-    /// Finish a published training invocation after its policy tape was already
-    /// consumed by ``SemanticPreparedStep.temporal_update_vjp`` inside both
-    /// branches of the exact prepared Update. This is a terminal ownership
-    /// handoff only; it does not execute a second backward or policy VJP.
-    ///
-    /// Enqueue every final GraphTask/optimizer consumer on ``consumer_stream``
-    /// before this call. Native validation binds the Proposal, Update and
-    /// invocation to the same completed segment and exact recording identities.
-    #[pyo3(signature = (update_step, *, consumer_stream))]
-    fn finish_recorded_training(
-        &self,
-        py: Python<'_>,
-        update_step: Py<PySemanticPreparedStep>,
-        consumer_stream: &Bound<'_, PyAny>,
-    ) -> PyResult<()> {
-        self.finish_recorded_training_use(py, update_step, consumer_stream, false)
     }
 
     /// Finish a published local Proposal that was outside the exact frozen
@@ -20135,7 +19404,7 @@ impl PySemanticPolicyInvocation {
         update_step: Py<PySemanticPreparedStep>,
         consumer_stream: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
-        self.finish_recorded_training_use(py, update_step, consumer_stream, true)
+        self.finish_unselected_recorded_training_use(py, update_step, consumer_stream)
     }
 
     /// Finish an actual native refusal from inference or training without a VJP.
@@ -20143,7 +19412,7 @@ impl PySemanticPolicyInvocation {
     /// Enqueue final consumers on the explicit ``consumer_stream`` first.
     /// Stream 1 is allowed; 0 and 2 are refused. Published outcomes are not
     /// admitted here. This shares the one-shot final-use owner with ``backward``,
-    /// ``finish_recorded_training`` and ``finish_inference`` and retains the
+    /// ``finish_unselected_recorded_training`` and ``finish_inference`` and retains the
     /// parent for its later release.
     #[pyo3(signature = (*, consumer_stream))]
     fn finish_refusal(&self, py: Python<'_>, consumer_stream: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -20189,12 +19458,11 @@ impl PySemanticPolicyInvocation {
         })
     }
 
-    fn finish_recorded_training_use(
+    fn finish_unselected_recorded_training_use(
         &self,
         py: Python<'_>,
         update_step: Py<PySemanticPreparedStep>,
         consumer_stream: &Bound<'_, PyAny>,
-        unselected: bool,
     ) -> PyResult<()> {
         self.session.borrow(py).require_creator()?;
         self.require_public_result(py)?;
@@ -20237,22 +19505,14 @@ impl PySemanticPolicyInvocation {
                 "policy authority changed before recorded training completion",
             ));
         }
-        let result = if unselected {
-            owner.finish_unselected_recorded_training_policy_invocation(
+        owner
+            .finish_unselected_recorded_training_policy_invocation(
                 &policy_step.borrow(py).inner,
                 &update_step.borrow(py).inner,
                 self.rng,
                 consumer_stream,
             )
-        } else {
-            owner.finish_recorded_training_policy_invocation(
-                &policy_step.borrow(py).inner,
-                &update_step.borrow(py).inner,
-                self.rng,
-                consumer_stream,
-            )
-        };
-        result.map_err(xlog_err)
+            .map_err(xlog_err)
     }
     fn finish_final_use(&self, py: Python<'_>, consumer_stream: &Bound<'_, PyAny>) -> PyResult<()> {
         let expected = {
@@ -24057,6 +23317,9 @@ impl PySemanticTransitionController {
     /// checkpoint still requires the bounded resolver and authority refresh.
     /// Selected replay requires an explicit current inference/training operation
     /// and trusted application callbacks, not permissions inferred from archive.
+    /// Retained SOURCE imports require the original ``prepare_invocation``
+    /// callback and return a prepared import before numerical execution. Direct
+    /// unprepared imports never retain a policy or acquire Update final-use rights.
     ///
     /// restore_invocation(task_use, restored_parent, full_row, transition) returns
     /// (original_model_output, finalize_continuation, consumer_stream). The second
@@ -24140,6 +23403,11 @@ impl PySemanticTransitionController {
         prepare_invocation: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
         self.session.borrow(py).require_creator()?;
+        if retain_policy != prepare_invocation.is_some() {
+            return Err(invalid(
+                "retained SOURCE import requires its original preparation callback",
+            ));
+        }
         if prepare_invocation.is_some_and(|callback| !callback.is_callable()) {
             return Err(invalid(
                 "task import metadata preparation requires its original callable",
@@ -24631,7 +23899,6 @@ impl PySemanticTransitionController {
                 pending_delivery_receiver: Mutex::new(None),
             },
         )?;
-        let mut retained = None;
         #[cfg(feature = "semantic-policy")]
         if let Some(child) = session.private_replay_custody()? {
             child.retain_import_task(py, &task_use)?;
@@ -24677,34 +23944,20 @@ impl PySemanticTransitionController {
                 finish_invocation,
                 refresh_snapshot,
                 &import,
-                retain_policy,
                 #[cfg(feature = "semantic-policy")]
                 None,
             );
-            match replay {
-                Ok(member) => retained = member,
-                Err(error) => {
-                    if let Ok(mut state) = task_use.borrow(py).state() {
-                        state.phase = TaskUsePhase::Refused;
-                    }
-                    return Err(error);
+            if let Err(error) = replay {
+                if let Ok(mut state) = task_use.borrow(py).state() {
+                    state.phase = TaskUsePhase::Refused;
                 }
+                return Err(error);
             }
         }
         if prepare_invocation.is_some() {
             return Err(invalid(
                 "prepared import requires its original selected replay material",
             ));
-        }
-        if let Some(member) = retained {
-            #[cfg(feature = "semantic-policy")]
-            if let Some(child) = session.private_replay_custody()? {
-                child.retain_member(py, &member)?;
-            }
-            let result = (task_use, member).into_pyobject(py)?.unbind().into_any();
-            import.committed = true;
-            import.deferred = true;
-            return Ok(result);
         }
         import.committed = true;
         Ok(task_use.into_any())
@@ -29269,13 +28522,12 @@ impl PySemanticTransitionController {
         finish_invocation: &Bound<'_, PyAny>,
         refresh_snapshot: &Bound<'_, PyAny>,
         import: &ColdImportGuard<'_>,
-        retain_policy: bool,
         #[cfg(feature = "semantic-policy")] prepared: Option<
             &prepared_import::PySemanticPreparedTaskImport,
         >,
     ) -> PyResult<Option<Py<PySemanticRetainedReplayMember>>> {
         #[cfg(not(feature = "semantic-policy"))]
-        let _ = (retain_policy, &original_decisions);
+        let _ = &original_decisions;
         let issued = task_use.borrow(py);
         let replay_row = self.original_replay_import_row(py, &issued, ordinal, import)?;
         #[cfg(feature = "semantic-policy")]
@@ -29437,7 +28689,7 @@ impl PySemanticTransitionController {
                         .and_then(|_| {
                             self.verify_import_successor(py, &issued, &acquired, &material, import)
                         });
-                    if retain_policy {
+                    if let Some(prepared) = prepared {
                         comparison?;
                         let invocation = Py::new(py, invocation)?;
                         return Py::new(
@@ -29455,11 +28707,7 @@ impl PySemanticTransitionController {
                                 expected: expected.clone(),
                                 finish_invocation: finish_invocation.clone().unbind(),
                                 refresh_snapshot: refresh_snapshot.clone().unbind(),
-                                group_use: prepared
-                                    .map(|prepared| Arc::clone(&prepared.group_use))
-                                    .unwrap_or_else(|| {
-                                        Arc::new(Mutex::new(RetainedGroupUse::new()))
-                                    }),
+                                source_target: Arc::clone(&prepared.source_target),
                                 final_use: Mutex::new(RetainedReplayFinalUse::default()),
                                 completed: AtomicBool::new(false),
                             },
@@ -33179,7 +32427,7 @@ for method in ('finish_inference', 'finish_refusal'):
     assert tuple(finish.parameters) == ('self', 'consumer_stream')
     assert finish.parameters['consumer_stream'].kind is inspect.Parameter.KEYWORD_ONLY
     assert finish.parameters['consumer_stream'].default is inspect.Parameter.empty
-for method in ('finish_recorded_training', 'finish_unselected_recorded_training'):
+for method in ('finish_unselected_recorded_training',):
     finish = inspect.signature(getattr(SemanticPolicyInvocation, method))
     assert tuple(finish.parameters) == ('self', 'update_step', 'consumer_stream')
     assert finish.parameters['consumer_stream'].kind is inspect.Parameter.KEYWORD_ONLY
