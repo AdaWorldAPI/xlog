@@ -3075,16 +3075,15 @@ pub(super) fn source_geometry_occurrence_native_work_ceiling<
 >(
     owner: &SourceContentGeometryOwner,
     event: &super::source_content_occurrences::SemanticSourceContentEvent<A>,
+    model: bool,
 ) -> Result<[u64; 9], SemanticTransitionError> {
     use super::source_content_occurrences::{SemanticSourceContentKind, SourceContentAllocation};
     let original = &owner.seed.proof.owner;
     let directory = &owner.publication.storage.bank_templates[0];
     let verify = event.family.kind() != SemanticSourceContentKind::Capture;
-    let model = verify
-        && event
-            .tensors
-            .iter()
-            .all(|tensor| matches!(tensor.layout.role, 18..=20));
+    if model && !verify {
+        return Err(SemanticTransitionError::ObservationMismatch);
+    }
     let mut ceiling = [0; 9];
     if model {
         model_content_ranges(

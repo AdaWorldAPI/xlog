@@ -311,6 +311,8 @@ impl PreparedTensorContentPlan {
                     bank,
                     event,
                     event.kind == SemanticSourceContentKind::Verify,
+                    event.kind == SemanticSourceContentKind::Verify
+                        && bindings[bank].model_slot == Some(event.receiver_slot),
                 )?;
                 native_work_bound::add_native_work_ceiling(&mut ceiling, bound)?;
                 ceilings.push(bound);
@@ -324,9 +326,7 @@ impl PreparedTensorContentPlan {
                 .ok_or(SemanticTransitionError::NotBound)?;
             if binding.policy_slot.is_some() != (kind == SemanticTransitionKind::Proposal)
                 || binding.continuation_slot.is_some() != (kind != SemanticTransitionKind::Drain)
-                || binding.model_slot.is_some()
-                    != (kind == SemanticTransitionKind::Proposal
-                        && storage.physical_parameter_roster.is_some())
+                || binding.model_slot.is_some() != (kind != SemanticTransitionKind::Drain)
             {
                 return Err(publication_input_error(
                     "prepared content bindings changed their original step services",
@@ -342,8 +342,9 @@ impl PreparedTensorContentPlan {
                                 "prepared intrinsic binding has no original capture witness slot",
                             )
                         })?;
-                    let guard = session
-                        .prepared_content_event_native_work_ceiling(step, bank, event, true)?;
+                    let guard = session.prepared_content_event_native_work_ceiling(
+                        step, bank, event, true, false,
+                    )?;
                     for _ in 0..copies {
                         native_work_bound::add_native_work_ceiling(&mut ceiling, guard)?;
                     }
@@ -358,7 +359,9 @@ impl PreparedTensorContentPlan {
                     "prepared block binding has no original model verification witness slot",
                 ));
             }
-            if binding.model_slot.is_some() {
+            if kind == SemanticTransitionKind::Proposal
+                && storage.physical_parameter_roster.is_some()
+            {
                 native_work_bound::add_native_work_ceiling(
                     &mut ceiling,
                     native_work_bound::numerical_block_snapshot_native_work_ceiling(
@@ -453,6 +456,9 @@ impl PreparedTensorContentPlan {
             || verify != (event.kind == SemanticSourceContentKind::Verify)
             || !same_source_tensor_geometry(&event.tensors, &content.tensors)
             || content.native_work_ceiling(verify)? != plan.ceilings[state.cursor]
+            || matches!(&content.seals, TensorContentSeals::Model(model)
+                if model.prepared.as_ref().is_some_and(|original| original.bank == bank))
+                != (verify && plan.bindings.model_slot == Some(event.receiver_slot))
         {
             return Err(publication_input_error(
                 "prepared content changed its next original typed occurrence or native producer",
@@ -852,18 +858,25 @@ impl SemanticTransitionSession {
         bank: usize,
         event: &SemanticPreparedTensorContentEvent,
         verify: bool,
+        model: bool,
     ) -> Result<[u64; 9], SemanticTransitionError> {
         let owner = &self.steps[&step.token];
         let inputs = owner
             .inputs
             .as_ref()
             .ok_or(SemanticTransitionError::NotBound)?;
-        let model = verify
-            && owner.content.iter().any(|content| {
-                matches!(&content.seals, TensorContentSeals::Model(model)
+        if model
+            && (!verify
+                || !owner.content.iter().any(|content| {
+                    matches!(&content.seals, TensorContentSeals::Model(model)
                 if model.prepared.as_ref().is_some_and(|original| original.bank == bank))
-                    && same_source_tensor_geometry(&event.tensors, &content.tensors)
-            });
+                        && same_source_tensor_geometry(&event.tensors, &content.tensors)
+                }))
+        {
+            return Err(publication_input_error(
+                "prepared model verification changed its original admitted bank roster",
+            ));
+        }
         let mut ceiling = [0; 9];
         if model {
             let contract = inputs.storage.bank_templates[bank]
@@ -1459,7 +1472,11 @@ impl FrozenSourceContentOccurrences {
             }
             let event_ceiling =
                 prepared_source_content::source_geometry_occurrence_native_work_ceiling(
-                    recipe, &event,
+                    recipe,
+                    &event,
+                    event.family.kind == SemanticSourceContentKind::BindModel
+                        || (event.family.kind == SemanticSourceContentKind::Verify
+                            && Some(event.receiver_slot) == *baseline),
                 )?;
             if !current {
                 native_work_bound::add_native_work_ceiling(&mut ceiling, event_ceiling)?;
@@ -1574,6 +1591,7 @@ impl FrozenSourceContentOccurrences {
                         prepared_source_content::source_geometry_occurrence_native_work_ceiling(
                             recipe,
                             &verification,
+                            false,
                         )?;
                     for &kind in kinds {
                         if native_guards
