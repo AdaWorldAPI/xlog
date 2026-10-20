@@ -1454,7 +1454,7 @@ static void captured_model_seals_follow_actual_reader() {
     const auto capture=[&] {
         semantic_publication_model_seals(reinterpret_cast<uint64_t>(&fixture.control),
             reinterpret_cast<uint64_t>(&fixture.lease),reinterpret_cast<uint64_t>(roster.data()),roster.size(),
-            reinterpret_cast<uint64_t>(retained.data()),reinterpret_cast<uint64_t>(contract_bytes.data()),contract_bytes.size());
+            reinterpret_cast<uint64_t>(retained.data()),reinterpret_cast<uint64_t>(contract_bytes.data()),contract_bytes.size(),0);
     };
     for(uint64_t invocation=0;invocation<3;++invocation) {
         if(invocation)fixture.publish();
@@ -1477,7 +1477,7 @@ static void captured_model_seals_follow_actual_reader() {
     require_content_trap([&] {
         semantic_publication_model_seals(reinterpret_cast<uint64_t>(&fixture.control),
             reinterpret_cast<uint64_t>(&fixture.lease),reinterpret_cast<uint64_t>(roster.data()),roster.size(),
-            reinterpret_cast<uint64_t>(retained.data()),reinterpret_cast<uint64_t>(contract_bytes.data()),contract_bytes.size()-1);
+            reinterpret_cast<uint64_t>(retained.data()),reinterpret_cast<uint64_t>(contract_bytes.data()),contract_bytes.size()-1,0);
     },"captured model accepted a truncated original contract allocation");
     require(publication_release(fixture.control,fixture.lease)==0,"captured model reader release failed");
     require_content_trap(capture,"captured model reused a released publication reader");
