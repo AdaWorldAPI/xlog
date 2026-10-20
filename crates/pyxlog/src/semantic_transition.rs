@@ -21153,6 +21153,7 @@ impl PySemanticTransitionController {
             usize,
             usize,
             [Vec<xlog_cuda::SemanticPreparedTensorContentEvent>; 2],
+            [xlog_cuda::SemanticPreparedTensorContentBindings; 2],
         )>();
         let reservation_bytes = std::mem::size_of::<xlog_cuda::SemanticReplayMaterialReservation>();
         let metadata_bytes = row_bytes
@@ -21188,8 +21189,8 @@ impl PySemanticTransitionController {
                 return Err(invalid("segment layout rows must be exact original tuples"));
             }
             let row = row.cast::<PyTuple>()?;
-            if row.len() != 4 {
-                return Err(invalid("segment layout rows require (original step, capture rows, bank event capacity, paired content rosters)"));
+            if row.len() != 5 {
+                return Err(invalid("segment layout rows require (original step, capture rows, bank event capacity, paired content rosters, paired witness bindings)"));
             }
             let step_value = row.get_item(0)?;
             let step = step_value.extract::<PyRef<'_, PySemanticPreparedStep>>()?;
@@ -21221,7 +21222,8 @@ impl PySemanticTransitionController {
                 >(&descriptors, &pool)?);
                 *content = source_content_occurrences::parse_prepared_events(&descriptors)?;
             }
-            rows.push((step.inner.clone(), tensors, events, content));
+            let bindings = source_content_occurrences::parse_prepared_bindings(&row.get_item(4)?)?;
+            rows.push((step.inner.clone(), tensors, events, content, bindings));
         }
         owner
             .finalize_prepared_segment_layout(&rows)

@@ -3,10 +3,10 @@
 use super::prepared_import::PySemanticPreparedSourceContent;
 use super::*;
 use xlog_cuda::{
-    SemanticPreparedTensorContentEvent, SemanticSourceAllocationDescriptor,
-    SemanticSourceContentAllocation, SemanticSourceContentEvent, SemanticSourceContentFamily,
-    SemanticSourceContentKind, SemanticSourceContentOccurrence, SemanticSourceContentPhase,
-    SemanticSourceTensorDescriptor,
+    SemanticPreparedTensorContentBindings, SemanticPreparedTensorContentEvent,
+    SemanticSourceAllocationDescriptor, SemanticSourceContentAllocation,
+    SemanticSourceContentEvent, SemanticSourceContentFamily, SemanticSourceContentKind,
+    SemanticSourceContentOccurrence, SemanticSourceContentPhase, SemanticSourceTensorDescriptor,
 };
 
 #[pyclass(
@@ -633,6 +633,22 @@ pub(super) fn parse_prepared_events(
             })
         },
     )
+}
+
+pub(super) fn parse_prepared_bindings(
+    value: &Bound<'_, PyAny>,
+) -> PyResult<[SemanticPreparedTensorContentBindings; 2]> {
+    let mut budget = 128;
+    let banks = exact_tuple(value, Some(2), &mut budget)?;
+    let mut parse = |bank: usize| -> PyResult<SemanticPreparedTensorContentBindings> {
+        let row = exact_tuple(&banks.get_item(bank)?, Some(3), &mut budget)?;
+        Ok(SemanticPreparedTensorContentBindings {
+            policy_slot: optional_unsigned(&row.get_item(0)?)?,
+            continuation_slot: optional_unsigned(&row.get_item(1)?)?,
+            model_slot: optional_unsigned(&row.get_item(2)?)?,
+        })
+    };
+    Ok([parse(0)?, parse(1)?])
 }
 
 fn parse_event_descriptors<E>(

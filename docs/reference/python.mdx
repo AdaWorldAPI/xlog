@@ -2868,7 +2868,15 @@ The sole complete pre-effect plan derives all original capture-row counts and
 the maximum event count across the two banks of each step. Its original producer
 calls `controller.finalize_segment_layout(task_use, layouts=...)` with the exact
 ordered tuple `(original_step, capture_rows, bank_event_capacity,
-(bank0_content, bank1_content))` for every step. Each bank contains the original
+(bank0_content, bank1_content), (bank0_bindings, bank1_bindings))` for every step.
+Each binding record is `(policy_witness_slot_or_None,
+continuation_witness_slot_or_None, model_witness_slot_or_None)`, taken from the
+original binder arguments and continuation tail in the same plan. An absent
+role is `None`, including a Drain without a continuation; slot zero is not an
+absence marker. Native checks that the actual binder uses that original witness
+and derives its additional intrinsic guards before freezing, rather than
+identifying a binding by equal tensor layouts. These intrinsic guards do not
+advance the public Capture/Verify cursor. Each bank contains the original
 ordered `(kind, receiver_slot, output_slot_or_None, tensors, allocations)` events;
 `kind` is `"capture"` or `"verify"`. Tensor and allocation descriptors use the same
 typed layout, logical interval, storage/version partitions, complete backing span,
