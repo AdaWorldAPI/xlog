@@ -207,15 +207,7 @@ def test_build_wheel_resolves_caller_relative_output_directory(
         assert Path(env["CARGO_TARGET_DIR"]) == caller / "relative-target"
         assert env["SOURCE_DATE_EPOCH"] == SOURCE_DATE_EPOCH
         commands.append(command)
-        if command[0] == "bash":
-            assert command == [
-                "bash",
-                "scripts/stage_pyxlog_kernels.sh",
-                "--features",
-                "semantic-policy",
-            ]
-            return subprocess.CompletedProcess(command, 0)
-        assert len(commands) == 2
+        assert len(commands) == 1
         assert command[0] == "maturin"
         assert command[-2:] == ["--features", "host-io,semantic-policy"]
         output = Path(command[command.index("--out") + 1])
@@ -236,7 +228,7 @@ def test_build_wheel_resolves_caller_relative_output_directory(
     )
 
     assert wheel == caller / "relative-wheelhouse" / "pyxlog-test.whl"
-    assert len(commands) == 2
+    assert len(commands) == 1
 
 
 def test_wheel_integrity_accepts_deterministic_sbom_and_record(
