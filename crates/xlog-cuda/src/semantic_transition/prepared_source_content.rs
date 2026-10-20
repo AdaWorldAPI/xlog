@@ -769,8 +769,9 @@ impl SourceContentGeometryOwner {
             declared.port,
             SourceGeometryAllocationPort::ContentOverlay(_)
         ) {
-            return self
-                .require_prepared_content_overlay(session, section, declared, descriptor, tensor);
+            return self.require_prepared_content_overlay(
+                session, step, section, declared, descriptor, tensor,
+            );
         }
         if matches!(declared.port, SourceGeometryAllocationPort::Model(_)) {
             let actual = tensor.native_allocation.as_ref().ok_or_else(|| {

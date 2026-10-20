@@ -258,6 +258,37 @@ impl SemanticPreparedSourceContentGeometry {
         Ok(())
     }
 
+    /// Authenticate the immutable producer stream before a foreign callback.
+    /// The canonical DLPack decoder preserves legacy stream 1 as CUDA stream 0.
+    pub fn require_content_overlay_backing_stream(
+        &self,
+        session: &SemanticTransitionSession,
+        instruction_admission: &SemanticSegmentInstructionAdmission,
+        consumer_stream: u64,
+    ) -> Result<(), SemanticTransitionError> {
+        let instruction = session.instruction_admission(instruction_admission)?;
+        if !Arc::ptr_eq(&self.owner.instruction, &instruction.instruction)
+            || session
+                .graph
+                .cold_work_allowance()
+                .as_ref()
+                .is_none_or(|allowance| !Arc::ptr_eq(allowance, &self.owner.allowance))
+        {
+            return Err(publication_input_error(
+                "content overlay backing changed its original instruction",
+            ));
+        }
+        let stream = dlpack_consumer_stream(consumer_stream)?;
+        if stream != session.stream.cu_stream()
+            || stream != session.provider.device().inner().stream().cu_stream()
+        {
+            return Err(publication_input_error(
+                "content overlay producer must use its original native import and capture stream",
+            ));
+        }
+        Ok(())
+    }
+
     /// Import the caller's original contiguous UInt8 pool block. The managed
     /// producer remains foreign and is retained by both original geometries.
     pub fn bind_content_overlay(
@@ -278,22 +309,18 @@ impl SemanticPreparedSourceContentGeometry {
             ready: false,
         };
         self.require_content_overlay_pair(other)?;
-        let instruction = session.instruction_admission(instruction_admission)?;
-        if !Arc::ptr_eq(&self.owner.instruction, &instruction.instruction)
-            || session
-                .graph
-                .cold_work_allowance()
-                .as_ref()
-                .is_none_or(|allowance| !Arc::ptr_eq(allowance, &self.owner.allowance))
-            || session.prepared_segment.as_ref().is_some_and(|build| {
-                build.capturing || build.submitted || build.finished || build.graph_call_entered
-            })
-        {
+        self.require_content_overlay_backing_stream(
+            session,
+            instruction_admission,
+            consumer_stream,
+        )?;
+        if session.prepared_segment.as_ref().is_some_and(|build| {
+            build.capturing || build.submitted || build.finished || build.graph_call_entered
+        }) {
             return Err(publication_input_error(
                 "content overlay backing changed its original instruction or entered after recording",
             ));
         }
-        dlpack_consumer_stream(consumer_stream)?;
         let owner = self.owner.content_overlay_owner(index)?;
         let other_owner = other.owner.content_overlay_owner(index)?;
         if !Arc::ptr_eq(&owner, &other_owner) {
@@ -518,10 +545,10 @@ impl SourceContentGeometryOwner {
         })?;
         if section.1 > 1
             || !state.bound
-            || state
-                .backing
-                .as_ref()
-                .is_none_or(|backing| backing.consumer_stream != consumer_stream)
+            || state.backing.as_ref().is_none_or(|backing| {
+                dlpack_consumer_stream(backing.consumer_stream)
+                    .map_or(true, |stream| stream as u64 != consumer_stream)
+            })
         {
             return Err(publication_input_error(
                 "CURRENT content changed its original overlay consumer stream",
@@ -754,6 +781,7 @@ impl SourceContentGeometryOwner {
     pub(super) fn require_prepared_content_overlay(
         &self,
         session: &SemanticTransitionSession,
+        step: &SemanticPreparedStep,
         section: (SemanticTransitionKind, usize),
         allocation: &SemanticSourceGeometryAllocation,
         descriptor: &SemanticSourceTensorDescriptor,
@@ -800,6 +828,20 @@ impl SourceContentGeometryOwner {
             .actor_refresh
             .as_ref()
             .ok_or(SemanticTransitionError::NotBound)?;
+        let inputs = session
+            .steps
+            .get(&step.token)
+            .and_then(|step| step.inputs.as_ref())
+            .ok_or(SemanticTransitionError::NotBound)?;
+        // Use the canonical complete input-owner check, including private
+        // headers, ranges, bindings, digest buffers and backing padding.
+        if staged.proof.inner.inputs.owns_tensor(&backing.tensor)?
+            || inputs.owns_tensor(&backing.tensor)?
+        {
+            return Err(publication_input_error(
+                "content overlay backing aliases its original native input owner",
+            ));
+        }
         for original in staged
             .proof
             .inner
@@ -807,6 +849,13 @@ impl SourceContentGeometryOwner {
             .allocations
             .iter()
             .chain(&staged.proof.inner.inputs.storage.allocations)
+            .chain(
+                session
+                    .publication
+                    .iter()
+                    .flat_map(|storage| &storage.allocations),
+            )
+            .chain(&inputs.storage.allocations)
         {
             if step_input_overlap(
                 backing.tensor.data,
@@ -823,6 +872,7 @@ impl SourceContentGeometryOwner {
             .inputs
             .views
             .iter()
+            .chain(&inputs.views)
             .flat_map(|views| views.values())
         {
             if step_input_overlap(
