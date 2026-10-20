@@ -2594,7 +2594,8 @@ pub(super) fn model_contract_guard_geometry_native_work_ceiling(
             .map(|bytes| bytes / 64)
             .ok_or_else(native_work_ceiling_overflow)
     };
-    let mut ceiling = [1, 0, 0, 0, 0, 0, 0, 0, 752];
+    // Selected-bank instance, descriptor, contract and numerical identities.
+    let mut ceiling = [1, 16, 0, 0, 0, 0, 0, 0, 752];
     ceiling[7] = blocks(size_of::<PublicationBank>() as u64)?
         .checked_add(
             blocks(

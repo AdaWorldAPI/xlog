@@ -3555,13 +3555,13 @@ __device__ uint64_t publication_validate_selected_model(const PublicationControl
        header.model_generation>UINT32_MAX || header.range_count>contract.range_capacity ||
        !directory || directory%alignof(PublicationRange) ||
        header.range_count>(UINT64_MAX-directory)/sizeof(PublicationRange) ||
-       !publication_bank_matches(control,bank,header.publication_word))return 1;
+       !publication_bank_matches(control,bank,header.publication_word,work))return 1;
     const auto* ranges=reinterpret_cast<const PublicationRange*>(directory);
     uint64_t digest[4];publication_original_descriptor_digest(control,bank,digest,work);
-    if(!publication_identity_equal(digest,header.descriptor_digest))return 1;
+    if(!publication_identity_equal(digest,header.descriptor_digest,work))return 1;
     const auto* model=publication_find_range(ranges,header.range_count,44,0,work);
     if(!model || publication_range_digest(control,*model,nullptr,digest,nullptr,work) ||
-       !publication_identity_equal(digest,model->digest) ||
+       !publication_identity_equal(digest,model->digest,work) ||
        publication_finalize_model_contract(control,header,*model,true,work))return 1;
     // Fold the original typed and full-backing seals in their canonical order.
     // Individual consumers still verify actual payloads against those seals;
@@ -3576,7 +3576,7 @@ __device__ uint64_t publication_validate_selected_model(const PublicationControl
             publication_fold(digest,ranges[i].role,ranges[i].index,ranges[i].backing_digest,work);
         }
     }
-    return publication_identity_equal(digest,header.model_numerical_digest) ? 0 : 1;
+    return publication_identity_equal(digest,header.model_numerical_digest,work) ? 0 : 1;
 }
 __device__ uint64_t publication_descriptor_digest(const PublicationControl& control,PublicationBank& bank,
         semantic_graph::NativeWorkTally* work=nullptr) {
