@@ -89,7 +89,7 @@ pub(super) fn policy_uniform_native_work_ceiling(
             .map(|component| u64::from(component.cardinality)),
     )?;
     Ok([
-        0,
+        1,
         0,
         0,
         ceiling_sum([
@@ -113,7 +113,7 @@ pub(super) fn policy_binding_native_work_ceiling(
     layouts: &[SemanticTensorLayout; 9],
 ) -> Result<[u64; 9], SemanticTransitionError> {
     let mut ceiling = policy_uniform_native_work_ceiling(components, layouts[2].dimensions[0])?;
-    ceiling[0] = 9;
+    add_native_work_ceiling(&mut ceiling, [9, 0, 0, 0, 0, 0, 0, 0, 0])?;
     for layout in layouts {
         let bytes = tensor_layout_bytes(layout)?;
         ceiling[8] = ceiling[8]
@@ -4205,12 +4205,11 @@ pub(super) fn actor_refresh_transition_native_work_ceilings(
         let transferred = binding
             .as_ref()
             .is_some_and(|binding| binding.work.is_some());
-        let uniform = if transferred {
-            0
-        } else {
-            policy_uniform_native_work_ceiling(components, parameter_cells)?[3]
-        };
         if !transferred {
+            add_native_work_ceiling(
+                ceiling,
+                policy_uniform_native_work_ceiling(components, parameter_cells)?,
+            )?;
             let bytes = binding.as_ref().map_or(0, |binding| binding.snapshot_bytes);
             add_native_work_ceiling(
                 ceiling,
@@ -4233,13 +4232,7 @@ pub(super) fn actor_refresh_transition_native_work_ceilings(
         // operand banks with supported+operand_matches; all three opcodes are
         // checked once. Each category has two legal-category visits and each
         // visit can perform one additional operand_matches.
-        let categories = ceiling_sum([
-            uniform,
-            alias,
-            primal,
-            viability,
-            ceiling_product(4, cells)?,
-        ])?;
+        let categories = ceiling_sum([alias, primal, viability, ceiling_product(4, cells)?])?;
         let mut comparisons = 0;
         for component in components {
             let width = u64::from(component.cardinality)

@@ -19707,7 +19707,10 @@ struct OriginalPolicyBindingWork {
     commands: Vec<OriginalNativeCommand>,
     cursor: usize,
     snapshot_bytes: u64,
-    copies: Vec<(u64, u64, usize)>,
+    copies: [(u64, u64, usize); 9],
+    // Keep the original metadata charge until every command/completion owner
+    // and the retained copy roster above has been dropped.
+    _allocation_reservation: Option<SemanticReplayMaterialReservation>,
 }
 
 /// Reserved with the original forward tape, then consumed by its sole backward.
@@ -19883,6 +19886,10 @@ fn policy_source_views(
 }
 
 #[cfg(feature = "semantic-policy")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "original snapshots retain their selected counter, DMA allowance and metadata pool explicitly"
+)]
 fn enqueue_policy_snapshots(
     domain: &ResidentExecutionDomain,
     poisoned: &mut bool,
@@ -19892,6 +19899,7 @@ fn enqueue_policy_snapshots(
     work: Option<DeviceMemoryView<u64>>,
     allowance: Option<&Arc<Mutex<ColdNativeAllowance>>>,
     capture: bool,
+    budget: Option<&SemanticReplayMaterialBudget>,
 ) -> Result<(), SemanticTransitionError> {
     if work
         .as_ref()
@@ -19901,6 +19909,11 @@ fn enqueue_policy_snapshots(
     {
         return Err(publication_input_error(
             "policy binding lost its original complete work owner",
+        ));
+    }
+    if work.is_some() && budget.is_none() {
+        return Err(publication_input_error(
+            "policy binding requires its original metadata byte pool",
         ));
     }
     if original.text_logits.len() != buffers.text_logits.len()
@@ -19922,7 +19935,7 @@ fn enqueue_policy_snapshots(
             "original numerical policy capacities differ",
         ));
     }
-    let mut copies = vec![
+    let primary = [
         (
             buffers.text_logits.device_ptr_value(),
             *original.text_logits.device_ptr(),
@@ -19944,15 +19957,19 @@ fn enqueue_policy_snapshots(
             original.component_baselines.len() * 4,
         ),
     ];
-    copies.extend(numerical_destinations.iter().zip(&original.numerical).map(
-        |(destination, source)| {
+    let copies: [_; 9] = std::array::from_fn(|index| {
+        if let Some(copy) = primary.get(index) {
+            *copy
+        } else {
+            let index = index - primary.len();
+            let source = &original.numerical[index];
             (
-                destination.device_ptr_value(),
+                numerical_destinations[index].device_ptr_value(),
                 *source.device_ptr(),
                 source.len() * 8,
             )
-        },
-    ));
+        }
+    });
     let snapshot_bytes = copies.iter().try_fold(0u64, |total, (_, _, bytes)| {
         total
             .checked_add(*bytes as u64)
@@ -19963,20 +19980,38 @@ fn enqueue_policy_snapshots(
         .lock()
         .map_err(|_| SemanticTransitionError::Poisoned)?;
     if retained.is_none() {
-        let commands = if capture || allowance.is_none() {
-            Vec::new()
+        let command_count = if capture || allowance.is_none() {
+            0
         } else {
-            (0..10)
-                .map(|_| OriginalNativeCommand::new(domain))
-                .collect::<Result<_, _>>()?
+            copies.len() + 1
         };
+        let allocation_reservation = budget
+            .map(|budget| {
+                let completion_bytes =
+                    crate::device::ExecutionCompletion::single_stream_allocation_bytes()
+                        .map_err(|_| SemanticTransitionError::GenerationExhausted)?;
+                let command_bytes = (size_of::<OriginalNativeCommand>() as u64)
+                    .checked_add(completion_bytes)
+                    .and_then(|bytes| bytes.checked_mul(command_count as u64))
+                    .ok_or(SemanticTransitionError::GenerationExhausted)?;
+                let bytes = (size_of::<OriginalPolicyBindingWork>() as u64)
+                    .checked_add(command_bytes)
+                    .ok_or(SemanticTransitionError::GenerationExhausted)?;
+                budget.reserve_auxiliary(bytes)
+            })
+            .transpose()?;
+        let mut commands = Vec::with_capacity(command_count);
+        for _ in 0..command_count {
+            commands.push(OriginalNativeCommand::new(domain)?);
+        }
         *retained = Some(OriginalPolicyBindingWork {
             work: work.clone(),
             allowance: allowance.map(Arc::downgrade),
             commands,
             cursor: 0,
             snapshot_bytes,
-            copies: copies.clone(),
+            copies,
+            _allocation_reservation: allocation_reservation,
         });
     }
     let retained = retained
@@ -45050,6 +45085,7 @@ impl SemanticTransitionSession {
             Some(work),
             None,
             true,
+            self.replay_material_budget.as_ref(),
         )?;
         enqueue_policy_uniform_domains(
             &self.domain,
@@ -45591,6 +45627,7 @@ impl SemanticTransitionSession {
             work,
             allowance.as_ref(),
             false,
+            self.replay_material_budget.as_ref(),
         )?;
         enqueue_policy_uniform_domains(
             &self.domain,

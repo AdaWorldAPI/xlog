@@ -2436,7 +2436,10 @@ impl SourcePublicationGeometry {
             &components,
             policy.parameter_cells as u64,
         )?;
-        policy_producer_ceiling[0] = 9;
+        native_work_bound::add_native_work_ceiling(
+            &mut policy_producer_ceiling,
+            [9, 0, 0, 0, 0, 0, 0, 0, 0],
+        )?;
         let mut support_layout = std::array::from_fn(|_| 0..0);
         for (component, span) in components.iter().zip(&mut support_layout) {
             let begin = usize::try_from(component.offset)
