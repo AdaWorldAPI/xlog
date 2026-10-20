@@ -21773,7 +21773,6 @@ fn validate_prepared_policy_score(
     Ok(())
 }
 
-#[cfg(feature = "semantic-policy")]
 impl SemanticTransitionSession {
     /// Bind the original shared capacity once. This grants no content access.
     pub fn bind_replay_material_budget(
@@ -21821,7 +21820,10 @@ impl SemanticTransitionSession {
             self.stream.context().cu_ctx() as u64,
         ))
     }
+}
 
+#[cfg(feature = "semantic-policy")]
+impl SemanticTransitionSession {
     /// Submit this Session's complete graph once with the freshly validated
     /// canonical authority snapshot. The metadata upload precedes graph launch.
     pub fn launch_prepared_segment(
