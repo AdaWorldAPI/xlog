@@ -634,8 +634,8 @@ unsafe impl DeviceRepr for ModelStreamLeaf {}
 unsafe impl DeviceRepr for ModelCanaryStreamPosition {}
 
 macro_rules! stream_kernel_parameter {
-    ($record:ident, $parameter:ident) => {
-        struct $parameter($record);
+    ($visibility:vis $record:ident, $parameter:ident) => {
+        $visibility struct $parameter($record);
         impl crate::cuda_compat::KernelParamStorage for $parameter {
             fn as_kernel_param(&self) -> *mut std::ffi::c_void {
                 (&self.0 as *const $record).cast_mut().cast()
@@ -649,7 +649,7 @@ macro_rules! stream_kernel_parameter {
         }
     };
 }
-stream_kernel_parameter!(ModelForwardStreamInputs, ModelForwardStreamParameter);
+stream_kernel_parameter!(pub(super) ModelForwardStreamInputs, ModelForwardStreamParameter);
 stream_kernel_parameter!(ModelCanaryStreamInputs, ModelCanaryStreamParameter);
 
 const _: () = assert!(size_of::<ModelForwardStreamState>() == 296);
