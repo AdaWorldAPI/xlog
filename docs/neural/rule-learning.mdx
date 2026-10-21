@@ -157,7 +157,8 @@ the gradient updates the scores. This is not the certified probabilistic-circuit
 
 In default strict training, temperature `τ` follows a linear schedule over the
 configured attempt budget toward its floor. The host-reporting mode instead uses
-the adaptive cosine controller. Lower temperature sharpens the soft mask toward a single hard choice
+an adaptive controller with linear cooling, plateau holds, and warmup.
+Lower temperature sharpens the soft mask toward a single hard choice
 (one-hot). At convergence the engine takes `argmax` over the scores — it keeps the
 single highest-scoring candidate. That winner is decoded back into a concrete Datalog
 clause: a discrete rule string, not a soft mixture.

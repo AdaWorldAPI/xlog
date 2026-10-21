@@ -105,7 +105,7 @@ soft mask toward a one-hot selection.
 | `pyxlog/ilp/neurosymbolic.py` | `train_neurosymbolic_program()` — joint `nn/4` and symbolic rule-weight training |
 | `pyxlog/ilp/inventory.py` | `build_rule_inventory()` — selected/rejected clause inventory with transfer metadata |
 | `pyxlog/ilp/backend.py` | Sparse weight initialization and host-reporting mask backends; strict application lives in the trainer |
-| `pyxlog/ilp/temperature.py` | `AdaptiveTempController` — cosine-annealed τ schedule |
+| `pyxlog/ilp/temperature.py` | `AdaptiveTempController` — host-reporting τ controller with linear cooling, plateau holds, and warmup |
 | `pyxlog/ilp/entropy.py` | Entropy regularization helpers |
 | `pyxlog/ilp/holdout.py` | `holdout_f1_and_variance()` — LOO (`<=20`) and k-fold (`>20`) F1 scoring |
 | `pyxlog/ilp/types.py` | `TrainConfig`, `TrainResult`, `PromotionResult`, `LearnedArtifact`, etc. |
@@ -176,7 +176,7 @@ W (N×N×N logits) → Gumbel-Softmax(τ) → 3D soft mask
    - Compute native loss and candidate credit with `compute_ilp_loss_grad_gpu`; the relation-input entry point uses `compute_ilp_loss_grad_gpu_relations`
    - Import the loss and credit through DLPack, then backpropagate credit through the candidate probabilities
    - Optimizer step on W
-   - Temperature anneal: τ_start → τ_floor (fixed-budget linear schedule in strict mode; adaptive cosine controller in host-reporting mode)
+   - Temperature anneal: τ_start → τ_floor (fixed-budget linear schedule in strict mode; adaptive linear cooling with plateau holds and warmup in host-reporting mode)
    - Optional deterministic controls (`deterministic=True`) for reproducible attempt seeding
    - Strict attempts run the configured budget and reject any counted D2H transfer; the host-reporting mode has convergence-based early stopping
 4. **Finalize** — retain final device state, select the attempt, and return the rule identity; host metrics and persistence require explicit export in strict mode
