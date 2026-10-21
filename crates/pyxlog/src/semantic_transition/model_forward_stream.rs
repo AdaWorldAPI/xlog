@@ -282,8 +282,9 @@ impl PySemanticModelForwardStream {
             ModelForwardSource::Evaluation(evaluation) => {
                 let evaluation = evaluation.borrow(py);
                 let parent = evaluation.parent.borrow(py);
+                let lease = parent.lease()?;
                 owner.begin_evaluation_model_forward_stream(
-                    &*parent.lease()?,
+                    &lease,
                     &evaluation.inner,
                     &self.inner,
                     stream,
@@ -339,8 +340,9 @@ impl PySemanticModelForwardStream {
             ModelForwardSource::Evaluation(evaluation) => {
                 let evaluation = evaluation.borrow(py);
                 let parent = evaluation.parent.borrow(py);
+                let lease = parent.lease()?;
                 owner.record_evaluation_model_forward_stream_block(
-                    &*parent.lease()?,
+                    &lease,
                     &evaluation.inner,
                     &self.inner,
                     row,
@@ -383,9 +385,10 @@ impl PySemanticModelForwardStream {
                 }
                 let evaluation = evaluation.borrow(py);
                 let parent = evaluation.parent.borrow(py);
+                let lease = parent.lease()?;
                 owner
                     .finish_evaluation_model_forward_stream(
-                        &*parent.lease()?,
+                        &lease,
                         &evaluation.inner,
                         &self.inner,
                         stream,
@@ -429,8 +432,8 @@ impl PySemanticModelCanaryStream {
         let step = self.step.borrow(py);
         original_recording_binding(py, &step, stream)?;
         let session = step.session.borrow(py);
-        session
-            .owner()?
+        let mut owner = session.owner()?;
+        owner
             .begin_model_canary_stream(&step.inner, &self.inner, stream)
             .map_err(xlog_err)
     }
@@ -463,8 +466,8 @@ impl PySemanticModelCanaryStream {
             ));
         }
         let session = step.session.borrow(py);
-        session
-            .owner()?
+        let mut owner = session.owner()?;
+        owner
             .record_model_canary_stream_block(
                 &step.inner,
                 &self.inner,
