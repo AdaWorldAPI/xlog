@@ -2169,6 +2169,7 @@ impl SemanticTransitionSession {
                     "actor capture requires the original outer graph retirement owner",
                 )
             })?;
+        let mut recorder = child.kernel_recorder()?;
         let child_build = child
             .prepared_segment
             .as_mut()
@@ -2203,7 +2204,6 @@ impl SemanticTransitionSession {
             operation: 10,
             native_work: native_work.device_ptr_value(),
         };
-        let mut recorder = child.kernel_recorder();
         proof.inner.target.record(&mut recorder);
         recorder.read(&proof.inner.inputs.reader);
         recorder.read(&proof.inner.inputs.header);
