@@ -2760,7 +2760,7 @@ impl SemanticTransitionSession {
             operation: 8,
             native_work: 0,
         };
-        let mut recorder = self.kernel_recorder();
+        let mut recorder = self.kernel_recorder()?;
         recorder.read(&pending.receipt.device);
         recorder.read(&pending.receiver_outcome.device);
         recorder.read(&pending.payload.device);

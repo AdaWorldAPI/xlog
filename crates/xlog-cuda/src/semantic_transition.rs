@@ -25550,9 +25550,7 @@ impl SemanticTransitionSession {
             for bank in &prepared.group_gradient_members {
                 if training.actor_group_members().iter().any(|member| {
                     bank.get(&(member.ordinal, ImportedPolicyContributionKind::CurrentActor))
-                        .is_none_or(|delivery| {
-                            delivery.invocation.is_some() || delivery.preparation.is_some()
-                        })
+                        .is_none_or(|delivery| delivery.invocation.is_some())
                 }) || training
                     .edit_group_members()
                     .iter()
@@ -25562,9 +25560,7 @@ impl SemanticTransitionSession {
                             member.ordinal,
                             ImportedPolicyContributionKind::CurrentDemonstration,
                         ))
-                        .is_none_or(|delivery| {
-                            delivery.invocation.is_some() || delivery.preparation.is_some()
-                        })
+                        .is_none_or(|delivery| delivery.invocation.is_some())
                     })
                 {
                     return Err(publication_input_error(
@@ -47859,7 +47855,9 @@ impl SemanticTransitionSession {
             PolicyVjpInput::PreparedPolicyRefresh {
                 critic_term: Some(critic_term),
                 ..
-            } => recorder.write(critic_term),
+            } => {
+                recorder.write(critic_term);
+            }
             _ => {}
         }
         recorder.write(&self.scratch);

@@ -1407,7 +1407,7 @@ impl SemanticTransitionSession {
                 runtime_error("kernel lookup", "original model continuation unavailable")
             })?;
         let mut descriptor = self.descriptor();
-        let mut recorder = self.kernel_recorder();
+        let mut recorder = self.kernel_recorder()?;
         owner.source_publication.record(&mut recorder);
         let source_reader = source
             .readers
