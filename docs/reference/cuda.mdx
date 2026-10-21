@@ -9,31 +9,58 @@ are grouped into modules by the job they do — joins, sorting, filtering, and s
 on. This page lists those modules so you can find which source file implements a
 given operation.
 
-The CUDA source lives in three places: `kernels/`, `crates/xlog-cuda/src/`, and
-`crates/xlog-cuda/kernels/`. During the docs build, Doxygen generates a detailed
-per-function reference from those sources. The table below is the higher-level
-map: one row per module, the kernels it exports, and what it is for.
+CUDA kernel translation units live in `crates/xlog-cuda/kernels/`; Rust launchers
+and owners live in `crates/xlog-cuda/src/`. The manual documentation build uses
+Doxygen for the detailed function reference. The table below maps each kernel
+source module to representative entry points and its purpose. Generated PTX and
+cubin files are build artifacts, not additional source implementations.
 
 ## Kernel Modules
 
-Each row is one source file. "Kernels" lists the functions it exports (`*` marks
-a family of same-named kernels specialized per data type); "Purpose" says what
-the module computes.
+Each row is one `.cu` source file. "Entry points" gives representative exported
+kernels (`*` marks a family specialized per data type); it is not a complete
+function inventory. "Purpose" says what the module computes.
 
-| File | Kernels | Purpose |
+| File | Entry points | Purpose |
 |------|---------|---------|
-| `arith.cu` | `arith_add_*`, `arith_sub_*`, `arith_mul_*`, `arith_div_*`, `arith_mod_*`, `arith_abs_*`, `arith_neg_*` | Arithmetic operations for `is` expressions (the operator that evaluates a numeric expression and binds the result) |
+| `arith.cu` | `arith_binary_*`, `arith_abs_*`, `arith_pow_f64`, `arith_select_*`, `arith_cast` | Arithmetic, conditional selection and casts for numeric expressions |
+| `cache.cu` | `cache_cnf_hash`, `cache_lookup_or_insert`, `cache_evict_lru`, `cache_store_*` | Device cache lookup, storage and eviction |
 | `join.cu` | `hash_join_bucket_count_v2`, `hash_join_scatter_v2`, `hash_join_probe_v2`, `hash_join_semi`, `hash_join_anti`, `compute_composite_hash` | Hash joins (the `v2` kernels use a bucketed hash-table layout) plus composite hashing, which combines several key columns into one hash value |
 | `pack.cu` | `pack_keys`, `pack_and_hash_keys`, `hash_packed_keys`, `gather_packed_rows`, `compare_packed_keys` | Key packing (encoding a multi-column key into one contiguous byte string), hashing of packed keys, and utilities that operate on the packed rows |
-| `dedup.cu` | `mark_unique_*`, `compact_rows` | Removing duplicate rows, done by sorting first and then keeping one row per group |
+| `dedup.cu` | `mark_unique_columnar`, `mark_unique_full_row_bytewise`, `compact_rows`, `mark_diff_full_row_typed_sorted` | Duplicate removal and typed row-set difference |
 | `filter.cu` | `filter_compare_*`, `compact_*_by_mask`, `mask_{and,or,not}` | Filtering rows against a condition and stream compaction (dropping the rows a boolean mask rejects and closing the gaps) |
-| `sort.cu` | `radix_histogram`, `radix_scatter_*`, `init_indices`, `apply_permutation_*`, `gather_keys_*` | Stable radix sort (a sort that preserves the order of equal keys) and applying the resulting permutation to reorder rows |
+| `sort.cu` | `radix_histogram`, `radix_scatter_stable`, `radix_scatter`, `init_indices`, `apply_permutation_*`, `gather_keys_*` | Radix sorting and applying row permutations; typed floating-point keys preserve total ordering |
 | `groupby.cu` | `detect_group_boundaries`, `extract_group_keys`, `groupby_*`, `groupby_logsumexp_*` | Aggregation over sorted rows; the `logsumexp` variant is the numerically stable way to sum values held in log space |
 | `scan.cu` | `exclusive_scan_mask`, `count_mask`, `multiblock_scan_*` | Prefix-sum operations (each output element is the running total of the inputs before it), used to compute output positions |
 | `set_ops.cu` | `concat_{u32,bytes}`, `sorted_diff_mark` | Set union and difference over sorted row sets |
 | `circuit.cu` | `xgcf_forward_level`, `xgcf_backward_level_*` | Evaluating a probabilistic program's compiled arithmetic circuit (XGCF, xlog's circuit form of the program) and computing gradients back through it with reverse-mode differentiation (the backpropagation used to train weights) |
 | `sat.cu` | `sat_cdcl_solve`, `sat_check_model`, `sat_proof_check`, `sat_assert_*`, `sat_xgcf_cnf_*`, `sat_emit_not_phi` | A GPU Boolean-satisfiability (SAT) verifier using CDCL (conflict-driven clause learning, the standard modern SAT search algorithm), plus helpers that build the formulas for checking whether two programs are equivalent |
+| `cnf.cu` | `cnf_reachability_*`, `cnf_count_clauses` | Constructing a Boolean formula in conjunctive normal form (CNF) from provenance |
+| `d4.cu` | `d4_validate_cnf`, `d4_frontier_expand`, `d4_compile_count`, `d4_compile_emit` | Compiling Boolean formulas into circuits used for exact probability counting |
+| `epistemic.cu` | `epistemic_generate_candidate_assumptions_u8`, `epistemic_validate_candidate_bits_u8` | Candidate assumptions and model membership for reasoning about knowledge |
+| `ilp.cu` | `extract_nonzero_indices`, `ilp_coo_fill_from_mask`, `ilp_validate_selected_ids_*` | Sparse rule-mask preparation and selected-rule validation |
+| `ilp_credit.cu` | `ilp_credit_forward_*`, `ilp_credit_backward_*` | Differentiable rule-credit computation |
+| `ilp_exact.cu` | `ilp_exact_score`, `ilp_exact_score_u32`, `ilp_exact_score_chain_smem*`, `ilp_exact_select_topk` | Exact scoring of four binary rule templates and device top-K selection |
+| `ilp_exact_nary.cu` | `ilp_exact_nary_score` | Exact candidate scoring for typed relations with more general arity |
+| `joint_solve.cu` | `joint_component_plan_init`, `joint_component_union`, `joint_label_top2`, `joint_label_feasibility` | Component planning and constrained label selection |
+| `mc_eval.cu` | `mc_eval_mask_var`, `mc_eval_query_evidence_truth`, `mc_accumulate_counts` | Monte Carlo query/evidence evaluation and count accumulation |
+| `mc_resident.cu` | `mc_resident_engine` | Resident Monte Carlo execution, keeping sample work on device |
 | `mc_sample.cu` | `mc_sample_bernoulli` | Drawing Bernoulli (biased-coin) samples for Monte Carlo inference, which estimates probabilities by averaging over many random samples |
+| `neural.cu` | `neural_fill_ad_chain_f32`, `neural_scatter_ad_chain_grads_f32` | Mapping neural probabilities and gradients to annotated choices |
+| `pir.cu` | `pir_pack_keys`, `pir_mark_unique`, `pir_gather_children` | Building provenance records, the support relationships used to explain or weight answers |
+| `resident_filter_project.cu` | `resident_filter_mask_scan`, `resident_filter_compact`, `resident_project_materialize` | Device-side filtering, compaction and projection |
+| `resident_relational.cu` | `resident_set_insert`, `resident_join_build`, `resident_join_probe_inner`, `resident_scc_begin` | Resident set, join and recursive-component operations |
+| `resident_schedule.cu` | `resident_schedule_execute` | Executing a prepared relational schedule on device |
+| `semantic_hypergraph.cu` | `semantic_hypergraph_execute` | Semantic graph updates and their supporting receipts |
+| `semantic_training_view.cu` | `semantic_training_view_select`, `semantic_training_view_gather` | Selecting and gathering admitted training views |
+| `semantic_transition.cu` | `semantic_model_invocation`, `semantic_learning_fold`, `semantic_model_evaluation_result` | Resident semantic/model transitions, learning and completion accounting |
+| `wcoj.cu` | `wcoj_build_metadata_*`, `wcoj_triangle_build_hg_work_plan_u32` | Metadata and multiway joins that avoid large binary-join intermediates |
+| `weights.cu` | `weights_fill_leaf`, `weights_fill_choice`, `weights_apply_evidence` | Probability weights and evidence conditioning |
+
+The neighboring `.cuh` headers supply shared definitions for typed ordering,
+semantic programs, task goals, policy arithmetic, feedback and streamed model
+execution. Kernel availability does not establish that a query dispatched it or
+that a complete runtime path has measured ZERO TRANSFER.
 
 See the [architecture overview](/architecture/overview) for how the runtime
 decides which of these kernels to run, and [GPU Execution](/architecture/gpu-execution)

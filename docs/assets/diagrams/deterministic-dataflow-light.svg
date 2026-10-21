@@ -1,4 +1,4 @@
-<!-- xlog diagram: deterministic dataflow (light). Source: ARCHITECTURE.md "RIR Node Execution" + gpu-execution page. The host executor walks the RIR plan; each operator dispatches a CUDA kernel family; results live in the device-resident relation store and feed later operators. -->
+<!-- xlog diagram: deterministic dataflow (light). Source: architecture/gpu-execution.mdx. The host executor walks the RIR plan; each operator dispatches a CUDA kernel family; results live in the device-resident relation store and feed later operators. -->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 310" font-family="Inter, system-ui, sans-serif">
   <rect width="900" height="310" fill="#FBFBFD"/>
   <defs>

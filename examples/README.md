@@ -49,13 +49,14 @@ Examples live under `examples/xlog/`, grouped by intent:
 - Feature showcase examples: comprehensive feature demonstrations for symbol values, recursion, and aggregations
 - `90-negative-tests/`: programs expected to fail (stratification/type errors)
 
-Phase 4 examples live under:
+Probabilistic and Python examples live under:
 - `examples/prob/`: probabilistic `.xlog` programs (prob facts, AD, evidence/query, and `prob_engine=mc`)
 - `examples/python/`: Python scripts exercising `pyxlog` via DLPack (Torch optional)
 
 Epistemic semantic fixtures live under:
 - `examples/epistemic/`: epistemic `.xlog` examples for EIR, G91, FAEEL, Generate-Propagate-Test, and splitting.
-  These are run through `cargo test -p xlog-logic --test test_epistemic_examples`, not the production CLI.
+  The semantic fixtures are also covered by `cargo test -p xlog-logic --test test_epistemic_examples`.
+  The production CLI supports epistemic execution through `xlog run`; see the directory README for supported shapes and constraints.
 
 Neural-symbolic examples live under:
 - `examples/neural/`: Neural-symbolic training examples
@@ -142,10 +143,13 @@ outputs become probabilistic facts in logic programs.
 To run:
 ```bash
 cd examples/neural/01_minimal
-python train.py --epochs 10 --batch-size 32
+python train.py --engine xlog --epochs 10 --batch-size 32
 ```
 
-The network learns digit classification purely from sum labels — no individual digit labels provided!
+This selects the XLOG integration path. The separate `--engine torch` path computes
+the addition objective directly in PyTorch and does not exercise XLOG. Training
+supervision uses sums; digit labels also serve data-pair construction and reported
+digit-accuracy evaluation, not an individual-digit classification loss.
 
 `scripts/validate_examples.py` smoke-runs the neural examples with deterministic
 fixture data when optional external datasets are absent. Set
@@ -171,8 +175,9 @@ Each directory is designed to collectively cover:
 ## Current Notes / Limitations
 
 XLOG is still evolving; the example suite prefers correctness and clarity over exotic features.
-When a language feature is syntactically accepted but not yet executed end-to-end, examples are
-kept in `70-aggregates/` or `90-negative-tests/` and clearly marked.
+Read each directory's limitations before selecting an execution route. The aggregate
+directory contains runnable examples as well as type-specific restrictions;
+`90-negative-tests/` deliberately exercises rejection rather than successful execution.
 
 Additional runner/runtime notes:
 - `symbol` values are stored as `u32` IDs with a bidirectional string table; symbols are **reversible** and display as readable strings in query output.

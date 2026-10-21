@@ -3,9 +3,10 @@
 `pyxlog` provides Python bindings for the XLOG GPU-accelerated probabilistic
 logic programming runtime:
 
-- **GPU-resident Datalog** evaluation with CUDA-backed DLPack producers and
-  zero-copy transient inputs and exported views (PyTorch, JAX, cuDF); persistent
-  relation replacements take owned device-to-device snapshots.
+- **GPU-backed Datalog** evaluation with CUDA-backed DLPack producers and
+  zero-copy transient inputs and query-result handoffs (PyTorch, JAX, cuDF).
+  Persistent relation replacements and stored-relation exports use owned
+  device-to-device copies.
 - **Probabilistic inference**: exact weighted model counting via knowledge
   compilation to device-resident arithmetic circuits, plus seeded Monte Carlo
   sampling with confidence intervals.
@@ -40,9 +41,13 @@ result = prog.evaluate({"edge": [edge_src, edge_dst]})
 q0 = result.queries[0]
 out_src = torch.utils.dlpack.from_dlpack(q0.tensors[0])
 out_dst = torch.utils.dlpack.from_dlpack(q0.tensors[1])
-print(torch.stack([out_src, out_dst], dim=1).cpu().tolist())
+print(sorted(torch.stack([out_src, out_dst], dim=1).cpu().tolist()))
 # [[1, 2], [1, 3], [2, 3]]
 ```
+
+The example reads rows on the host for display. A CUDA result or a DLPack handoff
+does not establish ZERO TRANSFER for the complete evaluation; measure transfers
+over the actual operation interval when that is required.
 
 The package is built from the `BrainyBlaze/xlog` repository and exposes the
 native extension module together with the staged CUDA kernel artifacts needed by

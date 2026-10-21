@@ -1,4 +1,4 @@
-<!-- xlog diagram: knowledge compilation (light). Source: docs ARCHITECTURE.md "Knowledge Compilation Pipeline" + probabilistic/engines page. PIR -> CNF -> GPU d-DNNF (compile+verify) -> XGCF -> weighted model counting; compile once, evaluate many. -->
+<!-- xlog diagram: knowledge compilation (light). Source: probabilistic/engines.mdx and xlog-prob/src/exact.rs. Canonical host PIR construction and upload precede GPU CNF, circuit compilation, verification and evaluation. -->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 224" font-family="Inter, system-ui, sans-serif">
   <rect width="900" height="224" fill="#FBFBFD"/>
   <defs>
@@ -15,7 +15,7 @@
     <rect x="28" y="96" width="118" height="58" rx="7" fill="#F3F3F8" stroke="#1E1B2E" stroke-width="1.25"/>
     <rect x="29.5" y="98" width="3.5" height="54" rx="1.75" fill="#7C3AED"/>
     <text x="87" y="120" text-anchor="middle" font-size="12" font-weight="600" fill="#1E1B2E">PIR</text>
-    <text x="87" y="135" text-anchor="middle" font-size="9.5" fill="#6B6880">provenance</text>
+    <text x="87" y="135" text-anchor="middle" font-size="9.5" fill="#6B6880">host; then upload</text>
     <path d="M146,125 H166" stroke="#6B6880" stroke-width="1.5" fill="none" marker-end="url(#ak)"/>
 
     <rect x="168" y="96" width="118" height="58" rx="7" fill="#F3F3F8" stroke="#1E1B2E" stroke-width="1.25"/>

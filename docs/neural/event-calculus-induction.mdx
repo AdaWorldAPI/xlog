@@ -16,9 +16,10 @@ the geometric relation the rules depend on.
 The third thing this page is about is what happens when the data is too thin. The search
 is gated against a statistical null: if no candidate rule beats what label-shuffling
 alone would produce, the harness returns **no rule at all**. That is called abstaining,
-and it is a designed outcome, not a crash and not a failure. On the leakage-free version
-of the reference benchmark, the meeting rule search abstains — and this page says so
-before it says anything else.
+and it is a designed outcome. On the leakage-free version of the reference benchmark,
+meeting rules selected on some folds fail to transfer: the direct search commits
+on 9 of 10 folds and the Event-Calculus initiation search on 1 of 10, but both
+score zero true positives on held-out scenes.
 
 <Note>
 The runnable material here lives in the repository's
@@ -130,8 +131,8 @@ over stretches of time — "these two people are meeting" is a fluent. There are
 learn one.
 
 The **direct protocol** (`--protocol direct`) predicts the fluent's truth at every single
-timestep independently. That is what the example above does. It is the easier target and
-it produces the highest scores on this benchmark, but it learns nothing about *change*.
+timestep independently. That is what the example above does. It learns state
+directly, without identifying the events that change that state.
 
 The **Event Calculus protocol** (`--protocol ec`) is the classical alternative. Instead of
 one theory over "is it true now", it induces **two** theories over events:
@@ -208,10 +209,11 @@ rises by 14%: deduplicating the corpus barely moved the statistical bar. The thi
 lower because its pool is smaller, not because its corpus is dirtier — comparing it against
 row two would charge a vocabulary change to the corpus.
 
-That matters for how you read the next section. The abstention on the clean protocol is
-**not** the gate rising out of reach. It is the other term collapsing: under leakage-free
-folds the candidates' own holdout scores fall to near zero, so they fail a bar that has
-hardly moved.
+That matters for how you read the next section. Similar thresholds do not imply
+that every empty theory failed the fit gate. Of the nine clean meeting folds with
+no initiation clause, seven stop for `insufficient new coverage` and two for
+`select_once abstained`. One other fold commits a clause, then stops on coverage.
+The selected clauses' held-out transfer scores are a separate measurement.
 
 ### Abstention
 
@@ -243,10 +245,9 @@ Five candidates tied at 0.100. The bar derived from 1000 label shufflings was 0.
 Nothing cleared it, so nothing was reported — and the run still tells you what the near
 misses were, so you can judge for yourself.
 
-That is not an error condition and not a bug to work around. It is the harness declining to
-report a rule it cannot distinguish from noise, and on the cleanest version of this
-benchmark it is the outcome for *every* target. See [Limits](#limits) — it is the single
-most important thing on this page.
+An empty theory records that no clause was committed. It is distinct from a selected
+clause that later scores zero on held-out scenes. Both occur on the clean protocol;
+see [Limits](#limits) for the counts.
 
 ### The Event-Calculus commands
 
@@ -297,9 +298,10 @@ the permutation-null gates and the tied top-five candidates quoted above — wer
 before it existed. Under the default `full`, the same command searches the enlarged pool
 and gives you a different, later configuration: section E's command becomes section E.1's.
 The page's other numbers were produced under `full`, as the gate table above records — the
-headline 0.7782 from `e11` and both clean-protocol `f_xml` runs.
-`activity` also happens to be the pool that withholds precomputed geometry from the search,
-which is what `--mode neural` does by construction.
+adaptive 0.7782 from `e11` and both clean-protocol `f_xml` runs.
+`activity` withholds the two distance-derived *transition* relations. Relational mode
+still receives the precomputed state relations `close` and `far`; neural mode removes
+those geometry relations from its initiation candidate pool as well.
 
 Watch the scope. The guard fires only on `--transition-vocab activity`, and it rejects it
 with a distinct reason in each case: under `--protocol direct` that vocabulary never
@@ -383,12 +385,14 @@ any close_nn training in any form."*
 
 ## Limits
 
-### On the clean protocol, this abstains
+### On the clean protocol, meeting rules fail to transfer
 
 This is the headline, not a caveat.
 
-Under the deduplicated, leakage-free scene-family protocol, the Event-Calculus search
-returns **no meeting rule and no moving rule at all**. Frame F1 is 0.0 for both.
+Under the deduplicated scene-family protocol, the direct meeting search commits a
+clause on 9 of 10 folds and the Event-Calculus initiation search on 1 of 10. Both
+produce zero true positives. Moving has no initiation clause on any fold, although
+its termination search commits on 7 of 10; without initiation, inertia never starts.
 
 | fluent, clean 10-fold scene-family CV | P | R | F1 | tp/fp/fn |
 |---|---|---|---|---|
@@ -435,8 +439,9 @@ all eight remaining meeting-bearing segments**; on two of them (`lb1gt`, `rffgt`
 beyond the 25-unit threshold. CAVIAR meeting is two disjoint regimes, and after
 deduplication one of them lives in exactly one place.
 
-Abstention at that event count is the correct behaviour. It is not evidence that no rule
-exists; it is the harness refusing to manufacture one.
+The search abstains on some folds and selects clauses that fail on others. Neither
+outcome proves that no rule exists; the measured result is zero meeting transfer
+under this vocabulary and scene-family split.
 
 ### No ranking against the published systems may be claimed
 
@@ -445,8 +450,9 @@ exists; it is the harness refusing to manufacture one.
 | OLED (published, tuned hyperparameters) | 0.792 | 0.732 |
 | WOLED-ASP (published) | 0.887 | 0.821 |
 | Hand-crafted rules (published) | 0.735 | 0.637 |
-| This work, distributed-corpus protocol (duplication caveat; second-iteration vocabulary) | 0.7782 | not run |
-| This work, clean protocol (deduplicated, leakage-free) | 0.0 (abstains) | 0.0 (abstains) |
+| This work, distributed corpus, pre-registered vocabulary | 0.7329 | not run |
+| This work, distributed corpus, adaptive second vocabulary | 0.7782 | not run |
+| This work, clean protocol (EC + inertia, scene-family folds) | 0.0 (initiation on 1/10 folds) | 0.0 (no initiation clauses) |
 
 The published moving column comes from the same papers and tables as the meeting column,
 but unlike the meeting figures it has not been re-verified against the downloaded PDFs.
@@ -467,8 +473,8 @@ report. It sits inside the published systems' own
   them `wk2gt`'s alone — and one termination exists only because the dump's
   segment-joining rule bridges two different videos as if they were one recording. It is
   not a clean-split result.
-- The clean protocol has too few events for a cross-validated comparison to mean anything
-  in *either* direction.
+- The clean protocol has only 11 meeting and 5 moving initiations. Its fold-level
+  failures do not establish a ranking against systems evaluated on the dump.
 - The published point estimates come from the authors' own selection of "the best among
   several other parameter settings that we tried", on the same corpus this audit finds
   flawed, under a richer rule language and a different evaluation window — not under a
@@ -516,10 +522,11 @@ current implementation.
 
 ### Smaller bounds
 
-- **The direct protocol beats the EC protocol on this benchmark**, and by a lot. Windowed
-  folds, direct protocol, per-timestep target — mean test F1 0.7905 with precomputed
-  geometry and 0.8276 with the learned detector (`results/caviar-s6-*_direct_fold*.json`).
-  If you only need "is it true now", the EC machinery buys you nothing.
+- **The windowed direct results use a different split.** Mean test F1 is 0.7905 with
+  precomputed geometry and 0.8276 with the learned detector
+  (`results/caviar-s6-*_direct_fold*.json`). They cannot rank the protocols against
+  the segment-fold EC figures. On the same ten dump folds, the direct reference
+  scores 0.2137 and the pre-registered EC run 0.7329.
 - **Body length is capped at three literals**, and only on the relational CPU path. The
   neural path is capped at two.
 - **`--steps` is required but has no effect in relational mode**, where it is clamped

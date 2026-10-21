@@ -32,8 +32,8 @@ intermediate blow-up, and each exposes a **dispatch counter** — a runtime tall
 you read to confirm the route actually fired. A few terms used below:
 
 - **WCOJ** — worst-case-optimal join, a join algorithm for multiway patterns
-  (triangles, cycles, cliques) that keeps peak memory flat instead of building a
-  large intermediate.
+  (triangles, cycles, cliques) without building the binary join chain's large
+  intermediates. Output and workspace memory can still grow.
 - **Free Join** — a generalized multiway join route for bodies that do not match
   a dedicated WCOJ shape.
 - **count-by-root** — counting grouped results by their group key without first

@@ -120,6 +120,29 @@ engine as a whole.
 
 ## Execution Families
 
+### Owned semantic transitions
+
+The source tree also exposes an owner-bearing semantic transition API through
+`pyxlog.SemanticTransitionSession` and `SemanticTransitionController`, backed by
+the native session in `xlog-cuda`. This is distinct from an ordinary relational
+`Executor`. An acquired `SemanticPublishedParent` identifies the published bank;
+`SemanticTransitionTaskUse` and `SemanticPreparedStep` retain the original task,
+session, and prepared continuation for proposal, recompute, update, and drain work.
+The controller consumes genuine instruction admissions rather than accepting an
+arbitrary replacement parent or publication setter.
+
+Checkpoint restore authenticates the closure before native/model allocation and
+returns the connected session/controller/task/model handoff. Pending or unknown
+completion retains the original owners and must follow their resolution path;
+it does not authorize resubmission or execution against a fabricated parent.
+The learning-phase API connects preparation, private execution and restore,
+evaluation, scientific acceptance or refusal, and delivery accounting in source.
+
+See the [Python semantic transition API](/reference/python) for the public owner
+types and lifecycle. Source connectivity and packaged API availability do not by
+themselves establish a complete downstream native GPU run, fresh-process recovery,
+scientific success, or measured ZERO TRANSFER.
+
 XLOG runs work through several execution families. Each has its own kernels and
 its own user-facing documentation.
 

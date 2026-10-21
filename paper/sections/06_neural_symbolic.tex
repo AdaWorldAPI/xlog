@@ -21,7 +21,7 @@ This is not a foreign-function escape hatch: it states that evaluating \texttt{p
 program.register_network("mnist_net", net, optimizer)
 \end{lstlisting}
 
-Registration goes by type rather than by name. A caller may state the arity of the network's predicate, and that claim is checked against every \texttt{nn/4} declaration bound to the network in the program and rejected on mismatch: the program's own declaration is the authority. Per-argument catalog sort identifiers may accompany the arity (one per declared argument, refused without an arity or at the wrong length) and an opaque content hash may identify the registered network, so a retrained one mints a new identity when it is registered again. The engine interprets neither; both are carried for consumers, which read them back through a queryable metadata view together with each declaration's predicate, predicate arity, input arity, and label set. A downstream rule learner can therefore check a candidate against what the program declares instead of against a naming convention---the property \Cref{subsec:engine-mode} relies on.
+Registration binds the declared network name to the supplied module. A caller may also state the arity of the network's predicate, and that claim is checked against every \texttt{nn/4} declaration bound to the network in the program and rejected on mismatch: the program's own declaration is the authority. Per-argument catalog sort identifiers may accompany the arity (one per declared argument, refused without an arity or at the wrong length), together with an opaque caller-supplied content hash. The engine carries those identifiers but neither derives the hash nor verifies it against model weights; re-registering a retrained network does not automatically mint a new identity. Consumers read this metadata back together with each declaration's predicate, predicate arity, input arity, and label set. A downstream rule learner can therefore check a candidate against what the program declares instead of against a naming convention---the property \Cref{subsec:engine-mode} relies on.
 
 The dataflow runs in two directions. \textbf{Forward:} when evaluation reaches an \texttt{nn/4}-backed predicate, the registered module runs, and its softmax vector is decomposed into weighted probabilistic facts, one per label, and fed into the knowledge-compilation pipeline of \Cref{sec:prob}, whose circuit cache carries across iterations. \textbf{Backward:} after the circuit computes the forward log-probability and backward gradients via level-parallel kernels, the per-leaf gradient buffers are exported as DLPack tensors and injected into PyTorch's autograd graph, and the optimizer updates the network as usual. The GIL is released during GPU work, so CUDA execution does not block the interpreter. A neural predicate is not confined to a query head: it may also appear inside rule bodies, so that the trainable object becomes a whole rule and not only a single perceptual predicate (\Cref{subsec:trainable-bodies}).
 
@@ -139,7 +139,7 @@ Placing a neural predicate in a rule body lifts xlog from learning a single perc
 
 \textbf{Learned body gates.} Inside that mixture a candidate may also carry a neural conjunct over a per-binding entity feature $\phi(x)$: its eligibility becomes its relational grounding \emph{and} a straight-through-thresholded gate $g_\theta(\phi(x))\ge\tau$. A gated clause then competes against ungated ones on the same noisy-OR terms, and $g_\theta$ trains jointly with the rule weights under the same held-out selector. By default $\phi$ is detached where it enters the engine: gradient reaches $\theta$ and the rule weight but stops at the neural head, leaving the feature producer frozen. Training the producer too is an explicit opt-in per candidate: one flag leaves $\phi$ attached, so gradient flows on into the backbone that computed it. Only the autograd linkage changes; the values uploaded are identical either way.
 
-These trainable-rule paths share the verified circuit and the zero-copy substrate of the simpler predicate case, and extend to recursive programs now that provenance converges on two-sided recursive strongly-connected components. \Cref{sec:ecinduction} carries the surface onto a public benchmark: the perceptual predicate inside an induced Event-Calculus rule body is trained through symbolic credit alone, cross-validated under pre-registered gates. \Cref{sec:limits} states what that evidence does and does not support.
+The single-clause path uses the verified circuit. Multiple same-head clauses instead select a PyTorch noisy-OR mixture: its per-candidate join probabilities can be compared with the single-clause circuit, but the combined mixture is not certified by that circuit. Engine-mode witness credit is a third route, described next. \Cref{sec:ecinduction} uses that credit route for its neural detector; its relational searches use a CPU harness. Neither constitutes a benchmark of the circuit-based multi-clause path. \Cref{sec:limits} states what that evidence does and does not support.
 
 \subsection{Engine-mode credit and candidate selection}\label{subsec:engine-mode}
 
@@ -165,13 +165,13 @@ Ties within the score quantum break toward the relational candidate on Occam gro
 
 \textbf{Differentiable ILP} learns first-order rules instead of network weights. Candidate rules are represented as sparse bitmasks over the ground-atom space, credit assignment runs entirely on-device via scatter--gather, and a promotion pipeline decides which rules enter the program.
 
-Four kinds of judgement sit on these two paths, and \Cref{tab:gates} separates them. Convergence and the supply of explicit held-out examples are preconditions checked before any gate runs: with neither held-out positives nor held-out negatives supplied, the pipeline returns for manual review before a gate is evaluated, so the always-run gates cannot promote on their own.
+Four kinds of judgement sit on these two paths, and \Cref{tab:gates} separates them. The promotion entry point requires the host-reporting training mode (\texttt{strict\_gpu\_native=False}); it refuses the default strict mode. Nonconvergence returns before trial compilation. After convergence it compiles and evaluates the trial, runs the six ordinary gates and optional ambiguity scan, and then checks for explicitly supplied held-out examples. With neither held-out positives nor held-out negatives supplied, it returns for manual review; the six gates cannot promote on their own. Ambiguity remains informational, not a promotion veto.
 
 The benchmark runs of \Cref{sec:ecinduction} exercise the last row only. Its permutation-null threshold is not an extra gate but the holdout arbiter's own fit threshold, derived per fold from label permutations instead of fixed at a constant; the promotion gates above it belong to the differentiable-ILP path and are not on that route.
 
 \begin{table}[htbp]
   \centering
-  \caption{What judges what, on which path: the promotion pipeline of differentiable ILP or the holdout arbiter of \Cref{subsec:engine-mode}. Convergence and supplied held-out examples are preconditions, not gates: without them the pipeline returns for manual review before any row below runs.}
+  \caption{What judges what, on which path: differentiable-ILP promotion or the holdout arbiter of \Cref{subsec:engine-mode}. Nonconvergence stops before trial evaluation; missing explicit held-out examples prevents promotion after the ordinary gates have run.}
   \label{tab:gates}
   \footnotesize
   \setlength{\tabcolsep}{3pt}
@@ -179,9 +179,9 @@ The benchmark runs of \Cref{sec:ecinduction} exercise the last row only. Its per
     \toprule
     \textbf{Judgement} & \textbf{What it judges} & \textbf{Path} \\
     \midrule
-    Six always-run gates & the rule derives every training positive and no training negative, passes the novel-fact audit, loses no protected fact, meets a held-out F1 threshold, and names only relations with typed schemas & dILP \\
+    Six always-run gates & the rule derives every training positive and no training negative, passes the novel-fact audit, loses no protected fact, meets the configured F1 threshold, and checks typed schemas when enforcement is enabled (off by default) & dILP \\
     \addlinespace
-    Two held-out gates & the same rule on the supplied held-out positives and negatives & dILP \\
+    Held-out gates & the same rule on each nonempty supplied held-out positive or negative set & dILP \\
     \addlinespace
     Ambiguity scan & which other candidates also explain the data; reported, never decisive & dILP \\
     \addlinespace

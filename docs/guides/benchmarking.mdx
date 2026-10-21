@@ -13,9 +13,11 @@ them so you can rerun it. Others are **targets** — a number a benchmark is *ai
 at, which no run backs at all. When you quote XLOG's performance, quote the
 measured numbers only.
 
-XLOG's benchmarks run on [Criterion.rs](https://github.com/bheisler/criterion.rs),
-a Rust harness that repeats each measurement many times and reports a confidence
-interval instead of a single fragile timing.
+XLOG's Rust query and kernel benchmarks use
+[Criterion.rs](https://github.com/bheisler/criterion.rs), a harness that repeats
+measurements and reports confidence intervals. Neural training and the paper's
+head-to-head comparisons have separate Python runners and protocols; their
+measurement regions must not be inferred from Criterion settings.
 
 ## When to use this page
 
@@ -103,9 +105,9 @@ development hardware — records the per-epoch shape:
 | `steady_epoch_sec_mean` | ~0.25 s | Mean of epochs 2–5, after the circuit is cached; batched evaluation |
 | `per_query_ms` | ~1.0 ms | **Steady-state** cost of one query's forward and backward pass — a steady epoch divided by its 256 pairs. Not to be confused with the amortized `per_query_ms` written into the run artifacts, which divides *total* training time by queries × epochs and so carries the cold first epoch. |
 
-These timings describe the current pipeline, and the run behind them is not among
-this repository's committed neural artifacts, which all record an earlier
-generation of the code.
+These are reported development timings from a separate, uncommitted run, not
+fresh measurements of the current checkout. Their per-run evidence is not among
+the committed neural artifacts, so they do not qualify the current pipeline.
 
 The first epoch is slow because XLOG compiles the logic program into a
 **Decision-DNNF** — a circuit form that makes exact probability counting cheap to
@@ -167,11 +169,14 @@ worlds and averaging, trading exactness for speed on larger problems.
 <Steps>
 <Step title="Check prerequisites">
 
-- A CUDA-capable NVIDIA GPU (compute capability 7.0+). Development device: RTX PRO
-  3000 Blackwell, `SM120`, 12 GB.
-- The CUDA Toolkit 13.x, with `nvcc` on `PATH`, to compile the kernels. Runtime PTX
-  is floored so the compiled artifacts also load on pre-CUDA-13 drivers.
-- Enough GPU memory: 4 GB minimum, 12 GB recommended for neural-symbolic training.
+- An NVIDIA GPU supported by the selected kernel artifacts and workload.
+  The reported development device was an RTX PRO 3000 Blackwell, `SM120`, 12 GB;
+  that is not a minimum-memory guarantee for every training run.
+- CUDA Toolkit 13.x, with `nvcc` on `PATH`, to compile kernels, and a compatible
+  NVIDIA driver. Portable PTX packaging does not by itself prove that every
+  kernel or conditional-graph API runs on an older driver.
+- Enough GPU memory for the selected fixture, output and workspaces. Record the
+  actual budget and peak rather than assuming one universal training minimum.
 
 </Step>
 <Step title="Run a suite">
@@ -226,8 +231,9 @@ tc_random/edges/100K_edges
 | `change` | Comparison against the saved baseline |
 | `p` | Statistical significance |
 
-A run is flagged as a regression when the `change` lower bound exceeds `+5%` with
-`p < 0.10`.
+Judge a regression against the selected target's significance/noise configuration
+and its recorded baseline. A `+5%` threshold or `p < 0.10` is not a uniform
+repository-wide rule.
 
 Two common noise sources can distort a run. GPU thermal throttling inflates
 variance, so let the card cool down between runs. And the first sample is slow
@@ -237,15 +243,11 @@ because of one-time compilation, which the warm-up phase absorbs.
 
 ### Measurement approach
 
-Criterion drives every benchmark. The default settings favor catching regressions
-over reporting a single peak number:
-
-| Setting | Value | Rationale |
-|---|---|---|
-| Sample size | 10–100 | GPU warm-up and noise reduction |
-| Warm-up | 3 iterations | JIT compilation, cache priming |
-| Significance level | 0.1 | Detect `>10%` regressions |
-| Noise threshold | 0.05 | Ignore `<5%` variance |
+Each benchmark target owns its measurement settings. For example,
+`wcoj_triangle_bench` sets Criterion's sample size to 10; it does not set a
+repository-wide three-iteration warm-up, significance level or noise threshold.
+Record the actual target configuration with a result. Python training runners
+and the paper's comparison scripts have their own warm-up and repetition laws.
 
 Throughput is elements per unit time, where "elements" varies by benchmark: input
 edges for transitive closure, total input rows for joins, input rows for
@@ -257,9 +259,10 @@ Monte Carlo.
 GPU benchmarks warm up so the timed region excludes one-time costs: PTX modules
 compile and cache, memory pools initialize, and the CUDA context is established.
 
-All random data uses deterministic seeding — a fixed-seed LCG, no system entropy —
-so the same seed produces identical graphs across runs. That is what makes a
-measured number reproducible rather than a one-off.
+The synthetic triangle fixtures use a fixed-seed linear congruential generator,
+so the same fixture seed produces the same graph. Other datasets and training
+runners have their own source identities and random-state owners; record those
+alongside the command rather than assuming this generator applies to all runs.
 
 ### The WCOJ triangle harness
 
@@ -269,8 +272,10 @@ the GPU 3-way worst-case-optimal join against the ordinary binary-join chain on
 identical fixtures across `u32`, `u64`, and a `Symbol` sanity case.
 
 Each case runs three modes: `Off` (binary join), `Force` (WCOJ always), and
-`Adaptive` (classifier-gated, the default). The mode is set explicitly via
-`RuntimeConfig` so the timed path never depends on process-global state.
+`Adaptive` (the default cardinality cost model). The mode is set explicitly via
+`RuntimeConfig`. The harness seeds cardinality statistics to fix each adaptive
+cell's intended route: uniform/empty use the binary path, while super-hub uses
+WCOJ. This measures those controlled cells, not an unconstrained optimizer choice.
 
 Two guards keep the numbers honest:
 
@@ -291,17 +296,15 @@ portable: report it with the GPU and the fixture size you ran it on.
 
 ## Reference: benchmark environment variables
 
-These variables tune what the benchmarks run and which code path they take. The
-last two are diagnostics for forcing or disabling the WCOJ triangle route.
+These variables tune benchmark coverage and route selection. Force and disable
+flags diagnose triangle dispatch; the union setting controls input grouping.
 
 | Variable | Description | Default |
 |---|---|---|
-| `CUDA_VISIBLE_DEVICES` | GPU device ordinal | `0` |
-| `XLOG_BENCH_MEMORY_MB` | GPU memory budget | `4096` |
 | `WCOJ_BENCH_FULL` | Run the full WCOJ triangle matrix (adds 100K + 250K row sizes) | `0` |
-| `XLOG_USE_WCOJ_TRIANGLE_U32` | Force-on WCOJ triangle dispatch (bypasses the adaptive classifier) | unset |
+| `XLOG_USE_WCOJ_TRIANGLE_U32` | Force-on triangle dispatch (bypasses the adaptive cost decision, unless explicitly disabled) | unset |
 | `XLOG_DISABLE_WCOJ_TRIANGLE` | Hard kill switch — pins all triangle WCOJ off, beats every other flag | unset |
-| `XLOG_UNION_CHUNK_BYTES` | Chunk budget in bytes for the multiway union that merges same-head rule outputs; bounds peak device memory for many-rule heads | `1073741824` (1 GiB) |
+| `XLOG_UNION_CHUNK_BYTES` | Input-grouping target for same-head multiway union; not a ceiling on live input, accumulator, output or sort-workspace memory | `1073741824` (1 GiB) |
 
 ## See also
 

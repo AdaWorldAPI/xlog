@@ -12,7 +12,7 @@ Every `CudaKernelProvider` owns a device runtime inside the `xlog-cuda` crate.
 It sits between the code that runs CUDA kernels and the GPU's memory allocator.
 
 It gives every provider four things: a stream-aware allocator (one that
-knows which CUDA stream each allocation belongs to), a process-wide device-memory
+knows which CUDA stream each allocation belongs to), a provider-owned device-memory
 budget, block-use tracking, and deferred free/reap semantics for work that runs on
 a non-default stream. A CUDA *stream* is an ordered queue of GPU operations;
 "non-default" means work that runs on a stream other than the implicit default

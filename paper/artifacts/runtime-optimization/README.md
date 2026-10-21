@@ -54,7 +54,8 @@ engine build as the head-to-head set; the records they replace are from the
 v0.8.6 campaign at `df2dbc03` and `ce78e32f`. Machine, build profile and engine
 version all differ, so neither ratio is a controlled before-and-after of the
 optimization — each is a fresh measurement of the current engine on a named
-machine.
+machine. Here, "current engine" means that recorded measurement build; these
+historical results do not qualify later source revisions.
 
 ## Reproduction
 

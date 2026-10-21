@@ -3,8 +3,9 @@ title: "CLI reference"
 description: "Every xlog subcommand and flag, with input and output formats, environment variables, and exit codes."
 ---
 
-The `xlog` binary runs, inspects, and watches XLOG programs. It has five subcommands:
-`run` and `prob` execute programs; `explain`, `repl`, and `watch` support development.
+The `xlog` binary runs, inspects, and watches XLOG programs. It has seven subcommands:
+`run` and `prob` execute programs; `explain`, `repl`, and `watch` support development;
+`extract` and `manifest` export resolved source information.
 An unsupported subcommand fails explicitly rather than falling back to another mode.
 
 <Note>
@@ -49,7 +50,8 @@ format, used to exchange tables between tools.
 | Option | Description | Default |
 |---|---|---|
 | `--input <REL>=<PATH>` | Load an Arrow IPC file as an EDB relation. Repeatable. | — |
-| `--output <FORMAT>` | `pretty`, `csv`, or `arrow`. | `pretty` |
+| `--output <FORMAT>` | `pretty`, `csv`, `arrow`, or `json`. | `pretty` |
+| `--materialize-relation <NAME>` | Include a completed runtime relation in JSON output. Repeatable; requires `--output json`. | — |
 | `--output-dir <DIR>` | Directory for Arrow output files (with `--output arrow`). | — |
 | `--device <N>` | CUDA device index. | `0` |
 | `--memory-mb <MB>` | GPU memory budget in mebibytes. | `1024` |
@@ -77,14 +79,26 @@ it then prints a `WCOJ kernels dispatched: ...` line with the per-route counts.
 If nothing fired, it prints instead:
 
 ```text
-WARNING: --wcoj set but no WCOJ kernel dispatched (declines <n>); the run fell back to binary joins
+WARNING: --wcoj set but no WCOJ kernel dispatched (fallbacks <n>, pipeline errors <m>); the run fell back to binary joins
 ```
 
-`<n>` is a live count of the routes that were entered and then declined on an
-error, so it is often non-zero on exactly the runs that print this warning. Both
-lines carry it; only the `dispatched` line means a kernel fired.
+`<n>` counts ordinary fallback executions; `<m>` counts pipeline errors. A
+fallback can run without an error. Both lines carry these counts; only the
+`dispatched` line means a specialized kernel fired. In JSON statistics, inspect
+`wcoj.triangle_dispatch` and `wcoj.four_cycle_dispatch` for the individual routes.
 
 The answer is the same either way — only the execution route differs.
+
+With `--output json`, stdout contains one `xlog.deterministic-run.v1` object.
+`queries` contains each query's relation name, projected column names, scalar
+types, and rows. `materialized_relations` contains the requested stored relations,
+deduplicated and ordered by name. An absent requested relation is an error.
+Floating-point NaNs and infinities cannot be encoded in this JSON output and
+cause an error. `--output-dir` cannot be combined with JSON.
+
+JSON rows are copied to the host after evaluation completes; the payload labels
+this as `materialization_transfer: "post_fixpoint_d2h"`. This output operation
+does not establish that the preceding evaluation met a strict residency contract.
 
 ## xlog prob
 
@@ -219,6 +233,21 @@ parse and cache summary. It does not run normalization or compilation, is not an
 interactive line-by-line session, and does not evaluate queries.
 </Note>
 
+## xlog extract and xlog manifest
+
+Export the entry program and its resolved imports without GPU execution:
+
+```bash
+xlog extract program.xlog --source-root . --module-path ./lib
+xlog manifest program.xlog --source-root . --module-path ./lib
+```
+
+Both commands require `--source-root <DIR>` to express portable module paths
+relative to that root, and accept colon-separated `--module-path` directories.
+`extract` prints the resolved executable program representation as JSON;
+`manifest` prints its source and module manifest as JSON. Source-loading,
+resolution, extraction, and serialization failures are command errors.
+
 ## xlog watch
 
 Re-read and re-check a source file at a fixed interval.
@@ -246,7 +275,8 @@ predicate's arity and its column types must be compatible with the declared type
 
 **Output formats.** `pretty` renders human-readable tables (the default). `csv` writes
 comma-separated rows. `arrow` writes one Arrow IPC file per query into `--output-dir`.
-`xlog prob` additionally supports `json`.
+Both execution commands support `json`, with distinct deterministic and probabilistic
+result schemas.
 
 ## Environment variables
 
