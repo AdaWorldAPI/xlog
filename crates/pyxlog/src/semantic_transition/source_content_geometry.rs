@@ -1,5 +1,6 @@
 //! Authenticated task metadata shared by early geometry and original child imports.
 
+use super::source_content_occurrences::exact_tuple;
 use super::*;
 
 pub(super) struct SourceTaskProjection {
