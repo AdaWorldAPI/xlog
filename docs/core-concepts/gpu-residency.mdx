@@ -9,9 +9,9 @@ boundary. XLOG instead runs relational, probabilistic, and solver kernels over
 device-backed state, while keeping host orchestration and each route's explicitly
 accounted observations visible.
 
-<Frame caption="The host launches kernels and reads only bounded metadata; relations, deltas, circuit values, and solver state stay in the device memory budget, and results reach PyTorch, JAX, and cuDF zero-copy through DLPack and Arrow.">
-  <img className="block dark:hidden" src="/assets/diagrams/gpu-residency-model-light.svg" alt="XLOG GPU residency model: the host executor and compiler launch kernels into a GPU-resident device plane holding relations, deltas, circuit values, and solver state within a memory budget, exposed zero-copy to PyTorch, JAX, and cuDF via DLPack and Arrow." />
-  <img className="hidden dark:block" src="/assets/diagrams/gpu-residency-model-dark.svg" alt="XLOG GPU residency model: the host executor and compiler launch kernels into a GPU-resident device plane holding relations, deltas, circuit values, and solver state within a memory budget, exposed zero-copy to PyTorch, JAX, and cuDF via DLPack and Arrow." />
+<Frame caption="Resident routes retain their device data plane and expose device views through DLPack. Host setup, control reads, exports, and budget scopes remain explicit.">
+  <img className="block dark:hidden" src="/assets/diagrams/gpu-residency-model-light.svg" alt="XLOG GPU residency model: host executor and compiler, device-backed relations, deltas, circuit values and solver state, and a DLPack consumer handoff. Residency and budgets are route-scoped, not inferred from a CUDA result." />
+  <img className="hidden dark:block" src="/assets/diagrams/gpu-residency-model-dark.svg" alt="XLOG GPU residency model: host executor and compiler, device-backed relations, deltas, circuit values and solver state, and a DLPack consumer handoff. Residency and budgets are route-scoped, not inferred from a CUDA result." />
 </Frame>
 
 ## The contract
@@ -33,7 +33,8 @@ boundaries.
 </Note>
 
 Query results and gradient tensors can be exposed as GPU-backed DLPack capsules and
-Arrow arrays, so PyTorch or JAX can consume the returned buffer without copying it.
+Arrow C Device arrays, so a compatible consumer can share the device buffer.
+Host Arrow/IPC export is a different path and can download relation data.
 `tensor.device` confirms the final buffer location; it does **not** prove the
 buffer's transfer history. Use route telemetry and the strict gate below for that
 stronger claim.

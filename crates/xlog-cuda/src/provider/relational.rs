@@ -34,11 +34,10 @@ const XLOG_TY_F64: u8 = 5;
 const XLOG_TY_BOOL: u8 = 6;
 const XLOG_TY_SYMBOL: u8 = 7;
 const SMALL_FULL_ROW_SORT_MAX_ROWS: usize = 1024;
-// Per-chunk byte budget for the multiway union fold. Bounds peak device
-// memory (the concat and sort workspace scale with one chunk plus the
-// deduplicated accumulator, not with the sum of all raw contributions) and
-// keeps every per-column chunk concat far inside the u32 byte range the
-// copy/permutation kernels index with.
+// Input-grouping byte target for the multiway union fold, not a peak-memory
+// ceiling: borrowed inputs remain live, the accumulator and sort workspace add
+// storage, and each group must consume at least one input even above the target.
+// Concat separately checks the u32 extents required by copy/permutation kernels.
 const UNION_MANY_CHUNK_BYTES: usize = 1 << 30;
 
 #[inline]

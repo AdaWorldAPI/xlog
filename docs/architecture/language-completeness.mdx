@@ -127,15 +127,20 @@ This path is separate from probabilistic or epistemic semantics.
 Finite probabilistic aggregate support is routed through the `xlog-prob` component.
 There are two evaluation paths:
 
-- **Exact paths** enumerate every finite aggregate outcome and record it into the
-  provenance structures the runtime carries (internally, PIR).
-- **Monte Carlo paths** approximate the result by sampling. They reuse the same
-  aggregate operator semantics as ordinary deterministic aggregate execution.
+- **Exact paths** enumerate finite aggregate outcomes in the host provenance
+  frontend and record them in PIR. The normal circuit route uploads PIR for GPU
+  encoding, compilation, verification, and evaluation.
+- **The explicit Monte Carlo CPU oracle** approximates the result by sampling
+  and reuses deterministic aggregate evaluation for sampled worlds. Production
+  resident Monte Carlo rejects aggregate heads; selecting `mc` alone does not
+  make these programs executable on the GPU.
 
 Each exact path has an accepted cap on the size of the finite domain it will
 enumerate. When an exact domain exceeds that cap, the program reports a typed
 probabilistic-aggregate diagnostic. The diagnostic names a remediation path, such
-as switching to Monte Carlo or reducing the domain.
+as switching to Monte Carlo or reducing the domain. For aggregates, the former
+requires explicit CPU-oracle opt-in and produces reference results, not GPU
+acceptance evidence.
 
 ## Incremental Parsing And Explain
 

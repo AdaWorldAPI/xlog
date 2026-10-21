@@ -17,7 +17,7 @@ A vocabulary goes in:
 pre_before_post   post_before_pre   co_occurs
 ```
 
-One same-head Stage-B candidate per relation comes out (`build_join_candidates`),
+One same-head existential-join candidate per relation comes out (`build_join_candidates`),
 and they all compete in **one joint mixture**:
 
 ```
@@ -212,12 +212,12 @@ pressure anywhere** — no L1, no `weight_decay`, no simplex over the weights. M
 
 Partial overlap is survivable, and that is a real result. Exact and near-duplicates are
 **not identifiable at all** — and there `select_rule` abstains, which is the right
-answer. The trivially-true case is worse and is **measured, not fixed** (`xfail`,
-`strict`): the mixture comes back **believing the wrong rule**, so the tie and
-min-weight gates pass it straight through. **Degeneracy is not ambiguity.** Closing it
-needs two things this branch does not have: an **Occam/sparsity term** on the candidate
-weights, so the objective prefers the *minimal* separating relation, and a **fit gate**,
-so a rule the model cannot actually fit the data with is not reported as a rule.
+answer. The trivially-true case is a separate optimization failure: the mixture can
+return the wrong candidate at weight 0.955 and train fit 0.500. The current demo
+passes `fits=result.candidate_train_fit` into `select_rule`; its fit gate drops
+candidates below 0.75 before weight ranking, so that measured failure now abstains.
+Omitting `fits` skips the gate. This prevents reporting that unfitting candidate;
+it does not repair the degenerate optimizer state or establish generalization.
 
 Two rules follow:
 
@@ -226,7 +226,8 @@ Two rules follow:
   reports whichever the caller **typed first** — reverse the vocabulary and the
   "discovered rule" reverses with it. Use `discovery.select_rule`: it names a rule only
   when one candidate is both *believed* (weight ≥ 0.5) and *alone* at the top (runner-up
-  more than 0.01 behind), and **abstains** otherwise.
+  more than 0.01 behind), and **abstains** otherwise. Pass the result's
+  `candidate_train_fit` as `fits=` to apply the fit gate first.
 - **Accuracy is not evidence of selection.** It is **1.000** in every tied row above.
   The demo prints the two side by side; they are independent claims.
 

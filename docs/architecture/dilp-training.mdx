@@ -60,13 +60,13 @@ soft mask toward a one-hot selection.
      ┌─────────────────────────────────────────────────────┐
      │  train_only()                                       │
      │    ├─ valid_candidates()  → candidate map           │
-     │    ├─ MaskBackend.init_weights()                    │
-     │    ├─ AdaptiveTempController                        │
+     │    ├─ SparseMaskBackend.init_weights()              │
+     │    ├─ fixed-budget temperature schedule             │
      │    └─ step loop ──────────────────────────┐         │
-     │         ├─ MaskBackend.apply_mask()       │         │
-     │         ├─ program.evaluate_device()      │ GPU     │
-     │         ├─ BCE loss (torch)               │ only    │
-     │         ├─ loss.backward()                │         │
+     │         ├─ selected mask tensors          │         │
+     │         ├─ native ILP loss + credit       │ CUDA    │
+     │         ├─ DLPack loss / gradient         │         │
+     │         ├─ cand_probs.backward(credit)    │         │
      │         └─ optimizer.step()               │         │
      │                                           │         │
      │  train_and_promote()                      │         │
@@ -78,9 +78,9 @@ soft mask toward a one-hot selection.
                         ▼                                   │
      ┌────────────────────────────────────┐                │
      │  Rust (xlog-runtime, xlog-cuda)   │                │
-     │    ├─ set_rule_mask_sparse()       │◄───────────────┘
+     │    ├─ selected-device mask upload │◄───────────────┘
      │    ├─ IlpRegistry (mask storage)  │
-     │    ├─ TensorMaskedJoin (executor) │
+     │    ├─ native loss/gradient path   │
      │    ├─ batch_fact_membership()     │
      │    ├─ batch_fact_membership_device() │
      │    ├─ batch_tagged_credit()       │
@@ -104,7 +104,7 @@ soft mask toward a one-hot selection.
 | `pyxlog/ilp/promoter.py` | `train_and_promote()` — training + gate pipeline |
 | `pyxlog/ilp/neurosymbolic.py` | `train_neurosymbolic_program()` — joint `nn/4` and symbolic rule-weight training |
 | `pyxlog/ilp/inventory.py` | `build_rule_inventory()` — selected/rejected clause inventory with transfer metadata |
-| `pyxlog/ilp/backend.py` | `MaskBackend` protocol, `SparseMaskBackend`, `DenseMaskBackend` |
+| `pyxlog/ilp/backend.py` | Sparse weight initialization and host-reporting mask backends; strict application lives in the trainer |
 | `pyxlog/ilp/temperature.py` | `AdaptiveTempController` — cosine-annealed τ schedule |
 | `pyxlog/ilp/entropy.py` | Entropy regularization helpers |
 | `pyxlog/ilp/holdout.py` | `holdout_f1_and_variance()` — LOO (`<=20`) and k-fold (`>20`) F1 scoring |
@@ -136,7 +136,7 @@ W (C logits) → Gumbel-Softmax(τ) → candidate_soft_probs (C,)
                                           │
                     argsort/top-k on CUDA in Python/Torch
                                           │
-                    set_rule_mask_sparse_selected(selected_ids, selected_soft_probs)
+             set_rule_mask_sparse_selected_device(selected_ids, selected_soft_probs)
                                           │
                                           ▼
                               Rust builds executor mask internally
@@ -145,10 +145,12 @@ W (C logits) → Gumbel-Softmax(τ) → candidate_soft_probs (C,)
 
 - Learnable params: `C` floats (one per candidate rule)
 - Memory: O(C) — typically C < 100
-- Preferred hot-loop path calls `set_rule_mask_sparse_selected()` on the compiled program
-- Legacy compatibility path `set_rule_mask_sparse()` remains available when Rust-side ranking is desired
+- Strict training calls `set_rule_mask_sparse_selected_device()` with CUDA ids and probabilities
+- Host-reporting sparse training calls `set_rule_mask_sparse_selected()` and copies selected ids to the host
+- `set_rule_mask_sparse()` ranks on the Rust side and downloads soft probabilities;
+  it does not have the selected-candidate path's transfer boundary
 
-### DenseMaskBackend (alpha-compatible, debug)
+### DenseMaskBackend (debug)
 
 ```
 W (N×N×N logits) → Gumbel-Softmax(τ) → 3D soft mask
@@ -167,32 +169,40 @@ W (N×N×N logits) → Gumbel-Softmax(τ) → 3D soft mask
 
 ### train_only()
 
-1. **Candidate enumeration** — `valid_candidates(source, mask_name)` returns all syntactically legal body-pair assignments
+1. **Candidate enumeration** — `prog.valid_candidates(mask_name, allow_recursive)` returns supported body-pair assignments from the compiled program
 2. **Multi-start** — up to `max_attempts` independent restarts with fresh logits
 3. **Step loop** (per attempt, up to `step_budget_per_attempt`):
-   - Apply mask via backend
-   - Forward pass: `program.evaluate_device()` (GPU-only, no host reads)
-   - BCE loss between predicted and target fact membership
-   - Backward pass: `loss.backward()` through PyTorch autograd
+   - In strict mode, rank candidate probabilities on CUDA and pass selected tensors to `set_rule_mask_sparse_selected_device`
+   - Compute native loss and candidate credit with `compute_ilp_loss_grad_gpu`; the relation-input entry point uses `compute_ilp_loss_grad_gpu_relations`
+   - Import the loss and credit through DLPack, then backpropagate credit through the candidate probabilities
    - Optimizer step on W
-   - Temperature anneal: τ_start → τ_floor (cosine schedule)
+   - Temperature anneal: τ_start → τ_floor (fixed-budget linear schedule in strict mode; adaptive cosine controller in host-reporting mode)
    - Optional deterministic controls (`deterministic=True`) for reproducible attempt seeding
-   - Early stopping: when argmax is stable and loss < threshold
-4. **Decode** — `argmax(W)` maps to winning candidate → discovered rule string
+   - Strict attempts run the configured budget and reject any counted D2H transfer; the host-reporting mode has convergence-based early stopping
+4. **Finalize** — retain final device state, select the attempt, and return the rule identity; host metrics and persistence require explicit export in strict mode
 
 ### train_and_promote()
 
 1. Call `train_only()` — get `TrainResult`
 2. If not converged → `PromotionStatus.NOT_CONVERGED`
 3. **Trial compile** — substitute discovered rule into source, compile via Rust
-4. **Promotion gates** (all must pass for `PROMOTED`):
-   - **Convergence gate** — training converged (already checked)
+4. **Six promotion gates** (all executed gates must pass for `PROMOTED`):
+   - **Training positives** — derive every training positive
+   - **Training negatives** — derive no training negative
    - **Novel-rate gate** — fraction of non-example derivations ≤ `max_novel_rate`
-   - **Protected-relation gate** — no unwanted relation side-effects
-   - **Holdout F1 gate** — F1 on held-out examples ≥ threshold
-   - **Ambiguity gate** — top-M scan (or exhaustive mode) detects no alternative winning candidates
-   - **Typed-schema gate** — optional hard gate requiring relation type metadata (or waiver-driven manual review)
-5. All pass → `PromotionStatus.PROMOTED` with `committed_source`
+   - **Protected-relation gate** — no existing protected fact is lost
+   - **Holdout F1 gate** — trainer's internal LOO/k-fold F1 ≥ threshold
+   - **Typed-schema gate** — optional enforcement of relation metadata; an untyped waiver still requires manual review
+5. Optional ambiguity scan reports alternatives; it is informational, not gating
+6. If neither explicit held-out set is supplied → `MANUAL_REVIEW_REQUIRED`
+7. For each nonempty explicit holdout set, check positive coverage or absence of negative derivations
+8. All executed gates pass → `PromotionStatus.PROMOTED` with `committed_source`; no source file is written
+
+Promotion requires `TrainConfig(strict_gpu_native=False)` and rejects the default
+strict mode. `train_only` defaults to strict training and returns
+`StrictTrainResult`; call `export_compat_result()` explicitly to materialize host
+summaries. Strict training rejects dense masks, host negative mining, per-step
+telemetry, and recursive candidates.
 
 ### External Consumer Training Surface
 
@@ -232,7 +242,7 @@ from `arity`, or one containing a bool or a non-int element.
 `{arity, arg_sorts, artifact_hash, declared}`; embedding-declared names are
 refused, since they carry no registration metadata.
 
-#### Existential-join trainable bodies (Stage B)
+#### Existential-join trainable bodies
 
 A `trainable_rule` body may join a neural predicate to an ordinary relation on an
 **existential** (non-head) variable — the neural predicate is grounded over the
@@ -412,10 +422,27 @@ Worked example + CUDA-gated tests:
    caught and abstained on rather than confidently misreported
    (`python/tests/test_join_identifiability.py`).
 
-6. **A neural predicate cannot ride in the dILP enumerator's own candidate space.**
-   The mixture's candidate vocabulary is supplied by the caller. The engine-side
-   enumerator (`valid_candidates`) and this mixture remain disjoint induction
-   paths.
+6. **The mixture does not use the engine enumerator.** Its relation vocabulary
+   is supplied by the caller. A separate witness-credit path can enumerate and
+   train supported neural-bodied candidates; that is not this mixture builder.
+
+### Engine-enumerated witness credit
+
+`pyxlog.ilp.neural_credit.train_engine_mode` trains candidate logits and a neural
+detector against witnesses read from the compiled engine. A witness is a concrete
+binding that supports a head fact. Neural witnesses combine by noisy-OR at that
+fact's own label; relational candidates carry fixed binary coverage.
+
+`kfold_select` trains on inner training folds and ranks each candidate by its
+held-out score, rather than its trained weight. It applies coverage and fit gates
+and abstains on unresolved ties. `frozen_select` scores an already trained
+detector without optimization; the caller must put that detector in evaluation
+mode. Witness masking withholds evidence and applies a coverage gate on the
+accuracy path; it cannot be combined with the F1 holdout.
+
+The CAVIAR neural examples use this path. They do not execute the certified
+probabilistic circuit for their training credit. Their host-side bookkeeping
+also means they are not evidence of ZERO TRANSFER for strict dILP training.
 
 `train_and_promote(...)` also accepts `training_fold`, `held_out_domains`,
 `base_kernel_checksum_before`, and `base_kernel_checksum_after`. These fields are
@@ -424,9 +451,11 @@ candidate clauses and gate outcomes.
 
 ## Artifact Persistence
 
-`LearnedArtifact` captures the full training result for reproducibility:
+`LearnedArtifact` captures host-materialized training results. A strict artifact
+must first be exported explicitly; calling `save` on it raises an error:
 
 ```python
+artifact = strict_result.artifact.export_compat_artifact()
 artifact.save("artifact.json")   # JSON with SHA-256 candidate-map hash
 loaded = LearnedArtifact.load("artifact.json", verify_hash=True)
 ```
@@ -436,7 +465,11 @@ precision/recall, metadata (timestamp, schema version, candidate map hash).
 
 ## GPU Contract
 
-The training step loop obeys XLOG's GPU-resident contract. *Tagged credit* below
+Strict training rejects counted device-to-host transfers during each step.
+That source guard is not a measurement of ZERO TRANSFER in both directions for
+an entire learning run. Setup, host-shaped example uploads, final reporting, and
+explicit exports must be accounted for at the boundary being measured.
+*Tagged credit* below
 means: for each derived fact, which candidate rules derived it — the coverage
 matrix the loss gradient is built from.
 
@@ -446,12 +479,13 @@ matrix the loss gradient is built from.
 - `batch_fact_membership()` / `batch_tagged_credit()` remain available when host materialization is desired
 - `AtomicU64` device-to-host counter on `CudaKernelProvider` — hard gate raises if `download_column_*` is observed during step loop
 - `host_transfer_stats()` / `reset_host_transfer_stats()` expose broader host transfer accounting for profiling
-- Legacy `set_rule_mask_sparse()` still performs a control-plane soft-probability download; the selected-candidate sparse path avoids it
+- `set_rule_mask_sparse()` downloads soft probabilities; the selected-device path avoids that download
 
-## Testing
+## Validation surfaces
 
-- **86+ static test functions** across ILP Python test files (expanded by parametrized GA/beta gates)
-- **Reliability gate**: 20 consecutive `train_only()` runs must all converge (20/20 pass)
+- Python ILP tests include parametrized reliability and transfer checks; their
+  presence is not evidence of a fresh passing run
+- **Reliability gate**: 20 consecutive `train_only()` runs must all converge
 - **GA reliability gate**: default 50-seed statistical run (`test_ilp_ga_reliability.py`)
 - **GA performance/transfer tests**: `forward_p95_us` + host transfer accounting (`test_ilp_performance.py`)
 - **Dense/sparse parity**: every sparse-path test has a `debug_dense_mask=True` variant

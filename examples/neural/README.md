@@ -10,7 +10,7 @@ These examples exercise XLOG's neural-symbolic training stack:
 - **Network Registration**: PyTorch networks with optimizers and schedulers
 - **Tensor Sources**: External data (images, embeddings) indexed by predicates
 - **Differentiable Training**: Gradients flow from logic queries through d-DNNF circuits to neural networks
-- **Circuit Caching**: Compiled circuits reused across training iterations (100x+ speedup)
+- **Circuit Caching**: Compiled circuits reused across training iterations; the paper's separate MNIST cache ablation measures a 2.74x gain under its stated protocol
 
 ## Examples
 
@@ -29,12 +29,15 @@ examples/neural/01_minimal/
 **Run:**
 ```bash
 cd examples/neural/01_minimal
-python train.py --engine torch --epochs 20 --batch-size 512 --pairs-per-epoch 65536 --train-limit 60000 --eval-limit 10000 --seed 0
+python train.py --engine xlog --epochs 20 --batch-size 64 --train-limit 20000 --eval-limit 10000 --seed 0
 ```
 
-This run uses addition supervision only, keeps train/test disjoint, and is the recommended no-leakage benchmark path.
+The `xlog` arm trains through `pyxlog.train_model_tensor` on addition queries.
+The `torch` arm is a direct PyTorch addition reference and bypasses the XLOG
+compiler, circuit, and gradient bridge. Both use addition supervision and separate
+MNIST training and test splits.
 
-**Observed benchmark (2026-02-09):**
+**Historical PyTorch-reference benchmark (2026-02-09):**
 
 | Metric | Value |
 |--------|-------|
@@ -45,7 +48,10 @@ This run uses addition supervision only, keeps train/test disjoint, and is the r
 | Initial loss | `1.3407` |
 | Final loss | `0.0138` |
 
-This benchmark is no-leakage: training uses only train split images with addition supervision, while evaluation uses disjoint MNIST test images.
+These numbers belong to the recorded `--engine torch` command, not to the XLOG
+arm above. They do not measure XLOG circuit performance or establish a current
+runtime result. Training used train-split images and addition supervision;
+evaluation used the disjoint MNIST test split.
 
 **Program:**
 ```prolog
@@ -71,14 +77,16 @@ The required neural-symbolic example set is now present in the repository:
 
 | Example | Description |
 |---------|-------------|
-| **02_coins** | Two coin classifiers with win/loss logic |
-| **03_mnist_multidigit** | Multi-digit number recognition |
-| **04_hwf** | Handwritten Formula recognition |
-| **05_poker** | Card rank classification |
-| **06_clutrr** | Family relationship reasoning with knowledge graphs |
+| **02_coins** | Direct `coin` label supervision; held-out classifier `test_acc` |
+| **03_mnist_multidigit** | Direct left/right digit supervision on two-digit SVHN; `eval_joint_proxy` is the mean of the two digit accuracies |
+| **04_hwf** | Direct four-way CROHME expression-type classification (`add`, `sub`, `mul`, `eq`); classifier `eval_acc` |
+| **05_poker** | Direct rank/suit supervision; `eval_joint_proxy` is the mean of rank and suit accuracy |
+| **06_clutrr** | Direct four-class relation supervision over story text; classifier `eval_acc` |
 
-The set is intended for end-to-end validation across these examples with real
-datasets.
+These five entrypoints exercise network registration and direct neural-head
+training. Their metrics do not establish compound-query reasoning, complete
+formula recognition, poker-hand evaluation, or rule induction from CLUTRR graphs.
+The mean-accuracy proxies are not joint exact-match accuracy.
 
 Each `train.py --mode release` run now emits a `FINAL_METRIC` line and enforces
 the example-specific minimum accuracy from `examples/neural/<example>/dataset.json`
@@ -98,12 +106,14 @@ unless overridden via `--min-accuracy`.
 - Python 3.8+
 - PyTorch 2.0+
 - torchvision (for MNIST)
-- pyxlog (built with `maturin develop --release`)
+- Linux x86_64, NVIDIA GPU, CUDA Toolkit 13.x for the XLOG execution path
+- An installed CUDA build of `pyxlog`; follow the repository's [manual build procedure](../../CONTRIBUTING.md)
 
 The repository validator uses `XLOG_NEURAL_FIXTURE_SMOKE=1` to execute every
 neural example entrypoint with deterministic in-memory fixtures when optional
-external datasets or torchvision are not installed. Real-dataset benchmark runs
-still use the paths documented above.
+external datasets or torchvision are not installed. That fixture mode disables
+minimum-accuracy enforcement even when `--min-accuracy` is supplied, and cannot
+establish real-dataset acceptance. Keep it unset for benchmark measurements.
 
 ## API Reference
 
@@ -128,7 +138,7 @@ program.add_tensor_source("train", images_tensor)
 # Single query training
 loss = program.forward_backward("addition(0, 1, 7)")  # host scalar (convenience)
 
-# Strict GPU-native training (returns CUDA tensor loss; no host reads required)
+# CUDA tensor loss; this API alone does not certify the whole loop's transfer boundary
 loss_t = program.forward_backward_tensor("addition(0, 1, 7)")
 
 # Batch training

@@ -3,23 +3,26 @@ title: "Errors and diagnostics"
 description: "XLOG's typed error surface: XlogError variants, CLI exit codes, the fail-closed rejections you may hit, and how they map to Python exceptions."
 ---
 
-XLOG fails closed: when a program asks for something the engine cannot run
-soundly on the device, the engine stops with a typed error that names the rule
-it violated. It does not silently fall back to a slower or semantically
-different path. This page catalogs the error types, the exit codes, and the
-specific rejections you are most likely to encounter.
+XLOG reports unsupported execution fragments and invalid inputs through typed
+errors. This page catalogs the error types, exit codes, and common rejections.
+An optimized join may use an ordinary GPU join when its specialized route does
+not apply; that routing behavior is distinct from selecting a CPU oracle or
+meeting a strict residency acceptance contract.
 
 ## Error types
 
-Every Rust-level error is a variant of a single enum, `XlogError` (defined in
+The shared Rust execution error type is `XlogError` (defined in
 `crates/xlog-core/src/error.rs`). The enum is marked non-exhaustive, so new
 variants may be added without a breaking change.
 
 | Variant | Meaning |
 |---|---|
+| `OwnedDiagnostic` | Retains an original error together with its diagnostic-allocation owner. Its displayed message and underlying classification are preserved; Rust callers use `unowned()` to inspect that classification. |
+| `AllocationRefused` | The original allocation owner refuses capacity, encounters an unrepresentable extent, or is poisoned before diagnostic storage can be acquired. Carries the operation and a structured `AllocationRefusal`. |
 | `Parse` | Parse error from the Datalog frontend. |
 | `StratificationCycle` | Stratification failed: a cycle through negation, reported with the predicates involved. |
 | `UnsafeVariable` | Domain safety violation: a variable is not bound in any positive body literal. |
+| `Configuration` | A supplied runtime setting is malformed; names the setting, rejected value, and expected domain. |
 | `ResourceExhausted` | A byte-addressed GPU allocation, buffer, or workspace exceeds its memory budget; carries the operation context, required bytes, and available bytes. It is not used for row, candidate, slot, dimension, or iteration limits. |
 | `CapacityExceeded` | A bounded count or representational capacity is insufficient; carries the context, required count, limit, and unit (for example candidates, rows, slots, or launch elements). |
 | `ConvergenceFailure` | A bounded iterative computation reached its iteration limit without convergence; resident Monte Carlo reports the unconverged and total world counts and the configured limit. |
@@ -34,9 +37,16 @@ variants may be added without a breaking change.
 
 ## Exit codes
 
-The `xlog` CLI returns `0` on success and `1` on any error. Every failure — parse,
-compile, execution, I/O, or an exhausted memory budget — surfaces as exit code `1`
-with a descriptive message on stderr. There are no other exit codes.
+The `xlog` CLI returns `0` when command processing completes and `1` when it
+fails, including source loading, parsing, import resolution, execution, I/O,
+and memory-budget errors. The argument parser returns `2` for usage errors,
+such as an unknown command, invalid option value, or missing required argument.
+
+`xlog explain` is report-oriented. After parsing and import resolution succeed,
+normalization and compiler failures can appear as unavailable report sections
+while the command returns `0`; inspect each section's status and reason.
+The ordinary recursive executor reports its exhausted round limit as an
+`Execution` error. Do not assume every iteration limit uses `ConvergenceFailure`.
 
 ## Fail-closed rejections you may hit
 
@@ -105,7 +115,7 @@ function normalization expands both branches eagerly, and a used cycle can still
 ### Cross-predicate type mismatch
 
 Compilation rejects a rule whose variables draw incompatible column types from
-the declared schemas of the predicates they touch. The conflict may be between
+the available schemas of the predicates they touch. The conflict may be between
 two body atoms, or between a body atom and the head. Both forms are
 `Compilation` errors that name the rule, the variable, both types, and where each
 came from:
@@ -115,10 +125,10 @@ Type mismatch in rule for '<head>': variable <V> is <Type> (from <predicate/posi
 Type mismatch in rule for '<head>': variable <V> is <Type> (from <predicate/position>) but <head> declares <Type> at position <N>
 ```
 
-The check applies only to predicates that carry an explicit `pred` declaration;
-an undeclared predicate has no schema to contradict. Available since 0.12.0 —
-before that the same program was accepted here and failed later with an internal
-GPU schema error that did not name the rule.
+The check uses available predicate schemas, including schemas inferred from
+facts and rules as well as explicit `pred` declarations. Aggregate result types
+and computed bindings participate too. A declaration makes the expected schema
+explicit; omitting it does not permit incompatible type flows.
 
 ### Epistemic rejections
 
@@ -135,7 +145,7 @@ literal is talking about.)
 | `epistemic tuple key` | A tuple-key epistemic fact whose key contains a variable, `_`, or an aggregate. These facts require ground terms. |
 | `world view boundary` | The program admits no stable model at all, so there is no world view to reason over. |
 | `epistemic GPU execution plan` | The program declares `know`/`possible`, but after reduction no rule body actually contains a modal literal, so there is nothing to build a world-view plan from. |
-| `epistemic GPU world-view constraint` | Four cases, all in epistemic integrity constraints such as `:- know p(X).` — (a) the program has no epistemic rule for the constraint to be checked against; (b) the constraint body mixes ordinary or comparison literals with modal literals, e.g. `:- p(X), know q(X).`; (c) a variable is shared across two modal literals or repeated inside one, e.g. `:- know p(X), possible q(X).` or `:- know p(X, X).`; (d) a key position uses a list, compound, float, or string term. Single-occurrence variable keys like `:- know p(X).` are fine. |
+| `epistemic GPU world-view constraint` | No epistemic rule supplies the world-view context, or a constraint remains outside the planner's pure-modal, scalar-key subset after normalization. Positive single-occurrence variable keys such as `:- know p(X).` range existentially. Shared-variable joins, diagonals, and mixed ordinary/modal bodies can normalize to a helper when every modal target has no epistemic defining rule; a target defined by a modal rule prevents this rewrite. Fixed finite outer list/compound keys flatten to scalar positions; unsupported residual keys are rejected. |
 | `recursive epistemic program` | Three cases — a dependency cycle the single-pass epistemic planner cannot iterate; a recursive epistemic program that also carries an epistemic integrity constraint (the recursive path never runs the constraint kernel, so it refuses rather than drop the constraint); or a modal dependency cycle reaching the stratified planner. |
 | `epistemic GPU final output relation` | An epistemic program compiled through the single (non-split) GPU path produces more than one distinct output head. Single-plan execution can materialize only one final relation; use split execution for independent epistemic outputs. |
 | `epistemic GPU constraint` | Split epistemic execution combined with any epistemic integrity constraint, including forms the single-plan path accepts. |
@@ -170,7 +180,8 @@ what the device can run; anything outside that model is rejected with a typed
 `resident MC engine rejected program [kind=...] construct=... context=...`).
 There is no silent CPU fallback.
 
-After a resident Monte Carlo launch, XLOG reads a fixed three-word device summary.
+After a resident Monte Carlo launch and the measured zero-transfer region, XLOG
+reads a fixed three-word device summary.
 If any sampled world exhausted its sparse-row capacity, evaluation returns
 `CapacityExceeded`; if any world failed to converge, evaluation returns
 `ConvergenceFailure`. Probabilities are never returned from a partial or
@@ -188,7 +199,6 @@ unconverged resident run.
 | `domain_too_large` | The bounded constant domain exceeds 256. |
 | `universe_too_large` | The bounded atom universe exceeds 65536 slots. |
 | `inconsistent_arity` | A predicate appears with inconsistent arity. |
-| `annotated_disjunction_unsupported` | The program uses an annotated disjunction the resident engine cannot ground. |
 
 <Note>
 On the CLI, `xlog prob --allow-cpu-oracle` lets a rejected program run on a labeled
@@ -196,6 +206,9 @@ CPU oracle instead; the result is tagged `mc_engine: "cpu-oracle"` and is never
 GPU-native evidence. Without the flag, a rejected program fails. See the
 [CLI reference](/reference/cli).
 </Note>
+
+Grounded annotated disjunctions are supported within the resident planner's normal
+domain and universe bounds. They are not a blanket rejection case.
 
 ### Exact aggregate caps
 
@@ -210,9 +223,10 @@ dynamic programming, and that evaluation is capped per aggregate group:
 Rows whose provenance is deterministically true or false do not count against the
 cap — only rows whose membership is genuinely uncertain do. Over the cap, the
 compile fails with a `Compilation` error that names the predicate, the group key,
-and the cap, and tells you the way out: `use prob_engine = mc or reduce the finite
-aggregate domain`. The Monte Carlo engine has no such cap because it samples
-worlds instead of enumerating outcome formulas. See
+and the cap. Its suggestion to use `prob_engine = mc` requires an additional
+decision: the production resident MC engine rejects aggregates. Reduce the finite
+domain to stay on the production exact path, or explicitly select the labeled CPU
+oracle for a reference calculation. That oracle is not GPU-native evidence. See
 [Probabilistic engines](/probabilistic/engines) for choosing between the two.
 
 ### Multiway union size caps
@@ -267,7 +281,7 @@ answered.
 | `RuntimeError` | Any `XlogError` propagated from the engine (including parse, compilation, kernel, execution, byte-memory exhaustion, count-capacity exhaustion, and convergence failure), host-output calls on a build without the `host-io` feature, and construction of fallback `RelationEvidence` when `pyxlog._native` is unavailable. |
 | `IlpConfigError` (a `ValueError` subclass) | `induce_exact(backend="python")` without `XLOG_ALLOW_PYTHON_ILP_REFERENCE=1`. The Python reference scorer exists only to cross-check results (parity-only) and is never a production path. |
 | `CarrierRefused` (a `RuntimeError` subclass) | Every typed refusal from the device-resident joint-constraint solver (`JointConstraintCarrier`) except running out of fuel: registering a schema twice, a zero-capacity dimension, using the carrier before `register_schema`, rebinding already-bound signature masks, a signature-mask shape mismatch, solving before `bind_signatures`, running the top-two stage before feasibility has solved, a malformed component plan, an out-of-range abstain label index, or an unavailable joint-solve kernel. Available since 0.11.0. |
-| `SolverResourceExhausted` (a `RuntimeError` subclass) | The joint-constraint solver used up its device fuel budget — a cap on how many search nodes it may expand — during `solve_label_feasibility`. The message is `solver fuel exhausted: spent {fuel_spent} of {fuel_limit} node expansions`. The fuel meter lives in the carrier session, so retrying reproduces the identical refusal instead of making partial progress; raise `fuel_limit` on a new carrier. Available since 0.11.0. |
+| `SolverResourceExhausted` (a `RuntimeError` subclass) | A joint-constraint stage's fuel charge exceeds the session limit. The message is `solver fuel exhausted: spent {fuel_spent} of {fuel_limit} node expansions`. A refused charge leaves the meter unchanged. Component search also exposes per-row refusal through `solve_status`; inspect it rather than treating method return alone as exact acceptance. |
 
 In a source-only import without `pyxlog._native`, package-level
 `RelationMetadataError` and `RelationEvidence` remain importable. The fallback

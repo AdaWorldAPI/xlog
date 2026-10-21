@@ -1,7 +1,8 @@
-# In-circuit saliency-driven plasticity rule induction (Stage B)
+# In-circuit saliency learning over an existential plasticity rule
 
-This flagship recovers a planted STDP-style **plasticity rule** end-to-end through
-the xlog differentiable circuit, using an **existential join** between a neural
+This example learns a saliency predicate and guard weight for a supplied
+spike-timing-dependent plasticity rule through the xlog differentiable circuit,
+using an **existential join** between a neural
 predicate and an ordinary relation:
 
 ```
@@ -12,8 +13,8 @@ plastic(Edge) :- saliency(Event, strengthen), pre_before_post(Event, Edge).
 the deterministic pre→post timing graph. The join variable `Event` is
 **existential** — it does not appear in the head — so the engine grounds
 `saliency` over the **real event domain inside the circuit** and OR-aggregates
-the per-event contributions at each edge. This is the capability Stage B adds:
-before it, an existential-join trainable body failed closed.
+the per-event contributions at each edge. The rule body is supplied in advance;
+this example does not search for its structure.
 
 Why it matters: `saliency` is learned as a **generalizable function of the event
 feature**, not a per-edge scalar or an id lookup. The same learned predicate

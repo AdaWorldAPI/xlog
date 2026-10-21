@@ -80,27 +80,39 @@ unconditioned or CPU fallback is substituted when validation fails.
 
 ## Semantic task programs
 
-`xlog_cuda::SemanticTaskEvaluationSpec` binds two ordered admitted statement
-records, their allowed supports, a native `SemanticTaskProgram`, explicit
+`xlog_cuda::SemanticTaskEvaluationSpec` binds a nonempty ordered query roster of
+admitted statement records, their allowed supports, a native `SemanticTaskProgram`, explicit
 `SemanticTaskScoring` coefficients, ordered task-local priority levels, and
-three truth-eligibility masks. XLOG does
+one truth-eligibility mask per query. XLOG does
 not prescribe the statement predicate, arguments, task answers, or reward
-weights. The resident transition ABI has three query slots and two candidate
-lanes; this is a capacity limit, not a task definition.
+weights. The roster retains its original order and may select the same statement
+more than once. The resident transition has two candidate lanes; each evaluates
+the complete admitted query roster.
 
 Use `xlog_gpu::logic::SemanticLogicTaskProgram::compile(source, query_ordinals)`
-for a self-contained XLOG source program with three selected zero-arity queries.
+for a self-contained XLOG source program with a nonempty selection of zero-arity
+queries, meaning queries that return truth rather than columns of answer values.
 Source facts provide its concrete inputs. During cold task binding, the native
-owner runs the canonical GPU evaluator and derives expected Boolean truth from
-the completed query results. Python cannot inject an expected-answer array.
+owner runs the canonical GPU evaluator. Logical tasks derive reference Boolean
+truth from those completed queries; Coding tasks retain actual initial results
+without a reference-answer vector. Python cannot inject an expected-answer array.
 This adapter does not resolve imports or accept external relation buffers.
 
-Selection first excludes candidates outside the three hard truth masks. It then
+The same specification retains `task_ground`, including Coding observation
+bindings and the ordered dependency requirements for every query. It also
+freezes the application's ex-ante `actor_eligible` decision. Query truth alone
+does not satisfy a Coding goal whose required observations or prerequisites
+are absent.
+
+Selection first excludes candidates outside any query's hard truth mask. It then
 compares ordered `SemanticTaskPriorityLevel` values lexicographically. Each
 `SemanticTaskPriorityGoal` names one native query, target truth and positive
-weight; its normalized truth-match progress is the candidate's zero-or-one
-match minus the acquired base's match for the current step. At most three
-levels and three distinct query goals fit the bank. Predictive query agreement,
+weight. Progress is the candidate's zero-or-one attainment minus the acquired
+base's attainment for the current step. Logical tasks match each goal's target
+truth; Coding tasks also require their protected goal dependencies. With `Q` queries,
+there may be at most `Q` nonempty levels and `Q` distinct query goals in total;
+each query can appear in only one goal. Coding tasks require a target for every
+query. Predictive query agreement,
 lower measured work, then earlier candidate index break ties. The six
 `SemanticTaskScoring` coefficients remain measurement and return inputs, not
 priority levels: return separately prices improvement, refusals and spent work.
@@ -157,7 +169,7 @@ Its typed result is `SemanticTransitionLane::program_rules`; graph support
 insertions remain in `SemanticTransitionLane::edits`. A rule attempt is retained
 in `program_rules` even if its lane later fails a hard constraint. Graph support
 insertion is unavailable for editable-program tasks because it would not change
-their program closure. Three task queries are evaluated from each candidate's
+their program closure. All admitted task queries are evaluated from each candidate's
 actual closure, with rule and query receipts checked at observation.
 
 ### Supplied numerical policy
@@ -300,7 +312,8 @@ Two edits fix a call site:
 
 ```rust
 // Construct: start from Default and override the fields you set.
-let stats = ExecutionStats { ..Default::default() };
+let mut stats = ExecutionStats::default();
+stats.total_duration_us = 42;
 
 // Match: add a `..` arm so future fields do not break the pattern.
 let ExecutionStats { total_duration_us, .. } = stats;

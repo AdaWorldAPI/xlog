@@ -41,7 +41,7 @@ each with its own rule, then combine them:
 ```xlog
 weight_sum(G, sum(W)) :- weighted(G, W).
 weight_count(G, count(W)) :- weighted(G, W).
-mean(G, M) :- weight_sum(G, S), weight_count(G, N), M is S / N.
+mean(G, M) :- weight_sum(G, S), weight_count(G, N), M is cast(S, f64) / cast(N, f64).
 ```
 </Note>
 
@@ -94,9 +94,10 @@ rules](/language-guide/facts-and-rules): both need their inputs settled before t
 produce a sound answer.
 
 <Warning>
-Under exact probabilistic inference, aggregates over *uncertain* rows have finite domain
-caps — beyond them you switch to the Monte Carlo engine. That is a property of the
-probabilistic engines, not of deterministic aggregation, and is covered separately.
+Under exact probabilistic inference, aggregates over uncertain rows have finite domain
+caps. Reduce the domain when you exceed them. Production Monte Carlo rejects
+aggregates; its explicitly selected CPU oracle can provide a labeled reference
+calculation, but cannot establish GPU execution. See the engine guide for the bounds.
 </Warning>
 
 <Card title="Probabilistic engines" icon="dice" href="/probabilistic/engines">

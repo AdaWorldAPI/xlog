@@ -1,4 +1,4 @@
-<!-- xlog diagram: semi-naive fixpoint (dark). Source: docs ARCHITECTURE.md "Fixpoint Iteration (Semi-Naive)" + recursion page. Delta-driven iteration until no new tuples. -->
+<!-- xlog diagram: semi-naive fixpoint (dark). Source: language-guide/recursion.mdx. Delta-driven iteration until no new tuples. -->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 264" font-family="Inter, system-ui, sans-serif">
   <rect width="900" height="264" fill="#0E0E16"/>
   <defs>

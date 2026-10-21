@@ -31,7 +31,7 @@ programs — and run through the high-level `xlog run` GPU epistemic runtime. An
 unsupported epistemic form must fail with a typed diagnostic rather than
 silently falling back to CPU evaluation.
 
-Within the epistemic surface, the executor is complete for:
+Within the epistemic surface, the executor implements these bounded operations:
 
 - enumerating candidate worlds from the EIR;
 - checking modal membership at the value level, one tuple key at a time;
@@ -40,7 +40,7 @@ Within the epistemic surface, the executor is complete for:
 - ground epistemic constraints, safe splitting of independent components, and
   solving several epistemic components jointly.
 
-Its semantic rules are also complete for:
+Its accepted execution routes also cover:
 
 - global and per-row modal gates, which combine with logical AND;
 - finite nested modal chains (such as `know possible fact()`), which normalize
@@ -96,7 +96,7 @@ executed. The concrete boundaries are listed under
 27. [GPU ILP Configuration](#gpu-ilp-configuration)
 28. [Pragmas and Directives](#pragmas-and-directives)
 29. [CLI Developer Experience](#cli-developer-experience)
-30. [Float Predicates and IEEE 754 Semantics](#float-predicates-and-ieee-754-semantics)
+30. [Float Predicates and Total-Order Semantics](#float-predicates-and-total-order-semantics)
 31. [Comments](#comments)
 32. [Complete Grammar Reference](#complete-grammar-reference)
 
@@ -117,7 +117,13 @@ logic programs into backend-specific GPU execution paths. It supports:
   negation contracts, magic-set planning, probabilistic aggregate semantics,
   approximate inference configuration, incremental parsing, and CLI
   inspectability
-- **GPU execution**: All core operations (joins, sorts, aggregations) run on the GPU
+- **GPU execution**: Deterministic relational operators include GPU joins, sorts,
+  and aggregations; backend-specific preparation and orchestration are separate
+
+GPU execution does not mean that every frontend stage is device-resident. Exact
+probabilistic source compilation constructs provenance on the host before the
+normal GPU circuit route. Its probabilistic WFS evaluator is also host-side,
+separate from the epistemic engine's GPU WFS path.
 
 ### Hello World Example
 
@@ -305,7 +311,8 @@ analyzed rather than implying that every construct traverses every subsystem.
 | Parser and AST | Recognize source syntax, preserve spans, and represent finite high-level terms |
 | Semantic analysis | Type check, safety check, reject unbounded or dynamic forms, and desugar high-level constructs |
 | Optimizer and planner | Rewrite programs, including magic sets, while preserving output semantics |
-| Runtime, epistemic, and probability engines | Execute accepted relational, epistemic, aggregate, exact, and MC work through production GPU-capable paths |
+| Probabilistic frontend | Construct host provenance and finite aggregate outcomes; evaluate accepted non-monotone probabilistic rules with host WFS |
+| Runtime, epistemic, and probability engines | Execute supported backend-specific paths, including GPU relational and circuit operators and resident MC; label the explicitly selected CPU MC oracle separately |
 | CLI | Orchestrate commands, format diagnostics, and transfer only requested final results |
 
 Accepted language-completeness and epistemic features must not execute by constructing
@@ -321,8 +328,8 @@ using a hidden CPU-only fallback for a GPU-claimed path.
 | Safe meta-predicates | `ground`, `var`, `nonvar`, `functor`, `=..`, `findall`, `maplist` | Static inspection and finite collection only | `xs(L) :- findall(X, edge(1, X), L).` | Unrestricted `call/N`, dynamic database mutation, runtime-variable predicate names | Compile-time/static expansion plus typed relational lowering |
 | Deterministic NAF | `not atom(...)` | Closed-world stratified negation over deterministic relations; named variables in the negated atom must be bound by a prior source-order binder | `leaf(X) :- node(X), not edge(X, _).` | Unbound variables in negated atoms, unstratified deterministic cycles | Existing stratification and runtime anti-join paths |
 | Magic sets | `#pragma magic_sets = on\|off\|auto` and compiler configuration override | Bound deterministic recursive queries may be rewritten with adornments and magic predicates | `?- reach(1, Y).` specializes recursive reachability | Unsafe interaction with negation, aggregates, meta/list helpers, mutual recursion, or SIPS cases if equivalence cannot be proven | Source/RIR rewrite before optimizer and WCOJ planning |
-| Probabilistic aggregates | Aggregate heads and aggregate outputs in `query`/`evidence` | Finite aggregate outcomes in exact and MC inference | `query(out_degree(1, 2)).` over probabilistic `edge` facts | Exact aggregate domains over cap, unsupported numeric operator/domain pairs | Exact provenance/PIR or MC sampling plus deterministic aggregate execution |
-| Aggregate lifting | Finite-domain aggregate metadata and caps | Use lifted compact-domain computation when identical to finite exact enumeration | Small count/sum domains avoid naive enumeration | Domain cap exceeded, non-finite domains, unsupported floating tolerance | Probabilistic aggregate planner and exact/MC engines |
+| Probabilistic aggregates | Aggregate heads and aggregate outputs in `query`/`evidence` | Finite aggregate outcomes in exact inference; sampled reference results only with explicit CPU-oracle opt-in | `query(out_degree(1, 2)).` over probabilistic `edge` facts | Exact aggregate domains over cap, unsupported numeric operator/domain pairs; production resident MC rejects aggregates | Exact provenance/PIR; labeled CPU oracle for sampled reference calculations |
+| Aggregate lifting | Finite-domain aggregate metadata and caps | Use lifted compact-domain computation when identical to finite exact enumeration | Small count/sum domains avoid naive enumeration | Domain cap exceeded, non-finite domains, unsupported floating tolerance | Probabilistic aggregate planner and exact engine |
 | Approximate inference | `#pragma prob_engine = mc`, samples, seed, confidence, method | MC estimates are reproducible under fixed seed and report uncertainty | `#pragma prob_samples = 10000` with `query(rain).` | Invalid confidence ranges, unsupported methods, hidden default override ambiguity | Existing MC engine with documented source/CLI precedence |
 | Epistemic literals | `know atom(...)`, `possible atom(...)`, `not know atom(...)`, `not possible atom(...)`, finite nested modal chains, `#pragma epistemic_mode = faeel\|g91` | Modal literals are preserved in EIR. The single-pass route derives candidate worlds from EIR and checks value-level tuple-key membership. Across all routes, the executor normalizes finite nested chains by parity/duality, solves same-name multi-arity by arity-qualified tuple sources, supports determined-head stratification, positive FAEEL modal dependency cycles through founded least-fixpoint reduction, supported Gelfond-1991 positive exact-tuple `possible` cycles through a greatest compatibility fixpoint, stratified negated-modal recursion, and cyclic negated-modal recursion through the `xlog-gpu` GPU-backed WFS plan without the old `xlog_prob` host-WFS solver. Gelfond-1991 refinement and WFS convergence may be host-orchestrated while relation evaluation, snapshots, and set comparison remain GPU-backed. | `accepted() :- know fact().` | Direct raw RIR lowering, genuinely unbounded/untyped modal tuple keys, unsafe unbound negated epistemic variables, CPU-only world-view scans, recursive epistemic programs that also carry modal integrity constraints, and a Gelfond-1991 compatibility component with recursive negation or aggregation | Parser/AST -> EIR -> single-pass epistemic GPU plans, reduced ordinary least-fixpoint plans, descending Gelfond-1991 compatibility plans, or GPU-backed WFS alternating-fixpoint plans through high-level `xlog run` dispatch |
 | CLI explain | `xlog explain --format text\|json\|dot file.xlog` | Report parse-cache and AST counts, analysis status and summaries, provenance, proof traces, and generated-row diagnostics | `xlog explain --format json reach.xlog` | Unknown output formats; unsupported analyses report an unavailable status and reason | CLI orchestration plus compiler/explain APIs |
@@ -347,7 +354,7 @@ list error at program.xlog:12: unbounded append/3 generation is unsupported; bin
 meta error at program.xlog:8: maplist predicate argument must be a static predref; replace runtime variable P with a named predicate.
 negation safety error: unbound variable Y in negated atom edge/2; bind it before not with a positive atom or deterministic is expression, or use '_' for existential positions.
 magic_sets declined at program.xlog:21: recursive query crosses an aggregate boundary; run with #pragma magic_sets = off or isolate the aggregate.
-prob_aggregate error at program.xlog:17: exact probabilistic aggregate domain cap exceeded (16 uncertain rows per group); use prob_engine = mc.
+prob_aggregate error at program.xlog:17: exact probabilistic aggregate domain cap exceeded (16 uncertain rows per group); reduce the finite aggregate domain.
 epistemic error at program.xlog:9: unbounded modal tuple key [H|T] has no finite GPU key-column set; use a fixed-arity typed list or bind the tail to a finite relation.
 ```
 
@@ -421,6 +428,11 @@ Private predicates may support other local definitions when the file is used as 
 entry file. An exported rule cannot depend on a private predicate because private
 definitions are not merged into importing programs; such an import is rejected with
 `error[E0406]`.
+
+Declarations are keyed by predicate name and must agree on arity, column names,
+and resolved column types across the entry program and selected imports.
+Arity-qualified modal lookup can distinguish undeclared extensional facts such
+as `p/1` and `p/2`; it does not permit conflicting `pred p(...)` declarations.
 
 ### Domain Declarations
 
@@ -566,6 +578,12 @@ Constraints assert that a condition must have **no solutions**. If any tuples sa
 ```
 
 Constraints are checked after all derivations complete. If violated, XLOG reports an error.
+
+Epistemic constraints have a different effect: they prune candidate world views,
+so removing every candidate can produce an empty successful answer. Supported
+diagonal, shared-variable, and mixed constraints are normalized to ordinary key
+helpers before modal checking. See [Ruling out worlds](/epistemic/overview#ruling-out-worlds)
+for examples and the remaining bounds.
 
 ---
 
@@ -719,7 +737,8 @@ doubled(X, Y) :- input(X, V), Y is V * cast(2, u32).
 
 | Condition | Integer Behavior | Float Behavior |
 |-----------|------------------|----------------|
-| Division by zero | Returns `INT64_MAX` | Returns `NaN` or `Inf` |
+| Division by zero | Maximum value of the operand type (`i32`, `i64`, `u32`, or `u64`) | Returns `NaN` or `Inf` |
+| Remainder by zero | Returns `0` | Source `%` rejects float operands |
 | Overflow | Wraps (standard semantics) | IEEE 754 behavior |
 
 To avoid division by zero errors, filter explicitly:
@@ -905,12 +924,12 @@ pred obs(u32, f64).         // group_id, log_value
 pred score(u32, f64).
 
 obs(1, 0.0). obs(1, 1.0). obs(1, 2.0).
-obs(2, 0.0). obs(2, 0.0).
+obs(2, 0.0). obs(2, 1.0).
 
 score(X, logsumexp(Y)) :- obs(X, Y).
 
 // score(1) = log(exp(0) + exp(1) + exp(2)) = log(1 + e + e^2) ≈ 2.407
-// score(2) = log(exp(0) + exp(0)) = log(2) ≈ 0.693
+// score(2) = log(exp(0) + exp(1)) = log(1 + e) ≈ 1.313
 ```
 
 ---
@@ -1037,7 +1056,8 @@ fanout(Ys) :- findall(Y, edge(1, Y), Ys).
 pred positive(u32).
 pred all_positive(list<u32>).
 
-all_positive(1) :- maplist(positive, [1, 2, 3]).
+positive(1). positive(2). positive(3).
+all_positive([1, 2, 3]) :- maplist(positive, [1, 2, 3]).
 ```
 
 ### Unsupported Forms
@@ -1056,7 +1076,7 @@ all_positive(1) :- maplist(positive, [1, 2, 3]).
 
 Magic-set rewriting specializes bound deterministic recursive queries by adding
 derived magic predicates and adorned rules before optimization. The accepted
-accepted magic-set subset is a source-level rewrite over positive recursive rules
+magic-set subset is a source-level rewrite over positive recursive rules
 that can be proven query-equivalent under the supported left-to-right SIPS
 (sideways-information-passing strategy — the order in which bound argument
 values flow through a rule).
@@ -1463,9 +1483,9 @@ Annotated disjunctions represent categorical distributions (mutually exclusive o
 // Coin flip: heads (60%) or tails (40%)
 0.6::coin(heads); 0.4::coin(tails).
 
-// Die roll
-0.167::die(1); 0.167::die(2); 0.167::die(3);
-0.167::die(4); 0.167::die(5); 0.166::die(6).
+// Six-outcome distribution (rounded probabilities sum to 1)
+0.166::die(1); 0.166::die(2); 0.166::die(3);
+0.166::die(4); 0.166::die(5); 0.170::die(6).
 ```
 
 If probabilities sum to less than 1, the remaining mass represents an implicit "none" outcome.
@@ -1535,8 +1555,8 @@ xlog prob weather.xlog --prob-engine exact_ddnnf
 Output:
 
 ```
-query(rain):      P = 0.875
-query(sprinkler): P = 0.25
+query(rain):      P ≈ 0.9210526316
+query(sprinkler): P ≈ 0.2631578947
 ```
 
 ### Inference Engines
@@ -1559,25 +1579,27 @@ XLOG supports two inference engines:
 - **Gradients**: Correct gradient flow through negated literals
 
 **Probabilistic aggregates in the language-completeness contract:** finite `count`, `sum`, `min`, `max`,
-and `logsumexp` aggregate programs are supported for exact and MC inference in
+and `logsumexp` aggregate programs are supported by exact inference in
 the finite probabilistic-aggregate subset. Exact mode enumerates finite aggregate
 outcomes into provenance/PIR formulas, so `query` and `evidence` may reference
 aggregate output tuples. Exact enumeration is capped per group by the operators
 in the head: a head whose aggregate expressions are all `count` accepts up to 64
 uncertain contributing rows per group, while `sum`, `min`, `max`, and `logsumexp`
 accept up to 16. Cap excess fails with a typed
-`prob_aggregate error` that recommends MC or reducing the finite domain.
+`prob_aggregate error` that recommends MC or reducing the finite domain. The MC
+recommendation requires explicit CPU-oracle opt-in for an aggregate program;
+reducing the domain preserves the production exact route.
 
-**Monte Carlo** supports probabilistic rules and non-monotone recursion.
-The production MC path is the GPU-resident megakernel engine, which rejects
+**Production Monte Carlo** supports bounded positive probabilistic rules,
+including positive recursion and grounded annotated disjunctions.
+Its GPU-resident megakernel rejects
 negation, aggregates, and other unbounded constructs with a typed
 `ResidentRejection`. Programs in that fragment (including non-monotone
 recursion and language-completeness probabilistic aggregates under MC) require an explicit
 opt-in to the **labeled CPU oracle** — `--allow-cpu-oracle` on the CLI,
 `allow_cpu_oracle=True` in Python, `McEvalConfig::allow_cpu_oracle_fallback`
 in Rust — and their results carry `mc_engine = "cpu-oracle"`. Without the
-opt-in, such programs fail closed with the typed rejection (corrected
-2026-06-10; previously this fallback was silent and unlabeled):
+opt-in, such programs fail with the typed rejection:
 
 ```bash
 xlog prob program.xlog --prob-engine mc --samples 10000 --seed 42
@@ -1600,8 +1622,9 @@ query(out_degree(1, 2)).
 
 Exact mode compiles each supported finite aggregate outcome into a Boolean PIR
 formula over contributing row-presence formulas. Empty probabilistic groups do
-not materialize `count(..., 0)` tuples. MC mode samples worlds on the GPU and
-executes the shared deterministic aggregate path for each accepted sample batch.
+not materialize `count(..., 0)` tuples. Production MC rejects these aggregate
+heads. The explicitly selected CPU oracle samples worlds and invokes the shared
+deterministic aggregate evaluator for reference results tagged `cpu-oracle`.
 
 ### Aggregate Lifting
 
@@ -1635,13 +1658,17 @@ The Monte Carlo engine supports two sampling methods:
 | `EvidenceClamping` | Force evidence variables directly in the CUDA sampler when the evidence is forceable at the probabilistic-fact / positive-AD level. |
 
 Evidence clamping avoids wasted samples when rejection acceptance rates are
-low. If evidence is derived, deterministic, or otherwise not directly
-forceable, XLOG falls back to rejection sampling.
+low. When no method is requested, XLOG chooses clamping if all evidence is
+forceable, and rejection otherwise. An explicit `EvidenceClamping` request with
+derived, deterministic, or otherwise non-forceable evidence raises an `Execution`
+error; it does not fall back. An explicit `Rejection` request stays rejection.
 
 ### Negation in Probabilistic Programs
 
 Probabilistic exact inference supports both stratified probabilistic negation
-and accepted non-monotone WFS profiles:
+and accepted non-monotone WFS profiles. The provenance frontend evaluates these
+profiles on the host before the normal GPU circuit-compilation route; this is not
+the epistemic engine's GPU WFS evaluator:
 
 ```xlog
 // Stratified negation (layered evaluation)
@@ -1697,7 +1724,6 @@ For approximate inference with confidence intervals:
 
 0.5::flip.
 p :- flip.
-q :- not p.
 
 query(p).  // P(p) ≈ 0.5 ± CI
 ```
@@ -2087,7 +2113,7 @@ is dropped at merge time and reported with `warning[W0510]`. See
 | `prob_engine` | `exact_ddnnf`, `mc` | Select probabilistic inference engine |
 | `prob_cache` | `on`, `off` | Enable/disable probability caching |
 | `epistemic_mode` | `faeel`, `g91` | Select FAEEL default or Gelfond 1991 compatibility epistemic semantics |
-| `max_recursion_depth` | integer | Maximum configured recursion depth; also bounds Gelfond-1991 compatibility refinements and GPU WFS alternating-fixpoint iterations |
+| `max_recursion_depth` | integer | User-defined function expansion depth; also bounds Gelfond-1991 compatibility refinements and GPU WFS alternating-fixpoint iterations. Ordinary recursive rounds use `RuntimeConfig.max_iterations` instead. |
 | `magic_sets` | `auto`, `on`, `off` | Control bound-recursive magic-set rewriting |
 | `prob_samples` | integer | Monte Carlo sample count |
 | `prob_seed` | integer | Monte Carlo random seed |
@@ -2212,8 +2238,9 @@ This means:
 - All values are comparable (no undefined ordering)
 - `min`, `max`, sorting, difference, and deduplication use the same order
 
-Arithmetic-generated NaNs are normalized to one positive quiet-NaN bit pattern,
-so the result does not depend on a host or CUDA payload choice.
+Division and `pow` normalize NaN results to one positive quiet-NaN bit pattern.
+Addition, subtraction, and multiplication do not canonicalize NaNs. Source `%`
+accepts integer operands only.
 
 ### Preventing Invalid Arithmetic
 
@@ -2221,7 +2248,7 @@ A NaN is equal to the same NaN bit pattern, so `V != V` is not a NaN test in
 XLOG. Validate the producing operation instead:
 
 ```xlog
-valid(Id, V) :- input(Id, Num, Denom), Denom != 0.0, V is Num / Denom.
+valid(Id, V) :- input(Id, Num, Denom), Denom != 0.0, Denom != -0.0, V is Num / Denom.
 ```
 
 When the accepted data domain has finite bounds, total-order comparisons can
@@ -2247,8 +2274,9 @@ raw(2, 0.0, 0.0).
 raw(3, 28.3, 1.0).
 
 reading(Id, V) :- raw(Id, Num, Denom), V is Num / Denom.
-valid(Id, V) :- raw(Id, Num, Denom), Denom != 0.0, V is Num / Denom.
+valid(Id, V) :- raw(Id, Num, Denom), Denom != 0.0, Denom != -0.0, V is Num / Denom.
 invalid_divisor(Id) :- raw(Id, _, Denom), Denom = 0.0.
+invalid_divisor(Id) :- raw(Id, _, Denom), Denom = -0.0.
 ```
 
 ---

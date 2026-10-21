@@ -1,6 +1,6 @@
 ---
 title: "Rule learning (differentiable ILP)"
-description: "Train neural predicates and learn Datalog rules end-to-end — one differentiable path from PyTorch tensors through the GPU circuit to a promoted symbolic clause."
+description: "Train neural predicates, learn relational rule masks, and check candidate clauses before promotion."
 ---
 
 You can teach an xlog program two ways at once: write the rules you already know,
@@ -8,7 +8,7 @@ and let the engine discover the rules you don't. A loss you compute on a symboli
 query flows all the way back into your PyTorch network's weights, so logic and
 learning train together instead of in separate stages.
 
-Two features make this work, and they share one machinery:
+Two related features are available:
 
 - A **neural predicate** turns a PyTorch network into a logical relation. Its facts
   carry probabilities that the network produces.
@@ -16,8 +16,11 @@ Two features make this work, and they share one machinery:
   examples) searches candidate Datalog clauses with gradient descent and promotes
   the winner into your program.
 
-Both compile down to the same circuit and use the same gradient bridge. That is why
-a single loss can reach from a symbolic answer back to network weights.
+Neural queries use the probabilistic circuit and its gradient bridge. The dILP
+trainer instead learns masks over relational candidate rules using fact membership
+and tagged credit — information about which candidate derived each fact. These
+are separate training paths. The multi-rule neural mixture described below has a
+third implementation in PyTorch.
 
 <Frame caption="A loss on a symbolic query backpropagates through the cached circuit into the network's weights; only weights change between iterations.">
   <img className="block dark:hidden" src="/assets/diagrams/neural-symbolic-loop-light.svg" alt="Neural-symbolic training loop: a PyTorch network produces predicate probabilities, the cached XGCF circuit evaluates the query probability, a loss is computed against the target, and gradients flow back through the circuit to the network weights." />
@@ -148,11 +151,13 @@ then decides which candidates are active.
 Each candidate gets a score (a logit). A **Gumbel-Softmax** relaxation — a
 differentiable way to make a soft, random pick among discrete options, controlled by
 a temperature `τ` — turns those scores into a soft selection over candidates. The
-circuit evaluates under that soft mask, a loss compares the derived facts against
-your examples, and the gradient updates the scores.
+relational candidate plan evaluates under that soft mask, a native loss and
+tagged candidate credit compare its derivations against your examples, and
+the gradient updates the scores. This is not the certified probabilistic-circuit path.
 
-As training proceeds, the temperature `τ` anneals toward a floor on a cosine
-schedule. Lower temperature sharpens the soft mask toward a single hard choice
+In default strict training, temperature `τ` follows a linear schedule over the
+configured attempt budget toward its floor. The host-reporting mode instead uses
+the adaptive cosine controller. Lower temperature sharpens the soft mask toward a single hard choice
 (one-hot). At convergence the engine takes `argmax` over the scores — it keeps the
 single highest-scoring candidate. That winner is decoded back into a concrete Datalog
 clause: a discrete rule string, not a soft mixture.
@@ -177,24 +182,36 @@ Two entry points drive learning, both in `pyxlog.ilp`.
 `train_only(...)` runs the search. It enumerates the legal candidates and launches
 several independent restarts from fresh scores. Each restart iterates the step loop:
 apply the mask, evaluate on the device, compute the loss, back-propagate, step the
-optimizer, anneal `τ`, and stop early once the `argmax` winner is stable and the loss
-is below threshold. It returns the discovered rule and its training telemetry.
+optimizer, and anneal `τ`. Strict attempts run their configured step budget; the
+host-reporting mode can stop early on stable winners and low loss.
+With the default `TrainConfig(strict_gpu_native=True)`, it
+returns `StrictTrainResult`; host summaries require an explicit
+`result.export_compat_result()`. Strict mode rejects dense masks, host negative
+mining, per-step telemetry, and recursive candidates.
 
-`train_and_promote(...)` wraps `train_only` with a set of **promotion gates** —
-checks a discovered rule must pass before xlog commits it into your program. A rule
-is written into your committed source only if it clears every gate:
+`train_and_promote(...)` runs training and checks a trial program before returning
+replacement source in `PromotionResult.committed_source`. It does not write your
+files. Pass `TrainConfig(strict_gpu_native=False)` for this host-reporting path;
+the entry point rejects the default strict mode.
+
+Nonconvergence stops before trial compilation. Once the trial compiles and runs,
+these six gates execute:
 
 | Gate | What it checks |
 |---|---|
-| Convergence | Training actually reached a stable `argmax` winner. |
+| Training positives | The rule derives every supplied training positive. |
+| Training negatives | The rule derives none of the supplied training negatives. |
 | Novel-rate | The rule does not over-derive facts outside the examples. |
-| Protected-relation | It produces no unwanted side effects on protected relations. |
-| Holdout F1 | F1 on held-out examples meets the threshold (leave-one-out for small sets, k-fold for larger). |
-| Ambiguity | No alternative candidate is a near-equal winner. |
-| Typed-schema | Relation type metadata is present (or a reviewed waiver is supplied). |
+| Protected-relation | No previously derived fact is lost from a protected relation. |
+| Holdout F1 | The trainer's leave-one-out or k-fold score meets the threshold. |
+| Typed-schema | When enforcement is enabled, head and body relations have type metadata. An untyped waiver still requires manual review. |
 
-A rule that fails any gate is reported along with the gate it failed. It is never
-silently promoted.
+An optional ambiguity scan reports alternative explanations but does not block
+promotion. Explicit `holdout_positives` or `holdout_negatives` are also required:
+with neither supplied, the result is `MANUAL_REVIEW_REQUIRED` after those six
+gates. Each nonempty supplied holdout set adds its own gate (sufficient positive
+coverage, or zero negative derivations). All executed gates must pass for
+`PROMOTED` and nonempty `committed_source`.
 
 ## Reliability gates
 
@@ -210,10 +227,12 @@ subsystem matures. A gate like `5/5` means "five consecutive runs must all succe
 
 ## A runnable neural-predicate example
 
-This is a self-contained DeepProbLog-style program built on a single `nn/4`
+Save the first block as `coins.xlog`. This example uses a single `nn/4`
 declaration. A small classifier decides
 whether each coin image shows heads or tails, symbolic rules define winning and
-losing, and the network is trained purely from the derived symbolic queries. The
+losing. Training supervises the `coin` classifier directly; the final `win` and
+`lose` queries demonstrate inference over its outputs. It does not demonstrate
+learning the classifier from win/loss supervision alone. The
 synthetic tensors let it run without a dataset download.
 
 ```xlog
@@ -230,7 +249,7 @@ import torch
 import torch.nn as nn
 import pyxlog
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda"
 
 # 2-class classifier over 3x64x64 coin images -> {heads, tails}
 class CoinNet(nn.Module):
@@ -240,7 +259,7 @@ class CoinNet(nn.Module):
             nn.Flatten(), nn.Linear(3 * 64 * 64, 64), nn.ReLU(), nn.Linear(64, 2)
         )
     def forward(self, x):
-        return torch.log_softmax(self.net(x), dim=-1)  # log-probs over [heads, tails]
+        return torch.softmax(self.net(x), dim=-1)  # probabilities over [heads, tails]
 
 # Compile the program and bind the network to the nn(coin_net, ...) declaration.
 program = pyxlog.Program.compile(open("coins.xlog").read())
@@ -310,9 +329,10 @@ plateau, so Adam is the practical default.
   becomes the noisy-OR over graded evidence masses. Map head bindings to world steps
   and masses to a fact's per-step confidence, and the guards train against an
   evolving trajectory. Omit the argument and the plain binary behavior is unchanged.
-- **GPU-resident zero-host training step** (v0.10.0). `forward_backward_grouped(queries,
-  expected)` performs one host synchronization per step instead of a per-query
-  round-trip, keeping the training loop resident on the device.
+- **Grouped circuit training** (v0.10.0). `forward_backward_grouped(queries,
+  expected)` accumulates loss on the device and returns one host scalar per call,
+  replacing per-query loss reads. That return is a host synchronization; this API
+  alone does not establish ZERO TRANSFER for a complete training loop.
 - **Row-addressed join domains** (v0.11.0). `train_neurosymbolic_program(...,
   domain_ids={net: [...]})` states which domain constant occupies each row of
   `domain_inputs[net]`. The ids may be given in any order but must be distinct, and

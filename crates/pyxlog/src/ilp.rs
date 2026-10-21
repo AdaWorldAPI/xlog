@@ -1940,7 +1940,7 @@ use train_only(..., strict_gpu_native=True) or export an explicit compatibility 
     /// GPU-side batch fact membership check.
     /// Uploads `facts` (list of value-lists) to a temporary CudaBuffer,
     /// semi-joins against the named relation, returns per-fact boolean mask.
-    /// Zero download_column_* calls — only downloads the u8 mask.
+    /// Returns the CUDA u8 mask through DLPack without downloading it.
     pub fn batch_fact_membership_device(
         &self,
         py: Python<'_>,
