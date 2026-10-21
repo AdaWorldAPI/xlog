@@ -8,12 +8,13 @@ Public support currently covers:
 - NVIDIA GPUs
 - CUDA Toolkit 13.x
 
-GitHub-hosted CI is non-GPU only. A targeted GitHub Actions workflow can run
-native Python and CUDA checks on a persistent self-hosted runner after trusted
-changes reach `main`, or for a maintainer-dispatched full commit SHA reviewed in
-advance. It never runs pull-request head code automatically and runs only when a
-matching CUDA runner is available. Complete release validation remains a
-maintainer-run gate on a real CUDA machine. Reports that depend on unsupported
+GitHub-hosted CI checks source hygiene and compiles only the CUDA-independent
+production libraries. Actions do not build GPU artifacts or run native Python,
+CUDA, integration, or certification suites, including on manual dispatch or
+self-hosted runners. GPU builds and complete runtime/release validation are
+separate manual operations under the
+[engineering policy](ENGINEERING.md#source-ci-and-manual-validation), with their
+own resource and execution authority. Reports that depend on unsupported
 platforms may still be reviewed, but fixes and response times are best-effort.
 
 ## Reporting a Vulnerability

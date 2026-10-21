@@ -58,11 +58,13 @@ buffer:
 | Project | Select, reorder, or compute output columns. |
 | Join | Dispatch hash join, nested-loop join, WCOJ (worst-case-optimal join — computes multiway patterns directly instead of building large intermediates), Free Join (a multiway join algorithm), or retain the ordinary route depending on shape and runtime gates. |
 | Groupby | Run recorded aggregate kernels for supported key/value widths. |
-| Rule union | Merge every rule that writes the same head through one chunked multiway concat-and-dedup fold, into a single deduplicated accumulator. Each chunk's byte budget is `XLOG_UNION_CHUNK_BYTES` (default 1 GiB), so peak device memory tracks one chunk plus the accumulator rather than the sum of all contributions. A pass declines fail-closed above 4294967295 rows, or when an output or per-column byte count would overflow a `u32`. |
+| Rule union | Merge same-head contributions through a chunked multiway concat-and-dedup fold. `XLOG_UNION_CHUNK_BYTES` (default 1 GiB) guides input grouping, not total physical memory: inputs remain live, the accumulator and sort workspace add storage, and a pass always takes at least one input even if it exceeds that target. A pass rejects an output or per-column extent that exceeds its `u32` representation. |
 | Recursive SCC | Execute semi-naive seed and delta variants until convergence or a configured iteration limit. |
 
-"Semi-naive" here means each recursive round processes only the rows newly
-derived in the previous round, not the whole relation again.
+"Semi-naive" here means each recursive rule variant reads the previous round's
+new rows through one recursive scan; other scans can still read full relations.
+It avoids repeating old-only combinations, but neither delta size nor work is
+guaranteed to decrease from one round to the next.
 
 The correctness rule is *row-set parity*: an optimized path must return exactly
 the same rows as the ordinary route. An optimized path is allowed to decline and
@@ -81,7 +83,8 @@ which rows survive, then compacts them:
 
 The runtime supports scalar integer, floating, boolean, and symbol comparisons,
 matching the types represented in RIR and the CUDA provider kernels. Floating-point
-equality follows IEEE 754 (`NaN != NaN`). Ordered comparisons use XLOG's
+equality compares the complete floating-point bit pattern: signed zeros are
+distinct, and identical NaN encodings compare equal. Ordered comparisons use XLOG's
 bit-defined total order: negative NaNs, negative infinity, negative finite values,
 `-0.0`, `+0.0`, positive finite values, positive infinity, then positive NaNs.
 NaN sign and payload make the order deterministic across host and CUDA paths.

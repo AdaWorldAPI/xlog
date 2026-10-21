@@ -25,7 +25,7 @@ words "GPU-resident."
 <Note>
 The certified resident conditional-graph core is the strongest deterministic
 contract. It permits no tracked data transfer, provider D2H call, or untracked
-metadata read while the graph runs. After one terminal synchronization, it copies one
+metadata read while the graph runs. After one terminal synchronization, it copies
 one final pinned receipt containing only status, counts, trace counters, and schema
 selections. Relation columns remain device-backed. Other GPU routes are
 host-orchestrated and can have different, separately documented observation
@@ -82,10 +82,14 @@ layer, current reservation, requested bytes, exact required bytes, configured bu
 and the manager's prior peak. Required bytes are calculated without saturation; if the
 exact value exceeds `u64`, `estimated_bytes` is `u64::MAX` and the context carries an
 explicit overflow marker. This makes an out-of-memory condition definite and
-diagnosable rather than a slow degradation. Count and representational limits use
-`CapacityExceeded` with a unit such as rows, slots, or candidates. Reaching an
-iteration bound without convergence uses `ConvergenceFailure`; neither condition is
-reported as byte-memory exhaustion.
+diagnosable rather than a slow degradation. Resource APIs can report count and
+representational limits as `CapacityExceeded`, with a unit such as rows, slots,
+or candidates; this is not a uniform error mapping across every backend.
+Resident Monte Carlo reports nonconvergence as `ConvergenceFailure`, structural
+rejections as `Compilation`, and an oversized sample count as `Execution`.
+The ordinary host-orchestrated recursive executor also reports an `Execution`
+error naming its iteration limit. These are distinct from byte-memory exhaustion;
+see the [error reference](/reference/errors) for route-specific diagnostics.
 
 Concurrent requests are reserved against the local budget before allocator admission,
 so in-flight requests still prevent oversubscription. The manager publishes current and

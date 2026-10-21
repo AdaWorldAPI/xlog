@@ -64,8 +64,9 @@ declines to the ordinary path.
 
 ## Recursive Delta Factorization
 
-Recursive rules are evaluated by a *semi-naive* fixpoint loop: each round joins
-only the newly derived tuples (the *delta*) rather than the whole relation.
+Recursive rules are evaluated by a *semi-naive* fixpoint loop: each rule variant
+reads one recursive occurrence from the newly derived tuples (the *delta*), while
+other occurrences can read full relations. Delta size need not shrink each round.
 Factorized recursive deltas target rules such as transitive closure — reachability
 over all chains of edges — where a delta join can produce many *witnesses* (many
 distinct derivations) for the same novel tuple.

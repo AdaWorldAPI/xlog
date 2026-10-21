@@ -9,9 +9,10 @@ purpose. It documents the runtime executor, not a user workflow.
 </Note>
 
 Adaptive indexing lets XLOG skip rebuilding the same join index over and over.
-When a query joins two relations, the smaller side (the *build side*) is turned
-into a hash table so the larger side can probe it. Adaptive indexing keeps that
-hash table around and reuses it when an identical join recurs.
+When a query joins two relations, the runtime can cache a hash table over its
+right-hand base-relation input (the *build side*). It reuses that table when the
+same relation generation and key recur. This cache does not independently swap
+the inputs to make the smaller relation the build side.
 
 It is deliberately narrow. It is a persistent build-side hash-index cache inside
 the runtime executor, not a broad physical-design subsystem. It reuses an
@@ -63,10 +64,12 @@ evicted until the new one fits. If it still cannot fit, the build is skipped.
 The runtime configuration can turn persistent hash indexes on or off explicitly.
 When that setting is left unset, environment defaults decide the behavior.
 
-There is also a background build mode. Instead of blocking the current join to
-build an index, it can request the build through the recorded provider path — the
-runtime code path that produced the relation's data. The finished index is then
-made available to later evaluations.
+There is also a background build mode: the current evaluation builds and caches
+the index but defers its indexed reuse to a later evaluation. The current join
+still takes the ordinary path. When recorded hash joins and a recorded operation
+stream are available, the provider enqueues the build on that stream; otherwise
+it uses its ordinary synchronous builder. The mode does not guarantee a separate
+host thread or a nonblocking build.
 
 ## Telemetry
 

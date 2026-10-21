@@ -839,16 +839,14 @@ impl super::CudaKernelProvider {
     /// to O(R · rows · log), which is what keeps many-rule predicate heads
     /// (one contribution per rule) from going quadratic.
     ///
-    /// Inputs are processed in byte-bounded chunks
-    /// ([`UNION_MANY_CHUNK_BYTES`], plus the deduplicated accumulator per
-    /// chunk): peak device memory is bounded by the chunk budget rather than
-    /// the sum of all raw contributions, and every per-chunk concat stays
-    /// far inside the `u32` byte range the copy/permutation kernels index
-    /// with. A batch that fits the budget — the common case — is one chunk
-    /// and behaves exactly like a single concat + sort + dedup. In the
-    /// degenerate regime where the deduplicated accumulator alone exceeds
-    /// the budget, every pass takes one input and the fold degrades to the
-    /// pairwise re-sort cost profile — the memory bound holds throughout.
+    /// Input grouping targets [`UNION_MANY_CHUNK_BYTES`], including the
+    /// deduplicated accumulator in each pass. This is not a physical-memory
+    /// ceiling: the borrowed inputs remain live, and concatenation, sorting,
+    /// output and accumulator storage add to their footprint. Every pass
+    /// takes at least one input, even if that input or the accumulator alone
+    /// exceeds the target. A batch that fits is one concat + sort + dedup;
+    /// an oversized accumulator can degrade to pairwise re-sorting. The
+    /// chunk implementation separately checks its `u32` row and byte extents.
     ///
     /// # Arguments
     /// * `inputs` - Buffers to union; at least one is required
@@ -940,10 +938,9 @@ impl super::CudaKernelProvider {
             .max(1);
         let budget_rows = (Self::union_many_chunk_bytes() / row_bytes).max(1);
 
-        // Fold byte-bounded chunks: each pass unions the accumulated result
-        // with the next slice of inputs. The accumulator is deduplicated
-        // between passes, so peak memory tracks |dedup| + chunk budget, not
-        // the sum of raw contributions.
+        // Group inputs toward the byte target, including the accumulator.
+        // This does not bound the live inputs or sort/output workspace, and
+        // the mandatory first input below may exceed the target on its own.
         let mut acc: Option<CudaBuffer> = None;
         let mut idx = 0usize;
         while idx < non_empty.len() {
