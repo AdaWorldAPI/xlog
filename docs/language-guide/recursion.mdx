@@ -70,21 +70,19 @@ hash joins you already use for non-recursive rules, run to a fixpoint.
 ## Termination
 
 Evaluation of a recursive component **halts when a round derives no new tuples** — the
-delta is empty, the relation has stopped growing, and the fixpoint is reached. Because
-every derived tuple is built from a finite domain of values already present in the
-program, the relation cannot grow forever, and evaluation always terminates on
-well-formed input.
+delta is empty, the relation has stopped growing, and the fixpoint is reached.
+Positive rules that only combine an existing finite set of values must eventually
+settle. Arithmetic can generate additional values, so a well-typed recursive program
+is not by itself a promise of practical convergence.
 
-As a safety bound against a runaway or accidentally explosive program, XLOG caps the
-number of recursive rounds with a pragma:
+The ordinary executor limits rounds through Rust's `RuntimeConfig.max_iterations`,
+whose default is `1000000`. Exhausting that bound produces an `Execution` error,
+rather than returning the unfinished relation as an answer. The CLI has no flag for
+this setting.
 
-```xlog
-#pragma max_recursion_depth = 5000.
-```
-
-The default is `1000`. If a recursive component has not reached its fixpoint within this
-many rounds, evaluation stops rather than looping indefinitely. Raise it for genuinely
-deep recursion; the bound exists to fail loudly, not to shape your answer.
+`#pragma max_recursion_depth` is a different limit. It bounds user-defined function
+expansion and the epistemic Gelfond-1991 refinement and well-founded iteration paths;
+it does not configure the ordinary executor's recursive rounds.
 
 ## Recursion must be stratified
 

@@ -61,9 +61,8 @@ holdsAt_meeting(PP,T) :- both_active(PP,T),   close*(PP,T).
 | relational (precomputed close, threshold 25) | 0.9215 | 0.6804 | 0.7695 | 0.7905 |
 | neural (learned close_nn, symmetrized) | 0.9215 | **0.7918** | 0.7695 | **0.8276** |
 
-The learned detector matches ground-truth geometry on folds 1/3 and beats
-the hard threshold on fold 2 (+0.11), where the soft learned boundary
-survives the train/test geometry shift better. Files:
+The learned detector matches the geometric baseline's task F1 on folds
+1/3 and exceeds it on fold 2 (+0.11). Files:
 `results/caviar-s6-*.json`.
 
 ## B. Continuous OLED split, direct protocol
@@ -395,7 +394,7 @@ this event count. File: `results/caviar-e12-neural-cv10.json`.
 ## F. Data integrity audit of the distributed corpus
 
 A frame-level audit cross-matched every meeting transition event in the
-OLED dump (the combined train+test corpus sections A–E.2 run on) against
+OLED dump (the combined train+test corpus used in sections E–E.2) against
 the original 30 CAVIAR ground-truth XML files, independently re-deriving
 transitions from each real video's own frame sequence — never bridging
 across a splice or a train/test duplicate — and matching by exact local
@@ -464,8 +463,8 @@ folds drawn over the 15 SCENE FAMILIES (every recording of one staged
 scene shares a fold, closing the same-scene leakage section F
 describes). All gates are otherwise exactly as pre-registered in section
 E (per-fold permutation-null fit thresholds, F1 holdout, seed 7). The
-relational search path is fully deterministic, so CPU and GPU execution
-of this protocol are byte-identical; the run is CPU-only. A full
+relational search path is fully deterministic and CPU-only. This does
+not establish equivalence to the separate neural/GPU path. A full
 independent replay reproduced every value exactly for the two artifacts
 it covered — `caviar-f-xml-meeting-cv10.json` and the threshold-25
 moving measurement (now preserved as
@@ -503,8 +502,8 @@ history, not the canonical row.
 | moving, direct reference (close_34) | 0.5334 | 0.3817 | **0.4450** | 1197/1047/1939 |
 | moving, EC + inertia (close_34) | 0.000 | 0.000 | 0.000 | 0/0/3136 |
 
-**Why the EC search abstains everywhere: the holdout collapses, not the
-gate.** The like-for-like comparison is against section E.1 (the same
+**Why most meeting initiation folds return no clause.** The like-for-like
+comparison is against section E.1 (the same
 enlarged vocabulary this section runs — the candidate pool sets the
 permutation-null distribution, so gates are only comparable at equal
 pools): the dump protocol's per-fold meeting initiation gates there are
@@ -514,19 +513,13 @@ the statistical bar. (An earlier revision of this paragraph quoted the
 dump range as 0.035–0.046 and concluded the gate "rises on every fold,
 up to 100%"; that range is section E's, measured under the SMALLER
 state-only vocabulary, so the rise it showed was a vocabulary-pool
-effect misattributed to corpus deduplication.) What actually changes on
-the clean corpus is the score being gated: under scene-family folds the
-candidate's own holdout F1 collapses, because the two-regime transfer
-failure the next paragraph documents — `both_inactive & close` holds
-only on wk scenes, which sit in one fold — leaves every training side
-without cross-regime support, and a clause that cannot cover held-out
-positives scores near zero against even an unchanged gate. The
-abstention is still the harness's own principled call at 11/5 observed
-initiations, not a search failure — but its mechanism is a collapsed
-holdout score under leak-free folds, not a raised gate: on the dump
-corpus the same 2-literal candidate clears essentially the SAME gates
-on 8 of 10 folds because same-scene transfer and duplication hold its
-holdout F1 up.
+effect misattributed to corpus deduplication.) The actual clean-meeting
+stop records distinguish the mechanisms: seven folds return no initiation
+clause for `insufficient new coverage`, and two for `select_once abstained`.
+The remaining fold commits `both_active & close` before stopping on
+residual coverage. Similar null thresholds therefore do not prove that
+all nine empty initiation theories failed the fit gate. The held-out
+transfer failure of the selected clauses is measured separately below.
 
 **The meeting zero is a property of the data under the stricter
 protocol, not a harness failure.** The direct-protocol reference still
@@ -582,7 +575,7 @@ selection tie band (margin 0.0093 against the 0.01 tie floor) and the
 search honestly abstains where the threshold-25 run had committed the
 clause. The canonical threshold does not "fix" moving — it exposes that
 the threshold-25 micro figure leaned on a fold whose selection was
-tie-fragile. The EC theory is empty everywhere for a counted reason:
+tie-fragile. The EC initiation theory is empty everywhere for a counted reason:
 the whole corpus contains only 5 observable moving initiations (13 of
 its 18 moving intervals begin before observation starts), so initiation
 search has nothing to clear its null gate with. The termination search
@@ -606,8 +599,9 @@ clause application and per-segment census; tool:
 | OLED (published, tuned hyperparameters) | 0.792 | 0.732 |
 | WOLED-ASP (published, ibid.) | 0.887 | 0.821 |
 | Hand-crafted rules (published, ibid.) | 0.735 | 0.637 |
-| This work, distributed-corpus protocol (duplication caveat, sections E.1/F; vocabulary a second iteration informed by step-1 error analysis on the same folds, section E.1) | 0.7782 | not run |
-| This work, clean protocol (deduplicated, leakage-free — section G) | 0.0 (abstains) | 0.0 (abstains) |
+| This work, distributed corpus, pre-registered vocabulary (sections E/F) | 0.7329 | not run |
+| This work, distributed corpus, adaptive second vocabulary (sections E.1/F) | 0.7782 | not run |
+| This work, clean protocol (EC + inertia, scene-family folds — section G) | 0.0 (initiation on 1/10 folds) | 0.0 (no initiation clauses) |
 
 The moving column is from the same papers and tables cited for meeting in
 section C (OLED Table 1(b); WOLED Table 2), not independently re-verified
@@ -619,10 +613,11 @@ parity range on the distributed-corpus protocol (0.7782, inside the
 section F and with its vocabulary honestly labeled a second iteration
 informed by step-1 error analysis on the same folds (section E.1);
 a reproducible, independently-verified integrity audit of the
-distributed benchmark corpus itself (section F); and principled
-abstention — the harness's own call, not a forced or tuned answer — at
-the clean protocol's actual event count (11 meeting / 5 moving
-initiations, section G).
+distributed benchmark corpus itself (section F); and a measured failure
+of meeting transfer under scene-family folds. The direct search commits
+on 9/10 folds and EC initiation on 1/10, with no held-out true positives
+on either route. Moving initiation is empty on all folds, while its
+termination search commits on 7/10 (section G).
 
 **What may NOT be claimed:** any ranking against OLED, WOLED-ASP, or
 hand-crafted rules on this benchmark. The clean protocol has too few
@@ -793,5 +788,5 @@ python examples/caviar_woled/xml_meeting_census.py \
   --folds 10 --seed 7 --out RESULT.json
 ```
 
-GPU runs need CUDA (see each script's docstring); the 3-literal EC search
-and both CV harness paths run on CPU.
+GPU runs need CUDA (see each script's docstring). The 3-literal relational
+EC search and relational CV run on CPU; neural CV requires CUDA.

@@ -577,7 +577,7 @@ fn task_candidate_better(
         || (facts[candidate].g == facts[incumbent].g && facts[candidate].c < facts[incumbent].c)
 }
 
-/// Three ordered query selections for the bounded transition ABI. Predicate,
+/// The complete nonempty ordered query selection for a retained task. Predicate,
 /// arguments, observer program, eligibility, and scoring are application inputs.
 /// This specification carries no authority; only the application controller may
 /// attach an authorized task to its retained semantic session.
@@ -2374,7 +2374,7 @@ fn canonical_text_null(receipt: &SemanticTransitionReceipt) -> bool {
         && receipt.mass == 1 << 63
 }
 
-/// Device-computed facts, using the three actual canonical truth-query results.
+/// Device-computed facts for the complete original task query roster.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SemanticTaskFacts {
     /// Ordered actual Truth4 codes for the complete task query roster. A refused

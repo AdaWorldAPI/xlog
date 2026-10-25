@@ -13,7 +13,7 @@ state cannot be mutated through an external tensor.
 Always `import pyxlog`, never `pyxlog._native`. The package has two layers: a native
 PyO3 extension (`pyxlog._native`) and a pure-Python wrapper that re-exports it and adds
 convenience methods. Some documented methods — including `evaluate_async`,
-`evaluate_stream`, the relation callbacks, temporal provenance, and the `nn/4` lineage
+`evaluate_stream`, `progress_stats`, temporal provenance, and the `nn/4` lineage
 helpers — live only on the wrapped classes. Importing from `pyxlog._native` directly
 will make those methods appear missing.
 </Note>
@@ -1668,7 +1668,7 @@ retention and revocation checks remain independent of scientific acceptance.
 The pending owner retains the exact original `source_model`, callable
 `prepare_checkpoint_writer`, callable
 `execute_phase_instruction`, callable `release_cancelled_phase_execution`,
-named `xlog.resource_observer.v2` capsule and
+named `xlog.resource_observer.v6` capsule and
 `feedback_interventions` tuple before entering the original issuer/store callbacks.
 The tuple contains exactly two builtin bytes objects in real/control order, each
 `b"xlog.learning-feedback-intervention.v1\0"` followed by one byte: `0` for
@@ -1752,8 +1752,9 @@ not entered by that cancellation may be skipped; failed or unknown registration
 is never reopened or declared complete. After known cancellation and cleanup,
 native retains the original error and actual expenditure, completes the same
 backing interval, and does not issue a scientific evaluation observation or
-advance the schedule. A complete terminal scientific refusal remains a separate
-required part of the full phase executor.
+advance the schedule. Terminal scientific refusal follows the original retained
+refusal executor, which joins cleanup and confirms its signed terminal outcome
+before resuming Source.
 
 The control checkpoint consumes its original singleton lifecycle entry and the
 same selected controller, task, parent and model. It calls the canonical
@@ -1806,8 +1807,8 @@ numerical group consumes its exact selected parent/model through the same native
 issuer and Worker. The predecessor's actual owners remain held until the next
 group's backing preparation interval and shared native tally cover their
 destruction outside phase mutexes. No partial roster, original step ordinal,
-instruction or budget is reset. Intermediate restore instructions still require
-their canonical lifecycle executor.
+instruction or budget is reset. Intermediate restore instructions run through
+the same retained sequence's canonical lifecycle executor.
 
 After the sequence's known accounting and release, real evaluations use the same
 original read-only observation and three cold regions as control evaluations.
@@ -1828,11 +1829,14 @@ task issuance and publication without repeating a model factory or exposing a
 Python constructor. Final recompute state, task capsule, Session configuration
 and initial prefill must still match the full checkpoint before retention.
 The initial restored publication is not substituted for the learned successor.
-This handoff alone does not measure the subsequent model verification callbacks
-or implement the budgeted delivery tail.
+The subsequent delivery executor verifies the same candidate, retires the actual
+Source owners, closes the original native/model work report and backing interval,
+and records the measured delivery tail. Candidate retention alone does not prove
+those later operations completed.
 
-ABI version 3 retains `bind_step_capture` and `read_step_interval` on the same
-original observer and adds device capacity and native backing-root callbacks.
+The installed resource-observer C header requires ABI version 6 and capsule name
+`xlog.resource_observer.v6`. Its exact table includes `bind_step_capture`,
+`read_step_interval`, device-capacity and native backing-root callbacks.
 Registration passes the actual capture stream immediately
 after enqueueing the admission or release kernel, inside its original capture.
 The collector must retain the precise graph/node identity and correlate its
@@ -1856,15 +1860,19 @@ known result; an unregistered suffix is not an unknown binding. Cancellation
 preserves the registered prefix and withdraws only execution-subinterval
 obligations. Whole-process backing validity, allocator completion, loss/error
 checks and original finish/read/release still apply. An unknown handoff retains
-the original owners without retry. This disposition handoff does not implement
-the remaining full private checkpoint/Source terminal recovery or grant resume.
+the original owners. When the cancellation handoff itself has unknown completion,
+`resolve_step_cancellation` may only observe that same retained original attempt;
+it cannot repeat binding, capture or submission. Cancellation alone does not
+release private checkpoint custody or resume Source: the retained terminal
+executor must complete those operations.
 
-The first control and real numerical groups, control evaluations/checkpoint/
-retirement and real source restore do not implement the remaining private
-control/real schedule, post-comparison delivery or fresh-process recovery. They
-cannot issue a prepared or accepted outcome before that complete original schedule.
+The phase executor consumes the complete original source, control and real
+schedule, including repeated numerical groups and intermediate restores, before
+scientific acceptance and delivery. A prefix of that schedule cannot issue a
+prepared or accepted outcome. Current source connectivity does not establish
+full GPU qualification or successful fresh-process recovery.
 
-`register_process_resource_observer(original_capsule)` pins the ABI3 collector
+`register_process_resource_observer(original_capsule)` pins the ABI version 6 collector
 before the first native GPU allocation. The exact same table is idempotent; an
 old ABI, late attachment or replacement cannot reset custody. Actual XLOG cold
 storage owners use direct allocation/free, query their containing extent with
@@ -1872,6 +1880,10 @@ storage owners use direct allocation/free, query their containing extent with
 context, address and never-reused generation into that same collector. Release
 requires original use fences and successful physical free. A failed confirmation
 retains unknown custody and cannot authorize a duplicate free.
+The same table also requires `observe_native_module`, which retains the original
+module observation and any returned lease even when the observation is incomplete.
+Its static read runs only at the owner's quiescent cold boundary. These callbacks
+cannot create CUDA activity or replace the original collector after admission.
 
 `resource_observer_device_certificate(device_ordinal)` returns that producer's
 immutable `xlog.device-capacity/1` projection, bound to the actual CUDA UUID and
@@ -1905,7 +1917,8 @@ Scientific callbacks carry `memory_unit="owned-gpu-backing-peak-bytes"`,
 separately from `(work, backing_peak_bytes, model_calls)`. Native checks the
 original certificate in every returned observation before signing the full
 history and preserves the eleven-argument acceptance call. Only the explicitly
-frozen `dlm-new.scientific-learning/2` program can use this interpretation; old physical-peak histories
+frozen scientific-learning program accepted by the native parser can use this
+interpretation; old physical-peak histories
 cannot be re-labelled. Trace completion alone does not prove the baseline,
 whole-operation work or ZERO TRANSFER. Unknown coverage/completion retains the
 original owners without a numerical observation, release or subsequent execution.
@@ -2387,13 +2400,13 @@ digest or manufacture a replacement candidate. Exceptions preserve the original
 pending and owners, and inconsistent result/status pairs do not authorize cleanup.
 Final checkpoint publication must use this same original `phase_record_owner`.
 
-This interface supplies signed admission/outcome custody for preparation, not a
-complete frozen-program operation journal, cold continuation, issuer rotation, or
-a full private learning executor. It does not establish whole-chain freshness,
-executor/GPU fencing, all-branch storage capacity or whole-execution resource usage.
-The supported scientific acceptance callback takes exactly eleven arguments.
-Checking its complete scientific prefix does not implement the private executor
-or establish full GPU execution or cold recovery.
+Signed preparation records retain admission and outcome custody. The connected
+private executor consumes the complete frozen schedule before its eleven-argument
+scientific acceptance callback. Full checkpoint recovery separately verifies the
+original signed phase records, checkpoint issuer and recovery fence through the
+canonical restore path. Preparation records alone do not establish freshness,
+physical resource usage, GPU fencing or successful cold recovery; each operation
+requires its own retained owners and completed evidence.
 
 Preparation retains the unchanged signed program and its original unmaterialized
 report owner. The event extent is derived only from the complete original
@@ -2748,6 +2761,13 @@ publication.
 
 ### Acquired model numerical identity
 
+Before reconstructing a model, `parent.model_numerical_mode()` returns the complete
+original model contribution retained in that parent's native runtime contract.
+The model producer owns its format and numerical validation; XLOG does not trim
+it to a fixed tuple prefix or replace it with current model settings. Read it at
+the cold reconstruction boundary, outside the resident loop. This record is
+separate from the numerical policy header's ABI and field count.
+
 The existing acquired parent's `model_context(consumer_stream=...)` returns
 `(parent_identity, descriptor_digest, semantic_root, prefix, ring, generations,
 contracts, capacities, numerical_state)`. Its final pair contains two 32-byte
@@ -2858,8 +2878,9 @@ which `prepared_record` exports and the retained content guard checks. Ordinary
 model-preserving continuations copy the original record into the unpublished
 bank before the same finalizer and sole publication. Cold restore instead compares
 all saved fields against the device-recomputed values without rewriting them.
-The separate Update execution, producer restoration and subsequent forward still
-require their connected runtime implementation and full GPU evidence.
+Update execution, producer restoration and the subsequent forward have separate
+runtime entry points; this identity fold alone does not prove their completion.
+Full GPU evidence must cover that complete connected path.
 
 ### Original model work recording
 
@@ -3544,16 +3565,18 @@ For an editable positive binary program, `INSERT_RULE` decodes one
 range-restricted rule with exactly two binary body atoms. Its `kind="rule"`
 delta binds all ten rule fields and any preceding rule edit in that lane;
 `theory_generation` binds the admitted program and preceding rule. The task's
-three queries are evaluated against the resulting program closure on device.
+complete admitted query roster is evaluated against the resulting program closure on device.
 Graph support insertion is not offered in this mode because it does not alter
 that program closure. For a graph-support edit, `kind="fact"` and
 `theory_generation` names the acquired predecessor semantic-root digest.
 Neither mode currently emits a forest delta. The invocation's `result` also
 contains `program_rules`: two lanes of two optional flat ten-field rule tuples,
 including attempted rules in a lane rejected by a hard constraint. These are
-distinct from graph-support edit results. Its `truths` and `correct` entries
-each contain three ordered triples: base, first candidate, and second
-candidate, with all three task queries in every triple.
+distinct from graph-support edit results. Its `query_count` is the full admitted
+query count `Q`. `truths` and `attained` each contain three ordered `Q`-element
+tuples: base, first candidate, and second candidate. For Logical tasks, `correct`
+contains the corresponding `Q`-element reference-agreement tuples; each Coding
+entry is `None` because Coding has no expected reference truth vector.
 
 The current semantic engine generation is the catalogue generation, so
 `engine_generation` returns the same material as `action_law`. `observation`
@@ -4045,6 +4068,11 @@ stored rows share one fact entry, repeated fact entries merge their records, exa
 duplicate records collapse, and facts and records are returned in deterministic
 canonical order.
 
+Floating-point fact identity preserves exact typed bits: positive and negative
+zero are distinct, as are distinct NaN encodings. XLOG relational comparisons
+use the same total ordering of typed bit patterns. Ordinary Python floating-point
+equality is not an appropriate substitute for this identity rule.
+
 Evidence follows the native relation lifecycle atomically:
 
 - `put_relation_with_provenance` replaces both rows and evidence;
@@ -4214,13 +4242,17 @@ handle = session.evaluate_async(memory_mb=512)
 result = handle.result(timeout=30)
 ```
 
-Large logic outputs can be consumed as DLPack-compatible CUDA tensor chunks:
+Logic outputs can be consumed as DLPack-compatible CUDA tensor chunks:
 
 ```python
 for chunk in session.evaluate_stream(memory_mb=512, chunk_rows=1024):
     cols = chunk.tensors  # torch CUDA tensor views, DLPack-compatible
     print(chunk.relation_name, chunk.offset, chunk.num_rows, cols)
 ```
+
+`evaluate_stream` completes the ordinary evaluation before yielding slices of
+its materialized CUDA columns. It does not bound query execution memory or
+produce rows before evaluation finishes. Tensor chunking requires PyTorch.
 
 The same chunking is available from an already materialized result:
 
@@ -4626,8 +4658,9 @@ This is experimental and currently rejects nulls; import does not yet support bi
 ### JointConstraintCarrier (joint constraint solving)
 
 `pyxlog.JointConstraintCarrier` picks one label per entity subject to pairwise
-constraints, entirely on the GPU. Its result buffers are handed back as DLPack
-capsules, so a caller never copies them to the host. Available since 0.11.0.
+constraints using GPU kernels. Its result buffers are handed back as DLPack
+capsules so the caller can consume them on CUDA. This output handoff alone does
+not establish ZERO TRANSFER for the solve. Available since 0.11.0.
 
 ```python
 import pyxlog
@@ -4838,22 +4871,37 @@ config = TrainConfig(
     seed=42,                       # reproducibility
 )
 
-# Train only (no promotion gates)
-result = train_only(source, "W", pos, neg, config)
-assert result.converged
-print(result.discovered_rule)      # e.g., "reach(X,Y) :- edge(X,Z), edge(Z,Y)."
+# Train only; strict_gpu_native=True is the default.
+strict_result = train_only(source, "W", pos, neg, config)
 
-# Train and promote (with gates)
-config = TrainConfig(check_ambiguity=True, max_novel_rate=0.05)
+# Explicit host summary, outside any measured resident interval.
+result = strict_result.export_compat_result()
+print(result.converged, result.discovered_rule)
+
+# Promotion uses host-side validation and requires this explicit mode.
+config = TrainConfig(
+    strict_gpu_native=False, check_ambiguity=True, max_novel_rate=0.05
+)
 promotion = train_and_promote(source, "W", pos, neg, config)
-print(promotion.status)            # PromotionStatus.PROMOTED
+print(promotion.status)  # inspect the actual gate outcome
 ```
+
+This promotion example supplies no held-out sets. Even if training converges and
+the ordinary gates pass, that call returns `MANUAL_REVIEW_REQUIRED`, not
+`PROMOTED`; provide separate held-out examples for automatic promotion.
+
+Default training returns `StrictTrainResult`, with device-owned learned state.
+Host convergence, precision/recall and JSON persistence require explicit export.
+`train_and_promote` rejects `strict_gpu_native=True`; its host validation gates
+are not part of a strict resident training interval. A finite training budget
+does not guarantee convergence or promotion.
 
 ### Artifact Persistence
 
 ```python
-# Save learned artifact
-result.artifact.save("artifact.json")
+# Materialize a persistable host artifact after strict training.
+artifact = strict_result.artifact.export_compat_artifact()
+artifact.save("artifact.json")
 
 # Load with hash verification
 loaded = LearnedArtifact.load("artifact.json", verify_hash=True)
@@ -4865,27 +4913,73 @@ print(loaded.logits)
 
 | Field | Default | Description |
 |-------|---------|-------------|
+| `global_step_limit` | 1000 | Total gradient-step limit across attempts |
 | `step_budget_per_attempt` | 150 | Max gradient steps per attempt |
 | `max_attempts` | 5 | Multi-start attempts |
 | `tau_start` | 2.0 | Initial Gumbel-softmax temperature |
 | `tau_floor` | 0.05 | Minimum temperature |
+| `plateau_window` | 10 | Window for temperature plateau detection |
+| `plateau_threshold` | 0.01 | Progress threshold for a plateau |
+| `warmup_increment` | 0.3 | Temperature increase during warmup |
+| `trap_disc_threshold` | 0.85 | Discreteness threshold for trap detection |
+| `trap_progress_window` | 15 | Window for trap-progress tracking |
+| `entropy_weight_start` | 0.1 | Initial entropy regularization coefficient |
+| `entropy_weight_end` | 0.0 | Final entropy regularization coefficient |
+| `random_reserve_fraction` | 0.2 | Retained configuration field; not consumed by the trainer |
+| `narrowing_top_fraction` | 0.5 | Retained configuration field; not consumed by the trainer |
+| `max_mined_negatives` | 0 | Maximum additional mined negative examples |
+| `max_active_rules` | 32 | Sparse active-rule limit |
 | `allow_recursive_candidates` | False | Enable body-references-head candidates |
 | `check_ambiguity` | False | Run ambiguity scan on convergence |
+| `exhaustive_ambiguity` | False | Request exhaustive ambiguity checking |
 | `max_novel_rate` | 0.0 | Max fraction of novel (non-example) derivations |
+| `protected_relations` | `()` | Relations protected during promotion |
+| `holdout_strategy` | `"kfold"` | Holdout-validation strategy |
+| `holdout_threshold` | 0.95 | Required holdout score |
+| `holdout_folds` | 5 | Number of holdout folds |
+| `typed_schema_required` | False | Require typed predicate schemas |
+| `waiver_untyped` | False | Explicit untyped-schema waiver |
 | `debug_dense_mask` | False | Force dense mask backend (for parity testing) |
 | `seed` | None | Random seed for reproducibility |
+| `deterministic` | False | Request deterministic training configuration |
+| `strict_gpu_native` | True | Require the native backend's strict GPU path |
 | `device` | 0 | CUDA device index |
 | `memory_mb` | 512 | GPU memory limit |
+| `telemetry_level` | 0 | Telemetry verbosity |
+| `max_telemetry_steps` | 1000 | Retained configuration field; not consumed by the trainer |
+| `telemetry_sink` | None | Retained path metadata; does not create a telemetry writer |
+| `persist_telemetry` | False | Include telemetry when persisting an artifact |
+| `telemetry_persist_limit` | 100 | Maximum persisted telemetry entries |
+| `max_numeric_failures` | 3 | Numerical-failure limit |
+
+Strict mode rejects CUDA-unavailable execution, host negative mining
+(`max_mined_negatives > 0`), telemetry collection (`telemetry_level > 0`), dense
+masks and recursive candidates. `strict_gpu_native` enforces the provider's
+device-to-host restrictions; it is not a measurement of every transfer by Python,
+PyTorch or an external model.
 
 The temperature fields (`tau_start`, `tau_floor`) control a Gumbel-softmax
 relaxation — a technique that makes discrete rule choices differentiable so they
 can be trained by gradient descent. Training starts hot (`tau_start`, soft and
-exploratory) and anneals toward `tau_floor` (sharp, near-discrete).
+exploratory) and anneals toward `tau_floor` (sharp, near-discrete). Strict mode
+uses a fixed linear schedule over the original attempt budget. Plateau and trap
+controls belong to the compatibility trainer's adaptive schedule.
 
 ### Result Types
 
 ```python
-# TrainResult
+# Default strict result
+strict_result.attempt_count        # int
+strict_result.total_steps          # int
+strict_result.single_attempt       # bool
+strict_result.winner_candidate_id  # int | None
+strict_result.discovered_rule      # str | None
+strict_result.artifact             # StrictLearnedArtifact
+strict_result.strict_gpu_native    # True
+strict_result.compat_materialized  # False
+
+# Explicitly exported TrainResult, or training with strict_gpu_native=False
+result = strict_result.export_compat_result()
 result.converged          # bool
 result.discovered_rule    # str | None
 result.attempt_count      # int
@@ -5021,7 +5115,10 @@ result = induce_exact(
 ```
 
 The native backend scores each topology independently in one batched CUDA
-pass. The Python reference can be used for parity checks with
+pass, selects top-K on device, and downloads one compact selected-row allocation
+for a nontrivial call. Empty candidates, zero positives or zero K skip that export.
+The complete call therefore is not a ZERO TRANSFER operation. The Python reference
+requires `XLOG_ALLOW_PYTHON_ILP_REFERENCE=1` and can be used for parity checks with
 `backend="python", strict_per_topology=True`; leaving `strict_per_topology`
 at its default preserves legacy prototype behavior and is not semantically
 equivalent to native scoring.
@@ -5064,6 +5161,11 @@ For Python consumers that need an auditable GPU-native ILP inner loop, the inten
   and any host-output API gated behind `host-io`
 - Use `host_transfer_stats()` / `reset_host_transfer_stats()` to audit the provider-tracked
   transfer behavior of the chosen path
+
+These guarantees concern the named provider's device-to-host counters. They do
+not establish end-to-end ZERO TRANSFER: Python-list query inputs still need
+uploading, and transfers by an external model or library require their own
+measurement over the same interval.
 
 ---
 
@@ -5425,15 +5527,17 @@ producer's canonical order, Bool `[1]` numerical admissibility, and the original
 contiguous UInt8 slab backing. Outputs must lie in that actual CUDA allocation,
 which must not alias publication storage. Native joins all consumers, validates
 the original cohort and witness, consumes actual work, and rechecks the complete
-original publication, including model allocations and RNG. It then returns
-`status`, six `loss_bits`, `model_work`, `operation_count`, `work_bound`, and
-`retained_allocation_bytes`. Status zero means the cohort, numerical outputs, and
+original publication, including model allocations and RNG. It then returns a
+`SemanticCompletedModelEvaluation` with read-only `status`, six `loss_bits`,
+`model_work`, `model_calls`, `operation_count`, `work_bound`, and
+`retained_allocation_bytes` attributes. Status zero means the cohort, numerical outputs, and
 work recording passed their native checks. Status one is a completed refusal:
 the original selection refused, numerical admissibility is false, or at least
-one loss is nonfinite. Status two means work overflow, an incomplete event count,
-or a work-bound mismatch; it takes precedence over numerical refusal and does
-not certify complete work. Neither nonzero status is a loss certificate. Do not
-record status two as an ordinary numerical refusal or retry the invocation.
+one loss is nonfinite. Internal status two means work overflow, an incomplete
+event count or a work-bound mismatch. Native rejects that incomplete expenditure
+and retains the invocation instead of issuing a completed observation. It is
+neither a numerical refusal nor permission to retry. A returned refusal status
+does not certify the losses.
 Operation count is registrar occurrences, not model forward calls.
 
 These statuses exist only when completion returns its result. A witness validation,

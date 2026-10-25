@@ -20723,7 +20723,7 @@ impl PySemanticTransitionTaskUse {
 
     /// Return one immutable native projection of the exact ordered query,
     /// admitted theory plus executed observer program, observed four-valued
-    /// result, and the three stored truths in query order. This does not
+    /// result, and the full stored truth vector in query order. This does not
     /// re-execute the observer and carries no use authority. A symbolic corpus
     /// anchor stores the same three identities in its ``semantic_task`` record
     /// and admission evidence; cold import rejects any mismatch with the task it
@@ -23412,15 +23412,15 @@ impl PySemanticTransitionController {
     ///
     /// All arguments are mandatory. ``task_scope`` is ``(controller, tenant,
     /// security_scope, request_scope, repository_scope)``. ``statement_records``
-    /// contains the three admitted native observer statement indices;
+    /// contains the complete ordered admitted query statement indices;
     /// ``allowed_support_records`` contains admitted support indices.
     /// ``task_program_source`` is the complete authored XLOG observer program,
-    /// including all concrete input facts. ``task_query_ordinals`` maps its three
+    /// including all concrete input facts. ``task_query_ordinals`` maps its
     /// selected zero-arity query results to the ordered statement records.
     /// The native owner executes that program during every cold task binding.
     /// ``task_scoring`` supplies (correct, all_correct, work, improvement,
-    /// refusal, spent) unsigned weights. ``admissible_truth_masks`` supplies three
-    /// bit masks over (neither, true, false, both), in that bit order.
+    /// refusal, spent) unsigned weights. ``admissible_truth_masks`` supplies one
+    /// bit mask per query over (neither, true, false, both), in that bit order.
     ///
     /// ``training_domain`` is the original ``(manifests, loader)`` projection:
     /// manifests are sorted ``(sha256_hex, (entries, keys, records, bytes))``
@@ -23477,8 +23477,8 @@ impl PySemanticTransitionController {
     /// admission evidence appends those three identities in that order. Native
     /// recomputes them from the ordered admitted statements and query selection,
     /// the admitted theory and complete executed observer source, and the exact
-    /// observed result bytes plus three four-valued truths. The imported row must
-    /// equal the task executed during this same cold binding.
+    /// observed result bytes plus the complete four-valued truth vector. The
+    /// imported row must equal the task executed during this same cold binding.
     /// Materials are the complete ordered ``(MaterialReference.payload(),
     /// bytes_or_None)`` closure. Evidence is the original opaque bytes, not a
     /// caller-decoded receipt. Identity-only rows are not a replay carrier.

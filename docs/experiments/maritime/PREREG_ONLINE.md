@@ -1,11 +1,9 @@
 # Maritime (Brest AIS) rendezVous: single-pass online weights column
 
-Status: **pre-registered, not yet run.** This document is committed BEFORE
-any code that executes these runs on the real archives; every parameter,
-mechanism, hypothesis and interpretive constraint below is fixed in
-advance. Results will be appended to this document only after the
-pre-registered runs complete; any deviation from the protocol below must
-be recorded as a deviation, not silently amended.
+Status: **pre-registered; runs completed on 2026-08-12.** The protocol
+below was committed before execution on the real archives. Its original
+parameters and hypotheses are retained; the results and the reporting-time
+operationalization of the prequential criterion are recorded below.
 
 The baseline this document extends is the batch soft-credit column
 A-soft of `PREREG_SOFT.md` (micro pointwise F1 0.7398,

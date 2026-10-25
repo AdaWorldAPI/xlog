@@ -19,7 +19,7 @@ solution and you care about that spread.
 
 A **stable model** is one such solution: an assignment of facts that justifies
 exactly itself and nothing more. A program can have many. Ordinary Datalog picks
-a single model and stops; an epistemic program instead reasons over the whole set
+its least model for positive rules; an epistemic program instead reasons over the whole set
 of models it considers possible at once — its **world view** — and lets you ask
 what holds across that set.
 
@@ -107,14 +107,32 @@ Now the query returns no rows at all. `quarantined()` is a plain fact, so
 constraint discards it. Pruning every candidate is a semantic result — an empty
 answer — not a runtime failure.
 
-**Limits.** A constraint body must be `know`/`possible` literals only; mixing in an
-ordinary or comparison literal, as in `:- p(X), know q(X).`, is rejected. Each
-variable may appear in exactly one modal literal, and only once inside it — so
-`:- know p(X).` is fine, but `:- know p(X), possible q(X).` and `:- know p(X, X).`
-are not. Key positions take ground integers or symbols, or a single-occurrence
-variable or `_`; lists, compound terms, floats and strings are refused. Finally, the
-program needs at least one `know`/`possible` rule for the constraint to be checked
-against — a constraint on its own has no world view to prune.
+Positive single-occurrence variables, as in `:- know flagged(X).`, mean “there
+exists a matching key.” Independent variables in separate positive modal literals
+range independently. A named variable used only under a negated modal literal is
+unsafe; `:- not know flagged(X).` is rejected.
+
+Shared variables and repeated positions have a supported rewrite when none of the
+modal targets is defined by a rule containing `know` or `possible`. This includes:
+
+```xlog
+:- know route(X, X).
+:- know flagged(X), possible blocked(X).
+:- person(X), not know vaccinated(X).
+```
+
+XLOG constructs an ordinary helper relation for the matching keys and then checks
+whether that helper has a known tuple. The last example therefore rules out a
+world view when some person lacks a matching vaccination fact. If a modal target
+has an epistemic defining rule, this rewrite does not apply; shared-variable or
+mixed bodies that remain outside the planner's subset are rejected.
+
+**Limits.** Constraints still need an epistemic rule to provide a world-view
+context. After normalization their bodies must be pure modal conjunctions, with
+integer/symbol keys, anonymous keys, or positive single-occurrence variables.
+Fixed finite outer lists and compounds can flatten to those scalar key columns;
+floats, strings, nested structures, and unbounded tails remain unsupported here.
+Recursive epistemic programs with modal constraints are also rejected.
 
 ## World-view semantics
 
@@ -241,8 +259,7 @@ mis-evaluates them. The ones you are most likely to write:
 |---|---|
 | A second clause for a head whose other clause uses `know`/`possible` | XLOG materializes the clause union in one pass and cannot tell which clause a row came from, so it cannot apply one clause's modal filter to the union. |
 | Recursion plus an epistemic constraint such as `:- know p(X).` | Recursive programs run through the ordinary engine, which never runs the constraint kernel — so XLOG refuses rather than drop the constraint. |
-| An epistemic constraint mixing ordinary and modal literals, e.g. `:- p(X), know q(X).` | Constraints support only pure `know`/`possible` conjunctions. |
-| An epistemic constraint sharing a variable across two modal literals, e.g. `:- know p(X), possible q(X).` | Only single-occurrence variable keys, such as `:- know p(X).`, are supported. |
+| A mixed or shared-variable epistemic constraint whose modal target has an epistemic defining rule | The ordinary-helper rewrite cannot handle that target; the remaining constraint must fit the pure-modal, independent-key subset. |
 | Two epistemic heads where one's modal literal ranges over the other | One joint world-view enumeration would mis-evaluate the nesting. |
 | The same predicate name defined as an epistemic-derived relation at two arities | A derived epistemic relation needs exactly one signature per name. |
 

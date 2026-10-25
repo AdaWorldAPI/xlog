@@ -53,14 +53,15 @@ stronger prior — carries most of the posterior mass.
 Reach for the **exact** engine when you need the true answer and your program is
 small — for example when it uses negation, recursion, or small aggregates.
 
-Reach for the **Monte Carlo** engine when the model is larger, or uses a feature
-the exact engine does not support, and a sampled estimate with error bars is good
-enough.
+Reach for the **Monte Carlo** engine when the model fits its bounded positive-rule
+subset and a sampled estimate with error bars is good enough. Its production
+subset is narrower than the exact engine's: negation and aggregates require the
+explicitly selected CPU reference oracle.
 
 | Engine | Pragma | What it computes | When to reach for it |
 |---|---|---|---|
 | Exact | `exact_ddnnf` | Exact marginals and conditionals via knowledge compilation, with gradients | Negation, recursion, and small aggregates where you need an exact answer |
-| Monte Carlo | `mc` | Sampled estimates with a confidence interval | Larger models, or anything outside the exact engine's supported fragment |
+| Monte Carlo | `mc` | Sampled estimates with a confidence interval | Bounded positive rules, positive recursion, and grounded annotated disjunctions |
 
 ## Writing a probabilistic program
 
@@ -123,22 +124,25 @@ The exact engine (`exact_ddnnf`) computes the true probability by turning your
 program into a circuit and then adding up the probability of every world in which
 the query holds. Turning a program into a circuit like this is called **knowledge
 compilation**; adding up those world probabilities is **weighted model counting**.
-The data plane runs on the GPU, while compilation and level-by-level evaluation are
-host-orchestrated:
+The source frontend constructs provenance on the host. On the normal circuit
+route, that graph is then uploaded for GPU CNF encoding, Decision-DNNF compilation,
+verification, and circuit evaluation. These stages are host-orchestrated:
 
-<Frame caption="The exact path compiles provenance to CNF, then to a verified GPU Decision-DNNF, then to the XGCF circuit; the circuit is compiled once and evaluated many times, with gradients flowing back through it.">
-  <img className="block dark:hidden" src="/assets/diagrams/knowledge-compilation-light.svg" alt="Exact inference pipeline: PIR provenance to CNF (Tseitin), to GPU Decision-DNNF (compile plus CDCL verify), to the XGCF circuit format, to weighted model counting; the compile stages run once and gradients flow backward through XGCF." />
-  <img className="hidden dark:block" src="/assets/diagrams/knowledge-compilation-dark.svg" alt="Exact inference pipeline: PIR provenance to CNF (Tseitin), to GPU Decision-DNNF (compile plus CDCL verify), to the XGCF circuit format, to weighted model counting; the compile stages run once and gradients flow backward through XGCF." />
+<Frame caption="After host provenance construction and upload, the normal exact circuit path encodes CNF, compiles a verified GPU Decision-DNNF, and evaluates XGCF; the circuit can be reused, with gradients flowing back through it.">
+  <img className="block dark:hidden" src="/assets/diagrams/knowledge-compilation-light.svg" alt="Exact circuit pipeline after host provenance construction and upload: PIR to CNF, GPU Decision-DNNF compilation and verification, XGCF, and weighted model counting; gradients flow backward through XGCF." />
+  <img className="hidden dark:block" src="/assets/diagrams/knowledge-compilation-dark.svg" alt="Exact circuit pipeline after host provenance construction and upload: PIR to CNF, GPU Decision-DNNF compilation and verification, XGCF, and weighted model counting; gradients flow backward through XGCF." />
 </Frame>
 
 <Steps>
   <Step title="Provenance">
-    Rule evaluation records, for every derived tuple, which probabilistic choices
+    Host rule evaluation records, for every derived tuple, which probabilistic choices
     support it. This record — a graph over the probabilistic facts and annotated
-    disjunctions — is called the tuple's *provenance*.
+    disjunctions — is called the tuple's *provenance*. Accepted non-monotone
+    probabilistic rules use the host well-founded-semantics (WFS) evaluator here;
+    this is separate from the epistemic engine's GPU WFS path.
   </Step>
   <Step title="CNF">
-    The provenance graph is encoded into a Boolean formula in the standard
+    The host provenance graph and roots are uploaded, then encoded into a Boolean formula in the standard
     AND-of-ORs form (`CNF`, conjunctive normal form), with a variable map that
     lives on the device.
   </Step>
@@ -263,8 +267,9 @@ The exact engine can push aggregates through uncertainty, up to fixed bounds:
   per group.
 
 Beyond those caps the engine stops with a typed rejection rather than silently
-approximating. The error message tells you to switch to `#pragma prob_engine = mc`
-for that program.
+approximating. Reduce the finite domain to use the production exact path. The
+error's suggestion to select `mc` does not enable aggregate GPU execution:
+aggregates need explicit CPU-oracle opt-in and return labeled reference results.
 
 ## Monte Carlo inference
 
@@ -272,18 +277,23 @@ The Monte Carlo engine (`mc`) estimates probabilities by sampling many possible
 worlds and counting how often the query holds.
 
 Its production path is a **megakernel** — a single GPU kernel that evaluates every
-sampled world in one launch, followed by one synchronization. Observations are
-handled by **rejection sampling**: only sampled worlds that satisfy `evidence(...)`
-are counted; the rest are thrown away.
+sampled world in one launch, followed by synchronization. Seeded samples and plan
+buffers are prepared before this measured region. With **rejection sampling**,
+only worlds satisfying `evidence(...)` count. `evidence_clamping` instead forces
+observations directly when they refer to forceable probabilistic facts or positive
+annotated-disjunction choices. With no requested method, XLOG selects clamping
+when all evidence is forceable and rejection otherwise. Explicitly requesting
+clamping for non-forceable evidence raises an `Execution` error rather than
+silently selecting rejection; explicit rejection stays rejection.
 
 Each query reports an estimate `prob` (with `log_prob`), a standard error
 `stderr`, a two-sided confidence interval (`ci_low`, `ci_high`), the sample counts,
 and the `seed`. The confidence interval is how you tell whether you drew enough
 samples: if it is too wide for your needs, draw more.
 
-<Frame caption="One kernel launch evaluates every sampled world in parallel on the device; counts stay device-resident, and the host reads back only the final estimate.">
-  <img className="block dark:hidden" src="/assets/diagrams/mc-resident-megakernel-light.svg" alt="Monte Carlo resident megakernel: a fragment gate rejects unsupported programs with a typed error; supported programs enter a single GPU-resident kernel launch where each world samples facts, derives, and checks the query in parallel; per-world results accumulate into device-resident counts that produce the estimate with confidence interval and seed." />
-  <img className="hidden dark:block" src="/assets/diagrams/mc-resident-megakernel-dark.svg" alt="Monte Carlo resident megakernel: a fragment gate rejects unsupported programs with a typed error; supported programs enter a single GPU-resident kernel launch where each world samples facts, derives, and checks the query in parallel; per-world results accumulate into device-resident counts that produce the estimate with confidence interval and seed." />
+<Frame caption="After sample preparation, one engine launch derives all sampled worlds on the device. A bounded status read follows the measured region; host-readable estimates require separate count reads.">
+  <img className="block dark:hidden" src="/assets/diagrams/mc-resident-megakernel-light.svg" alt="Monte Carlo resident path: a fragment gate checks the program, setup prepares seeded samples and buffers, and one measured GPU engine launch derives each world and counts query and evidence matches. A bounded status read follows that region; optional result reads produce host estimates." />
+  <img className="hidden dark:block" src="/assets/diagrams/mc-resident-megakernel-dark.svg" alt="Monte Carlo resident path: a fragment gate checks the program, setup prepares seeded samples and buffers, and one measured GPU engine launch derives each world and counts query and evidence matches. A bounded status read follows that region; optional result reads produce host estimates." />
 </Frame>
 
 ### Limits of the Monte Carlo engine
@@ -300,17 +310,15 @@ bounds:
 | Universe (bounded domain) | `<= 65536` |
 | Domain size | `<= 256` |
 
-Exceeding a structural, domain, sample, or other fixed-count capacity stops with
-`CapacityExceeded`, including the name of the exhausted unit. Exceeding the configured
-byte budget stops with `ResourceExhausted` before the failing allocation. Reaching a
-bounded fixpoint's iteration limit without convergence stops with
-`ConvergenceFailure`. These conditions are distinct so callers do not mistake a count
-limit or nonconvergence for VRAM exhaustion. There is no larger host-sized execution
-path.
+The planner reports structural and domain limits as a typed `ResidentRejection`,
+surfaced as a `Compilation` error. A sample count above `u32::MAX` is an `Execution`
+error. After execution, sparse-row overflow produces `CapacityExceeded`, while
+unconverged worlds produce `ConvergenceFailure`. The configured resident byte budget
+produces `ResourceExhausted` before allocation when the estimate exceeds it.
 
-The engine also rejects — with a typed error — any program that uses negation,
-aggregates, or annotated disjunctions. In every one of these cases it refuses
-cleanly rather than guessing (it "fails closed").
+The engine also rejects negation, aggregate heads, comparisons, arithmetic
+bindings, and modal literals. Grounded annotated disjunctions are encoded within
+the same bounded domain and universe as probabilistic facts.
 
 <Warning>
 The `--allow-cpu-oracle` flag (Python: `allow_cpu_oracle=True`) is an explicit,
@@ -324,23 +332,35 @@ evidence — treat them as a reference check, not a production result.
 This section is for readers who need to reason about where computation runs and
 what the engines promise. You do not need it to write a probabilistic program.
 
-**Monte Carlo — certified sampled core.** For the sampled region, the megakernel keeps
-all work on the GPU. It performs `0` tracked host-to-device transfers, `0` tracked
-device-to-host transfers, and `0` untracked metadata reads. This holds constant
-whether you draw `128` samples or `1024`. After the single launch and synchronization,
-one pinned terminal receipt transfers authoritative convergence status, counts, and
-trace metadata. A nonconverged receipt is an error even if partial counters exist.
+**Monte Carlo — measured resident core.** `McResidentResult.no_host` measures the
+engine launch and its completion synchronization, after allocation, uploads, and
+seeded sample preparation. A ZERO TRANSFER acceptance check requires zero tracked
+host-to-device and device-to-host calls, zero untracked metadata reads, zero host
+sample/fixpoint loops, zero per-sample launches, and zero allocations in that region.
+The engine reports its launch count separately. These fields must be checked on
+the actual run; this source description is not a measurement of a new workload.
 
-**Exact engine — GPU-accelerated, host-orchestrated.** The exact engine runs on
-the GPU but is driven from a host loop: the forward evaluation launches one kernel
-per circuit level. No per-level data is read back — the circuit and its intermediate
+After the measured region, the engine reads three device status words and checks
+sparse overflow and convergence before returning. Counts, per-world iteration
+traces, and sparse metadata remain device buffers. A host-readable estimate reads
+the requested counts afterward. The status check is not a pinned receipt containing
+all results, and zero tracked count transfers alone does not prove the full
+resident-core contract.
+
+**Exact engine — host provenance, GPU circuit execution.** Source compilation
+builds provenance on the host, including host WFS evaluation for accepted
+non-monotone probabilistic rules. On the normal circuit route, the graph and roots
+are uploaded before GPU encoding and compilation. Forward circuit evaluation is
+driven from a host loop that launches one kernel per circuit level. No per-level
+data is read back — the circuit and its intermediate
 values stay on the device. Device-result APIs retain requested result and gradient
 buffers on the GPU; host-convenience APIs copy the result fields the caller requests.
 The exact route also observes bounded solver status and error scalars. It therefore
 does **not** offer the single-launch sampled-core guarantee of the Monte Carlo engine.
 
-**No CPU Decision-DNNF compiler.** Production exact inference is always the GPU
-compiler and verifier described above. XLOG never bundles a CPU d-DNNF compiler and
+**No CPU Decision-DNNF compiler.** The production Decision-DNNF compilation route
+uses the GPU compiler and verifier described above; this does not make the host
+provenance frontend GPU-resident. XLOG never bundles a CPU d-DNNF compiler and
 never shells out to an external `d4` binary. Decision-DNNF parsing exists only for
 tests and fixtures.
 

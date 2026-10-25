@@ -14,8 +14,9 @@
 //!     comparison, arithmetic, epistemic, aggregate, or univ literals);
 //!   * <= [`MAX_VARS`] distinct variables per rule;
 //!   * all terms are variables or ground constants (no lists/compounds/functors);
+//!   * grounded annotated disjunctions use device decision-variable records;
 //!   * bounded Herbrand universe: `domain^arity` slots, with the total universe
-//!     and per-predicate domain capped so one world fits one CUDA block.
+//!     and per-predicate domain capped independently of the configured blocks per world;
 //!   * positive joins are lowered to device rule records and evaluated from a
 //!     world-segmented sparse column arena (`slot`, `arg0`, `arg1`) with
 //!     device row counters and static device offsets; the dense bitset is only
@@ -45,8 +46,7 @@ pub(super) const MAX_ARITY: usize = 3;
 pub(super) const MAX_BODY: usize = 3;
 /// Maximum supported distinct variables per rule.
 pub(super) const MAX_VARS: usize = 8;
-/// Maximum supported bounded-universe slot count (one world must fit one block's
-/// working set comfortably).
+/// Maximum supported bounded-universe slot count per world.
 pub(super) const MAX_UNIVERSE: usize = 1 << 16;
 /// Maximum supported domain size (distinct constants).
 pub(super) const MAX_DOMAIN: usize = 256;
@@ -82,7 +82,8 @@ pub enum ResidentRejectKind {
     UniverseTooLarge,
     /// A predicate appears with inconsistent arity.
     InconsistentArity,
-    /// Annotated disjunctions are not yet supported by the resident engine.
+    /// Reserved annotated-disjunction rejection classification. The current
+    /// resident planner encodes grounded choices within the normal universe bounds.
     AnnotatedDisjunctionUnsupported,
 }
 

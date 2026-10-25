@@ -4,24 +4,26 @@ This section reports measurements for xlog's deterministic, probabilistic, and n
 
 \subsection{Methodology}
 
-The subsystem ablations were collected on an NVIDIA RTX PRO 3000 (Blackwell, 12\,GB VRAM, compute capability 12.0). The head-to-head comparisons of \Cref{sec:h2h}, the overhead isolations of \Cref{sec:overhead} and the runtime-optimization ablations of \Cref{sec:runtime-eval} ran on cloud GPUs, as stated with each, and the neural Event-Calculus runs of \Cref{sec:ec-eval} on an NVIDIA A40. Each cloud artifact records its own device, driver and CPU quota. For the seven head-to-head and overhead artifacts, a number that differs from an earlier version of the same artifact differs because of the machine: those seven were all measured on one engine build. That does not extend to the two runtime-optimization fixtures of \Cref{sec:runtime-eval}, whose earlier records date from the v0.8.6 campaign, so both the hardware and the engine version changed between them. The relational searches of \Cref{sec:ec-eval} and \Cref{sec:maritime} are deterministic CPU procedures whose results do not depend on the host; the weight trainings beside them run on CPU as well. Rust crates are built in release mode; CUDA modules are staged cubin-first with PTX fallback and explicit JIT warm-up; Python components use \texttt{pyxlog} with CUDA-enabled PyTorch. The benchmark harness uses Criterion.rs with the settings in \Cref{tab:stat-protocol}, and GPU measurements include warm-up to amortize kernel-module loading and CUDA context setup.
+The subsystem ablations were collected on an NVIDIA RTX PRO 3000 (Blackwell, 12\,GB VRAM, compute capability 12.0). The head-to-head comparisons of \Cref{sec:h2h}, the overhead isolations of \Cref{sec:overhead} and the runtime-optimization ablations of \Cref{sec:runtime-eval} ran on cloud GPUs, as stated with each, and the neural Event-Calculus runs of \Cref{sec:ec-eval} on an NVIDIA A40. Each cloud artifact records its own device, driver and CPU quota. The seven head-to-head and overhead artifacts use one recorded engine build. Their differences from earlier records do not isolate hardware alone: the reconstructed runs also choose previously unrecorded generator parameters and seed values, so neither fixture identity nor a hardware-only comparison is established. For the two runtime-optimization fixtures, earlier records date from the v0.8.6 campaign, so hardware and engine version both changed. The relational searches of \Cref{sec:ec-eval} and \Cref{sec:maritime} are deterministic CPU procedures; the maritime weight training runs on CPU as well. Rust crates are built in release mode; CUDA modules are staged cubin-first with PTX fallback and explicit JIT warm-up; Python components use \texttt{pyxlog} with CUDA-enabled PyTorch. Native query-kernel targets use Criterion.rs; Python training and comparison scripts use their own runners. \Cref{tab:stat-protocol} separates their protocol scopes; warm-up and seeding must be read from each recorded run.
 
 Per-run measurement data is distributed with the paper for the head-to-head comparisons and overhead isolations, the circuit-cache ablation, the runtime-optimization ablations of \Cref{sec:runtime-eval}, and every rule-induction run of \Cref{sec:ecinduction,sec:maritime}. Each other figure below is stated together with the fixture, protocol and aggregation that produced it.
 
+These are measurements of the revisions and environments recorded in the artifacts. They are not a fresh qualification of later source changes. In particular, the CAVIAR neural runs use engine-enumerated witness credit, its relational runs and all maritime runs use CPU procedures, and none establishes a current complete native learning, restoration, or ZERO TRANSFER result.
+
 \begin{table}[htbp]
   \centering
-  \caption{Benchmark harness settings.}
+  \caption{Protocol scope; settings belong to each benchmark, not one universal harness.}
   \label{tab:stat-protocol}
   \small
   \begin{tabularx}{\linewidth}{@{}lL@{}}
     \toprule
     \textbf{Setting} & \textbf{Value} \\
     \midrule
-    Sample size       & 10--100 runs (benchmark-dependent) \\
-    Warm-up           & 3 iterations (PTX JIT, memory-pool init) \\
-    Significance level & 0.10 \\
-    Noise threshold   & 0.05 (ignore ${<}5\%$ variance) \\
-    Seeding           & Deterministic LCG \\
+    Native WCOJ Criterion target & explicitly selects 10 samples; other Criterion settings are not overridden there \\
+    Retained WCOJ ablation & 20 warm-up windows and 10 timing windows, as specified in \Cref{tab:wcoj-protocol} \\
+    Python comparisons & runner-specific warm-up, repetitions, and seed lists recorded with each artifact \\
+    Synthetic triangle fixture & deterministic LCG key generation; not a universal data or training seed protocol \\
+    Acceptance & no universal three-iteration warm-up, 0.10 significance, or 5\% noise gate is established \\
     \bottomrule
   \end{tabularx}
 \end{table}
@@ -64,7 +66,7 @@ The keys are generated by four fixture variants named for the workloads they sta
   \label{fig:wcoj}
 \end{figure}
 
-On uniform or empty inputs the adaptive classifier selects the binary-join chain.
+In the retained benchmark protocol, uniform or empty cases select the binary-join chain. Current runtime defaults use cardinality costing; the skew classifier is a separate selectable model.
 
 \subsection{Circuit caching and training}\label{sec:cache-eval}
 

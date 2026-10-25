@@ -1,4 +1,4 @@
-<!-- xlog diagram: XGCF circuit structure (light). Source: ARCHITECTURE.md "XGCF: GPU Circuit Format" + probabilistic engines. Levelized DAG (LIT/AND/OR/DECISION), evaluated level-by-level in log space; forward values up, adjoints back down. -->
+<!-- xlog diagram: XGCF circuit structure (light). Source: probabilistic/engines.mdx. Levelized DAG (LIT/AND/OR/DECISION), evaluated level-by-level in log space; forward values up, adjoints back down. -->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 320" font-family="Inter, system-ui, sans-serif">
   <rect width="900" height="320" fill="#FBFBFD"/>
   <defs>

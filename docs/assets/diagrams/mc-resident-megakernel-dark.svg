@@ -8,14 +8,14 @@
   </defs>
 
   <text x="28" y="38" font-size="16" font-weight="600" fill="#E7E6F0">Monte Carlo: the resident megakernel</text>
-  <text x="28" y="56" font-size="11" fill="#9B98B4">One kernel launch evaluates every sampled world on the device; the host reads back only the final counts.</text>
+  <text x="28" y="56" font-size="11" fill="#9B98B4">One device launch; a three-word postflight check follows synchronization. Result reads are separate.</text>
 
   <!-- fail-closed gate -->
   <rect x="28" y="112" width="128" height="64" rx="7" fill="#171626" stroke="#E7E6F0" stroke-width="1.25"/>
   <rect x="29.5" y="114" width="3.5" height="60" rx="1.75" fill="#D97706"/>
   <text x="92" y="134" text-anchor="middle" font-size="11.5" font-weight="600" fill="#E7E6F0">Fragment gate</text>
-  <text x="92" y="149" text-anchor="middle" font-size="8.5" fill="#9B98B4">negation / aggregates /</text>
-  <text x="92" y="161" text-anchor="middle" font-size="8.5" fill="#9B98B4">disjunctions rejected</text>
+  <text x="92" y="149" text-anchor="middle" font-size="8.5" fill="#9B98B4">negation / aggregates</text>
+  <text x="92" y="161" text-anchor="middle" font-size="8.5" fill="#9B98B4">outside resident fragment</text>
   <path d="M156,144 H184" stroke="#9B98B4" stroke-width="1.5" fill="none" marker-end="url(#amd)"/>
   <text x="170" y="132" text-anchor="middle" font-size="8.5" fill="#9B98B4">pass</text>
   <path d="M92,176 V208" stroke="#F87171" stroke-width="1.4" fill="none" stroke-dasharray="4 3" marker-end="url(#amd)"/>
@@ -55,8 +55,8 @@
   <!-- host result -->
   <path d="M728,170 H760" stroke="#9B98B4" stroke-width="1.5" fill="none" marker-end="url(#amd)"/>
   <rect x="762" y="140" width="110" height="60" rx="7" fill="#171626" stroke="#E7E6F0" stroke-width="1.25"/>
-  <text x="817" y="163" text-anchor="middle" font-size="11" font-weight="600" fill="#E7E6F0">Estimate</text>
-  <text x="817" y="179" text-anchor="middle" font-size="8.5" fill="#9B98B4" font-family="'JetBrains Mono','SF Mono',ui-monospace,Menlo,monospace">p&#770; &#177; CI &#183; seed</text>
+  <text x="817" y="163" text-anchor="middle" font-size="11" font-weight="600" fill="#E7E6F0">Postflight</text>
+  <text x="817" y="179" text-anchor="middle" font-size="8.5" fill="#9B98B4" font-family="'JetBrains Mono','SF Mono',ui-monospace,Menlo,monospace">3 metadata words</text>
 
-  <text x="28" y="288" font-size="10.5" fill="#9B98B4">Each world samples its facts (deterministic per seed), derives, and checks the query in parallel; unsupported programs need the labeled CPU-oracle opt-in.</text>
+  <text x="28" y="288" font-size="10" fill="#9B98B4">Grounded choices are supported; result buffers remain on device. The limited CPU oracle requires a separate opt-in.</text>
 </svg>

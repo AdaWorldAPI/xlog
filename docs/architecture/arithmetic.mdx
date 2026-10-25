@@ -44,6 +44,15 @@ pub enum ArithExpr {
     // Type cast: cast(expr, target_type)
     Cast(Box<ArithExpr>, ScalarType),
 
+    // Conditional result (both branches are normalized before execution)
+    Conditional {
+        cond_left: Box<ArithExpr>,
+        cond_op: CompOp,
+        cond_right: Box<ArithExpr>,
+        then_expr: Box<ArithExpr>,
+        else_expr: Box<ArithExpr>,
+    },
+
     // User-defined function call (inlined before lowering)
     FuncCall { name: String, args: Vec<ArithExpr> },
 }
@@ -84,37 +93,14 @@ compiler works with after parsing and before it hits the GPU. Here the lowerer
 converts each `IsExpr` into a computed projection: it appends one new column to
 the current plan, and that column holds the value of the expression.
 
-```rust
-fn lower_is_expr(
-    &mut self,
-    is_expr: &IsExpr,
-    input: RirNode,
-    var_env: &mut VariableEnv,
-) -> Result<RirNode> {
-    // 1. Target must be fresh
-    if var_env.contains(&is_expr.target) {
-        return Err(XlogError::Compilation(format!(
-            "Variable {} already bound; 'is' requires fresh variable",
-            is_expr.target
-        )));
-    }
-
-    // 2. Convert expression (all vars must be bound)
-    let expr = self.arith_to_expr(&is_expr.expr, var_env)?;
-
-    // 3. Infer result type
-    let result_type = self.infer_arith_type(&is_expr.expr, var_env)?;
-
-    // 4. Extend projection
-    let new_col = var_env.column_count();
-    var_env.bind(&is_expr.target, new_col, result_type);
-
-    Ok(RirNode::Project {
-        input: Box::new(input),
-        columns: self.extend_projection_with(expr, result_type),
-    })
-}
-```
+Program-wide validation checks binding freshness and source order before schema
+inference, so those diagnostics cannot be hidden by a later type error.
+`Lowerer::lower_is_expr_with_owner` then infers the result type, converts the
+arithmetic tree to an IR expression, and constructs pass-through projections for
+the existing columns plus one `ProjectExpr::Computed` column. It binds the target
+to that new column and returns `RirNode::Project`. When a compilation allocation
+owner is supplied, the same method reserves the expression, projection, and
+variable-storage extents through that owner.
 
 ### ProjectExpr
 
@@ -167,9 +153,10 @@ The order distinguishes negative zero from positive zero and preserves the
 sign, signaling state, and payload of NaNs. Equality is equality in that total
 order: two values compare equal only when their bit patterns are identical.
 Consequently, `-0.0` is not equal to `0.0`, and a NaN compares equal to the
-same NaN bit pattern. Arithmetic operations that produce a NaN normalize it to
-one positive quiet-NaN bit pattern, so host and CUDA results do not depend on a
-platform-specific NaN payload.
+same NaN bit pattern. Division and exponentiation normalize NaN results to one
+positive quiet-NaN bit pattern in both the shared host evaluator and CUDA helpers.
+The low-level remainder helper does too, although source lowering rejects float
+`%`. Addition, subtraction, and multiplication do not canonicalize NaNs.
 
 ### Error Handling
 
@@ -179,7 +166,8 @@ each fault yields for integer versus float columns.
 
 | Condition | Integer Behavior | Float Behavior |
 |-----------|------------------|----------------|
-| Division by zero | `INT64_MAX` | `NaN` / `Inf` |
+| Division by zero | Maximum value of the operand type (`i32`, `i64`, `u32`, or `u64`) | `NaN` / `Inf` |
+| Remainder by zero | `0` | Source `%` rejects float operands |
 | Overflow | Wraps (standard semantics) | IEEE 754 |
 
 Because faults become values rather than errors, filter them out explicitly when

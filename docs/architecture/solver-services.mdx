@@ -95,22 +95,25 @@ deciding. It is never a proof of either SAT or UNSAT.
 
 Available since 0.11.0. Alongside the CNF/CDCL substrate, `xlog-cuda` carries a
 second device-resident solver for *joint label assignment*: picking one label per
-entity subject to pairwise constraints between candidate pairs. It is exposed to
+entity subject to candidate argument and role-signature constraints. It is exposed to
 Python as `pyxlog.JointConstraintCarrier`.
 
 A carrier is constructed with `(device, entities, domain_lanes, candidates,
-labels, fuel_limit)`. `register_schema(catalog_sha, solver_identity)` pins it to a
-schema and to the ABI string `pyxlog.SOLVER_ABI_IDENTITY`, once per session;
-`bind_signatures(head_masks, tail_masks)` installs the constraint masks, also once.
+labels, fuel_limit, max_arity=2)`. `register_schema(catalog_sha, solver_identity)`
+pins it to a schema and to the ABI string `pyxlog.SOLVER_ABI_IDENTITY`, once per
+session. `bind_signatures(head_masks, tail_masks)` installs binary-role masks;
+`bind_role_signatures(role_masks)` installs masks for the configured argument roles.
+Signatures may be bound only once.
 Two solve stages then run on device in order — `solve_label_feasibility(abstain_label)`
 narrows each entity's feasible label set, then `solve_label_map_top2()` computes the
-per-candidate top-two scores — followed by `solve_components_exact(comp_offsets,
-comp_indices)`, which solves each listed multi-candidate component by complete
-enumeration.
+per-candidate top-two scores. `solve_components_exact()` then discovers connected
+components from the carrier's argument matrix on device. It runs finite enumeration,
+chain dynamic programming, and general branch-and-bound search through the same
+carrier, with per-row status identifying which stage established exact authority.
 
 `export_buffer(name)` hands one named result buffer back as a zero-copy DLPack
 capsule (`domains`, `scores`, `constraints`, `outputs`, `feasible_sets`,
-`logical_counts`, `map_results`, or `solve_status`). Because the buffer stays on
+`argument_arities`, `logical_counts`, `map_results`, or `solve_status`). Because the buffer stays on
 the device and xlog stays its owner, ordering is explicit: `note_producer_stream`
 records an external CUDA stream whose writes the next solve must wait on, and
 `note_consumer_stream` records a stream the carrier signals after a stage
@@ -122,20 +125,26 @@ Refusals are typed and fail-closed, matching the rest of the solver contract.
 mismatch, a re-registration, a zero capacity dimension, binding or solving before
 `register_schema`, rebinding already-bound masks, a mask shape mismatch, solving
 before signatures are bound, running the top-two stage before feasibility solved,
-a malformed component plan, an out-of-range abstain label, and an unavailable or
-unloadable kernel. `pyxlog.SolverResourceExhausted` is raised only when a solve
-would exceed `fuel_limit`; the overflowing charge is never applied, so the
-session's `fuel_spent` is unchanged and an identical retry refuses identically.
+a malformed argument layout, an out-of-range abstain label, and an unavailable or
+unloadable kernel. `pyxlog.SolverResourceExhausted` reports a fuel charge whose
+saturating sum exceeds `fuel_limit`; that refused charge is not applied. Feasibility
+and top-two each charge `candidates * labels` before launch. Component search
+authorizes the remaining fuel, then reconciles it to device-measured expansions
+through an eight-byte counter read after a stream completion wait. Unspent fuel is
+refunded with saturating subtraction. This stage therefore has an explicit host
+metadata observation; it does not itself meet a ZERO TRANSFER claim.
+
+The fuel meter uses `u64::saturating_add`, not checked addition. At a limit of
+`u64::MAX`, arithmetic overflow saturates to that limit and is accepted; the meter
+does not signal overflow as a separate refusal. A failed launch after a successful
+charge also does not automatically refund the charge.
 
 Two limits are worth stating plainly:
 
-- `solve_components_exact` enumerates. A component past the stage's capacity is
-  not solved — it is marked refused in `solve_status` (row value `3`), leaving
-  those rows on top-two authority rather than exact. The exact memoized
-  dynamic-programming stage for chain-order components
-  (`xlog_cuda::JointConstraintCarrier::solve_components_memoized`, backed by the
-  `joint_label_memoized` kernel) exists in the Rust carrier only; it is not
-  reachable from `pyxlog.JointConstraintCarrier`.
+- `solve_components_exact()` returning successfully does not make every row exact.
+  Inspect `solve_status`: `2` means exact enumeration, `4` exact chain dynamic
+  programming, `5` exact general branch-and-bound, `3` fuel refusal, and
+  `0xFFFFFFFF` poisoned input/result. Untouched rows retain top-two authority.
 - `map_results` is the global max-marginal label only for single-candidate
   components. For a multi-candidate component the top-two stage's answer is not
   authoritative until `solve_components_exact` has covered it.
