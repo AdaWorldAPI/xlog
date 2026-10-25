@@ -956,7 +956,6 @@ impl SourceContentGeometryOwner {
                 .as_ref()
                 .and_then(|work| work.capture_bank)
                 != Some(section.1)
-            || prepared.model_content_recorded & (1 << section.1) == 0
         {
             return Err(publication_input_error(
                 "CURRENT content changed its original child admission, prepared operation or bank",
@@ -1458,7 +1457,9 @@ impl SemanticPreparedSourceContentGeometry {
                     != layouts.get(&(view.role, view.index))
             })
         {
-            return Err(publication_input_error("actor refresh CURRENT model geometry changed its original immutable layout and alias partition"));
+            return Err(publication_input_error(
+                "actor refresh CURRENT model geometry changed its original immutable layout and alias partition",
+            ));
         }
         self.model_input_generation_port()?
             .require_target_binding(inputs, &build.scope)?;
@@ -1685,9 +1686,11 @@ impl SemanticPreparedSourceContentGeometry {
         match self.owner.kind {
             SemanticSourceContentGeometryKind::Historical => Ok("checkpoint-model"),
             SemanticSourceContentGeometryKind::Current
-            | SemanticSourceContentGeometryKind::CurrentDemonstration => Err(publication_input_error(
-                "current geometry uses its original native-bank adoption, not checkpoint restoration",
-            )),
+            | SemanticSourceContentGeometryKind::CurrentDemonstration => {
+                Err(publication_input_error(
+                    "current geometry uses its original native-bank adoption, not checkpoint restoration",
+                ))
+            }
         }
     }
     pub fn model_contract_material(
@@ -1698,12 +1701,7 @@ impl SemanticPreparedSourceContentGeometry {
     pub fn model_restore_context(
         &self,
     ) -> Result<
-        (
-            SemanticPublishedIdentity,
-            u64,
-            (u64, u64, u64),
-            (Identity256, Identity256),
-        ),
+        (SemanticPublishedIdentity, u64, (u64, u64, u64), Identity256),
         SemanticTransitionError,
     > {
         if self.owner.kind.is_current() {
@@ -2702,7 +2700,9 @@ impl native_work_bound::FrozenColdSourceContent {
                     .map_err(|_| publication_input_error("original SOURCE activation is poisoned"))?
                     .is_some()
             {
-                return Err(publication_input_error("SOURCE union requires distinct unentered recipes from the same original report"));
+                return Err(publication_input_error(
+                    "SOURCE union requires distinct unentered recipes from the same original report",
+                ));
             }
             let destinations = owner.destinations.lock().map_err(|_| {
                 publication_input_error("original SOURCE destinations are poisoned")
