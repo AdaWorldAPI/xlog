@@ -218,8 +218,7 @@ impl SemanticTransitionSession {
             || self.task_evaluation_identity() != Some(stage.task_identity)
             || stage.layout.prefill_tokens.is_empty()
             || stage.layout.prefill_tokens.len() as u64 != parent.bank.header.prefix_extent
-            || (restored.is_none()
-                && (stage.input.is_none() || stage.consumer_stream.is_none()))
+            || (restored.is_none() && (stage.input.is_none() || stage.consumer_stream.is_none()))
         {
             return Err(publication_input_error(
                 "dormant prefill is not its original completed input/output boundary",
@@ -1553,14 +1552,7 @@ impl OriginalRestoredModelContextPrefill {
     }
 
     pub(super) fn native_ceilings(&self) -> Result<([u64; 9], [u64; 9]), SemanticTransitionError> {
-        let token_bytes = self
-            .record
-            .tokens
-            .len()
-            .checked_mul(size_of::<u64>())
-            .and_then(|bytes| u64::try_from(bytes).ok())
-            .ok_or(SemanticTransitionError::GenerationExhausted)?;
-        let mut dma = [1, 0, 0, 0, 0, 0, 0, 0, token_bytes];
+        let mut dma = [0u64; 9];
         for (_, _, bytes) in self.copy_plans.iter().flatten() {
             dma[0] = dma[0]
                 .checked_add(1)
@@ -1576,8 +1568,7 @@ impl OriginalRestoredModelContextPrefill {
         Ok(self
             .cache_copies
             .iter()
-            .any(crate::device::RetainedDeviceMemoryCommand::completion_pending)
-)
+            .any(crate::device::RetainedDeviceMemoryCommand::completion_pending))
     }
 
     pub(super) fn proof(

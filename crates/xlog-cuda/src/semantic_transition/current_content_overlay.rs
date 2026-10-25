@@ -1,9 +1,6 @@
 //! One backing for mutually exclusive CURRENT child content producers.
 
-use super::super::source_content_occurrences::{
-    SemanticSourceContentEvent, SemanticSourceContentKind, SemanticSourceTensorDescriptor,
-    SourceContentAllocation,
-};
+use super::super::source_content_occurrences::SemanticSourceTensorDescriptor;
 use super::*;
 
 /// Private custody rooted in one original decoded instruction. It survives
@@ -45,7 +42,6 @@ pub(super) struct CurrentContentOverlay {
 }
 
 struct ContentOverlayState {
-    rosters: [Option<ContentOverlayRoster>; 4],
     backing: Option<ContentOverlayBacking>,
     binding_entered: bool,
     bound: bool,
@@ -59,11 +55,6 @@ struct ContentOverlayBacking {
     _retirement: ModelExportOwner,
 }
 
-pub(super) struct ContentOverlayRoster {
-    tensors: Vec<SemanticSourceTensorDescriptor>,
-    _reservation: SemanticReplayMaterialReservation,
-}
-
 fn overlay_index(kind: SemanticTransitionKind) -> Result<usize, SemanticTransitionError> {
     match kind {
         SemanticTransitionKind::Recompute => Ok(0),
@@ -75,9 +66,9 @@ fn overlay_index(kind: SemanticTransitionKind) -> Result<usize, SemanticTransiti
 }
 
 impl SemanticPreparedSourceContentGeometry {
-    /// Declare the complete original allocation rosters before either SOURCE
-    /// freezes. Outer Update banks and each child's conditional banks provide
-    /// the alternatives; the caller supplies no exclusion claim.
+    /// Declare the original allocation alternatives for both SOURCE owners.
+    /// Outer Update banks and each child's conditional banks provide the
+    /// alternatives; the caller supplies no exclusion claim.
     pub fn content_overlay(
         &self,
         other: &Self,
@@ -89,12 +80,6 @@ impl SemanticPreparedSourceContentGeometry {
     > {
         let index = overlay_index(prepared_kind)?;
         self.require_content_overlay_pair(other)?;
-        let first_frozen = self.owner.occurrences.lock().map_err(|_| {
-            publication_input_error("original content occurrence custody is poisoned")
-        })?;
-        let second_frozen = other.owner.occurrences.lock().map_err(|_| {
-            publication_input_error("original content occurrence custody is poisoned")
-        })?;
         let mut first =
             self.owner.overlays.lock().map_err(|_| {
                 publication_input_error("original content overlay custody is poisoned")
@@ -117,11 +102,6 @@ impl SemanticPreparedSourceContentGeometry {
         }
         if second[index].is_some() {
             return Err(SemanticTransitionError::ObservationMismatch);
-        }
-        if first_frozen.is_some() || second_frozen.is_some() {
-            return Err(publication_input_error(
-                "content overlay must precede the original SOURCE freeze",
-            ));
         }
         for owner in [&self.owner, &other.owner] {
             if owner
@@ -204,7 +184,6 @@ impl SemanticPreparedSourceContentGeometry {
             span_bytes,
             alignment,
             state: Mutex::new(ContentOverlayState {
-                rosters: std::array::from_fn(|_| None),
                 backing: None,
                 binding_entered: false,
                 bound: false,
@@ -333,9 +312,9 @@ impl SemanticPreparedSourceContentGeometry {
         let mut state = owner.state.lock().map_err(|_| {
             publication_input_error("original content overlay backing custody is poisoned")
         })?;
-        if state.binding_entered || state.rosters.iter().any(Option::is_none) {
+        if state.binding_entered {
             return Err(publication_input_error(
-                "content overlay binds once after its complete original four-body roster freezes",
+                "content overlay binds once for its declared allocation alternatives",
             ));
         }
         state.binding_entered = true;
@@ -631,154 +610,7 @@ impl SourceContentGeometryOwner {
                 .ok_or(SemanticTransitionError::ObservationMismatch)?
                 .1;
         owner.placement(alternative, descriptor)?;
-        if owner
-            .state
-            .lock()
-            .map_err(|_| {
-                publication_input_error("original content overlay roster custody is poisoned")
-            })?
-            .rosters[alternative]
-            .as_ref()
-            .is_some_and(|roster| !roster.tensors.contains(descriptor))
-        {
-            return Err(publication_input_error(
-                "content overlay tensor differs from its original typed capture roster",
-            ));
-        }
         Ok((false, false))
-    }
-
-    pub(super) fn prepare_content_overlay_rosters<A: SourceContentAllocation>(
-        &self,
-        events: &[SemanticSourceContentEvent<A>],
-    ) -> Result<[Option<[ContentOverlayRoster; 2]>; 2], SemanticTransitionError> {
-        let overlays = self
-            .overlays
-            .lock()
-            .map_err(|_| publication_input_error("original content overlay custody is poisoned"))?;
-        let mut prepared = [None, None];
-        for (index, owner) in overlays
-            .iter()
-            .enumerate()
-            .filter_map(|(i, value)| value.as_ref().map(|value| (i, value)))
-        {
-            let outer = self
-                .bank
-                .ok_or(SemanticTransitionError::ObservationMismatch)?;
-            let count = events.iter().try_fold(0usize, |count, event| {
-                count
-                    .checked_add(event.tensors.len())
-                    .ok_or(SemanticTransitionError::GenerationExhausted)
-            })?;
-            let bytes = count
-                .checked_mul(size_of::<SemanticSourceTensorDescriptor>())
-                .and_then(|bytes| bytes.checked_add(2 * size_of::<ContentOverlayRoster>()))
-                .ok_or(SemanticTransitionError::GenerationExhausted)?;
-            let mut rosters = [None, None];
-            for inner in 0..2 {
-                let reservation = self.seed.proof.owner.budget.reserve_auxiliary(
-                    u64::try_from(bytes)
-                        .map_err(|_| SemanticTransitionError::GenerationExhausted)?,
-                )?;
-                let alternative = 2 * outer + inner;
-                let mut tensors = Vec::with_capacity(count);
-                for event in events
-                    .iter()
-                    .filter(|event| event.family.prepared_section() == Some((owner.kind, inner)))
-                {
-                    for descriptor in &event.tensors {
-                        let Some(allocation) = event
-                            .allocations
-                            .iter()
-                            .find(|allocation| allocation.slot == descriptor.allocation_slot)
-                            .and_then(|allocation| allocation.native_allocation.as_ref())
-                            .and_then(SourceContentAllocation::original_geometry)
-                        else {
-                            continue;
-                        };
-                        if !allocation.same_handle(&owner.allocation(index)) {
-                            continue;
-                        }
-                        owner.placement(alternative, descriptor)?;
-                        if matches!(descriptor.layout.role, 18..=25)
-                            || event.family.kind() == SemanticSourceContentKind::BindModel
-                            || (event.family.kind() == SemanticSourceContentKind::Verify
-                                && !tensors.contains(descriptor))
-                        {
-                            return Err(publication_input_error(
-                                "content overlay accepts only original owned capture outputs, never borrowed model or input roots",
-                            ));
-                        }
-                        if !tensors.contains(descriptor) {
-                            tensors.push(descriptor.clone());
-                        }
-                    }
-                }
-                for &(slot, _, span) in &owner.placements[alternative] {
-                    if !tensors.iter().any(|tensor| {
-                        owner
-                            .placement(alternative, tensor)
-                            .is_ok_and(|placement| placement.0 == slot)
-                    }) && span != 0
-                    {
-                        return Err(publication_input_error("content overlay omitted an original allocation slot from its complete capture roster"));
-                    }
-                    for tensor in &tensors {
-                        let placement = owner.placement(alternative, tensor)?;
-                        if placement.0 != slot {
-                            continue;
-                        }
-                        if tensors.iter().any(|other| {
-                            other.storage_slot == tensor.storage_slot
-                                && owner
-                                    .placement(alternative, other)
-                                    .is_ok_and(|other| other.0 != slot)
-                        }) {
-                            return Err(publication_input_error("content overlay changed an original within-body storage alias partition"));
-                        }
-                    }
-                }
-                rosters[inner] = Some(ContentOverlayRoster {
-                    tensors,
-                    _reservation: reservation,
-                });
-            }
-            let [Some(first), Some(second)] = rosters else {
-                return Err(SemanticTransitionError::ObservationMismatch);
-            };
-            prepared[index] = Some([first, second]);
-        }
-        Ok(prepared)
-    }
-
-    pub(super) fn freeze_content_overlay_rosters(
-        &self,
-        rosters: [Option<[ContentOverlayRoster; 2]>; 2],
-    ) -> Result<(), SemanticTransitionError> {
-        for (index, rosters) in rosters.into_iter().enumerate() {
-            let Some(rosters) = rosters else {
-                continue;
-            };
-            let owner = self.content_overlay_owner(index)?;
-            let mut state = owner.state.lock().map_err(|_| {
-                publication_input_error("original content overlay roster custody is poisoned")
-            })?;
-            let outer = self
-                .bank
-                .ok_or(SemanticTransitionError::ObservationMismatch)?;
-            if state.rosters[2 * outer..2 * outer + 2]
-                .iter()
-                .any(Option::is_some)
-            {
-                return Err(publication_input_error(
-                    "content overlay typed rosters freeze once under their original SOURCE",
-                ));
-            }
-            for (inner, roster) in rosters.into_iter().enumerate() {
-                state.rosters[2 * outer + inner] = Some(roster);
-            }
-        }
-        Ok(())
     }
 
     pub(super) fn require_prepared_content_overlay(
@@ -801,10 +633,6 @@ impl SourceContentGeometryOwner {
             .backing
             .as_ref()
             .ok_or(SemanticTransitionError::NotBound)?;
-        let alternative = 2 * self
-            .bank
-            .ok_or(SemanticTransitionError::ObservationMismatch)?
-            + section.1;
         if !state.bound
             || session
                 .prepared_segment
@@ -812,9 +640,6 @@ impl SourceContentGeometryOwner {
                 .is_none_or(|build| build.submitted)
             || backing.device != session.provider.device().ordinal()
             || tensor.native_allocation.is_some()
-            || state.rosters[alternative]
-                .as_ref()
-                .is_none_or(|roster| !roster.tensors.contains(descriptor))
             || backing.tensor.data.checked_add(descriptor.byte_offset) != Some(tensor.data)
             || session.actor_refresh.as_ref().is_none_or(|staged| {
                 state

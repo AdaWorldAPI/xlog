@@ -2072,7 +2072,6 @@ impl SemanticTransitionSession {
             source_parent,
             source_admission,
             source_work,
-            layout.prefill_tokens.len(),
         )?;
         self.attach_model_context_prefill_work(
             continuation,
