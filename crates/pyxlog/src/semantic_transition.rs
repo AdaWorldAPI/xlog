@@ -18043,9 +18043,9 @@ impl PySemanticPreparedStep {
     /// Cold original records, not encoded features or current-bank substitutes.
     /// Returns (predecessor_identity, successor_identity_or_None, records), with
     /// records ordered by (role, index). Each record is (role, index, generation,
-    /// capacity_bytes, logical_begin, logical_end, native_identity, raw_bytes).
-    /// Native identity is the original range seal; a carrier hashes raw_bytes
-    /// separately for bytes_sha256. No new model or publication identity issues.
+    /// capacity_bytes, logical_begin, logical_end, raw_bytes).
+    /// These actual records retain their original owning publication, not a
+    /// separate numerical content identity.
     #[pyo3(signature = (*, consumer_streams))]
     fn completed_feedback_records(
         &self,
@@ -25322,7 +25322,7 @@ impl PySemanticTransitionController {
     /// acknowledgement_payload_capacity_bytes, model_generation, policy_generation,
     /// model_numerical_mode (complete, restorable producer-owned cold metadata),
     /// model_contract_layout (S_begin, S_bytes, S_digest_offset, generation_offset,
-    /// N_offset, identity_offset), six u64 byte coordinates in record 44,
+    /// identity_offset), five u64 coordinates in record 44,
     /// neural_generation, cache_generation, training_cursor, training_rng
     /// (four u64 words), fuel, rng (model u32, stream u64, family u8, proposal u32),
     /// topology_identity and table_identity (bytes32), role_counts (55 u64s),
