@@ -655,7 +655,7 @@ impl SemanticTransitionSession {
         })?;
         self.record_evaluation_model_stream_dependencies(handle, stream, recorder)?;
         stream.record(recorder)?;
-        content.record_uses(recorder);
+        content.record_uses(recorder)?;
         recorder.write(&binding.gate);
         recorder.read_write(&cold);
         let inputs = self.evaluation_model_forward_inputs(handle, stream)?;
