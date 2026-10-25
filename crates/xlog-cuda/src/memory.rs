@@ -3382,6 +3382,9 @@ fn map_resource_error(e: ResourceError, prior_peak_bytes: u64) -> XlogError {
             prior_peak_bytes,
         }
         .into_error(),
+        ResourceError::CudaDriver(error) => {
+            XlogError::Kernel(format!("device-runtime driver: {error}"))
+        }
         ResourceError::Driver(msg) => XlogError::Kernel(format!("device-runtime driver: {}", msg)),
         ResourceError::StreamMisuse(msg) => {
             XlogError::Kernel(format!("device-runtime stream misuse: {}", msg))
