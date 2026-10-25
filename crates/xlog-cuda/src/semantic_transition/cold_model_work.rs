@@ -299,36 +299,6 @@ impl SemanticColdResidentRestorationPrelude {
     }
 }
 
-/// Actual model and native components, not the complete operation's
-/// native work or physical peak. Other cold producers remain independent.
-#[derive(Clone, Copy, Debug)]
-pub struct SemanticColdModelWorkResult {
-    pub model_work: u64,
-    pub operation_count: u64,
-    pub work_bound: u64,
-    pub model_calls: u64,
-    pub native_work: u64,
-    pub native_events: [u64; 9],
-}
-
-impl SemanticColdModelWorkResult {
-    fn include(&mut self, other: Self) -> Result<(), SemanticTransitionError> {
-        let add = |left: u64, right: u64| {
-            left.checked_add(right)
-                .ok_or(SemanticTransitionError::GenerationExhausted)
-        };
-        self.model_work = add(self.model_work, other.model_work)?;
-        self.operation_count = add(self.operation_count, other.operation_count)?;
-        self.work_bound = add(self.work_bound, other.work_bound)?;
-        self.model_calls = add(self.model_calls, other.model_calls)?;
-        self.native_work = add(self.native_work, other.native_work)?;
-        for (total, actual) in self.native_events.iter_mut().zip(other.native_events) {
-            *total = add(*total, actual)?;
-        }
-        Ok(())
-    }
-}
-
 pub(super) struct CompletedModelContextColdResult {
     instruction: Arc<[u8]>,
     result: SemanticColdModelWorkResult,
@@ -6548,17 +6518,6 @@ impl SemanticTransitionSession {
             if let Some(error) = admission_error.take() {
                 return Err(error);
             }
-            let kernel = self
-                .provider
-                .device()
-                .inner()
-                .get_func(
-                    "xlog_semantic_transition",
-                    "semantic_cold_model_work_result",
-                )
-                .ok_or_else(|| {
-                    runtime_error("kernel lookup", "cold model work result unavailable")
-                })?;
             let input = if storage.recorded_events().is_empty() {
                 ModelWorkInput::default()
             } else {
@@ -6568,51 +6527,15 @@ impl SemanticTransitionSession {
             if let Some(work) = &storage.work {
                 work.record_reads(&mut recorder);
             }
-            recorder.read(&storage.native_work);
-            recorder.write(&storage.report);
-            let arguments = (
-                input.events,
-                input.count,
-                input.bound,
-                storage.native_work.device_ptr_value(),
-                storage.report.device_ptr_value(),
-            );
-            completion.command.run(
+            native_work_report::run_native_work_report(
+                &self.provider,
                 &self.domain,
+                &mut completion.command,
                 &mut completion.poisoned,
+                input,
+                &storage.native_work.view(),
+                &storage.report.view(),
                 recorder,
-                |enqueue, entered, submitted| {
-                    let (events, count, bound, native, report) = arguments;
-                    let events = events.into_kernel_param_storage();
-                    let count = count.into_kernel_param_storage();
-                    let bound = bound.into_kernel_param_storage();
-                    let native = native.into_kernel_param_storage();
-                    let report = report.into_kernel_param_storage();
-                    let mut parameters = [
-                        events.as_kernel_param(),
-                        count.as_kernel_param(),
-                        bound.as_kernel_param(),
-                        native.as_kernel_param(),
-                        report.as_kernel_param(),
-                    ];
-                    // SAFETY: all inputs and the report remain in this exact
-                    // original invocation through driver entry and completion.
-                    unsafe {
-                        kernel.launch_raw_in_original(
-                            enqueue,
-                            LaunchConfig {
-                                grid_dim: (1, 1, 1),
-                                block_dim: (1, 1, 1),
-                                shared_mem_bytes: 0,
-                            },
-                            &mut parameters,
-                            false,
-                            entered,
-                            submitted,
-                        )
-                    }
-                    .map_err(|error| XlogError::Kernel(error.to_string()))
-                },
             )?;
         }
         storage.state = RecordingState::Submitted;
@@ -6656,16 +6579,7 @@ impl SemanticTransitionSession {
                 "cold model work report is incomplete; retain its original operation",
             ));
         }
-        let mut result = SemanticColdModelWorkResult {
-            model_work: words[1],
-            operation_count: words[2],
-            work_bound: words[3],
-            model_calls: words[4],
-            native_work: words[5],
-            native_events: words[6..15]
-                .try_into()
-                .expect("checked original native event extent"),
-        };
+        let mut result = SemanticColdModelWorkResult::from_native_report(&words)?;
         storage
             .allowance
             .lock()

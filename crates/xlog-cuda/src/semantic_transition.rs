@@ -76,6 +76,10 @@ mod publication_readback;
 pub use material_output::{
     SemanticPublicationReadbackLoan, SemanticReplayMaterialOutput, SemanticReplayMaterialScratch,
 };
+mod native_work_report;
+pub use native_work_report::SemanticColdModelWorkResult;
+mod training_arena_materialization;
+use training_arena_materialization::OriginalTrainingMaterializationWork;
 mod model_work_port;
 pub use model_work_port::{SemanticModelWorkBufferExport, SemanticModelWorkBufferPort};
 #[cfg(feature = "semantic-policy")]
@@ -97,7 +101,7 @@ mod verification_receipts;
 pub use cold_model_work::{
     SemanticColdModelWork, SemanticColdModelWorkAdmission, SemanticColdModelWorkDisposition,
     SemanticColdModelWorkOperation, SemanticColdModelWorkPurpose, SemanticColdModelWorkRegion,
-    SemanticColdModelWorkReportCursor, SemanticColdModelWorkResult, SemanticColdNativeWork,
+    SemanticColdModelWorkReportCursor, SemanticColdNativeWork,
     SemanticColdNativeWorkActivationIdentity, SemanticColdNativeWorkActivationPermit,
     SemanticColdResidentRestorationPrelude,
 };
@@ -13000,6 +13004,7 @@ struct PublishedReader {
     device: TrackedCudaSlice<PublicationLease>,
     #[cfg(feature = "semantic-policy")]
     initialization_dma_recorded: bool,
+    materialization_initialization_dma_recorded: bool,
     acquisition_owner: Arc<Mutex<OriginalPublishedAcquisition>>,
     acquisition_pending: bool,
     acquisition: PublishedReaderAcquisition,
@@ -19628,6 +19633,7 @@ struct PublicationRead<T: DeviceRepr + Copy> {
     read: crate::device::RetainedDeviceRead<T>,
     uncertain_dma_bytes: Option<usize>,
     dma_observation_recorded: bool,
+    materialization_dma_recorded: bool,
     _material_reservation: Option<Arc<SemanticReplayMaterialReservation>>,
     _byte_custody: Option<Arc<dyn Send + Sync>>,
     #[cfg(feature = "semantic-policy")]
@@ -19894,6 +19900,8 @@ pub struct SemanticTransitionSession {
     completed_delivery_acknowledgement_dma: OriginalDeliveryAcknowledgementDma,
     replay_authentication: Option<ReplayAuthentication>,
     pending_training_materialization: Option<PendingTrainingMaterialization>,
+    training_materialization_work:
+        Option<Arc<Mutex<native_work_report::OriginalNativeWorkAccounting>>>,
     replay_join: Option<Arc<Mutex<replay_join::OriginalReplayPublicationJoin>>>,
     replay_join_pending: Arc<AtomicBool>,
     resident_model_activation: Option<Arc<Mutex<resident_model_memory::ResidentModelActivation>>>,
@@ -22116,15 +22124,25 @@ mod prepared_completion_tests {
     }
 }
 
+pub(crate) fn original_training_materialization_metadata_bytes(
+) -> Result<usize, SemanticTransitionError> {
+    training_arena_materialization::metadata_allocation_bytes()
+}
+
 struct PendingTrainingMaterialization {
     base: SemanticPublishedIdentity,
     lease_token: u64,
     completion: Option<SemanticPublishedIdentity>,
     handoff_reader: Option<u64>,
-    release_started: bool,
+    release_complete: bool,
+    failed: bool,
+    quiesced: bool,
+    consumer_streams: Vec<u64>,
     prepared: Option<crate::semantic_training_view::PreparedOriginalTrainingRoster>,
-    _source: TrackedCudaSlice<u8>,
-    _input: TrackedCudaSlice<crate::semantic_training_view::TrainingOriginalMaterializationInput>,
+    packed: Vec<u8>,
+    input: crate::semantic_training_view::TrainingOriginalMaterializationInput,
+    destinations: Vec<DeviceMemoryView<u8>>,
+    work: OriginalTrainingMaterializationWork,
 }
 
 struct UnreleasedPublicationOwners {
@@ -32565,17 +32583,38 @@ impl SemanticTransitionSession {
         original: Option<&mut OriginalNativeCommand>,
         poisoned: &mut bool,
     ) -> Result<(), SemanticTransitionError> {
+        let materialization_work = self
+            .training_materialization_work
+            .as_ref()
+            .map(|owner| {
+                owner
+                    .lock()
+                    .map_err(|_| SemanticTransitionError::Poisoned)
+                    .map(|owner| {
+                        if owner.initialized {
+                            owner.work.clone()
+                        } else {
+                            None
+                        }
+                    })
+            })
+            .transpose()?
+            .flatten();
         #[cfg(feature = "semantic-policy")]
         let native_work = if operation == 2 || operation == 3 {
-            token
+            materialization_work.or(token
                 .map(|token| self.cold_native_work(token))
                 .transpose()?
-                .flatten()
+                .flatten())
         } else {
             None
         };
         #[cfg(not(feature = "semantic-policy"))]
-        let native_work: Option<DeviceMemoryView<u64>> = None;
+        let native_work = if operation == 2 || operation == 3 {
+            materialization_work
+        } else {
+            None
+        };
         let storage = self
             .publication
             .as_ref()
@@ -32737,6 +32776,7 @@ impl SemanticTransitionSession {
             read,
             uncertain_dma_bytes: None,
             dma_observation_recorded: false,
+            materialization_dma_recorded: false,
             _material_reservation: material_reservation,
             _byte_custody: byte_custody,
             #[cfg(feature = "semantic-policy")]
@@ -32821,7 +32861,6 @@ impl SemanticTransitionSession {
         }
         #[cfg(feature = "semantic-policy")]
         let allowance = self.require_publication_read_dma_allowance(original)?;
-        #[cfg(feature = "semantic-policy")]
         let bytes = original
             .read
             .source()
@@ -32844,6 +32883,13 @@ impl SemanticTransitionSession {
                 error
             })
         });
+        if original.read.submitted() {
+            training_arena_materialization::record_materialization_dma(
+                self.training_materialization_work.as_ref(),
+                bytes,
+                &mut original.materialization_dma_recorded,
+            )?;
+        }
         #[cfg(feature = "semantic-policy")]
         self.record_publication_read_submitted_dma(original)?;
         match copy_status {
@@ -33033,6 +33079,7 @@ impl SemanticTransitionSession {
                 device,
                 #[cfg(feature = "semantic-policy")]
                 initialization_dma_recorded: false,
+                materialization_initialization_dma_recorded: false,
                 acquisition_owner: Arc::clone(&original),
                 acquisition_pending: true,
                 acquisition: PublishedReaderAcquisition::Allocated,
@@ -33248,7 +33295,7 @@ impl SemanticTransitionSession {
                     owner,
                 )
                 .map_err(|error| {
-                    runtime_error("publication lease initialization staging", error)
+                    native_runtime_error("publication lease initialization staging", error)
                 })?;
                 self.provider
                     .admit_launch_metadata_htod(size_of::<PublicationLease>());
@@ -33259,6 +33306,7 @@ impl SemanticTransitionSession {
             }
             #[cfg(feature = "semantic-policy")]
             let allowance = self.graph.cold_work_allowance();
+            let materialization_accounting = self.training_materialization_work.clone();
             let reader = self
                 .readers
                 .get_mut(&token)
@@ -33304,12 +33352,19 @@ impl SemanticTransitionSession {
                                 )?;
                         }
                     }
+                    if initialization.submitted() {
+                        training_arena_materialization::record_materialization_dma(
+                            materialization_accounting.as_ref(),
+                            size_of::<PublicationLease>(),
+                            &mut reader.materialization_initialization_dma_recorded,
+                        )?;
+                    }
                     submission.map_err(|error| {
-                        runtime_error("publication lease initialization upload", error)
+                        native_runtime_error("publication lease initialization upload", error)
                     })?;
                 }
                 initialization.resolve().map_err(|error| {
-                    runtime_error("publication lease initialization completion", error)
+                    native_runtime_error("publication lease initialization completion", error)
                 })
             })();
             if let Err(error) = initialized {
@@ -33349,7 +33404,7 @@ impl SemanticTransitionSession {
         if !original.command.completed {
             original.command.completion.wait().map_err(|error| {
                 original.poisoned = true;
-                runtime_error("original acquisition completion", error)
+                native_runtime_error("original acquisition completion", error)
             })?;
         }
         let lease = self.finish_acquired_reader(token, may_submit, &mut original.poisoned)?;
@@ -38595,6 +38650,7 @@ impl SemanticTransitionSession {
             completed_delivery_acknowledgement_dma: OriginalDeliveryAcknowledgementDma::default(),
             replay_authentication: None,
             pending_training_materialization: None,
+            training_materialization_work: None,
             replay_join: None,
             replay_join_pending: Arc::new(AtomicBool::new(false)),
             resident_model_activation: None,
@@ -40168,26 +40224,18 @@ impl SemanticTransitionSession {
         consumer_streams: &[u64],
         material_reservation: Option<SemanticReplayMaterialReservation>,
     ) -> Result<SemanticPublishedIdentity, SemanticTransitionError> {
-        let quiesced = self
-            .steps
-            .get(&lease.token)
-            .is_some_and(|step| step.consumer_completion.is_some());
-        if quiesced {
-            self.quiesce_step_content(lease, consumer_streams)?;
-        }
         self.ensure_rebindable_with_prefill()?;
         self.checked_reader(lease)?;
+        self.step_consumer_streams(lease.token, consumer_streams)?;
         if self.readers.len() != 1
             || self.admitted_transition.is_some()
             || self.continuation_base.is_some()
             || lease.header.terminal != 0
+            || self.training_materialization_work.is_some()
         {
             return Err(publication_input_error(
                 "original roster admission requires its sole quiescent nonterminal parent",
             ));
-        }
-        if !quiesced {
-            self.quiesce_step_content(lease, consumer_streams)?;
         }
         self.task_objective_law()
             .ok_or(SemanticTransitionError::NotBound)?
@@ -40238,11 +40286,9 @@ impl SemanticTransitionSession {
         if packed.len() != destination_bytes {
             return Err(SemanticTransitionError::ObservationMismatch);
         }
-        let source = allocate_publication::<u8>(&self.provider, packed.len())?;
-        upload_publication(&self.provider, &packed, &source)?;
         let mut input = crate::semantic_training_view::TrainingOriginalMaterializationInput {
             lease: self.readers[&lease.token].device.device_ptr_value(),
-            source: source.device_ptr_value(),
+            source: 0,
             source_bytes: packed.len() as u64,
             destinations: [0; 7],
             lengths: [0; 7],
@@ -40253,69 +40299,109 @@ impl SemanticTransitionSession {
             input.destinations[index] = *destination.device_ptr();
             input.lengths[index] = destination.len() as u64;
         }
-        let input_device = allocate_publication::<
-            crate::semantic_training_view::TrainingOriginalMaterializationInput,
-        >(&self.provider, 1)?;
-        upload_publication(&self.provider, &[input], &input_device)?;
-        let publication = self
+        let storage = self
             .publication
             .as_ref()
             .ok_or(SemanticTransitionError::NotBound)?;
-        let mut descriptor = self.descriptor();
-        descriptor.publication = PublicationCommand {
-            control: publication.control.device_ptr_value(),
-            lease: input_device.device_ptr_value(),
-            operation: 9,
-            native_work: 0,
-        };
-        let mut recorder = self.kernel_recorder()?;
-        recorder.read(&source);
-        recorder.read(&input_device);
-        recorder.read(&self.readers[&lease.token].device);
-        for destination in &destinations {
-            recorder.write(destination);
-        }
+        let work =
+            OriginalTrainingMaterializationWork::new(storage, &lease.directory, packed.len())?;
+        self.training_materialization_work = Some(Arc::clone(&work.accounting));
         self.pending_training_materialization = Some(PendingTrainingMaterialization {
             base: lease.identity,
             lease_token: lease.token,
             completion: None,
             handoff_reader: None,
-            release_started: false,
+            release_complete: false,
+            failed: false,
+            quiesced: false,
+            consumer_streams: consumer_streams.to_vec(),
             prepared: Some(prepared),
-            _source: source,
-            _input: input_device,
+            packed,
+            input,
+            destinations,
+            work,
         });
-        let execute = self.execute.clone();
-        let mut entered = false;
-        let result = enqueue_recorded(&self.domain, &mut self.poisoned, recorder, |stream| {
-            entered = true;
-            // SAFETY: the original pending owner retains every source and exact reserved destination through the join.
-            unsafe {
-                execute.launch_in(
-                    stream,
-                    LaunchConfig {
-                        grid_dim: (1, 1, 1),
-                        block_dim: (256, 1, 1),
-                        shared_mem_bytes: 0,
-                    },
-                    (descriptor,),
-                )
-            }
-            .map_err(|error| XlogError::Kernel(error.to_string()))
-        });
-        if let Err(error) = result {
-            if entered {
-                self.poisoned = true;
-            } else {
-                self.pending_training_materialization = None;
-            }
-            return Err(error);
-        }
         self.resolve_training_arena(lease)
     }
 
     pub fn training_arena_pending(&self) -> bool {
+        self.pending_training_materialization
+            .as_ref()
+            .is_some_and(|pending| !pending.failed)
+    }
+
+    pub fn training_arena_started(&self) -> bool {
         self.pending_training_materialization.is_some()
+    }
+
+    fn classify_training_arena_error(
+        &mut self,
+        pending: &mut PendingTrainingMaterialization,
+        error: SemanticTransitionError,
+    ) -> SemanticTransitionError {
+        self.poisoned = true;
+        let retained_failure = (|| {
+            if let Some(status) = pending.work.known_completion_failure() {
+                return Ok(Some(status));
+            }
+            for token in [Some(pending.lease_token), pending.handoff_reader]
+                .into_iter()
+                .flatten()
+            {
+                let Some(reader) = self.readers.get(&token) else {
+                    continue;
+                };
+                let acquisition = reader.acquisition_owner.lock().map_err(|_| {
+                    publication_input_error("original training acquisition owner poisoned")
+                })?;
+                if let Some(status) = acquisition
+                    .command
+                    .completion_failure
+                    .or_else(|| acquisition.command.completion.known_completion_failure())
+                {
+                    return Ok(Some(status));
+                }
+                if let Some(original) = &reader.retirement_owner {
+                    let original = original.lock().map_err(|_| {
+                        publication_input_error("original training retirement owner poisoned")
+                    })?;
+                    let read = original.read.lock().map_err(|_| {
+                        publication_input_error("original training retirement read owner poisoned")
+                    })?;
+                    if let Some(status) = original
+                        .command
+                        .completion_failure
+                        .or_else(|| original.command.completion.known_completion_failure())
+                        .or_else(|| read.known_completion_failure())
+                    {
+                        return Ok(Some(status));
+                    }
+                }
+            }
+            Ok(None)
+        })();
+        let error = match retained_failure {
+            Ok(Some(status)) => native_runtime_error(
+                "original training arena completion",
+                cudarc::driver::DriverError(status),
+            ),
+            Ok(None) => error,
+            Err(error) => error,
+        };
+        let retryable = match &error {
+            SemanticTransitionError::NativeCompletionPending { .. } => true,
+            SemanticTransitionError::NativeExecutionFailure { status, .. } => {
+                crate::device::known_execution_failure(&cudarc::driver::DriverError(*status))
+                    .is_none()
+                    && matches!(
+                        *status,
+                        sys::CUresult::CUDA_ERROR_UNKNOWN | sys::CUresult::CUDA_ERROR_NOT_READY
+                    )
+            }
+            _ => false,
+        };
+        pending.failed |= !retryable;
+        error
     }
 
     pub fn validate_training_arena_parent(
@@ -40326,9 +40412,12 @@ impl SemanticTransitionSession {
             .pending_training_materialization
             .as_ref()
             .ok_or(SemanticTransitionError::NoPendingLaunch)?;
-        if !lease.active
+        if pending.failed {
+            return Err(SemanticTransitionError::Poisoned);
+        }
+        if (!lease.active && !pending.release_complete)
             || !Arc::ptr_eq(&lease.issuer, &self.publication_issuer)
-            || !self.readers.contains_key(&lease.token)
+            || (!pending.release_complete && !self.readers.contains_key(&lease.token))
             || lease.identity != pending.base
             || lease.token != pending.lease_token
         {
@@ -40344,69 +40433,195 @@ impl SemanticTransitionSession {
         lease: &SemanticPublishedLease,
     ) -> Result<SemanticPublishedIdentity, SemanticTransitionError> {
         self.validate_training_arena_parent(lease)?;
-        let pending = self
+        let mut pending = self
             .pending_training_materialization
-            .as_ref()
-            .expect("checked original operation");
-        if let Some(identity) = pending.completion {
-            return Ok(identity);
-        }
-        let base = pending.base;
-        wait_on_stream(
-            &self.stream,
-            &mut self.poisoned,
-            &mut self.stream_waits,
-            "original training roster materialization",
-            CudaStream::synchronize,
-        )?;
-        let publication = Arc::clone(
-            self.publication
-                .as_ref()
-                .ok_or(SemanticTransitionError::NotBound)?,
-        );
-        let control = self.publication_read(publication.control.view())?[0];
-        let expected_word = (((base.word >> 1) + 1) << 1) | ((base.word & 1) ^ 1);
-        if control.word == base.word && control.refusal != 0 {
-            let status = control.refusal;
-            self.pending_training_materialization = None;
-            self.poisoned = false;
-            return Err(SemanticTransitionError::PublicationRefused { status });
-        }
-        let header = self.read_publication_header((control.word & 1) as usize)?;
-        if control.word != expected_word
-            || header.publication_word != expected_word
-            || header.instance != base.instance
-            || header.terminal != lease.header.terminal
-            || header.fuel != lease.header.fuel
-            || header.training_cursor != lease.header.training_cursor
-            || header.training_rng != lease.header.training_rng
-        {
-            self.poisoned = true;
-            return Err(SemanticTransitionError::ObservationMismatch);
-        }
-        let arena = Arc::get_mut(
-            self.training_views
-                .as_mut()
-                .ok_or(SemanticTransitionError::NotBound)?,
-        )
-        .ok_or(SemanticTransitionError::ObservationMismatch)?;
-        let pending = self
-            .pending_training_materialization
-            .as_mut()
-            .expect("retained original operation");
-        let prepared = pending
-            .prepared
             .take()
+            .expect("original materialization owner");
+        let result = (|| {
+            if let Some(identity) = pending.completion {
+                return Ok(identity);
+            }
+            // Join the retained entered prefix before admitting its unentered suffix.
+            if self.poisoned {
+                self.stream
+                    .context()
+                    .bind_to_thread()
+                    .and_then(|_| self.stream.context().synchronize())
+                    .map_err(|error| {
+                        native_runtime_error("original training materialization prefix", error)
+                    })?;
+                self.poisoned = false;
+            }
+            let reservation = pending
+                .prepared
+                .as_ref()
+                .and_then(|prepared| prepared.material_reservation.clone());
+            pending
+                .work
+                .prepare(self, &pending.packed, pending.input, reservation)?;
+            pending.work.upload(self)?;
+            if !pending.quiesced {
+                self.quiesce_step_content(lease, &pending.consumer_streams)?;
+                pending.quiesced = true;
+            }
+            let publication = Arc::clone(
+                self.publication
+                    .as_ref()
+                    .ok_or(SemanticTransitionError::NotBound)?,
+            );
+            let mut descriptor = self.descriptor();
+            descriptor.publication = PublicationCommand {
+                control: publication.control.device_ptr_value(),
+                lease: pending.work.input().device_ptr_value(),
+                operation: 9,
+                native_work: pending.work.native().device_ptr_value(),
+            };
+            let mut recorder = self.kernel_recorder()?;
+            recorder.read(pending.work.source());
+            recorder.read(pending.work.input());
+            recorder.read(&self.readers[&lease.token].device);
+            recorder.read_write(pending.work.native());
+            for destination in &pending.destinations {
+                recorder.write(destination);
+            }
+            let execute = self.execute.clone();
+            let command = pending
+                .work
+                .command
+                .as_mut()
+                .expect("original materialization command");
+            let mut failure = None;
+            let dispatched = command.run(
+                &self.domain,
+                &mut self.poisoned,
+                recorder,
+                |enqueue, entered, submitted| {
+                    let mut parameters = [(&mut descriptor as *mut Descriptor).cast()];
+                    // SAFETY: this original owner retains the unchanged descriptor's complete allocations.
+                    unsafe {
+                        execute.launch_raw_in_original(
+                            enqueue,
+                            LaunchConfig {
+                                grid_dim: (1, 1, 1),
+                                block_dim: (256, 1, 1),
+                                shared_mem_bytes: 0,
+                            },
+                            &mut parameters,
+                            false,
+                            entered,
+                            submitted,
+                        )
+                    }
+                    .map_err(|error| {
+                        failure = Some(error.0);
+                        XlogError::Kernel(error.to_string())
+                    })
+                },
+            );
+            if let Some(status) = failure {
+                command.submission_failure = Some(status);
+            }
+            if let Err(error) = dispatched {
+                let status = failure.or(command.submission_failure);
+                if !matches!(
+                    status,
+                    Some(sys::CUresult::CUDA_ERROR_UNKNOWN | sys::CUresult::CUDA_ERROR_NOT_READY)
+                ) {
+                    return Err(match status {
+                        Some(status) => native_runtime_error(
+                            "original training roster materialization",
+                            cudarc::driver::DriverError(status),
+                        ),
+                        None => error,
+                    });
+                }
+            }
+            self.stream
+                .context()
+                .bind_to_thread()
+                .and_then(|_| self.stream.context().synchronize())
+                .map_err(|error| {
+                    native_runtime_error("original training roster materialization", error)
+                })?;
+            let control = self.resolve_publication_read_with_poison(
+                pending
+                    .work
+                    .control
+                    .as_mut()
+                    .expect("original control read"),
+                &mut false,
+            )?[0];
+            let base = pending.base;
+            let expected_word = (((base.word >> 1) + 1) << 1) | ((base.word & 1) ^ 1);
+            if control.word == base.word && control.refusal != 0 {
+                return Err(SemanticTransitionError::PublicationRefused {
+                    status: control.refusal,
+                });
+            }
+            if control.word != expected_word {
+                return Err(SemanticTransitionError::NativeCompletionPending {
+                    operation: "original training roster publication",
+                });
+            }
+            if pending.work.header.is_none() {
+                // SAFETY: the original bank contains the checked fixed native header ABI.
+                let view = unsafe {
+                    publication.banks[(control.word & 1) as usize]
+                        .view()
+                        .cast::<u8>()
+                        .expect("publication bank bytes")
+                        .slice(..size_of::<PublicationHeader>())
+                        .cast::<PublicationHeader>()
+                        .expect("publication header alignment")
+                };
+                pending.work.header = Some(
+                    self.stage_publication_read_with_owner(
+                        view,
+                        pending
+                            .prepared
+                            .as_ref()
+                            .and_then(|prepared| prepared.material_reservation.clone()),
+                    )?,
+                );
+            }
+            let header = self.resolve_publication_read_with_poison(
+                pending.work.header.as_mut().expect("original header read"),
+                &mut false,
+            )?[0];
+            if header.publication_word != expected_word
+                || header.instance != base.instance
+                || header.terminal != lease.header.terminal
+                || header.fuel != lease.header.fuel
+                || header.training_cursor != lease.header.training_cursor
+                || header.training_rng != lease.header.training_rng
+            {
+                return Err(SemanticTransitionError::ObservationMismatch);
+            }
+            let arena = Arc::get_mut(
+                self.training_views
+                    .as_mut()
+                    .ok_or(SemanticTransitionError::NotBound)?,
+            )
             .ok_or(SemanticTransitionError::ObservationMismatch)?;
-        arena.finish_materialization(prepared);
-        let identity = SemanticPublishedIdentity {
-            instance: header.instance,
-            word: header.publication_word,
-            logical_digest: header.logical_digest,
-        };
-        self.poisoned = false;
-        pending.completion = Some(identity);
-        Ok(identity)
+            arena.finish_materialization(
+                pending
+                    .prepared
+                    .take()
+                    .ok_or(SemanticTransitionError::ObservationMismatch)?,
+            );
+            let identity = SemanticPublishedIdentity {
+                instance: header.instance,
+                word: header.publication_word,
+                logical_digest: header.logical_digest,
+            };
+            pending.completion = Some(identity);
+            self.poisoned = false;
+            Ok(identity)
+        })();
+        let result =
+            result.map_err(|error| self.classify_training_arena_error(&mut pending, error));
+        self.pending_training_materialization = Some(pending);
+        result
     }
 
     /// Private, inactive storage for the original operation's Python handoff.
@@ -40448,27 +40663,39 @@ impl SemanticTransitionSession {
             .pending_training_materialization
             .take()
             .expect("resolved original operation");
-        let acquired = if let Some(token) = pending.handoff_reader {
-            // Join the original prefix before continuing. Only its retained
-            // unentered suffix may enqueue; an entered Acquire is observed only.
-            self.continue_acquire_reader(token)
-        } else {
-            let token = self
-                .next_reader
-                .checked_add(1)
-                .ok_or(SemanticTransitionError::GenerationExhausted);
-            match token {
-                Err(error) => Err(error),
-                Ok(token) => {
-                    pending.handoff_reader = Some(token);
-                    let result = self.acquire();
-                    if result.is_err() && !self.readers.contains_key(&token) {
-                        pending.handoff_reader = None;
+        let acquired = (|| {
+            if self.poisoned {
+                self.stream
+                    .context()
+                    .bind_to_thread()
+                    .and_then(|_| self.stream.context().synchronize())
+                    .map_err(|error| {
+                        native_runtime_error("original training successor acquisition", error)
+                    })?;
+                self.poisoned = false;
+            }
+            if let Some(token) = pending.handoff_reader {
+                // Join the original prefix before continuing. Only its retained
+                // unentered suffix may enqueue; an entered Acquire is observed only.
+                self.continue_acquire_reader(token)
+            } else {
+                let token = self
+                    .next_reader
+                    .checked_add(1)
+                    .ok_or(SemanticTransitionError::GenerationExhausted);
+                match token {
+                    Err(error) => Err(error),
+                    Ok(token) => {
+                        pending.handoff_reader = Some(token);
+                        let result = self.acquire();
+                        if result.is_err() && !self.readers.contains_key(&token) {
+                            pending.handoff_reader = None;
+                        }
+                        result
                     }
-                    result
                 }
             }
-        };
+        })();
         if acquired.is_err()
             && pending
                 .handoff_reader
@@ -40482,10 +40709,16 @@ impl SemanticTransitionSession {
                 self.poisoned = false;
             }
         }
+        let acquired =
+            acquired.map_err(|error| self.classify_training_arena_error(&mut pending, error));
         self.pending_training_materialization = Some(pending);
         *successor = acquired?;
         if successor.identity != identity {
             self.poisoned = true;
+            self.pending_training_materialization
+                .as_mut()
+                .expect("original handoff owner")
+                .failed = true;
             return Err(SemanticTransitionError::ObservationMismatch);
         }
         Ok(())
@@ -40497,58 +40730,59 @@ impl SemanticTransitionSession {
         source: &mut SemanticPublishedLease,
         successor: &SemanticPublishedLease,
         consumer_streams: &[u64],
-    ) -> Result<(), SemanticTransitionError> {
+    ) -> Result<SemanticColdModelWorkResult, SemanticTransitionError> {
         self.validate_training_arena_parent(source)?;
-        if self
+        let pending = self
             .pending_training_materialization
             .as_ref()
-            .and_then(|pending| pending.completion)
-            != Some(successor.identity)
+            .expect("original materialization owner");
+        if pending.completion != Some(successor.identity)
             || !successor.active
             || !Arc::ptr_eq(&successor.issuer, &self.publication_issuer)
+            || pending.handoff_reader != Some(successor.token)
+            || pending
+                .consumer_streams
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                != consumer_streams.iter().copied().collect::<BTreeSet<_>>()
         {
             return Err(SemanticTransitionError::ObservationMismatch);
         }
         let mut pending = self
             .pending_training_materialization
             .take()
-            .expect("checked original completion");
+            .expect("original completion");
         let result = (|| {
-            if pending.release_started {
-                wait_on_stream(
-                    &self.stream,
-                    &mut self.poisoned,
-                    &mut self.stream_waits,
-                    "original training source retirement",
-                    CudaStream::synchronize,
-                )?;
-                let actual = self.publication_read(self.readers[&source.token].device.view())?[0];
-                if actual.abi != 1
-                    || actual.instance != source.identity.instance
-                    || actual.word != source.identity.word
-                    || actual.active > 1
-                {
-                    return Err(SemanticTransitionError::ObservationMismatch);
-                }
-                if actual.active == 0 {
-                    self.finish_retired_reader(source, &[actual])?;
+            if !pending.release_complete {
+                if self.poisoned {
+                    self.stream
+                        .context()
+                        .bind_to_thread()
+                        .and_then(|_| self.stream.context().synchronize())
+                        .map_err(|error| {
+                            native_runtime_error("original training source retirement", error)
+                        })?;
                     self.poisoned = false;
-                    return Ok(());
                 }
-                // The joined original device lease proves no decrement committed.
-                // Only this known retained reader may retry its retirement.
-                self.poisoned = false;
+                self.release_published_reader(source, consumer_streams)?;
+                pending.release_complete = true;
+                self.steps.remove(&source.token);
             }
-            self.training_arena_state(successor)?;
-            pending.release_started = true;
-            self.release_published_reader(source, consumer_streams)
+            pending.work.finish_report(self)
         })();
-        if let Err(error) = result {
-            self.pending_training_materialization = Some(pending);
-            return Err(error);
+        match result {
+            Ok(result) => {
+                self.training_materialization_work = None;
+                self.poisoned = false;
+                Ok(result)
+            }
+            Err(error) => {
+                let error = self.classify_training_arena_error(&mut pending, error);
+                self.pending_training_materialization = Some(pending);
+                Err(error)
+            }
         }
-        self.steps.remove(&source.token);
-        Ok(())
     }
 
     pub fn training_arena_state(
