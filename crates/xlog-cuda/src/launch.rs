@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use cudarc::driver::CudaStream;
 
+use crate::cuda_graph::RetirementDisposition;
 use crate::device_runtime::resource::MemoryUseGroup;
 use crate::device_runtime::{
     Access, BlockId, BlockUse, Generation, ResourceError, ResourceResult, StreamId,
@@ -597,22 +598,22 @@ fn quarantine_owner_and_pending<R: RecorderCleanup<U>, U: Copy + Send + 'static>
     let attempted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::cuda_graph::retry_retirement_after_stream_captures(move || {
             let Some(owner) = retained.as_ref() else {
-                return true;
+                return RetirementDisposition::Complete;
             };
             if needs_completion {
                 if owner.synchronize_retired().is_err() {
-                    return false;
+                    return RetirementDisposition::Pending;
                 }
                 needs_completion = false;
             }
             while let Some(use_) = pending.get(remaining_start) {
                 if owner.cancel_retired(*use_).is_err() {
-                    return false;
+                    return RetirementDisposition::Pending;
                 }
                 remaining_start += 1;
             }
             drop(retained.take());
-            true
+            RetirementDisposition::Complete
         });
     }));
     if let Err(payload) = attempted {
