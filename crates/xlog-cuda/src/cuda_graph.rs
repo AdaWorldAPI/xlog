@@ -598,9 +598,7 @@ impl Drop for DriverMutationReservation {
             // destructor or driver operation runs under this mutex.
             let mut registry = stream_capture_registry();
             registry.deferred.append(&mut self.retry);
-            registry
-                .retained_unknown
-                .append(&mut self.retained_unknown);
+            registry.retained_unknown.append(&mut self.retained_unknown);
             if matches!(self.current, Some(DeferredRetirement::Retry(_))) {
                 registry
                     .deferred
