@@ -219,16 +219,7 @@ impl SemanticTransitionSession {
             || stage.layout.prefill_tokens.is_empty()
             || stage.layout.prefill_tokens.len() as u64 != parent.bank.header.prefix_extent
             || (restored.is_none()
-                && (stage.input.is_none()
-                    || stage.consumer_stream.is_none()
-                    || stage
-                        .input_guard
-                        .as_ref()
-                        .is_none_or(|guard| !guard.submitted || !guard.completed)))
-            || stage
-                .token_write
-                .as_ref()
-                .is_none_or(|write| !write.completed())
+                && (stage.input.is_none() || stage.consumer_stream.is_none()))
         {
             return Err(publication_input_error(
                 "dormant prefill is not its original completed input/output boundary",
@@ -1586,11 +1577,7 @@ impl OriginalRestoredModelContextPrefill {
             .cache_copies
             .iter()
             .any(crate::device::RetainedDeviceMemoryCommand::completion_pending)
-            || self
-                .stage
-                .as_ref()
-                .and_then(|stage| stage.token_write.as_ref())
-                .is_some_and(state_restoration::OriginalDeviceWrite::completion_pending))
+)
     }
 
     pub(super) fn proof(
@@ -1772,15 +1759,6 @@ impl SemanticTransitionSession {
         original.work = Some(work.clone());
         if original.stage.is_none() {
             let scope = Arc::clone(&original.declaration.inner.scope);
-            let expected_tokens =
-                allocate_publication(&self.provider, original.record.tokens.len())?;
-            let token_write = state_restoration::OriginalDeviceWrite::new_with_owner(
-                &self.stream,
-                &original.record.tokens,
-                expected_tokens.view(),
-                true,
-                Some(Arc::clone(&original.reservation)),
-            )?;
             let mut contents = Vec::with_capacity(2);
             if original
                 .cache_copies
@@ -1862,31 +1840,12 @@ impl SemanticTransitionSession {
                 task_epoch: original.record.task_epoch,
                 model_generation: original.record.model_generation,
                 layout: original.layout.clone(),
-                expected_tokens,
-                token_write: Some(token_write),
                 input: None,
-                input_guard: None,
                 model_content: Some(model_content),
                 output_content: Some(output_content),
                 consumer_stream: None,
             });
         }
-        let stage = original
-            .stage
-            .as_mut()
-            .expect("retained fresh native prefill stage");
-        stage
-            .token_write
-            .as_mut()
-            .expect("retained native token metadata")
-            .resolve_with_dma(
-                &self.domain,
-                &self.stream,
-                &self.provider,
-                &mut original.poisoned,
-                true,
-                Some(&allowance),
-            )?;
         while original.copy_cursor < original.cache_copies.len() {
             let copy = &mut original.cache_copies[original.copy_cursor];
             allowance

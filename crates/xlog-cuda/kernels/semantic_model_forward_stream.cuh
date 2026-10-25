@@ -14,7 +14,7 @@ struct ModelForwardStreamInputs {
     uint64_t control,lease,selection,state,row_seals,receipt;
     uint64_t row_count,capacity,vocabulary,scalar_type,block_positions,role;
     uint64_t row,position_begin,count,logits,position_stride_bytes;
-    uint64_t candidate_seals,candidate_seal_count,work_sequence;
+    uint64_t work_sequence;
     uint64_t leaf_scratch,leaf_capacity;
 };
 struct ModelStreamLeaf {
@@ -258,40 +258,6 @@ extern "C" __global__ void semantic_model_forward_stream_block(ModelForwardStrea
     semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::CanonicalByte,4*sizeof(uint64_t));
 }
 
-// The only candidate numerical digest is the original, already-recorded output
-// content witness. Its cell addresses are immutable cold metadata; their values
-// are produced BEFORE this finish node in the captured graph.
-__device__ bool semantic_stream_model_numerical(const PublicationControl& control,
-        const PublicationBank& base,const ModelForwardStreamInputs& inputs,
-        uint64_t* numerical,semantic_graph::NativeWorkTally* work) {
-    if(inputs.role!=1) {
-        semantic_stream_copy_identity(numerical,base.header.model_numerical_digest,work);return true;
-    }
-    if(!inputs.candidate_seals || !inputs.candidate_seal_count)return false;
-    const uint64_t directory=control.directories[base.header.publication_word&1];
-    if(!directory || directory%alignof(PublicationRange))return false;
-    const auto* ranges=reinterpret_cast<const PublicationRange*>(directory);
-    const auto* seals=reinterpret_cast<const ModelForwardSealInput*>(inputs.candidate_seals);
-    const char domain[]="xlog.semantic.model-numerics.v1";
-    semantic_graph::sha256(reinterpret_cast<const uint8_t*>(domain),sizeof(domain),numerical,work);
-    publication_fold(numerical,0,0,base.header.model_geometry_digest,work);
-    uint64_t seal_index=0;
-    for(uint64_t item=0;item<base.header.range_count;++item) {
-        semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::TableSlot,1);
-        const auto& range=ranges[item];
-        if(range.role<18 || range.role>25)continue;
-        if(seal_index>=inputs.candidate_seal_count)return false;
-        const auto& seal=seals[seal_index++];
-        if(seal.role!=range.role || seal.index!=range.index || !seal.tensor_digest ||
-           seal.tensor_digest%alignof(uint64_t) || !seal.backing_digest ||
-           seal.backing_digest%alignof(uint64_t))return false;
-        publication_fold(numerical,seal.role,seal.index,
-            reinterpret_cast<const uint64_t*>(seal.tensor_digest),work);
-        publication_fold(numerical,seal.role,seal.index,
-            reinterpret_cast<const uint64_t*>(seal.backing_digest),work);
-    }
-    return seal_index==inputs.candidate_seal_count;
-}
 
 extern "C" __global__ void semantic_model_forward_stream_finish(ModelForwardStreamInputs inputs) {
     if(blockIdx.x || threadIdx.x)return;
@@ -315,9 +281,6 @@ extern "C" __global__ void semantic_model_forward_stream_finish(ModelForwardStre
     receipt.block_positions=state.block_positions;
     receipt.row_seals=inputs.row_seals;receipt.finite=state.finite;
     semantic_stream_copy_identity(receipt.model_geometry_digest,base->header.model_geometry_digest,work);
-    if(!semantic_stream_model_numerical(control,*base,inputs,receipt.model_numerical_digest,work)) {
-        semantic_content_integrity_trap();return;
-    }
     semantic_stream_copy_identity(receipt.logits_digest,state.logits_digest,work);
     semantic_graph::sha256(reinterpret_cast<const uint8_t*>(&receipt),
         sizeof(receipt)-sizeof(receipt.identity),receipt.identity,work);
@@ -341,83 +304,35 @@ __device__ bool semantic_stream_forward_valid(const ModelForwardStreamState& sta
        receipt.block_positions!=state.block_positions || receipt.row_seals!=row_seals ||
        receipt.finite!=state.finite ||
        !publication_identity_equal(receipt.logits_digest,state.logits_digest,work) ||
-       !publication_identity_equal(receipt.model_geometry_digest,baseline.model_geometry_digest,work) ||
-       (role!=1 && !publication_identity_equal(receipt.model_numerical_digest,
-           baseline.model_numerical_digest,work)))return false;
+       !publication_identity_equal(receipt.model_geometry_digest,baseline.model_geometry_digest,work))return false;
     uint64_t identity[4];
     semantic_graph::sha256(reinterpret_cast<const uint8_t*>(&receipt),
         sizeof(receipt)-sizeof(receipt.identity),identity,work);
     return publication_identity_equal(identity,receipt.identity,work);
 }
 
-// Evaluation's original wrapper hashes losses/admissibility/slab AFTER its
-// enqueue callback. Bind those existing device seals here, never a duplicate
-// output hash or an unavailable future candidate-style numerical seal.
-struct ModelEvaluationStreamBinding {
-    uint64_t abi,forward_identity[4],output_digests[3][4],identity[4];
-};
+// Complete the actual evaluation by combining its producer admissibility
+// with the finite result of the full forward. The original model work enters
+// the owning cold tally once per real captured execution.
 struct ModelEvaluationStreamInputs {
-    uint64_t control,lease,selection,state,row_seals,receipt,binding;
-    uint64_t output_digests[3],admissible,gate,native_work;
+    uint64_t state,admissible,gate,native_work;
 };
-static_assert(sizeof(ModelEvaluationStreamBinding)==168,"evaluation stream binding ABI");
-static_assert(sizeof(ModelEvaluationStreamInputs)==104,"evaluation stream input ABI");
+static_assert(sizeof(ModelEvaluationStreamInputs)==32,"evaluation stream input ABI");
 
 extern "C" __global__ void semantic_model_evaluation_stream_binding(
-        ModelEvaluationStreamInputs inputs,uint64_t verify) {
+        ModelEvaluationStreamInputs inputs) {
     if(blockIdx.x || threadIdx.x)return;
-    if(!inputs.native_work) { semantic_content_integrity_trap();return; }
     auto* target=reinterpret_cast<semantic_graph::NativeWorkTally*>(inputs.native_work);
     semantic_graph::NativeWorkTally work{};
     semantic_graph::charge_native(&work,semantic_graph::NativeWorkEvent::Command,1);
     const auto& state=*reinterpret_cast<const ModelForwardStreamState*>(inputs.state);
-    const auto& receipt=*reinterpret_cast<const ModelForwardReceipt*>(inputs.receipt);
-    const bool valid=[&]() {
-        const auto& control=*reinterpret_cast<const PublicationControl*>(inputs.control);
-        const auto& lease=*reinterpret_cast<const PublicationLease*>(inputs.lease);
-        const auto* base=publication_acquired_bank(control,lease,&work);
-        const auto& selection=*reinterpret_cast<const SemanticTrainingViewSelection*>(inputs.selection);
-        if(!base || verify>1 || selection.status || state.finite>1 ||
-           !semantic_stream_forward_valid(state,receipt,inputs.state,inputs.row_seals,
-               2,base->header,&work) ||
-           !publication_identity_equal(state.selection_identity,selection.identity,&work))return false;
-        for(uint32_t output=0;output<3;++output)
-            if(!inputs.output_digests[output] || inputs.output_digests[output]%alignof(uint64_t))return false;
-        auto& stored=*reinterpret_cast<ModelEvaluationStreamBinding*>(inputs.binding);
-        if(!verify) {
-            ModelEvaluationStreamBinding binding{};binding.abi=1;
-            semantic_stream_copy_identity(binding.forward_identity,receipt.identity,&work);
-            for(uint32_t output=0;output<3;++output)
-                semantic_stream_copy_identity(binding.output_digests[output],
-                    reinterpret_cast<const uint64_t*>(inputs.output_digests[output]),&work);
-            semantic_graph::sha256(reinterpret_cast<const uint8_t*>(&binding),
-                sizeof(binding)-sizeof(binding.identity),binding.identity,&work);
-            stored=binding;
-            semantic_graph::charge_native(&work,semantic_graph::NativeWorkEvent::CanonicalByte,sizeof(binding));
-        } else {
-            semantic_graph::charge_native(&work,semantic_graph::NativeWorkEvent::CanonicalByte,sizeof(stored));
-            if(stored.abi!=1 || !inputs.admissible || !inputs.gate ||
-               !publication_identity_equal(stored.forward_identity,receipt.identity,&work))return false;
-            for(uint32_t output=0;output<3;++output)
-                if(!publication_identity_equal(stored.output_digests[output],
-                    reinterpret_cast<const uint64_t*>(inputs.output_digests[output]),&work))return false;
-            uint64_t identity[4];
-            semantic_graph::sha256(reinterpret_cast<const uint8_t*>(&stored),
-                sizeof(stored)-sizeof(stored.identity),identity,&work);
-            if(!publication_identity_equal(identity,stored.identity,&work))return false;
-            const uint8_t admissible=*reinterpret_cast<const uint8_t*>(inputs.admissible);
-            semantic_graph::charge_native(&work,semantic_graph::NativeWorkEvent::CanonicalByte,1);
-            if(admissible>1)return false;
-            *reinterpret_cast<uint64_t*>(inputs.gate)=semantic_graph::written_word(
-                admissible && state.finite,&work);
-        }
-        return true;
-    }();
-    // The full producer's independent tally enters its original cold attempt
-    // exactly once per actual replay, never again at result verification.
-    if(!verify)semantic_stream_merge_native(&work,state.work);
+    const uint8_t admissible=*reinterpret_cast<const uint8_t*>(inputs.admissible);
+    semantic_graph::charge_native(&work,semantic_graph::NativeWorkEvent::CanonicalByte,1);
+    *reinterpret_cast<uint64_t*>(inputs.gate)=semantic_graph::written_word(
+        admissible && state.finite,&work);
+    semantic_stream_merge_native(&work,state.work);
     semantic_stream_merge_native(target,work);
-    if(!valid || work.overflow || target->overflow) {
+    if(work.overflow || target->overflow) {
         target->overflow=1;semantic_content_integrity_trap();
     }
 }

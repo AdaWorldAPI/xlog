@@ -269,29 +269,8 @@ pub(super) fn evaluation_forward_native_work_ceiling(
 /// Authenticate the same completed forward and the three original output seals.
 /// These bounds follow the fixed identity/merge loops in the shared GPU owner;
 /// hashing uses the canonical padding and tariff helpers above.
-pub(super) fn evaluation_forward_binding_native_work_ceiling(
-    verify: bool,
-) -> Result<[u64; 9], SemanticTransitionError> {
-    let mut ceiling = [0; 9];
-    stream_work_events(
-        &mut ceiling,
-        1,
-        if verify { 66 } else { 64 },
-        0,
-        size_of::<ModelForwardStreamState>() as u64
-            + size_of::<ModelForwardReceipt>() as u64
-            + 168
-            + if verify { 9 } else { 128 },
-        1,
-    )?;
-    stream_work_hash(
-        &mut ceiling,
-        size_of::<ModelForwardReceipt>() as u64 - 32,
-        1,
-    )?;
-    stream_work_hash(&mut ceiling, 136, 1)?;
-    native_work_bound::native_work_ceiling_units(ceiling)?;
-    Ok(ceiling)
+pub(super) fn evaluation_forward_binding_native_work_ceiling() -> Result<[u64; 9], SemanticTransitionError> {
+    Ok([1, 0, 0, 0, 0, 0, 0, 0, 9])
 }
 
 fn paired_canary_native_work_ceiling(
@@ -584,8 +563,6 @@ pub(super) struct ModelForwardStreamInputs {
     pub(super) count: u64,
     pub(super) logits: u64,
     pub(super) position_stride_bytes: u64,
-    pub(super) candidate_seals: u64,
-    pub(super) candidate_seal_count: u64,
     pub(super) work_sequence: u64,
     pub(super) leaf_scratch: u64,
     pub(super) leaf_capacity: u64,
@@ -776,7 +753,7 @@ struct StreamRecording {
     row: u64,
     position: u64,
     scratch: [Option<PreparedSemanticTensor>; 2],
-    candidate_content: Option<SemanticTensorContentWitness>,
+    candidate_owner: Option<SemanticTensorOwner>,
 }
 
 /// An original prepared full forward, not a retained or fabricated dense tensor.
@@ -1064,7 +1041,7 @@ impl SemanticTransitionSession {
         baseline: &SemanticModelForwardWitness,
         candidate: &SemanticModelForwardWitness,
         comparison: &SemanticModelCanaryWitness,
-        output: &SemanticTensorContentWitness,
+        output: &SemanticTensorOwner,
         consumer_stream: u64,
     ) -> Result<[PreparedSemanticTensor; 4], SemanticTransitionError> {
         let forwards = [&baseline.stream, &candidate.stream];
@@ -1087,7 +1064,7 @@ impl SemanticTransitionSession {
             }
             if role == 1 {
                 let original = recording
-                    .candidate_content
+                    .candidate_owner
                     .as_ref()
                     .ok_or(SemanticTransitionError::ObservationMismatch)?;
                 if !Arc::ptr_eq(&original.issuer, &output.issuer)
@@ -1445,21 +1422,18 @@ impl SemanticTransitionSession {
         &mut self,
         step: &SemanticPreparedStep,
         stream: &SemanticModelForwardStream,
-        allocation_witness: Option<&SemanticTensorContentWitness>,
+        allocation_owner: Option<&SemanticTensorOwner>,
         consumer_stream: u64,
     ) -> Result<SemanticModelForwardWitness, SemanticTransitionError> {
         self.require_model_forward_stream(step, stream, consumer_stream)?;
-        if (stream.role == 0) != allocation_witness.is_none() {
-            return Err(publication_input_error("only the candidate full forward requires its already-recorded original output content witness"));
+        if (stream.role == 0) != allocation_owner.is_none() {
+            return Err(publication_input_error("only the candidate full forward requires its retained original output owner"));
         }
-        if let Some(witness) = allocation_witness {
-            self.checked_prepared_content_witness(step, witness)?;
-            if !matches!(
-                self.steps[&step.token].content[witness.index].seals,
-                TensorContentSeals::Captured(_)
-            ) {
+        if let Some(witness) = allocation_owner {
+            self.checked_prepared_tensor_owner(step, witness)?;
+            if self.steps[&step.token].content[witness.index].model_bank.is_some() {
                 return Err(publication_input_error(
-                    "candidate full forward requires its original transient producer content",
+                    "candidate full forward requires its original output storage owner",
                 ));
             }
         }
@@ -1479,13 +1453,13 @@ impl SemanticTransitionSession {
                 "full forward finish requires its actual producer model work",
             ));
         }
-        self.finish_model_forward_stream_inner(stream, allocation_witness, inputs)
+        self.finish_model_forward_stream_inner(stream, allocation_owner, inputs)
     }
 
     pub(super) fn finish_model_forward_stream_inner(
         &mut self,
         stream: &SemanticModelForwardStream,
-        allocation_witness: Option<&SemanticTensorContentWitness>,
+        allocation_owner: Option<&SemanticTensorOwner>,
         inputs: ModelForwardStreamInputs,
     ) -> Result<SemanticModelForwardWitness, SemanticTransitionError> {
         if inputs.work_sequence == 0 {
@@ -1507,7 +1481,7 @@ impl SemanticTransitionSession {
                     "full forward finish requires complete original row and position coverage",
                 ));
             }
-            recording.candidate_content = allocation_witness.cloned();
+            recording.candidate_owner = allocation_owner.cloned();
             recording.phase = 2;
         }
         self.enqueue_model_forward_stream(stream, 2, inputs)?;
@@ -2007,8 +1981,6 @@ impl SemanticTransitionSession {
             scalar_type: geometry.scalar_type,
             block_positions: geometry.block_positions,
             role: stream.role as u64,
-            candidate_seals: update.forward_seals.device_ptr_value(),
-            candidate_seal_count: update.forward_seals.len() as u64,
             leaf_scratch: stream.owner.leaves.device_ptr_value(),
             leaf_capacity: stream.owner.leaves.len() as u64,
             ..Default::default()
@@ -2105,7 +2077,6 @@ impl SemanticTransitionSession {
                     .model_update
                     .as_ref()
                     .expect("checked update");
-                recorder.read(&update.forward_seals);
                 recorder.read_write(&update.forward_receipts);
                 if operation == 2 && stream.role == 1 {
                     let recording = stream
@@ -2114,20 +2085,11 @@ impl SemanticTransitionSession {
                         .lock()
                         .map_err(|_| SemanticTransitionError::ObservationMismatch)?;
                     let witness = recording
-                        .candidate_content
+                        .candidate_owner
                         .as_ref()
                         .ok_or(SemanticTransitionError::ObservationMismatch)?;
-                    let TensorContentSeals::Captured(digests) =
-                        &self.steps[&stream.reader_token].content[witness.index].seals
-                    else {
-                        return Err(SemanticTransitionError::ObservationMismatch);
-                    };
-                    // The metadata array contains device addresses, not ownership.
-                    // Record every genuine original output digest allocation as a read.
-                    for index in 0..digests.len() {
-                        let (_, cells) = captured_tensor_digest_pointer(digests, index)?;
-                        recorder.read(cells.as_ref());
-                    }
+                    self.steps[&stream.reader_token].content[witness.index]
+                        .record_uses(&mut recorder);
                 }
             }
             ModelForwardStreamOrigin::Evaluation(handle) => {
