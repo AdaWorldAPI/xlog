@@ -1,15 +1,14 @@
-//! Structural aliases and admitted content checks of one resident model owner.
+//! Structural aliases, original reader ownership and resident model use.
 
 #[cfg(feature = "semantic-policy")]
 use super::cold_model_work::{
     SemanticColdNativeWorkActivationIdentity, SemanticColdNativeWorkActivationPermit,
 };
-use super::replay_verification::OriginalPublicationGuard;
 use super::*;
 
 /// One original reader's structural envelope. Preparing this owner performs no
 /// device work and grants no numerical access. Its backing capsules are issued
-/// once; activation checks their original content on every numerical occurrence.
+/// once; activation retains their original reader and actual consumer lifetime.
 pub struct SemanticPreparedResidentModelMemory {
     owner: Arc<ResidentModelMemoryOwner>,
     memory: Option<SemanticResidentModelMemory>,
@@ -44,7 +43,6 @@ pub struct SemanticResidentModelRead {
 struct ResidentModelReadOccurrence {
     work: SemanticColdModelWork,
     region: usize,
-    ceiling: [u64; 9],
     origin: ResidentModelReadOrigin,
     readback: std::sync::OnceLock<SemanticPublicationReadbackLoan>,
     _reservation: SemanticReplayMaterialReservation,
@@ -72,7 +70,6 @@ pub(super) struct ResidentModelRestorationOwner {
     checkpoint_geometry: Arc<publication_readback::CheckpointReadbackGeometry>,
     keys: Vec<(SemanticStateRole, u64)>,
     layouts: Vec<SemanticTensorLayout>,
-    ceiling: [u64; 9],
     dma_ceiling: [u64; 9],
     budget: SemanticReplayMaterialBudget,
     _reservation: SemanticReplayMaterialReservation,
@@ -178,10 +175,6 @@ impl SemanticResidentModelRead {
         }
     }
 
-    pub(super) fn native_work_ceiling(&self) -> Result<[u64; 9], SemanticTransitionError> {
-        Ok(self.occurrence.ceiling)
-    }
-
     pub(super) fn require_report(
         &self,
         work: &SemanticColdModelWork,
@@ -202,13 +195,7 @@ impl SemanticResidentModelRead {
     pub(super) fn claim_actual(
         &self,
         owner: &Arc<ResidentModelMemoryOwner>,
-        ceiling: [u64; 9],
     ) -> Result<(), SemanticTransitionError> {
-        if ceiling != self.occurrence.ceiling || owner.native_guard_ceiling()? != ceiling {
-            return Err(publication_input_error(
-                "resident read changed its complete admitted guard geometry",
-            ));
-        }
         match &self.occurrence.origin {
             ResidentModelReadOrigin::Selected(original)
                 if original
@@ -346,7 +333,6 @@ impl SemanticPreparedResidentModelRestoration {
             occurrence: Arc::new(ResidentModelReadOccurrence {
                 work: work.clone(),
                 region,
-                ceiling: self.owner.ceiling,
                 origin: ResidentModelReadOrigin::Restored(Arc::downgrade(&self.owner)),
                 readback: std::sync::OnceLock::new(),
                 _reservation: self.owner.budget.reserve_auxiliary(
@@ -477,17 +463,6 @@ impl SemanticPreparedResidentModelRestoration {
     }
 }
 
-#[cfg(feature = "semantic-policy")]
-impl ResidentModelMemoryOwner {
-    pub(super) fn native_guard_ceiling(&self) -> Result<[u64; 9], SemanticTransitionError> {
-        super::native_work_bound::resident_model_content_guard_native_work_ceiling(
-            &self.storage,
-            &self.directory,
-            &self.keys,
-        )
-    }
-}
-
 // Capsules retain only their genuine numerical generation, not the publication
 // reader. The carrier separately pins that reader through cold use and Unknown.
 struct ResidentModelExportOwner {
@@ -540,10 +515,9 @@ impl Drop for ResidentModelExportOwner {
 
 pub(super) struct ResidentModelActivation {
     memory: Arc<ResidentModelMemoryOwner>,
-    guard: Option<OriginalPublicationGuard>,
     authority: ResidentModelActivationAuthority,
     #[cfg(feature = "semantic-policy")]
-    guard_claimed: bool,
+    read_claimed: bool,
 }
 
 enum ResidentModelActivationAuthority {
@@ -584,7 +558,6 @@ impl SemanticPreparedResidentModelMemory {
             occurrence: Arc::new(ResidentModelReadOccurrence {
                 work: work.clone(),
                 region,
-                ceiling: self.owner.native_guard_ceiling()?,
                 origin: ResidentModelReadOrigin::Selected(Arc::downgrade(&self.owner)),
                 readback: std::sync::OnceLock::new(),
                 _reservation: reservation,
@@ -655,7 +628,6 @@ impl SemanticPreparedResidentModelMemory {
                 ),
                 keys: self.owner.keys.clone(),
                 layouts,
-                ceiling: self.owner.native_guard_ceiling()?,
                 dma_ceiling,
                 budget: budget.clone(),
                 _reservation: reservation,
@@ -814,7 +786,7 @@ impl SemanticTransitionSession {
                 header.neural_bank,
                 header.neural_generation,
             ),
-            numerical_state: (header.model_geometry_digest, header.model_numerical_digest),
+            model_geometry_digest: header.model_geometry_digest,
             allocations,
             storages: storage.model_memory.storages.clone(),
             views,
@@ -849,7 +821,7 @@ impl SemanticTransitionSession {
 
     /// Check every original typed seal and full backing seal before this
     /// occurrence reads resident content. Unknown retains this exact command
-    /// roster in the Session; a later successful occurrence starts fresh guards.
+    /// roster in the Session; a later successful occurrence retains its own reader use.
     #[cfg(feature = "semantic-policy")]
     pub fn activate_resident_model_memory(
         &mut self,
@@ -923,9 +895,9 @@ impl SemanticTransitionSession {
         }
         // Exclude only this carrier's pending activation. Independent original
         // commands, reader retirement and cold-report completion still forbid
-        // access, including when this exact guard is being resumed.
-        if self.has_unresolved_session_native_effect_except_replay_verification()
-            || self.replay_verification_pending.load(Ordering::Acquire)
+        // access, including when this exact activation is being resumed.
+        if self.has_unresolved_session_native_effect_except_replay_join()
+            || self.replay_join_pending.load(Ordering::Acquire)
             || self.has_pending_state_restoration_except(None, None)
             || self
                 .readers
@@ -955,10 +927,9 @@ impl SemanticTransitionSession {
             // replace this occurrence, even after a constructor refusal.
             self.resident_model_activation = Some(Arc::new(Mutex::new(ResidentModelActivation {
                 memory: Arc::clone(original),
-                guard: None,
                 authority,
                 #[cfg(feature = "semantic-policy")]
-                guard_claimed: false,
+                read_claimed: false,
             })));
         } else {
             let activation = self
@@ -986,34 +957,20 @@ impl SemanticTransitionSession {
                 "resident model activation cannot replace its pending original carrier",
             ));
         }
-        if activation.guard.is_none() {
-            #[cfg(feature = "semantic-policy")]
-            if let ResidentModelActivationAuthority::Cold(identity) = &activation.authority {
-                if !activation.guard_claimed {
-                    let mut allowance = identity.allowance().lock().map_err(|_| {
-                        publication_input_error("original resident guard allowance is poisoned")
-                    })?;
-                    let ceiling = original.native_guard_ceiling()?;
-                    if allowance.has_resident_reads() {
-                        allowance.claim_resident_read(
-                            original,
-                            identity.region_ordinal(),
-                            ceiling,
-                        )?;
-                    } else {
-                        allowance.claim_source_resident_guard(original, ceiling)?;
-                    }
-                    drop(allowance);
-                    activation.guard_claimed = true;
+        #[cfg(feature = "semantic-policy")]
+        if let ResidentModelActivationAuthority::Cold(identity) = &activation.authority {
+            if !activation.read_claimed {
+                let mut allowance = identity.allowance().lock().map_err(|_| {
+                    publication_input_error("original resident read allowance is poisoned")
+                })?;
+                if allowance.has_resident_reads() {
+                    allowance.claim_resident_read(original, identity.region_ordinal())?;
+                } else {
+                    allowance.claim_source_resident_owner(original)?;
                 }
+                drop(allowance);
+                activation.read_claimed = true;
             }
-            let mut guard =
-                self.stage_publication_content_guard(lease, &original.keys, consumer_stream)?;
-            #[cfg(feature = "semantic-policy")]
-            if let ResidentModelActivationAuthority::Cold(identity) = &activation.authority {
-                guard.use_cold_work(identity.work());
-            }
-            activation.guard = Some(guard);
         }
         self.readers
             .get_mut(&lease.token)
@@ -1028,18 +985,13 @@ impl SemanticTransitionSession {
         for export in &activation.memory.exports {
             export.arm(&self.stream, consumer_stream)?;
         }
-        activation
-            .guard
-            .as_mut()
-            .expect("retained resident model publication guard")
-            .complete(self, lease)?;
         drop(activation);
         self.resident_model_activation = None;
         Ok(())
     }
 
     /// Inspect only this carrier's retained activation, including uncertainty
-    /// before a driver acknowledgement. This grants no new guard submission.
+    /// before a driver acknowledgement. This grants no new reader use.
     pub fn resident_model_memory_activation_pending(
         &self,
         lease: &SemanticPublishedLease,

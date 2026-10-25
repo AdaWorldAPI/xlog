@@ -111,8 +111,7 @@ impl OriginalSourceTensorExport {
 #[cfg(feature = "semantic-policy")]
 struct OriginalSourceModelContext {
     parent: SemanticPublishedIdentity,
-    descriptor_digest: Identity256,
-    numerical_state: (Identity256, Identity256),
+    model_geometry_digest: Identity256,
     semantic_root: (u64, u64, u64, Identity256, [u64; 3]),
     tensors: [OriginalSourceTensorExport; 4],
     generations: (u64, u64, u64, u64, u64),
@@ -199,8 +198,8 @@ impl OriginalSourcePortProjection {
             )
             .ok_or_else(|| invalid("SOURCE capsule metadata extent overflow"))?;
         for len in [
-            9,
-            4,
+            8,
+            3,
             5,
             3,
             2,
@@ -209,10 +208,9 @@ impl OriginalSourcePortProjection {
             2,
             3,
             2,
-            2,
-            4,
+            3,
             5,
-            4,
+            3,
             7,
             6,
             xlog_cuda::SEMANTIC_FEEDBACK_SUPPORT_FIELDS.len(),
@@ -238,7 +236,7 @@ impl OriginalSourcePortProjection {
             .and_then(|value| value.checked_add(count.checked_mul(per_cache)?))
             .and_then(|value| {
                 value.checked_add(
-                    17 * (material_bytes::python_instance_extent::<PyBytes>(py).ok()? + 32),
+                    12 * (material_bytes::python_instance_extent::<PyBytes>(py).ok()? + 32),
                 )
             })
             .and_then(|value| {
@@ -285,8 +283,7 @@ impl OriginalSourcePortProjection {
         Self {
             context: OriginalSourceModelContext {
                 parent: context.parent,
-                descriptor_digest: context.descriptor_digest,
-                numerical_state: context.numerical_state,
+                model_geometry_digest: context.model_geometry_digest,
                 semantic_root: context.semantic_root,
                 tensors: [
                     context.prefix.0,
@@ -325,14 +322,12 @@ impl OriginalSourcePortProjection {
                 PyBytes::new(py, identity.instance.as_bytes()),
                 identity.word,
                 PyBytes::new(py, identity.logical_digest.as_bytes()),
-                PyBytes::new(py, identity.state_digest.as_bytes()),
             )
         };
         let context = &mut self.context;
         let root = context.semantic_root;
         let model_context = (
             identity(context.parent),
-            PyBytes::new(py, context.descriptor_digest.as_bytes()),
             (
                 root.0,
                 root.1,
@@ -354,10 +349,7 @@ impl OriginalSourcePortProjection {
                 PyBytes::new(py, context.table_identity.as_bytes()),
             ),
             context.capacities,
-            (
-                PyBytes::new(py, context.numerical_state.0.as_bytes()),
-                PyBytes::new(py, context.numerical_state.1.as_bytes()),
-            ),
+            PyBytes::new(py, context.model_geometry_digest.as_bytes()),
         )
             .into_pyobject(py)?
             .unbind();
@@ -554,16 +546,6 @@ impl PySemanticPreparedSourceContent {
             &budget,
         )?);
         Ok(())
-    }
-
-    pub(super) fn original_binding(
-        &self,
-    ) -> (
-        &Py<PySemanticPublishedParent>,
-        &SemanticPreparedSourceContent,
-        u64,
-    ) {
-        (&self.parent, &self.inner, self.consumer_stream)
     }
 
     pub(super) fn material_budget(
@@ -848,7 +830,7 @@ pub(crate) struct PySemanticPreparedTaskImport {
     completed: Mutex<Option<Py<PyAny>>>,
     cancelled_final_use: Mutex<Option<ReplayImportFinalization>>,
     source_ports: Mutex<Option<Vec<OriginalImportTensorPort>>>,
-    source_witness: Mutex<Option<Py<PySemanticTensorContentWitness>>>,
+    source_owner: Mutex<Option<Py<PySemanticTensorOwner>>>,
     #[cfg(feature = "semantic-policy")]
     source_content: Mutex<Option<Py<PySemanticPreparedSourceContent>>>,
     #[cfg(feature = "semantic-policy")]
@@ -900,7 +882,7 @@ impl PySemanticPreparedTaskImport {
                 completed: Mutex::new(None),
                 cancelled_final_use: Mutex::new(Some(ReplayImportFinalization::default())),
                 source_ports: Mutex::new(None),
-                source_witness: Mutex::new(None),
+                source_owner: Mutex::new(None),
                 #[cfg(feature = "semantic-policy")]
                 source_content: Mutex::new(None),
                 #[cfg(feature = "semantic-policy")]
@@ -1146,7 +1128,7 @@ impl PySemanticPreparedTaskImport {
                 &mut progress,
             )?;
             // Target final use and the one original cleanup have returned.
-            // The retired witness must leave before native reader retirement;
+            // The retired owner must leave before native reader retirement;
             // real producer backings and pending release custody remain held.
             #[cfg(feature = "semantic-policy")]
             if let Some(recipe) = self
@@ -1163,7 +1145,7 @@ impl PySemanticPreparedTaskImport {
                     &cancellation.2,
                 )?;
             }
-            self.retire_source_witness(py)?;
+            self.retire_source_owner(py)?;
             if !progress.predecessor_released {
                 let mut owner = session.owner()?;
                 issued.require_original_identity(&owner)?;
@@ -1234,13 +1216,13 @@ impl PySemanticPreparedTaskImport {
             .map_err(|_| invalid("SOURCE model ports are poisoned"))?
             .is_none()
             || self
-                .source_witness
+                .source_owner
                 .lock()
-                .map_err(|_| invalid("SOURCE model witness is poisoned"))?
+                .map_err(|_| invalid("SOURCE model owner is poisoned"))?
                 .is_none()
         {
             return Err(invalid(
-                "historical replay preparation requires its complete original SOURCE model ports and witness",
+                "historical replay preparation requires its complete original SOURCE model ports and owner",
             ));
         }
         {
@@ -1333,12 +1315,12 @@ impl PySemanticPreparedTaskImport {
         Ok(())
     }
 
-    pub(super) fn retain_source_witness(
+    pub(super) fn retain_source_owner(
         &self,
         py: Python<'_>,
-        witness: Py<PySemanticTensorContentWitness>,
+        owner: Py<PySemanticTensorOwner>,
     ) -> PyResult<()> {
-        let original = witness.borrow(py);
+        let original = owner.borrow(py);
         if original.session.as_ptr() != self.session.as_ptr()
             || !matches!(&original.parent, ContentStepOwner::Published(parent) if parent.as_ptr() == self.parent.as_ptr())
             || !original.model_binding
@@ -1356,24 +1338,22 @@ impl PySemanticPreparedTaskImport {
                 .is_none()
         {
             return Err(invalid(
-                "SOURCE model witness changed its original authenticated owner",
+                "SOURCE model owner changed its original authenticated owner",
             ));
         }
         drop(original);
         let mut retained = self
-            .source_witness
+            .source_owner
             .lock()
-            .map_err(|_| invalid("SOURCE model witness is poisoned"))?;
+            .map_err(|_| invalid("SOURCE model owner is poisoned"))?;
         if retained.is_some() {
-            return Err(invalid(
-                "original SOURCE model witness was already retained",
-            ));
+            return Err(invalid("original SOURCE model owner was already retained"));
         }
-        *retained = Some(witness);
+        *retained = Some(owner);
         Ok(())
     }
 
-    pub(super) fn retire_source_witness(&self, py: Python<'_>) -> PyResult<()> {
+    pub(super) fn retire_source_owner(&self, py: Python<'_>) -> PyResult<()> {
         #[cfg(feature = "semantic-policy")]
         let recipe = self
             .source_content
@@ -1386,12 +1366,12 @@ impl PySemanticPreparedTaskImport {
             .as_ref()
             .map(|recipe| recipe.borrow(py).retirement_receipt(py))
             .transpose()?;
-        let witness = self
-            .source_witness
+        let owner = self
+            .source_owner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
-        drop(witness);
+        drop(owner);
         #[cfg(feature = "semantic-policy")]
         {
             if let Some(recipe) = recipe {
@@ -1415,15 +1395,15 @@ impl PySemanticPreparedTaskImport {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
-        let witness = self
-            .source_witness
+        let owner = self
+            .source_owner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         // All retained owners leave on the creator thread without a Session,
         // group-use, final-use or roster mutex held. Cached results remain.
         drop(ports);
-        drop(witness);
+        drop(owner);
     }
 
     fn require_metadata(&self, py: Python<'_>) -> PyResult<()> {
@@ -1526,8 +1506,8 @@ impl PySemanticPreparedTaskImport {
         // producer's final Python decref may reenter this original import.
         drop(target.owner()?);
         drop(session.owner()?);
-        let target_owner = target.witness_owner()?;
-        let mut owner = session.witness_owner()?;
+        let target_owner = target.serialized_owner()?;
+        let mut owner = session.serialized_owner()?;
         let mut handoff = self
             .source_content_handoff
             .try_lock()
@@ -1733,7 +1713,6 @@ impl PySemanticPreparedTaskImport {
                 layout.schema_bytes,
                 layout.schema_digest_offset,
                 layout.generation_offset,
-                layout.numerical_digest_offset,
                 layout.identity_offset,
             ),
         )
@@ -1929,7 +1908,6 @@ impl PySemanticPublishedParent {
                 layout.schema_bytes,
                 layout.schema_digest_offset,
                 layout.generation_offset,
-                layout.numerical_digest_offset,
                 layout.identity_offset,
             ),
         )

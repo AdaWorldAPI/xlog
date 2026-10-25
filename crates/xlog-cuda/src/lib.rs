@@ -88,8 +88,7 @@ pub use semantic_transition::{
     SemanticCheckpointInitialPrefillObservation, SemanticCheckpointNativeProjection,
     SemanticComponent, SemanticComponentInput, SemanticContinuationInput, SemanticFeedback,
     SemanticFeedbackRecordMaterial, SemanticFeedbackSchema, SemanticFrozenModelContext,
-    SemanticGradientDeliveryBinding, SemanticImportedTaskRelease,
-    SemanticInitialPrefillContentWitness, SemanticInitialPrefillLease, SemanticInitialSourceLayout,
+    SemanticGradientDeliveryBinding, SemanticInitialPrefillLease, SemanticInitialSourceLayout,
     SemanticLearningCopyReset, SemanticLearningPhase, SemanticLearningPhaseAdmission,
     SemanticLearningPhaseRecord, SemanticLearningPhaseTransition,
     SemanticLoadedPublicationInputProjection, SemanticModelContext, SemanticModelContractLayout,
@@ -106,7 +105,7 @@ pub use semantic_transition::{
     SemanticReplayAppendRows, SemanticReplayDecisionBytes, SemanticReplayLoadedMaterial,
     SemanticReplayMaterial, SemanticReplayMaterialBudget, SemanticReplayMaterialOutput,
     SemanticReplayMaterialReservation, SemanticReplayMaterialScratch, SemanticReplayModelBackings,
-    SemanticReplayPublicationVerification, SemanticReplayStateMaterialAdmission,
+    SemanticReplayPublicationJoin, SemanticReplayStateMaterialAdmission,
     SemanticReplayStateMaterialProof, SemanticReplayTrainingViewRow, SemanticResidentModelMemory,
     SemanticResolvedReplayMaterial, SemanticRngBinding, SemanticSegmentColdCapacity,
     SemanticSegmentTerminalWait, SemanticSourceMapping, SemanticStateRecord, SemanticStateRole,
@@ -115,14 +114,14 @@ pub use semantic_transition::{
     SemanticTaskFacts, SemanticTaskGoalWitness, SemanticTaskGround, SemanticTaskMeasurementBinding,
     SemanticTaskObjectiveLaw, SemanticTaskObservation, SemanticTaskObservationRoots,
     SemanticTaskObservationRootsOwner, SemanticTaskPriorityGoal, SemanticTaskPriorityLevel,
-    SemanticTaskProgram, SemanticTaskReceiptFamily, SemanticTaskRefusal, SemanticTaskScoring,
-    SemanticTaskVerificationBinding, SemanticTensorContentWitness, SemanticTensorInput,
-    SemanticTensorLayout, SemanticTextRow, SemanticTextSlot, SemanticTokenProvenance,
-    SemanticTransitionError, SemanticTransitionHostIoStats, SemanticTransitionKind,
-    SemanticTransitionLane, SemanticTransitionObservation, SemanticTransitionOutcome,
-    SemanticTransitionReceipt, SemanticTransitionRefusal, SemanticTransitionSession,
-    SemanticTransitionWork, SEMANTIC_FEEDBACK_SUPPORT_FIELDS, SEMANTIC_TRANSITION_COMPONENT_COUNT,
-    SEMANTIC_TRANSITION_GENERATION,
+    SemanticTaskProgram, SemanticTaskReceiptFamily, SemanticTaskRefusal, SemanticTaskRelease,
+    SemanticTaskScoring, SemanticTaskVerificationBinding, SemanticTensorInput,
+    SemanticTensorLayout, SemanticTensorOwner, SemanticTextRow, SemanticTextSlot,
+    SemanticTokenProvenance, SemanticTransitionError, SemanticTransitionHostIoStats,
+    SemanticTransitionKind, SemanticTransitionLane, SemanticTransitionObservation,
+    SemanticTransitionOutcome, SemanticTransitionReceipt, SemanticTransitionRefusal,
+    SemanticTransitionSession, SemanticTransitionWork, SEMANTIC_FEEDBACK_SUPPORT_FIELDS,
+    SEMANTIC_TRANSITION_COMPONENT_COUNT, SEMANTIC_TRANSITION_GENERATION,
 };
 #[cfg(feature = "semantic-policy")]
 pub use semantic_transition::{
@@ -134,8 +133,7 @@ pub use semantic_transition::{
     SemanticCompletedStepWitnessMaterial, SemanticCompletedTaskGroundMaterial,
     SemanticCompletedTheoryDeltaMaterial, SemanticModelCanaryStream, SemanticModelCanaryWitness,
     SemanticModelContextCheckpointAttachment, SemanticModelContextContinuation,
-    SemanticModelContextPrefillContentGeometry, SemanticModelContextPrefillRestoreDeclaration,
-    SemanticModelContextPrefillTensorGeometry, SemanticModelForwardStream,
+    SemanticModelContextPrefillRestoreDeclaration, SemanticModelForwardStream,
     SemanticModelForwardWitness, SemanticPolicyGradients, SemanticPolicyNumericalDomainLayout,
     SemanticPreparedActorRefresh, SemanticPreparedResidentModelRestoration,
     SemanticPrivateModelContextCheckpointOrigin, SemanticPrivateModelContextCheckpointSave,
@@ -147,14 +145,14 @@ pub use semantic_transition::{
 #[cfg(feature = "semantic-policy")]
 pub use semantic_transition::{
     SemanticCancelledEvaluationCapture, SemanticCancelledModelEvaluation,
-    SemanticColdEvaluationContent, SemanticCompletedModelEvaluation, SemanticEvaluationCohort,
-    SemanticModelEvaluation, SemanticModelEvaluationResult,
+    SemanticCompletedModelEvaluation, SemanticEvaluationCohort, SemanticModelEvaluation,
+    SemanticModelEvaluationResult,
 };
 #[cfg(feature = "semantic-policy")]
 pub use semantic_transition::{
     SemanticColdModelWork, SemanticColdModelWorkAdmission, SemanticColdModelWorkDisposition,
     SemanticColdModelWorkOperation, SemanticColdModelWorkPurpose, SemanticColdModelWorkRegion,
-    SemanticColdModelWorkReportCursor, SemanticColdModelWorkResult, SemanticColdNativeWork,
+    SemanticColdModelWorkReportCursor, SemanticColdNativeWork,
     SemanticColdNativeWorkActivationIdentity, SemanticColdNativeWorkActivationPermit,
     SemanticColdResidentRestorationPrelude,
 };
@@ -164,11 +162,8 @@ pub use semantic_work::ModelWorkKind;
 pub use semantic_transition::{
     SemanticModelInputGenerationPort, SemanticPreparedSourceCache, SemanticPreparedSourceContent,
     SemanticPreparedSourceContentGeometry, SemanticPreparedSourceContentPorts,
-    SemanticPreparedTensorContentBindings, SemanticPreparedTensorContentEvent,
-    SemanticPreparedTensorContentReceiver, SemanticSourceAllocationDescriptor,
-    SemanticSourceContentAllocation, SemanticSourceContentEvent, SemanticSourceContentFamily,
+    SemanticSourceAllocationDescriptor, SemanticSourceContentAllocation,
     SemanticSourceContentGeometryKind, SemanticSourceContentGeometrySeed,
-    SemanticSourceContentKind, SemanticSourceContentOccurrence, SemanticSourceContentPhase,
     SemanticSourceContentRetirement, SemanticSourceGeometryAllocation,
     SemanticSourceGeometryTensor, SemanticSourceTensorDescriptor,
 };
@@ -178,3 +173,5 @@ pub use wcoj_metadata::{
     WcojCycle4HgWorkPlanU64, WcojRelationMetadata, WcojTriangleHgWorkPlanU32,
     WcojTriangleHgWorkPlanU64,
 };
+
+pub use semantic_transition::SemanticColdModelWorkResult;

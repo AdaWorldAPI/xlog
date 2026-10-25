@@ -11,7 +11,7 @@ use phase_record::{PhaseRecords, RecordKind, RecordLimits};
 pub(super) mod cold_restore;
 mod resource_observer;
 pub(super) use resource_observer::require_restore_memory_admission;
-use resource_observer::ResourceObserver;
+pub(super) use resource_observer::ResourceObserver;
 pub(crate) use resource_observer::{
     register_process_resource_observer, resource_observer_device_certificate,
 };

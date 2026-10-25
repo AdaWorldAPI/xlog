@@ -17,7 +17,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<OriginalCompletedAction, SemanticTr
         .take(magic.len())
         .map_err(SemanticTransitionError::Semantic)?
         != magic
-        || reader.u64().map_err(SemanticTransitionError::Semantic)? != 1
+        || reader.u64().map_err(SemanticTransitionError::Semantic)? != 2
     {
         return Err(publication_input_error(
             "completed action witness has another native envelope",

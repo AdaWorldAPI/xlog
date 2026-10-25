@@ -1176,7 +1176,6 @@ impl SemanticTransitionSession {
                 instance: header.instance,
                 word: header.publication_word,
                 logical_digest: header.logical_digest,
-                state_digest: header.state_digest,
             };
             let range = |role| {
                 next_ranges
@@ -1220,7 +1219,6 @@ impl SemanticTransitionSession {
                         successor: identity(next.header),
                         invocation: header.rng_binding()?,
                         model_geometry_digest: header.model_geometry_digest,
-                        model_numerical_digest: header.model_numerical_digest,
                     }),
                     next.state.action_batch_root,
                     publication_abi_bytes(&[next.state.action_batch]),

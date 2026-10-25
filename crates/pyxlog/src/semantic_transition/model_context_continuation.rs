@@ -139,7 +139,7 @@ struct ContinuationState {
     restored_prefill_native: Option<xlog_cuda::SemanticRestoredModelContextPrefill>,
     restored_prefill: Option<Py<restored_prefill::PySemanticRestoredModelContextPrefill>>,
     source_alias: Option<SourceModelAlias>,
-    prefill_arguments: Option<([u64; 6], Vec<u8>)>,
+    prefill_arguments: Option<[u64; 6]>,
     prefill_entered: bool,
     prefill_error: Option<PyErr>,
     prefill_layout: Option<(Py<PyTuple>, usize)>,
@@ -786,13 +786,6 @@ impl PySemanticModelContextContinuation {
             state.consumer_streams = streams.to_vec();
         }
         let mut owner = session.owner()?;
-        owner
-            .resolve_model_context_prepared_model_rosters(
-                &self.inner,
-                &steps[0].borrow(py).inner,
-                &native_work,
-            )
-            .map_err(xlog_err)?;
         if !owner
             .cold_model_work_report_cursor(&native_work, None)
             .map_err(xlog_err)?
@@ -1189,34 +1182,6 @@ impl PySemanticModelContextContinuation {
             .unbind())
     }
 
-    /// Declare every original native prefill verification before admit_plan.
-    /// The compiler supplies layouts/physical extents, not tensor contents.
-    fn declare_activation_prefill_content(
-        &self,
-        py: Python<'_>,
-        content_geometry: &Bound<'_, PyAny>,
-    ) -> PyResult<()> {
-        let work = self
-            .state()?
-            .activation_work
-            .as_ref()
-            .ok_or_else(|| invalid("activation content requires its original report"))?
-            .clone_ref(py);
-        work.borrow(py).check(py)?;
-        let geometry = parse_prefill_geometry(content_geometry)?;
-        let task = self.target_task.borrow(py);
-        let session = task.session.borrow(py);
-        let result = session
-            .owner()?
-            .freeze_model_context_activation_prefill(
-                &self.inner,
-                &work.borrow(py).custody(py)?.inner,
-                &geometry,
-            )
-            .map_err(xlog_err);
-        result
-    }
-
     #[pyo3(signature = (parent, *, consumer_stream))]
     fn activation_prefix_views(
         &self,
@@ -1246,7 +1211,7 @@ impl PySemanticModelContextContinuation {
         parent.borrow(py).require_task(py, &task)?;
         let session = task.session.borrow(py);
         let stream = parse_witness_consumer_stream(consumer_stream, &mut 128)?;
-        let (prefix, extent, descriptor) = session
+        let (prefix, extent) = session
             .owner()?
             .model_context_activation_prefix_views(
                 &self.inner,
@@ -1260,11 +1225,7 @@ impl PySemanticModelContextContinuation {
                 retain_export_owner(tensor, task.session.clone_ref(py), session.owner_thread)?,
             )
         };
-        Ok((
-            capsule(prefix)?,
-            capsule(extent)?,
-            PyBytes::new(py, descriptor.as_bytes()),
-        )
+        Ok((capsule(prefix)?, capsule(extent)?)
             .into_pyobject(py)?
             .unbind())
     }
@@ -1911,10 +1872,10 @@ impl PySemanticModelContextContinuation {
             .unbind())
     }
 
-    #[pyo3(signature = (*, prefix_capacity, feedback_capacity, max_position, pad_token, provenance_capacity_records, model_generation, content_geometry))]
+    #[pyo3(signature = (*, prefix_capacity, feedback_capacity, max_position, pad_token, provenance_capacity_records, model_generation))]
     #[expect(
         clippy::too_many_arguments,
-        reason = "initial prefill retains the complete original layout and content roster"
+        reason = "initial prefill retains the complete original source and model layout"
     )]
     fn begin_initial_prefill(
         &self,
@@ -1925,7 +1886,6 @@ impl PySemanticModelContextContinuation {
         pad_token: u64,
         provenance_capacity_records: u64,
         model_generation: u64,
-        content_geometry: &Bound<'_, PyAny>,
     ) -> PyResult<Py<PySemanticInitialPrefillStage>> {
         let instruction = self.source.live_instruction()?;
         self.require_target(
@@ -1933,24 +1893,19 @@ impl PySemanticModelContextContinuation {
             &self.target_controller.borrow(py),
             &self.target_task.borrow(py),
         )?;
-        let arguments = (
-            [
-                prefix_capacity,
-                feedback_capacity,
-                max_position,
-                pad_token,
-                provenance_capacity_records,
-                model_generation,
-            ],
-            ColdValue::read(content_geometry, &mut (16 * 1024 * 1024), 0)?.canonical_bytes(),
-        );
+        let arguments = [
+            prefix_capacity,
+            feedback_capacity,
+            max_position,
+            pad_token,
+            provenance_capacity_records,
+            model_generation,
+        ];
         {
             let mut state = self.state()?;
             if let Some(original) = &state.prefill_arguments {
                 if original != &arguments {
-                    return Err(invalid(
-                        "future prefill cannot replace its original layout or occurrence roster",
-                    ));
+                    return Err(invalid("future prefill cannot replace its original layout"));
                 }
                 if let Some(stage) = &state.prefill {
                     return Ok(stage.clone_ref(py));
@@ -1976,7 +1931,6 @@ impl PySemanticModelContextContinuation {
             let parts = initial_source_parts(py, layout.clone())?;
             self.state()?.prefill_layout = Some((parts, prefix_len));
         }
-        let geometries = parse_prefill_geometry(content_geometry)?;
         if let Some(error) = &self.state()?.prefill_error {
             return Err(error.clone_ref(py));
         }
@@ -2003,7 +1957,6 @@ impl PySemanticModelContextContinuation {
                 &source_work.borrow(py).custody(py)?.inner,
                 layout,
                 model_generation,
-                &geometries,
             )
         };
         let lease = match result {
@@ -2714,64 +2667,4 @@ impl PySemanticModelContextContinuation {
         context.handoff_target_parent(py, &admission.borrow(py), &slf)?;
         Ok(admission)
     }
-}
-
-fn parse_prefill_geometry(
-    value: &Bound<'_, PyAny>,
-) -> PyResult<Vec<xlog_cuda::SemanticModelContextPrefillContentGeometry>> {
-    if !value.is_exact_instance_of::<PyTuple>() {
-        return Err(invalid(
-            "future prefill geometry requires its exact immutable roster",
-        ));
-    }
-    let mut budget = 16 * 1024 * 1024;
-    let mut occurrences = Vec::new();
-    for occurrence in value.cast::<PyTuple>()?.iter() {
-        if !occurrence.is_exact_instance_of::<PyTuple>() {
-            return Err(invalid(
-                "future prefill occurrences must be exact immutable tuples",
-            ));
-        }
-        let occurrence = occurrence.cast::<PyTuple>()?;
-        if occurrence.len() != 2
-            || !occurrence.get_item(0)?.is_exact_instance_of::<PyBool>()
-            || !occurrence.get_item(1)?.is_exact_instance_of::<PyTuple>()
-        {
-            return Err(invalid(
-                "future prefill occurrence requires verification and original tensor geometries",
-            ));
-        }
-        let mut tensors = Vec::new();
-        for tensor in occurrence.get_item(1)?.cast::<PyTuple>()?.iter() {
-            if !tensor.is_exact_instance_of::<PyTuple>() {
-                return Err(invalid(
-                    "future prefill tensors must be exact immutable geometry tuples",
-                ));
-            }
-            let tensor = tensor.cast::<PyTuple>()?;
-            if tensor.len() != 4 {
-                return Err(invalid(
-                    "future tensor geometry requires layout, logical extent and physical bytes",
-                ));
-            }
-            tensors.push(xlog_cuda::SemanticModelContextPrefillTensorGeometry {
-                layout: parse_tensor_layout(&ColdValue::read(
-                    &tensor.get_item(0)?,
-                    &mut budget,
-                    0,
-                )?)?,
-                logical_begin: ColdValue::read(&tensor.get_item(1)?, &mut budget, 0)?.unsigned()?,
-                logical_end: ColdValue::read(&tensor.get_item(2)?, &mut budget, 0)?.unsigned()?,
-                physical_bytes: usize::try_from(
-                    ColdValue::read(&tensor.get_item(3)?, &mut budget, 0)?.unsigned()?,
-                )
-                .map_err(|_| invalid("future physical extent exceeds address space"))?,
-            });
-        }
-        occurrences.push(xlog_cuda::SemanticModelContextPrefillContentGeometry {
-            tensors,
-            verify: occurrence.get_item(0)?.extract::<bool>()?,
-        });
-    }
-    Ok(occurrences)
 }

@@ -81,7 +81,6 @@ fn model_context_header_identity(header: &PublicationHeader) -> SemanticPublishe
         instance: header.instance,
         word: header.publication_word,
         logical_digest: header.logical_digest,
-        state_digest: header.state_digest,
     }
 }
 
@@ -90,13 +89,13 @@ fn model_context_model_header_unchanged(
     current: &PublicationHeader,
 ) -> bool {
     original.instance == current.instance
+        && original.original_instance == current.original_instance
         && original.model_generation == current.model_generation
         && original.neural_bank == current.neural_bank
         && original.neural_generation == current.neural_generation
         && original.cache_generation == current.cache_generation
         && original.authority_generation == current.authority_generation
         && original.model_geometry_digest == current.model_geometry_digest
-        && original.model_numerical_digest == current.model_numerical_digest
         && original.proposal == current.proposal
         && original.stream_serial == current.stream_serial
         && original.family_id == current.family_id
@@ -109,11 +108,11 @@ fn model_context_frozen_model_unchanged(
     current: &PublicationHeader,
 ) -> bool {
     frozen.instance == current.instance
+        && frozen.original_instance == current.original_instance
         && frozen.model_generation == current.model_generation
         && frozen.neural_bank == current.neural_bank
         && frozen.neural_generation == current.neural_generation
         && frozen.model_geometry_digest == current.model_geometry_digest
-        && frozen.model_numerical_digest == current.model_numerical_digest
 }
 
 fn model_context_model_range_unchanged(
@@ -128,8 +127,6 @@ fn model_context_model_range_unchanged(
         && original.length_bytes == current.length_bytes
         && original.logical_begin == current.logical_begin
         && original.logical_end == current.logical_end
-        && original.digest == current.digest
-        && original.backing_digest == current.backing_digest
 }
 
 impl OriginalDormantContextRestore {
@@ -705,8 +702,6 @@ impl SemanticTransitionSession {
                 activation_rng: None,
                 native_work: None,
                 native_claimed: false,
-                prefix_guard: None,
-                prefix_guard_stream: None,
                 source_work_attached: false,
                 initial_prefill_scope: None,
                 activating: false,
@@ -821,7 +816,6 @@ impl SemanticTransitionSession {
                 instance: source_header.instance,
                 word: source_header.publication_word,
                 logical_digest: source_header.logical_digest,
-                state_digest: source_header.state_digest,
             };
             let budget = self
                 .replay_material_budget
@@ -1114,7 +1108,6 @@ impl SemanticTransitionSession {
         if restoration.completed {
             let proof = restoration.known_prefill_proof()?;
             drop(restoration);
-            self.resolve_restored_model_context_prefill_consumer_commands(continuation, &proof)?;
             return Ok(proof);
         }
         let allowance = Arc::clone(
@@ -1123,11 +1116,6 @@ impl SemanticTransitionSession {
                 .as_ref()
                 .expect("original dormant restore allowance"),
         );
-        restoration
-            .prefill
-            .as_ref()
-            .ok_or(SemanticTransitionError::NotBound)?
-            .require_factory_geometry()?;
         source.initialize_model_context_material_work(self, continuation, parent, &work)?;
         let actual_allowance =
             self.require_dormant_model_context_restore_work(continuation, &work)?;
@@ -1203,7 +1191,6 @@ impl SemanticTransitionSession {
                 source_instance: owner.source_publication.instance,
                 target_instance: storage.instance,
                 model_geometry_digest: header.model_geometry_digest,
-                model_numerical_digest: header.model_numerical_digest,
                 ..PreparedModelContextContinuationDevice::default()
             };
             let write = state_restoration::OriginalDeviceWrite::new_with_owner(
@@ -1295,7 +1282,7 @@ impl SemanticTransitionSession {
             return Err(SemanticTransitionError::ObservationMismatch);
         }
         let proof = restoration.known_prefill_proof()?;
-        self.require_restored_model_context_prefill_consumers_complete(continuation, &proof)?;
+        self.require_restored_model_context_prefill(continuation, &proof)?;
         if !restoration.report_completed {
             source.finish_model_context_material_work(
                 self,
@@ -1452,10 +1439,6 @@ impl SemanticTransitionSession {
             .ok_or(SemanticTransitionError::GenerationExhausted)?;
         let mut total = dma;
         native_work_bound::add_native_work_ceiling(&mut total, graph.kernel_ceiling)?;
-        let (prefill_dma, prefill_total) =
-            self.dormant_prefill_checkpoint_native_ceilings(continuation)?;
-        native_work_bound::add_native_work_ceiling(&mut dma, prefill_dma)?;
-        native_work_bound::add_native_work_ceiling(&mut total, prefill_total)?;
         Ok((dma, total))
     }
 

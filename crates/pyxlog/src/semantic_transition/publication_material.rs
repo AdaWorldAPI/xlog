@@ -4,12 +4,11 @@ use super::material_bytes::PySemanticMaterialBytes;
 use super::*;
 use pyo3::exceptions::PyKeyError;
 
-const FIELD_NAMES: [&str; 15] = [
+const FIELD_NAMES: [&str; 14] = [
     "schema",
     "publication",
     "semantic_root",
     "model_geometry_digest",
-    "model_numerical_digest",
     "prefix_identity",
     "model_generation",
     "neural_generation",
@@ -33,18 +32,17 @@ const ORIGIN_KEYS: [&str; 12] = [
     "action_receipt_digest",
     "origin_logical_digest",
     "successor_logical_digest",
-    "authority_closure_digest",
+    "authority_closure_origin",
     "record_digest",
 ];
 
-const CACHE_KEYS: [&str; 8] = [
+const CACHE_KEYS: [&str; 7] = [
     "role",
     "index",
     "capacity_bytes",
     "logical_begin",
     "logical_end",
     "layout",
-    "identity",
     "logical_bytes",
 ];
 
@@ -54,7 +52,7 @@ const CACHE_KEYS: [&str; 8] = [
     frozen
 )]
 pub(crate) struct PySemanticPublicationMaterialProjection {
-    fields: [Py<PyAny>; 15],
+    fields: [Py<PyAny>; 14],
     _original: xlog_cuda::SemanticLoadedPublicationInputProjection,
     _metadata: Arc<xlog_cuda::SemanticReplayMaterialReservation>,
 }
@@ -145,8 +143,8 @@ fn projection_metadata_extent(
         .checked_add(33)
         .ok_or_else(|| invalid("publication identity extent overflow"))?;
     add_extent(&mut extent, repeated_extent(integer, 7)?)?;
-    add_extent(&mut extent, repeated_extent(identity, 7)?)?;
-    add_extent(&mut extent, python_metadata_tuple_extent(py, 4)?)?;
+    add_extent(&mut extent, repeated_extent(identity, 5)?)?;
+    add_extent(&mut extent, python_metadata_tuple_extent(py, 3)?)?;
     for count in [original.prefix.len(), original.source.len()] {
         add_extent(&mut extent, python_metadata_tuple_extent(py, count)?)?;
         let row = python_metadata_tuple_extent(py, 8)?
@@ -169,7 +167,6 @@ fn projection_metadata_extent(
         add_extent(&mut cache, python_metadata_tuple_extent(py, count)?)?;
     }
     add_extent(&mut cache, repeated_extent(integer, 19)?)?;
-    add_extent(&mut cache, identity)?;
     add_extent(&mut cache, std::mem::size_of::<Bound<'_, PyDict>>())?;
     add_extent(&mut extent, repeated_extent(cache, count)?)?;
     Ok(extent)
@@ -220,7 +217,7 @@ pub(super) fn inspect(
             ("action_receipt_digest", record.action_receipt_digest),
             ("origin_logical_digest", record.origin_logical_digest),
             ("successor_logical_digest", record.successor_logical_digest),
-            ("authority_closure_digest", record.authority_closure_digest),
+            ("authority_closure_origin", record.authority_closure_origin),
             ("record_digest", record.record_digest),
         ] {
             origin.set_item(name, PyBytes::new(py, identity.as_bytes()))?;
@@ -254,7 +251,6 @@ pub(super) fn inspect(
                 PyTuple::new(py, layout.strides_bytes)?,
             ),
         )?;
-        cache.set_item("identity", PyBytes::new(py, item.identity.as_bytes()))?;
         let payload = item
             .logical_bytes
             .slice_payload(0..item.logical_bytes.as_bytes().len())
@@ -279,9 +275,6 @@ pub(super) fn inspect(
             .into_any()
             .unbind(),
         PyBytes::new(py, projection.model_geometry_digest.as_bytes())
-            .into_any()
-            .unbind(),
-        PyBytes::new(py, projection.model_numerical_digest.as_bytes())
             .into_any()
             .unbind(),
         PyBytes::new(py, projection.prefix_identity.as_bytes())

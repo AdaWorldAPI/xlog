@@ -560,7 +560,7 @@ impl RecordedExecutionFailure {
     ];
 
     fn record_synchronize_error(&self, error: &DriverError) {
-        if Self::FAULTS.contains(&error.0) {
+        if known_execution_failure(error).is_some() {
             self.0
                 .store(error.0 as u32, std::sync::atomic::Ordering::Release);
         }
@@ -570,6 +570,12 @@ impl RecordedExecutionFailure {
         let code = self.0.load(std::sync::atomic::Ordering::Acquire);
         Self::FAULTS.into_iter().find(|error| *error as u32 == code)
     }
+}
+
+pub(crate) fn known_execution_failure(error: &DriverError) -> Option<sys::CUresult> {
+    RecordedExecutionFailure::FAULTS
+        .contains(&error.0)
+        .then_some(error.0)
 }
 
 /// Preserve direct command rejection, not an error from recording its fence.

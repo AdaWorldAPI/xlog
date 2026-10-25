@@ -94,7 +94,6 @@ impl SemanticTransitionSession {
                 instance: header.instance,
                 word: header.publication_word,
                 logical_digest: header.logical_digest,
-                state_digest: header.state_digest,
             },
             digest,
         )
@@ -111,7 +110,6 @@ impl SemanticTransitionSession {
             instance: header.instance,
             word: header.publication_word,
             logical_digest: header.logical_digest,
-            state_digest: header.state_digest,
         };
         let digest = Identity256::from_bytes(Sha256::digest(bytes).into());
         self.require_checkpoint_source_digest(parent, source, digest)
@@ -187,7 +185,6 @@ impl SemanticTransitionSession {
                     instance: original.material.bank.header.instance,
                     word: original.material.bank.header.publication_word,
                     logical_digest: original.material.bank.header.logical_digest,
-                    state_digest: original.material.bank.header.state_digest,
                 })
         {
             return Err(SemanticTransitionError::ObservationMismatch);
@@ -1640,7 +1637,8 @@ impl SemanticTransitionSession {
                         || control.word != 0
                         || header.model_geometry_digest != bank.header.model_geometry_digest
                         || (operation == 4
-                            && header.model_numerical_digest != bank.header.model_numerical_digest)
+                            && (header.original_instance != bank.header.original_instance
+                                || header.logical_digest != bank.header.logical_digest))
                     {
                         return Err(SemanticTransitionError::ObservationMismatch);
                     }
@@ -1651,12 +1649,10 @@ impl SemanticTransitionSession {
                         instance: header.instance,
                         word: header.publication_word,
                         logical_digest: header.logical_digest,
-                        state_digest: header.state_digest,
                     });
                     if !original.transitioned
                         && original.result.is_some_and(|restored| {
                             restored.logical_digest != original.header.logical_digest
-                                || restored.state_digest != original.header.state_digest
                         })
                     {
                         return Err(SemanticTransitionError::ObservationMismatch);
@@ -1733,8 +1729,7 @@ impl SemanticTransitionSession {
                         .result
                         .ok_or(SemanticTransitionError::ObservationMismatch)?;
                     if !original.transitioned
-                        && (restored.logical_digest != original.header.logical_digest
-                            || restored.state_digest != original.header.state_digest)
+                        && (restored.logical_digest != original.header.logical_digest)
                     {
                         return Err(SemanticTransitionError::ObservationMismatch);
                     }
@@ -1808,15 +1803,26 @@ impl<T: DeviceRepr + Send + Sync> OriginalTypedWrite for TypedOriginalWrite<T> {
         let mut recorder = domain.new_strict_recorder();
         recorder.write(&self.destination);
         let _ = stream;
-        enqueue_recorded(domain, poisoned, recorder, |enqueue| {
-            self.write.enqueue_admitted(enqueue)
-        })
+        let mut failure = None;
+        let result = enqueue_recorded(domain, poisoned, recorder, |enqueue| {
+            self.write.enqueue_admitted(enqueue).map_err(|error| {
+                failure = error.driver_error();
+                error
+            })
+        });
+        match failure {
+            Some(error) => Err(native_runtime_error(
+                "original device write submission",
+                error,
+            )),
+            None => result,
+        }
     }
 
     fn resolve(&mut self, stream: &Arc<CudaStream>) -> Result<(), SemanticTransitionError> {
         self.write
             .resolve_on(stream)
-            .map_err(|error| runtime_error("original device write completion", error))
+            .map_err(|error| native_runtime_error("original device write completion", error))
     }
 
     fn retire_without_result(
@@ -1847,6 +1853,10 @@ pub(crate) struct OriginalDeviceWrite {
 }
 
 impl OriginalDeviceWrite {
+    pub(super) fn submitted(&self) -> bool {
+        self.transfer.submitted()
+    }
+
     pub(super) fn dma_bytes(&self) -> usize {
         self.bytes
     }

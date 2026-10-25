@@ -1281,7 +1281,6 @@ fn pyxlog(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<semantic_transition::cold_task::PySemanticTransitionFreshParent>()?;
     m.add_class::<semantic_transition::PySemanticTransitionTaskUse>()?;
     m.add_class::<semantic_transition::PySemanticInitialPrefillStage>()?;
-    m.add_class::<semantic_transition::PySemanticInitialPrefillContentWitness>()?;
     m.add_class::<semantic_transition::PySemanticInitialPrefillReceipt>()?;
     m.add_class::<semantic_transition::PySemanticPublishedParent>()?;
     m.add_class::<semantic_transition::material_bytes::PySemanticMaterialBytes>()?;
@@ -1309,9 +1308,9 @@ fn pyxlog(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
             .get_type::<semantic_transition::SemanticModelContextFreezePending>(),
     )?;
     m.add(
-        "SemanticImportedTaskReleasePending",
+        "SemanticTaskReleasePending",
         m.py()
-            .get_type::<semantic_transition::SemanticImportedTaskReleasePending>(),
+            .get_type::<semantic_transition::SemanticTaskReleasePending>(),
     )?;
     m.add_class::<semantic_transition::model_work_port::PySemanticModelWorkBufferPort>()?;
     #[cfg(feature = "semantic-policy")]
@@ -1332,8 +1331,6 @@ fn pyxlog(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<semantic_transition::source_content_geometry::PySemanticPreparedSourceContentGeometry>()?;
         m.add_class::<semantic_transition::source_content_geometry::PySemanticSourceGeometryAllocation>()?;
         m.add_class::<semantic_transition::source_content_geometry::PySemanticModelInputGenerationPort>()?;
-        m.add_class::<semantic_transition::source_content_occurrences::PySemanticSourceContentFamily>()?;
-        m.add_class::<semantic_transition::source_content_occurrences::PySemanticSourceContentOccurrence>()?;
         m.add(
             "SemanticTransitionCheckpointCancelled",
             m.py().get_type::<semantic_transition::cancelled_checkpoint::SemanticTransitionCheckpointCancelled>(),
@@ -1401,7 +1398,7 @@ fn pyxlog(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "semantic-policy")]
     m.add_class::<semantic_transition::PySemanticCompletedActionProjection>()?;
     m.add_class::<semantic_transition::PySemanticGradientDelivery>()?;
-    m.add_class::<semantic_transition::PySemanticTensorContentWitness>()?;
+    m.add_class::<semantic_transition::PySemanticTensorOwner>()?;
     #[cfg(feature = "semantic-policy")]
     m.add_class::<semantic_transition::PySemanticModelForwardWitness>()?;
     #[cfg(feature = "semantic-policy")]

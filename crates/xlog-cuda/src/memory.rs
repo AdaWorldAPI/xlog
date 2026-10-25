@@ -2661,7 +2661,11 @@ fn with_memory_operation<T>(
             MemoryOperationOwner::synchronize,
             MemoryOperationOwner::cancel,
         )
-        .map_err(|error| ResourceError::Driver(error.to_string()))?;
+        .map_err(|error| match error {
+            crate::launch::LaunchEnqueueError::Operation(error)
+            | crate::launch::LaunchEnqueueError::Preparation(error) => error,
+            error => ResourceError::Driver(error.to_string()),
+        })?;
     guard.transaction.commit_with(
         MemoryOperationOwner::finish,
         MemoryOperationOwner::synchronize,
@@ -3378,6 +3382,9 @@ fn map_resource_error(e: ResourceError, prior_peak_bytes: u64) -> XlogError {
             prior_peak_bytes,
         }
         .into_error(),
+        ResourceError::CudaDriver(error) => {
+            XlogError::Kernel(format!("device-runtime driver: {error}"))
+        }
         ResourceError::Driver(msg) => XlogError::Kernel(format!("device-runtime driver: {}", msg)),
         ResourceError::StreamMisuse(msg) => {
             XlogError::Kernel(format!("device-runtime stream misuse: {}", msg))

@@ -521,8 +521,6 @@ pub(super) struct SourceContentGeometryOwner {
     pub(super) recipe: Mutex<Option<std::sync::Weak<PreparedSourceContentOwner>>>,
     current: Mutex<Option<actor_refresh::ActorRefreshPreparationEntry>>,
     reader: Mutex<Option<(Arc<()>, u64)>>,
-    pub(super) occurrences:
-        Mutex<Option<Arc<super::source_content_occurrences::FrozenSourceContentOccurrences>>>,
     uniform: Mutex<Option<[SemanticPolicyNumericalDomainLayout; 3]>>,
     input_generation: Option<SemanticModelInputGenerationPort>,
     overlays: Mutex<[Option<Arc<current_content_overlay::CurrentContentOverlay>>; 2]>,
@@ -958,7 +956,6 @@ impl SourceContentGeometryOwner {
                 .as_ref()
                 .and_then(|work| work.capture_bank)
                 != Some(section.1)
-            || prepared.model_content_recorded & (1 << section.1) == 0
         {
             return Err(publication_input_error(
                 "CURRENT content changed its original child admission, prepared operation or bank",
@@ -1443,14 +1440,6 @@ impl SemanticPreparedSourceContentGeometry {
                     publication_input_error("original actor geometry custody is poisoned")
                 })?
                 .is_some()
-            || self
-                .owner
-                .occurrences
-                .lock()
-                .map_err(|_| {
-                    publication_input_error("original content occurrence custody is poisoned")
-                })?
-                .is_none()
         {
             return Err(publication_input_error(
                 "actor refresh changed its original declared Update, bank or member geometry",
@@ -1468,7 +1457,9 @@ impl SemanticPreparedSourceContentGeometry {
                     != layouts.get(&(view.role, view.index))
             })
         {
-            return Err(publication_input_error("actor refresh CURRENT model geometry changed its original immutable layout and alias partition"));
+            return Err(publication_input_error(
+                "actor refresh CURRENT model geometry changed its original immutable layout and alias partition",
+            ));
         }
         self.model_input_generation_port()?
             .require_target_binding(inputs, &build.scope)?;
@@ -1676,84 +1667,6 @@ impl SemanticPreparedSourceContentGeometry {
         self.owner.seed.proof.owner.contract.table_identity
     }
 
-    pub fn content_family(
-        &self,
-        phase: super::source_content_occurrences::SemanticSourceContentPhase,
-        kind: super::source_content_occurrences::SemanticSourceContentKind,
-        prepared_section: Option<(SemanticTransitionKind, usize)>,
-    ) -> Result<
-        super::source_content_occurrences::SemanticSourceContentFamily,
-        SemanticTransitionError,
-    > {
-        use super::source_content_occurrences::{
-            SemanticSourceContentFamily, SemanticSourceContentKind, SemanticSourceContentPhase,
-        };
-        match (self.owner.kind, prepared_section) {
-            (SemanticSourceContentGeometryKind::Historical, None) => {
-                Ok(SemanticSourceContentFamily::new(&self.owner, phase, kind))
-            }
-            (
-                SemanticSourceContentGeometryKind::Current
-                | SemanticSourceContentGeometryKind::CurrentDemonstration,
-                Some((operation, bank)),
-            ) if bank < 2
-                && matches!(
-                    operation,
-                    SemanticTransitionKind::Recompute | SemanticTransitionKind::Proposal
-                )
-                && kind != SemanticSourceContentKind::BindModel
-                && !(operation == SemanticTransitionKind::Recompute
-                    && phase == SemanticSourceContentPhase::PackPolicy) =>
-            {
-                Ok(SemanticSourceContentFamily::for_prepared_section(
-                    &self.owner,
-                    phase,
-                    kind,
-                    (operation, bank),
-                ))
-            }
-            _ => Err(publication_input_error(
-                "content family changed its original historical or prepared child section",
-            )),
-        }
-    }
-
-    pub fn freeze_content_occurrences<
-        A: super::source_content_occurrences::SourceContentAllocation,
-    >(
-        &self,
-        events: Vec<super::source_content_occurrences::SemanticSourceContentEvent<A>>,
-    ) -> Result<
-        Vec<super::source_content_occurrences::SemanticSourceContentOccurrence>,
-        SemanticTransitionError,
-    > {
-        let mut original = self.owner.occurrences.lock().map_err(|_| {
-            publication_input_error("original content geometry custody is poisoned")
-        })?;
-        if original.is_some()
-            || self
-                .owner
-                .reader
-                .lock()
-                .map_err(|_| {
-                    publication_input_error("original content reader custody is poisoned")
-                })?
-                .is_some()
-        {
-            return Err(publication_input_error(
-                "original content occurrences freeze once before physical binding",
-            ));
-        }
-        let overlay_rosters = self.owner.prepare_content_overlay_rosters(&events)?;
-        let frozen = super::source_content_occurrences::FrozenSourceContentOccurrences::new(
-            &self.owner,
-            events,
-        )?;
-        self.owner.freeze_content_overlay_rosters(overlay_rosters)?;
-        let handles = frozen.occurrence_handles();
-        *original = Some(frozen);
-        Ok(handles)
-    }
     pub fn kind(&self) -> SemanticSourceContentGeometryKind {
         self.owner.kind
     }
@@ -1773,9 +1686,11 @@ impl SemanticPreparedSourceContentGeometry {
         match self.owner.kind {
             SemanticSourceContentGeometryKind::Historical => Ok("checkpoint-model"),
             SemanticSourceContentGeometryKind::Current
-            | SemanticSourceContentGeometryKind::CurrentDemonstration => Err(publication_input_error(
-                "current geometry uses its original native-bank adoption, not checkpoint restoration",
-            )),
+            | SemanticSourceContentGeometryKind::CurrentDemonstration => {
+                Err(publication_input_error(
+                    "current geometry uses its original native-bank adoption, not checkpoint restoration",
+                ))
+            }
         }
     }
     pub fn model_contract_material(
@@ -1786,12 +1701,7 @@ impl SemanticPreparedSourceContentGeometry {
     pub fn model_restore_context(
         &self,
     ) -> Result<
-        (
-            SemanticPublishedIdentity,
-            u64,
-            (u64, u64, u64),
-            (Identity256, Identity256),
-        ),
+        (SemanticPublishedIdentity, u64, (u64, u64, u64), Identity256),
         SemanticTransitionError,
     > {
         if self.owner.kind.is_current() {
@@ -2019,45 +1929,6 @@ impl SemanticTransitionSession {
         Ok(())
     }
 
-    pub(super) fn prepare_prepared_content_retirement(
-        &self,
-    ) -> Result<Option<PreparedContentRetirement>, SemanticTransitionError> {
-        let Some(staged) = &self.actor_refresh else {
-            return Ok(None);
-        };
-        let geometry = &staged.proof.inner.content_geometry[staged.target_bank];
-        geometry.owner.require_current_child(self)?;
-        let frozen = geometry
-            .owner
-            .occurrences
-            .lock()
-            .map_err(|_| publication_input_error("original prepared content custody is poisoned"))?
-            .as_ref()
-            .map(Arc::clone)
-            .ok_or(SemanticTransitionError::NotBound)?;
-        let vector_bytes = if self.prepared_resources.len() == self.prepared_resources.capacity() {
-            self.prepared_resources
-                .len()
-                .checked_add(1)
-                .and_then(|count| count.checked_mul(size_of::<Arc<dyn Send + Sync>>()))
-                .ok_or(SemanticTransitionError::GenerationExhausted)?
-        } else {
-            0
-        };
-        let bytes = size_of::<PreparedContentRetirement>()
-            .checked_add(2 * size_of::<usize>())
-            .and_then(|bytes| bytes.checked_add(vector_bytes))
-            .ok_or(SemanticTransitionError::GenerationExhausted)?;
-        let reservation = geometry.material_budget().reserve_auxiliary(
-            u64::try_from(bytes).map_err(|_| SemanticTransitionError::GenerationExhausted)?,
-        )?;
-        Ok(Some(PreparedContentRetirement {
-            frozen,
-            armed: false,
-            _reservation: reservation,
-        }))
-    }
-
     pub fn source_content_geometry_member_ordinals<'a>(
         &'a self,
         parent: &SemanticPublishedLease,
@@ -2264,7 +2135,6 @@ impl SemanticTransitionSession {
                                 recipe: Mutex::new(None),
                                 current: Mutex::new(None),
                                 reader: Mutex::new(None),
-                                occurrences: Mutex::new(None),
                                 uniform: Mutex::new(None),
                                 overlays: Mutex::new(std::array::from_fn(|_| None)),
                                 overlay_instruction: Arc::clone(&overlay_instruction),
@@ -2317,11 +2187,8 @@ pub(super) struct SourcePublicationGeometry {
     support_layout: [std::ops::Range<usize>; COMPONENT_COUNT],
     support_cells: usize,
     pub(super) feedback_ceiling: [u64; 9],
-    pub(super) snapshot_ceiling: [u64; 9],
-    pub(super) contract_guard_ceiling: [u64; 9],
     pub(super) input_ceiling: [u64; 9],
     pub(super) input_dma_ceiling: [u64; 9],
-    pub(super) resident_ceiling: [u64; 9],
     _reservation: SemanticReplayMaterialReservation,
 }
 
@@ -2379,34 +2246,6 @@ impl SourcePublicationGeometry {
             &storage.allocation_bytes,
         )?;
         let directory = &storage.bank_templates[0];
-        let contract = directory
-            .iter()
-            .find(|range| (range.role, range.index) == (44, 0))
-            .ok_or(SemanticTransitionError::ObservationMismatch)?;
-        let model_ranges = directory
-            .iter()
-            .filter(|range| matches!(range.role, 18..=25))
-            .count()
-            .checked_add(1)
-            .ok_or(SemanticTransitionError::GenerationExhausted)?;
-        let snapshot_ceiling = native_work_bound::model_snapshot_native_work_ceiling(
-            model_ranges,
-            usize::try_from(contract.length_bytes)
-                .map_err(|_| SemanticTransitionError::GenerationExhausted)?,
-        )?;
-        let contract_guard_ceiling =
-            native_work_bound::model_contract_guard_geometry_native_work_ceiling(
-                &original.contract,
-                directory,
-            )?;
-        let allocation_bytes = |slot: usize| {
-            storage
-                .allocation_bytes
-                .get(slot)
-                .copied()
-                .and_then(|bytes| u64::try_from(bytes).ok())
-                .ok_or(SemanticTransitionError::ObservationMismatch)
-        };
         let input_ceiling = native_work_bound::step_input_producer_geometry_native_work_ceiling(
             &original.contract,
             original.layouts.len(),
@@ -2414,29 +2253,8 @@ impl SourcePublicationGeometry {
             PUBLICATION_ROLE_COUNT,
             &inputs,
             directory,
-            allocation_bytes,
         )?;
         let input_dma_ceiling = native_work_bound::step_input_dma_ceiling(inputs.len())?;
-        let keys = original
-            .model_memory
-            .views
-            .iter()
-            .map(|view| {
-                Ok((
-                    SemanticStateRole::from_code(view.role)
-                        .ok_or(SemanticTransitionError::ObservationMismatch)?,
-                    view.index,
-                ))
-            })
-            .collect::<Result<Vec<_>, SemanticTransitionError>>()?;
-        let resident_ceiling =
-            native_work_bound::resident_model_content_guard_geometry_native_work_ceiling(
-                &original.model_memory,
-                &original.layouts,
-                directory,
-                &keys,
-                allocation_bytes,
-            )?;
         let feedback_schema = SemanticFeedbackSchema::from_statement_lengths(
             original
                 .allocation_geometry
@@ -2458,19 +2276,6 @@ impl SourcePublicationGeometry {
             capacities[2],
         )?;
         let feedback_layouts = feedback_plan.tensor_layouts(&feedback_schema)?;
-        let mut feedback_output = [0; 9];
-        for layout in &feedback_layouts {
-            native_work_bound::add_native_work_ceiling(
-                &mut feedback_output,
-                native_work_bound::tensor_layout_native_work_ceiling(
-                    layout,
-                    0,
-                    0,
-                    tensor_layout_bytes(layout)?,
-                    false,
-                )?,
-            )?;
-        }
         let feedback_ceiling = native_work_bound::feedback_geometry_native_work_ceiling(
             directory,
             u64::try_from(feedback_plan.slots)
@@ -2481,7 +2286,6 @@ impl SourcePublicationGeometry {
             capacities[1],
             capacities[3],
             &seed.task,
-            feedback_output,
         )?;
         let (components, support_cells) =
             ActionCodebooks::component_geometry(&original.codebook_header, seed.program.is_some())?;
@@ -2529,11 +2333,8 @@ impl SourcePublicationGeometry {
             support_layout,
             support_cells,
             feedback_ceiling,
-            snapshot_ceiling,
-            contract_guard_ceiling,
             input_ceiling,
             input_dma_ceiling,
-            resident_ceiling,
             _reservation: reservation,
         })
     }
@@ -2629,8 +2430,6 @@ pub(super) struct PreparedSourceContentOwner {
     ports_issued: std::sync::atomic::AtomicBool,
     ports: Mutex<Option<SourceContentPortsState>>,
     destinations: Mutex<SourceDestinations>,
-    pub(super) occurrences:
-        Mutex<Option<Arc<super::source_content_occurrences::FrozenSourceContentOccurrences>>>,
     _metadata: Arc<SemanticReplayMaterialReservation>,
 }
 
@@ -2751,36 +2550,8 @@ pub struct SemanticSourceContentRetirement {
     owner: Arc<PreparedSourceContentOwner>,
 }
 
-pub(super) struct PreparedContentRetirement {
-    frozen: Arc<super::source_content_occurrences::FrozenSourceContentOccurrences>,
-    armed: bool,
-    _reservation: SemanticReplayMaterialReservation,
-}
-
-impl PreparedContentRetirement {
-    pub(super) fn arm(mut self) -> Arc<dyn Send + Sync> {
-        self.armed = true;
-        Arc::new(self)
-    }
-}
-
-impl Drop for PreparedContentRetirement {
-    fn drop(&mut self) {
-        if self.armed {
-            self.frozen.retire_physical_custody();
-        }
-    }
-}
-
 impl Drop for SemanticSourceContentRetirement {
     fn drop(&mut self) {
-        let frozen = self
-            .owner
-            .occurrences
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .map(Arc::clone);
         let feedback = self
             .owner
             .feedback_geometry
@@ -2806,22 +2577,11 @@ impl Drop for SemanticSourceContentRetirement {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
-        if let Some(frozen) = frozen {
-            frozen.retire_physical_custody();
-        }
         drop(feedback);
         drop(activation);
         drop(ports);
         drop(uniform);
     }
-}
-
-pub(super) struct PendingSourceContent {
-    pub(super) occurrence: super::source_content_occurrences::SemanticSourceContentOccurrence,
-    pub(super) claim: super::source_content_occurrences::SourceContentClaim,
-    pub(super) index: usize,
-    pub(super) consumer_stream: u64,
-    pub(super) verify: bool,
 }
 
 struct SourceDestinations {
@@ -2940,7 +2700,9 @@ impl native_work_bound::FrozenColdSourceContent {
                     .map_err(|_| publication_input_error("original SOURCE activation is poisoned"))?
                     .is_some()
             {
-                return Err(publication_input_error("SOURCE union requires distinct unentered recipes from the same original report"));
+                return Err(publication_input_error(
+                    "SOURCE union requires distinct unentered recipes from the same original report",
+                ));
             }
             let destinations = owner.destinations.lock().map_err(|_| {
                 publication_input_error("original SOURCE destinations are poisoned")
@@ -3005,13 +2767,6 @@ impl native_work_bound::FrozenColdSourceContent {
             }
             previous_update = Some(update);
             groups.entry(target.step).or_default().push(owner);
-            let frozen = owner.occurrences.lock().map_err(|_| {
-                publication_input_error("original SOURCE occurrence roster is poisoned")
-            })?;
-            let frozen = frozen.as_ref().ok_or_else(|| {
-                publication_input_error("SOURCE union lacks its whole frozen expression roster")
-            })?;
-            frozen.require_original_recipe(owner)?;
             let storage = owner
                 .storage
                 .upgrade()
@@ -3020,63 +2775,42 @@ impl native_work_bound::FrozenColdSourceContent {
                 .inputs
                 .upgrade()
                 .ok_or(SemanticTransitionError::ObservationMismatch)?;
-            let resident = owner.resident.upgrade().ok_or_else(|| {
+            owner.resident.upgrade().ok_or_else(|| {
                 publication_input_error("SOURCE union lost its original resident carrier")
             })?;
-            let model_ranges = owner
-                .directory
-                .iter()
-                .filter(|range| matches!(range.role, 18..=25))
-                .count()
-                .checked_add(1)
-                .ok_or(SemanticTransitionError::GenerationExhausted)?;
-            let contract = owner
-                .directory
-                .iter()
-                .find(|range| range.role == 44 && range.index == 0)
-                .ok_or(SemanticTransitionError::ObservationMismatch)?;
-            let snapshot = native_work_bound::model_snapshot_native_work_ceiling(
-                model_ranges,
-                usize::try_from(contract.length_bytes)
-                    .map_err(|_| SemanticTransitionError::GenerationExhausted)?,
-            )?;
-            let guard = native_work_bound::model_contract_guard_native_work_ceiling(
-                &storage,
-                &owner.directory,
-            )?;
             let input_native = native_work_bound::step_input_producer_native_work_ceiling(
                 &storage,
                 &inputs.plans,
                 &owner.directory,
             )?;
             let input_dma = native_work_bound::step_input_dma_ceiling(inputs.plans.len())?;
-            let resident_ceiling = resident.native_guard_ceiling()?;
-            let mut dma = snapshot;
-            native_work_bound::add_native_work_ceiling(&mut dma, input_dma)?;
+            let mut dma = input_dma;
+            let policy_bytes = owner
+                .policy_layouts
+                .iter()
+                .try_fold(0u64, |total, layout| {
+                    total
+                        .checked_add(tensor_layout_bytes(layout)? as u64)
+                        .ok_or(SemanticTransitionError::GenerationExhausted)
+                })?;
             native_work_bound::add_native_work_ceiling(
                 &mut dma,
-                frozen.policy_binding_dma_ceiling()?,
+                [9, 0, 0, 0, 0, 0, 0, 0, policy_bytes],
             )?;
             for producer in [
-                snapshot,
-                guard,
                 input_native,
                 input_dma,
-                resident_ceiling,
                 owner.feedback_ceiling,
-                frozen.native_work_ceiling(),
+                owner.geometry.publication.policy_producer_ceiling,
             ] {
                 native_work_bound::add_native_work_ceiling(&mut ceiling, producer)?;
             }
             recipes.push(native_work_bound::FrozenSourceRecipe {
                 owner: Arc::downgrade(owner),
                 resident: owner.resident.clone(),
-                resident_ceiling,
                 preparation_claimed: false,
                 resident_claimed: false,
                 dma_ceiling: dma,
-                model_snapshot: Some(snapshot),
-                model_contract_guard: Some(guard),
                 step_input_preparation: Some((input_native, input_dma)),
             });
         }
@@ -3119,194 +2853,10 @@ impl native_work_bound::FrozenColdSourceContent {
     }
 }
 
-/// Price the same canonical content producer from original structural owners.
-/// No tensor bytes, model seals or numerical completion witness are read here.
-pub(super) fn source_geometry_occurrence_native_work_ceiling<
-    A: super::source_content_occurrences::SourceContentAllocation,
->(
-    owner: &SourceContentGeometryOwner,
-    event: &super::source_content_occurrences::SemanticSourceContentEvent<A>,
-    model: bool,
-) -> Result<[u64; 9], SemanticTransitionError> {
-    use super::source_content_occurrences::{SemanticSourceContentKind, SourceContentAllocation};
-    let original = &owner.seed.proof.owner;
-    let directory = &owner.publication.storage.bank_templates[0];
-    let verify = event.family.kind() != SemanticSourceContentKind::Capture;
-    if model && !verify {
-        return Err(SemanticTransitionError::ObservationMismatch);
-    }
-    let mut ceiling = [0; 9];
-    if model {
-        model_content_ranges(
-            directory,
-            &original.layouts,
-            event
-                .tensors
-                .iter()
-                .map(|tensor| {
-                    Ok((
-                        tensor.layout,
-                        tensor.logical_begin,
-                        tensor.logical_end,
-                        tensor_layout_bytes(&tensor.layout)?,
-                    ))
-                })
-                .collect::<Result<Vec<_>, SemanticTransitionError>>()?
-                .into_iter(),
-        )?;
-        let contract = directory
-            .iter()
-            .find(|range| (range.role, range.index) == (44, 0))
-            .ok_or(SemanticTransitionError::ObservationMismatch)?;
-        native_work_bound::add_native_work_ceiling(
-            &mut ceiling,
-            native_work_bound::content_digest_ceiling(contract.length_bytes, 21, false)?,
-        )?;
-    }
-    let mut input_guard = false;
-    for descriptor in &event.tensors {
-        let bytes = tensor_layout_bytes(&descriptor.layout)?;
-        let allocation = event
-            .allocations
-            .iter()
-            .find(|allocation| allocation.slot == descriptor.allocation_slot)
-            .ok_or(SemanticTransitionError::ObservationMismatch)?;
-        let (native_input, producer_sealed) =
-            if let Some(declaration) = allocation.native_allocation.as_ref() {
-                if declaration.native_provenance().is_some() {
-                    return Err(publication_input_error(
-                    "pre-factory native content requires its original geometry allocation handle",
-                ));
-                }
-                let token = declaration
-                    .original_geometry()
-                    .ok_or(SemanticTransitionError::ObservationMismatch)?;
-                owner.require_allocation(token, allocation.span_bytes)?;
-                owner.classify_tensor(token, descriptor, event.family.prepared_section())?
-            } else {
-                (false, false)
-            };
-        if !model && native_input {
-            if !input_guard {
-                let basis = native_work_bound::step_input_basis_geometry_native_work_ceiling(
-                    &owner.publication.inputs,
-                    |slot| {
-                        owner
-                            .publication
-                            .storage
-                            .allocation_bytes
-                            .get(slot)
-                            .copied()
-                            .and_then(|bytes| u64::try_from(bytes).ok())
-                            .ok_or(SemanticTransitionError::ObservationMismatch)
-                    },
-                )?;
-                native_work_bound::add_native_work_ceiling(&mut ceiling, basis)?;
-                input_guard = true;
-            }
-        } else {
-            native_work_bound::add_native_work_ceiling(
-                &mut ceiling,
-                native_work_bound::tensor_layout_native_work_ceiling(
-                    &descriptor.layout,
-                    descriptor.logical_begin,
-                    descriptor.logical_end,
-                    bytes,
-                    verify || producer_sealed,
-                )?,
-            )?;
-        }
-    }
-    native_work_bound::native_work_ceiling_units(ceiling)?;
-    Ok(ceiling)
-}
-
 impl SemanticTransitionSession {
-    pub(super) fn guard_source_continuation_content(
-        &mut self,
-        binding: &TextBindingStorage,
-        kind: super::source_content_occurrences::SourceNativeContentGuard,
-    ) -> Result<(), SemanticTransitionError> {
-        self.check_continuation_content(binding)?;
-        self.retain_source_native_content_guard(&binding._witness, binding.consumer_stream, kind)?;
-        self.guard_continuation_content(binding)
-    }
-
-    pub(super) fn retain_source_native_content_guard(
-        &self,
-        witness: &SemanticTensorContentWitness,
-        stream: u64,
-        kind: super::source_content_occurrences::SourceNativeContentGuard,
-    ) -> Result<(), SemanticTransitionError> {
-        let step = self
-            .steps
-            .get(&witness.reader_token)
-            .ok_or(SemanticTransitionError::ObservationMismatch)?;
-        let Some(owner) = &step.source_content else {
-            return Ok(());
-        };
-        // Source execution and backward consumers are not turned into cold
-        // work by keeping structural recipe metadata after their preparation.
-        let Some(work) = self.cold_native_work(witness.reader_token)? else {
-            return Ok(());
-        };
-        let allowance = self
-            .cold_native_allowance(witness.reader_token)?
-            .ok_or(SemanticTransitionError::ObservationMismatch)?;
-        if !allowance
-            .lock()
-            .map_err(|_| publication_input_error("original native allowance is poisoned"))?
-            .is_source_prefix()
-        {
-            return Ok(());
-        }
-        if !Arc::ptr_eq(&owner.issuer, &witness.issuer)
-            || owner.token != witness.reader_token
-            || !Arc::ptr_eq(&step.content_witnesses, &witness._witness)
-            || witness.index >= step.content.len()
-            || stream != owner.consumer_stream
-            || !Arc::ptr_eq(&allowance, &owner.allowance)
-            || owner
-                .activation
-                .lock()
-                .map_err(|_| publication_input_error("original SOURCE activation is poisoned"))?
-                .as_ref()
-                .is_none_or(|activation| activation.cursor != 4)
-            || step.pending_source_content.is_some()
-        {
-            return Err(publication_input_error(
-                "SOURCE native consumer changed its original owner, stream or finite admission",
-            ));
-        }
-        allowance
-            .lock()
-            .map_err(|_| publication_input_error("original SOURCE allowance is poisoned"))?
-            .require_source_content_admitted(owner)?;
-        let borrowed = self.graph.borrowed_cold_work().is_some_and(|original| {
-            original.device_ptr() == work.device_ptr() && original.len() == work.len()
-        });
-        self.graph
-            .require_cold_work_owner(&work, borrowed)
-            .map_err(SemanticTransitionError::Semantic)?;
-        let frozen = owner
-            .occurrences
-            .lock()
-            .map_err(|_| publication_input_error("original SOURCE occurrence custody is poisoned"))?
-            .as_ref()
-            .map(Arc::clone)
-            .ok_or(SemanticTransitionError::ObservationMismatch)?;
-        frozen.require_original_recipe(owner)?;
-        let claim = frozen.claim_native(kind, witness)?;
-        step.content[witness.index].retain_source_native_guard_batch(
-            &self.domain,
-            &claim,
-            &allowance,
-        )
-    }
-
     pub(super) fn complete_source_content_final_use(
         &self,
-        witness: &SemanticTensorContentWitness,
+        witness: &SemanticTensorOwner,
         invocation: SemanticRngBinding,
     ) -> Result<(), SemanticTransitionError> {
         let Some(step) = self.steps.get(&witness.reader_token) else {
@@ -3318,9 +2868,7 @@ impl SemanticTransitionSession {
         if !Arc::ptr_eq(&owner.issuer, &witness.issuer)
             || !Arc::ptr_eq(&owner.issuer, &self.publication_issuer)
             || owner.token != witness.reader_token
-            || !Arc::ptr_eq(&step.content_witnesses, &witness._witness)
             || witness.index >= step.content.len()
-            || step.pending_source_content.is_some()
             || owner
                 .activation
                 .lock()
@@ -3332,13 +2880,6 @@ impl SemanticTransitionSession {
                 "SOURCE final use changed its original witness or still has unresolved preparation",
             ));
         }
-        owner
-            .occurrences
-            .lock()
-            .map_err(|_| publication_input_error("original SOURCE occurrence custody is poisoned"))?
-            .as_ref()
-            .ok_or(SemanticTransitionError::ObservationMismatch)?
-            .require_complete()?;
         let mut terminal = owner
             .terminal
             .lock()
@@ -3369,8 +2910,6 @@ impl SemanticTransitionSession {
                 .lock()
                 .map_err(|_| publication_input_error("original SOURCE activation is poisoned"))?
                 .is_some()
-            || self.steps[&lease.token].pending_source_content.is_some()
-            || self.steps[&lease.token].pending_cold_content.is_some()
             || owner.inputs.upgrade().is_none_or(|inputs| {
                 inputs
                     .original_preparation
@@ -3409,8 +2948,6 @@ impl SemanticTransitionSession {
             .lock()
             .map_err(|_| publication_input_error("original SOURCE terminal custody is poisoned"))?
             .is_none()
-            || self.steps[&lease.token].pending_source_content.is_some()
-            || self.steps[&lease.token].pending_cold_content.is_some()
         {
             return Err(publication_input_error(
                 "SOURCE custody retirement requires positive original native terminal proof",
@@ -3449,13 +2986,13 @@ impl SemanticTransitionSession {
         stream: u64,
         identity: SemanticColdNativeWorkActivationIdentity,
     ) -> Result<(), SemanticTransitionError> {
-        self.require_original_cold_content_reader(lease)?;
+        self.require_original_cold_reader(lease)?;
         let original = self.original_source_content_binding(lease, recipe)?;
         if stream != original.consumer_stream
             || !Arc::ptr_eq(identity.allowance(), &original.allowance)
             || self.has_pending_state_restoration_except(None, None)
             || self.resident_model_activation.is_some()
-            || self.replay_verification_pending.load(Ordering::Acquire)
+            || self.replay_join_pending.load(Ordering::Acquire)
             || self.has_pending_cold_model_work_completion(None)
             || self
                 .readers
@@ -3543,9 +3080,6 @@ impl SemanticTransitionSession {
                     let descriptor = self.descriptor();
                     let step = &self.steps[&lease.token];
                     let feedback = &step.feedback[original.feedback];
-                    feedback
-                        .content
-                        .retain_source_feedback_batch(&self.domain, &original)?;
                     let task = &self
                         .task
                         .as_ref()
@@ -3578,237 +3112,6 @@ impl SemanticTransitionSession {
             activation.cursor += 1;
         }
         Ok(())
-    }
-
-    pub(super) fn require_pending_source_occurrence(
-        &self,
-        token: u64,
-        occurrence: Option<&super::source_content_occurrences::SemanticSourceContentOccurrence>,
-    ) -> Result<(), SemanticTransitionError> {
-        match (
-            self.steps[&token].pending_source_content.as_ref(),
-            occurrence,
-        ) {
-            (Some(pending), Some(actual)) if pending.occurrence.same_handle(actual) => Ok(()),
-            (None, None) => Ok(()),
-            _ => Err(publication_input_error(
-                "SOURCE content continuation changed its original occurrence",
-            )),
-        }
-    }
-
-    pub(super) fn prepare_source_content_claim(
-        &self,
-        lease: &SemanticPublishedLease,
-        receiver: Option<&SemanticTensorContentWitness>,
-        tensors: &[PreparedSemanticTensor],
-        consumer_stream: u64,
-        model: bool,
-        occurrence: Option<&super::source_content_occurrences::SemanticSourceContentOccurrence>,
-    ) -> Result<
-        Option<(
-            super::source_content_occurrences::SemanticSourceContentOccurrence,
-            super::source_content_occurrences::SourceContentClaim,
-        )>,
-        SemanticTransitionError,
-    > {
-        use super::source_content_occurrences::SemanticSourceContentKind;
-        let Some(original) = &self.steps[&lease.token].source_content else {
-            return if occurrence.is_none() {
-                Ok(None)
-            } else {
-                Err(publication_input_error(
-                    "content occurrence has no original SOURCE recipe",
-                ))
-            };
-        };
-        if original.consumer_stream != consumer_stream {
-            return Err(publication_input_error(
-                "SOURCE content changed its fixed original consumer stream",
-            ));
-        }
-        original
-            .allowance
-            .lock()
-            .map_err(|_| publication_input_error("original SOURCE allowance is poisoned"))?
-            .require_source_content_admitted(original)?;
-        if original
-            .activation
-            .lock()
-            .map_err(|_| publication_input_error("original SOURCE activation is poisoned"))?
-            .as_ref()
-            .is_none_or(|activation| activation.cursor != 4)
-        {
-            return Err(publication_input_error(
-                "SOURCE content precedes its completed original input and feedback preparation",
-            ));
-        }
-        let occurrence = occurrence.ok_or_else(|| {
-            publication_input_error("SOURCE content requires its frozen original occurrence")
-        })?;
-        let verify = model || receiver.is_some();
-        let expected_kind = if model {
-            SemanticSourceContentKind::BindModel
-        } else if verify {
-            SemanticSourceContentKind::Verify
-        } else {
-            SemanticSourceContentKind::Capture
-        };
-        if occurrence.kind() != expected_kind {
-            return Err(publication_input_error(
-                "SOURCE content occurrence changed its original capture or verification kind",
-            ));
-        }
-        if let Some(pending) = &self.steps[&lease.token].pending_source_content {
-            if !pending.occurrence.same_handle(occurrence)
-                || pending.consumer_stream != consumer_stream
-                || pending.verify != verify
-            {
-                return Err(publication_input_error(
-                    "SOURCE content cannot replace its pending original occurrence",
-                ));
-            }
-            let expected = &self.steps[&lease.token].content[pending.index].tensors;
-            if expected.len() != tensors.len()
-                || expected
-                    .iter()
-                    .zip(tensors)
-                    .any(|(expected, actual)| !same_tensor_content_owner(expected, actual))
-            {
-                return Err(publication_input_error(
-                    "SOURCE content continuation changed its original producer allocations",
-                ));
-            }
-            return Ok(Some((occurrence.clone(), pending.claim.clone())));
-        }
-        let frozen = original.occurrences.lock().map_err(|_| {
-            publication_input_error("original SOURCE occurrence roster is poisoned")
-        })?;
-        let frozen = frozen.as_ref().ok_or_else(|| {
-            publication_input_error("SOURCE content has no frozen original occurrence roster")
-        })?;
-        frozen.require_original_recipe(original)?;
-        frozen.require_original_occurrence(occurrence)?;
-        let bind_uniform = occurrence.uses_uniform_domains() && {
-            let original = original.geometry.uniform.lock().map_err(|_| {
-                publication_input_error("original uniform domain custody is poisoned")
-            })?;
-            original.is_none()
-        };
-        if bind_uniform {
-            original
-                .geometry
-                .bind_uniform_domain_layouts(self.policy_numerical_domain_layouts(lease)?)?;
-        }
-        let inputs = original
-            .inputs
-            .upgrade()
-            .ok_or(SemanticTransitionError::ObservationMismatch)?;
-        let feedback = &self.steps[&lease.token].feedback[original.feedback]
-            .content
-            .tensors;
-        for tensor in tensors
-            .iter()
-            .filter(|tensor| !model && tensor.native_allocation.is_some())
-        {
-            if !inputs.owns_tensor(tensor)?
-                && !feedback
-                    .iter()
-                    .any(|expected| same_tensor_content_owner(expected, tensor))
-            {
-                return Err(publication_input_error("SOURCE native content allocation is not its actual original input or feedback producer"));
-            }
-        }
-        let retained_receiver;
-        let receiver = if model {
-            None
-        } else if let Some(receiver) = receiver {
-            Some(receiver)
-        } else {
-            let (issuer, token, index) = frozen.receiver_content_identity(occurrence)?;
-            if !Arc::ptr_eq(&issuer, &self.publication_issuer)
-                || token != lease.token
-                || index >= self.steps[&token].content.len()
-            {
-                return Err(publication_input_error(
-                    "SOURCE capture lost its previously authenticated original receiver",
-                ));
-            }
-            retained_receiver = SemanticTensorContentWitness {
-                issuer,
-                reader_token: token,
-                index,
-                _witness: Arc::clone(&self.steps[&token].content_witnesses),
-            };
-            Some(&retained_receiver)
-        };
-        let claim = frozen.claim(occurrence, receiver, tensors)?;
-        Ok(Some((occurrence.clone(), claim)))
-    }
-
-    pub fn source_content_family(
-        &self,
-        lease: &SemanticPublishedLease,
-        recipe: &SemanticPreparedSourceContent,
-        phase: super::source_content_occurrences::SemanticSourceContentPhase,
-        kind: super::source_content_occurrences::SemanticSourceContentKind,
-    ) -> Result<
-        super::source_content_occurrences::SemanticSourceContentFamily,
-        SemanticTransitionError,
-    > {
-        let original = self.original_source_content(lease, recipe)?;
-        original
-            .allowance
-            .lock()
-            .map_err(|_| publication_input_error("original SOURCE allowance is poisoned"))?
-            .require_source_preparation()?;
-        Ok(
-            super::source_content_occurrences::SemanticSourceContentFamily::new(
-                &original.geometry,
-                phase,
-                kind,
-            ),
-        )
-    }
-
-    pub fn freeze_source_content_occurrences<
-        A: super::source_content_occurrences::SourceContentAllocation,
-    >(
-        &self,
-        lease: &SemanticPublishedLease,
-        recipe: &SemanticPreparedSourceContent,
-        events: Vec<super::source_content_occurrences::SemanticSourceContentEvent<A>>,
-    ) -> Result<
-        Vec<super::source_content_occurrences::SemanticSourceContentOccurrence>,
-        SemanticTransitionError,
-    > {
-        let original = self.original_source_content(lease, recipe)?;
-        SemanticPreparedSourceContentGeometry {
-            owner: Arc::clone(&original.geometry),
-        }
-        .freeze_content_occurrences(events)
-    }
-
-    /// Retrieve the sole already-frozen declaration after a fallible binding
-    /// handoff. This never freezes, reprices or issues a new native owner.
-    pub fn source_content_occurrences(
-        &self,
-        lease: &SemanticPublishedLease,
-        recipe: &SemanticPreparedSourceContent,
-    ) -> Result<
-        Vec<super::source_content_occurrences::SemanticSourceContentOccurrence>,
-        SemanticTransitionError,
-    > {
-        let original = self.original_source_content(lease, recipe)?;
-        let frozen = original.occurrences.lock().map_err(|_| {
-            publication_input_error("original SOURCE occurrence roster is poisoned")
-        })?;
-        Ok(frozen
-            .as_ref()
-            .ok_or_else(|| {
-                publication_input_error("original SOURCE occurrence roster has not been frozen")
-            })?
-            .occurrence_handles())
     }
 
     /// Allocate the original future outputs, without commands, events, copies,
@@ -3898,17 +3201,6 @@ impl SemanticTransitionSession {
                 "SOURCE recipe changed its original instruction, member or geometry owner",
             ));
         }
-        let occurrence_owner = declared
-            .occurrences
-            .lock()
-            .map_err(|_| publication_input_error("original content geometry custody is poisoned"))?
-            .as_ref()
-            .map(Arc::clone)
-            .ok_or_else(|| {
-                publication_input_error(
-                    "SOURCE recipe requires its original frozen content declarations",
-                )
-            })?;
         let mut recipe_binding = declared
             .recipe
             .lock()
@@ -4138,7 +3430,6 @@ impl SemanticTransitionSession {
                 target: destination,
                 sealed: false,
             }),
-            occurrences: Mutex::new(Some(occurrence_owner)),
         });
         *recipe_binding = Some(Arc::downgrade(&owner));
         *reader_binding = Some((Arc::clone(&owner.issuer), owner.token));
@@ -4301,8 +3592,7 @@ impl SemanticTransitionSession {
         let result = SemanticPreparedSourceContentPorts {
             model_context: SemanticModelContext {
                 parent: lease.identity,
-                descriptor_digest: header.descriptor_digest,
-                numerical_state: (header.model_geometry_digest, header.model_numerical_digest),
+                model_geometry_digest: header.model_geometry_digest,
                 semantic_root: (
                     header.semantic_owner,
                     header.semantic_slot,

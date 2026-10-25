@@ -1128,7 +1128,9 @@ pub enum ResourceError {
         remaining: usize,
         limit: usize,
     },
-    /// CUDA driver returned an error. Carries the wrapped message.
+    /// CUDA driver returned this exact status, retained before diagnostic formatting.
+    CudaDriver(cudarc::driver::DriverError),
+    /// Resource or backend diagnostic without an original CUDA driver status.
     Driver(String),
     /// A stream-ordered contract was violated (e.g. dealloc on a
     /// stream that does not match the alloc stream without an
@@ -1160,6 +1162,7 @@ impl fmt::Display for ResourceError {
                 limit,
                 remaining,
             ),
+            Self::CudaDriver(error) => write!(f, "CUDA driver error: {}", error),
             Self::Driver(msg) => write!(f, "CUDA driver error: {}", msg),
             Self::StreamMisuse(msg) => write!(f, "stream-ordered contract violated: {}", msg),
             Self::UseAfterFree { generation } => {
@@ -1172,7 +1175,15 @@ impl fmt::Display for ResourceError {
     }
 }
 
-impl std::error::Error for ResourceError {}
+impl std::error::Error for ResourceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::AllocationRetained(owner) => Some(owner.cause.as_ref()),
+            Self::CudaDriver(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 /// Diagnostic sharing the allocation's lifecycle ticket. The actual storage
 /// owner remains governed by its cold reaper, independently of this error.
@@ -1203,6 +1214,14 @@ impl fmt::Debug for RetainedAllocation {
 }
 
 impl ResourceError {
+    pub(crate) fn driver_error(&self) -> Option<cudarc::driver::DriverError> {
+        match self {
+            Self::CudaDriver(error) => Some(cudarc::driver::DriverError(error.0)),
+            Self::AllocationRetained(owner) => owner.cause.driver_error(),
+            _ => None,
+        }
+    }
+
     pub(crate) fn retaining(
         self,
         bytes: usize,
@@ -1233,7 +1252,7 @@ pub type ResourceResult<T> = std::result::Result<T, ResourceError>;
 
 impl From<cudarc::driver::DriverError> for ResourceError {
     fn from(error: cudarc::driver::DriverError) -> Self {
-        Self::Driver(error.to_string())
+        Self::CudaDriver(error)
     }
 }
 

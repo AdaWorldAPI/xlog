@@ -77,45 +77,6 @@ impl PrefillTensorGeometry {
     }
 }
 
-fn require_completed_prefill_content(
-    content: &TensorContentBuffers,
-    verified: bool,
-) -> Result<(), SemanticTransitionError> {
-    let original = content
-        .original_cold
-        .lock()
-        .map_err(|_| SemanticTransitionError::Poisoned)?;
-    let original = original.as_ref().ok_or_else(|| {
-        publication_input_error("dormant prefill has no original native content producer")
-    })?;
-    if (verified && !original.verify)
-        || original.cursor != original.commands.len()
-        || original.commands.len() != content.tensors.len()
-        || original
-            .commands
-            .iter()
-            .any(|command| !command.submitted || !command.completed)
-    {
-        return Err(publication_input_error(
-            "dormant prefill content has not completed its original native producer",
-        ));
-    }
-    let TensorContentSeals::Captured(digests) = &content.seals else {
-        return Err(SemanticTransitionError::ObservationMismatch);
-    };
-    if digests.len() != content.tensors.len()
-        || digests.iter().any(|digest| match digest {
-            CapturedTensorDigest::Tensor { cells, offset, .. } => {
-                offset.checked_add(4).is_none_or(|end| end > cells.len())
-            }
-            CapturedTensorDigest::Publication(_) => true,
-        })
-    {
-        return Err(SemanticTransitionError::ObservationMismatch);
-    }
-    Ok(())
-}
-
 pub(super) struct OriginalDormantPrefillCheckpoint {
     continuation: Arc<ModelContextContinuationOwner>,
     storage: Arc<PublicationStorage>,
@@ -126,17 +87,7 @@ pub(super) struct OriginalDormantPrefillCheckpoint {
     loaded: Option<SemanticReplayLoadedMaterial>,
     bindings: Option<(Identity256, Identity256)>,
     allowance: Arc<Mutex<native_work_bound::ColdNativeAllowance>>,
-    poisoned: bool,
     reservation: Arc<SemanticReplayMaterialReservation>,
-}
-
-impl OriginalDormantPrefillCheckpoint {
-    pub(super) fn completion_pending(&self) -> bool {
-        self.content.reads.iter().any(|part| match part {
-            OriginalInitialPrefillPart::Count(_) => false,
-            OriginalInitialPrefillPart::Digest { read, .. } => read.completion_pending(),
-        })
-    }
 }
 
 impl SemanticTransitionSession {
@@ -166,69 +117,8 @@ impl SemanticTransitionSession {
             .lock()
             .map_err(|_| SemanticTransitionError::Poisoned)?
             .completed_prefill_proof()?;
-        self.require_restored_model_context_prefill_consumers_complete(continuation, &proof)?;
+        self.require_restored_model_context_prefill(continuation, &proof)?;
         Ok(Some(proof))
-    }
-
-    pub(super) fn dormant_prefill_checkpoint_native_ceilings(
-        &self,
-        continuation: &SemanticModelContextContinuation,
-    ) -> Result<([u64; 9], [u64; 9]), SemanticTransitionError> {
-        continuation.inner.require_dormant_parent(self)?;
-        let restored = self.completed_restored_prefill_for_checkpoint(continuation)?;
-        let original = continuation
-            .inner
-            .original
-            .lock()
-            .map_err(|_| SemanticTransitionError::Poisoned)?;
-        let stage = original
-            .parent
-            .as_ref()
-            .and_then(|parent| parent.prefill.as_ref())
-            .ok_or_else(|| {
-                publication_input_error(
-                    "dormant checkpoint requires its original completed prefill",
-                )
-            })?;
-        let mut dma = [0u64; 9];
-        for (group, content) in [&stage.model_content, &stage.output_content]
-            .into_iter()
-            .enumerate()
-        {
-            let content = content.as_ref().ok_or(SemanticTransitionError::NotBound)?;
-            if let Some(proof) = &restored {
-                proof.require_consumer_content_slot(
-                    if group == 0 { 0 } else { 4 },
-                    if group == 0 {
-                        InitialPrefillCaptureKind::Model
-                    } else {
-                        InitialPrefillCaptureKind::Outputs
-                    },
-                    content,
-                )?;
-            } else {
-                require_completed_prefill_content(content, true)?;
-            }
-            let TensorContentSeals::Captured(digests) = &content.seals else {
-                return Err(SemanticTransitionError::ObservationMismatch);
-            };
-            for digest in digests {
-                let CapturedTensorDigest::Tensor { cells, .. } = digest else {
-                    return Err(SemanticTransitionError::ObservationMismatch);
-                };
-                dma[0] = dma[0]
-                    .checked_add(1)
-                    .ok_or(SemanticTransitionError::GenerationExhausted)?;
-                dma[8] = dma[8]
-                    .checked_add(
-                        (cells.len() as u64)
-                            .checked_mul(8)
-                            .ok_or(SemanticTransitionError::GenerationExhausted)?,
-                    )
-                    .ok_or(SemanticTransitionError::GenerationExhausted)?;
-            }
-        }
-        Ok((dma, dma))
     }
 
     pub(super) fn dormant_prefill_checkpoint_allocation_bound(
@@ -262,20 +152,14 @@ impl SemanticTransitionSession {
             .len()
             .checked_add(output.tensors.len())
             .ok_or(SemanticTransitionError::GenerationExhausted)?;
-        let mut bytes = initial_prefill_geometry_content_extent(
+        let bytes = initial_prefill_geometry_content_extent(
             &stage.layout.prefill_tokens,
             &stage.layout.prefill_mapping,
-            model.tensors.len(),
-            output.tensors.len(),
         )?
         .checked_mul(3)
         .and_then(|bytes| {
             bytes.checked_add(count.checked_mul(
-                2 * size_of::<PrefillTensorGeometry>()
-                    + size_of::<InitialPrefillSealSource>()
-                    + size_of::<OriginalInitialPrefillPart>()
-                    + 2 * size_of::<usize>()
-                    + 17 * 8,
+                2 * size_of::<PrefillTensorGeometry>() + 2 * size_of::<usize>() + 17 * 8,
             )?)
         })
         .and_then(|bytes| {
@@ -289,24 +173,6 @@ impl SemanticTransitionSession {
             )
         })
         .ok_or(SemanticTransitionError::GenerationExhausted)?;
-        for content in [model, output] {
-            let TensorContentSeals::Captured(digests) = &content.seals else {
-                return Err(SemanticTransitionError::ObservationMismatch);
-            };
-            for digest in digests {
-                let CapturedTensorDigest::Tensor { cells, .. } = digest else {
-                    return Err(SemanticTransitionError::ObservationMismatch);
-                };
-                bytes = bytes
-                    .checked_add(
-                        cells
-                            .len()
-                            .checked_mul(2 * size_of::<u64>())
-                            .ok_or(SemanticTransitionError::GenerationExhausted)?,
-                    )
-                    .ok_or(SemanticTransitionError::GenerationExhausted)?;
-            }
-        }
         u64::try_from(bytes).map_err(|_| SemanticTransitionError::GenerationExhausted)
     }
 
@@ -350,24 +216,11 @@ impl SemanticTransitionSession {
             || self.task_evaluation_identity() != Some(stage.task_identity)
             || stage.layout.prefill_tokens.is_empty()
             || stage.layout.prefill_tokens.len() as u64 != parent.bank.header.prefix_extent
-            || (restored.is_none()
-                && (stage.input.is_none()
-                    || stage.consumer_stream.is_none()
-                    || stage
-                        .input_guard
-                        .as_ref()
-                        .is_none_or(|guard| !guard.submitted || !guard.completed)))
-            || stage
-                .token_write
-                .as_ref()
-                .is_none_or(|write| !write.completed())
+            || (restored.is_none() && (stage.input.is_none() || stage.consumer_stream.is_none()))
         {
             return Err(publication_input_error(
                 "dormant prefill is not its original completed input/output boundary",
             ));
-        }
-        for content in &stage.captured_content {
-            require_completed_prefill_content(content, false)?;
         }
         let model = stage
             .model_content
@@ -377,13 +230,6 @@ impl SemanticTransitionSession {
             .output_content
             .as_ref()
             .ok_or(SemanticTransitionError::NotBound)?;
-        if let Some(proof) = &restored {
-            proof.require_consumer_content_slot(0, InitialPrefillCaptureKind::Model, model)?;
-            proof.require_consumer_content_slot(4, InitialPrefillCaptureKind::Outputs, output)?;
-        } else {
-            require_completed_prefill_content(model, true)?;
-            require_completed_prefill_content(output, true)?;
-        }
         let record = InitialPrefillRecord {
             predecessor: source_parent,
             semantic_root: parent.bank.header.semantic_digest,
@@ -399,39 +245,14 @@ impl SemanticTransitionSession {
             tokens: stage.layout.prefill_tokens.clone(),
             mapping: stage.layout.prefill_mapping.clone(),
         };
-        let bytes = encode_initial_prefill_record_prefix(
-            &record,
-            model.tensors.len(),
-            output.tensors.len(),
-        )?;
+        let bytes = encode_initial_prefill_record_prefix(&record)?;
         let mut geometry = [Vec::new(), Vec::new()];
-        let mut reads = Vec::new();
-        reads
-            .try_reserve_exact(model.tensors.len() + output.tensors.len() + 2)
-            .map_err(|_| {
-                publication_input_error("dormant prefill read roster allocation failed")
-            })?;
         for (group, content) in [model, output].into_iter().enumerate() {
             geometry[group] = content
                 .tensors
                 .iter()
                 .map(PrefillTensorGeometry::from_tensor)
                 .collect::<Result<_, _>>()?;
-            let seals = initial_prefill_seal_sources(content)?;
-            reads.push(OriginalInitialPrefillPart::Count(seals.len() as u64));
-            for (role, index, cells, offset) in seals {
-                let mut read = self.stage_publication_read_with_owner(
-                    cells.view(),
-                    Some(Arc::clone(&reservation)),
-                )?;
-                read.dma_allowance = Some(Arc::downgrade(&allowance));
-                reads.push(OriginalInitialPrefillPart::Digest {
-                    role,
-                    index,
-                    offset,
-                    read,
-                });
-            }
         }
         Ok(OriginalDormantPrefillCheckpoint {
             continuation: Arc::clone(&continuation.inner),
@@ -440,9 +261,6 @@ impl SemanticTransitionSession {
             source_parent,
             content: OriginalInitialPrefillContent {
                 predecessor: source_parent,
-                scope: Arc::clone(&stage.scope),
-                reads,
-                cursor: 0,
                 bytes,
                 installed: false,
             },
@@ -450,7 +268,6 @@ impl SemanticTransitionSession {
             loaded: None,
             bindings: None,
             allowance,
-            poisoned: false,
             reservation,
         })
     }
@@ -497,48 +314,19 @@ impl SemanticTransitionSession {
                 decoded: None,
             });
         }
-        while original.content.cursor < original.content.reads.len() {
-            match &mut original.content.reads[original.content.cursor] {
-                OriginalInitialPrefillPart::Count(count) => {
-                    material_u64(&mut original.content.bytes, *count)
-                }
-                OriginalInitialPrefillPart::Digest {
-                    role,
-                    index,
-                    offset,
-                    read,
-                } => {
-                    let words = self.resolve_restoration_read_with_dma(
-                        read,
-                        &mut original.poisoned,
-                        Some(&original.allowance),
-                    )?;
-                    let end = offset
-                        .checked_add(4)
-                        .filter(|end| *end <= words.len())
-                        .ok_or(SemanticTransitionError::ObservationMismatch)?;
-                    material_u64(&mut original.content.bytes, *role);
-                    material_u64(&mut original.content.bytes, *index);
-                    for word in &words[*offset..end] {
-                        material_u64(&mut original.content.bytes, *word);
-                    }
-                }
-            }
-            original.content.cursor += 1;
-        }
-        CheckpointInitialPrefill::parse_content(&original.content.bytes)?;
+
         let mut bytes = Vec::new();
         let extent = CheckpointInitialPrefill::MAGIC.len()
             + 1
             + 5 * 8
-            + 5 * 32
+            + 4 * 32
             + original.content.bytes.len()
             + (original.geometry[0].len() + original.geometry[1].len()) * 17 * 8;
         bytes
             .try_reserve_exact(extent)
             .map_err(|_| publication_input_error("dormant prefill section allocation failed"))?;
         bytes.extend_from_slice(CheckpointInitialPrefill::MAGIC);
-        material_u64(&mut bytes, 2);
+        material_u64(&mut bytes, 4);
         bytes.push(1);
         encode_publication_identity(&mut bytes, original.source_parent);
         bytes.extend_from_slice(source_native_digest.as_bytes());
@@ -570,8 +358,8 @@ impl SemanticTransitionSession {
     }
 }
 
-/// A boundary issued only after the new native owners have verified the saved
-/// original model and complete persistent cache content. It authorizes no model
+/// A boundary retaining the restored model owners and complete persistent cache
+/// buffers after their actual native copies finish. It authorizes no model
 /// call or publication; activation still owns the actual PublishedParent.
 #[derive(Clone)]
 pub struct SemanticRestoredModelContextPrefill {
@@ -680,12 +468,7 @@ struct RestoredModelContextPrefillOwner {
     target_native_digest: Identity256,
     layout: SemanticInitialSourceLayout,
     output_tensors: Vec<PreparedSemanticTensor>,
-    verifications: [native_work_bound::OriginalContentBatch; 2],
-    consumer_batches: Mutex<Vec<Option<native_work_bound::OriginalContentBatch>>>,
-    _consumer_reservation: Arc<SemanticReplayMaterialReservation>,
     declaration: SemanticModelContextPrefillRestoreDeclaration,
-    _seal_uploads: Vec<state_restoration::OriginalDeviceWrite>,
-    _seal_cells: Vec<Arc<TrackedCudaSlice<u64>>>,
     _cache_copies: Vec<crate::device::RetainedDeviceMemoryCommand>,
     _section: SemanticReplayLoadedMaterial,
     _reservation: Arc<SemanticReplayMaterialReservation>,
@@ -735,209 +518,6 @@ impl ModelContextContinuationOwner {
         }
         operation(stage)
     }
-
-    pub(in crate::semantic_transition) fn restored_prefill_content_proof(
-        &self,
-        target: &SemanticTransitionSession,
-        scope: &Arc<()>,
-    ) -> Result<SemanticRestoredModelContextPrefill, SemanticTransitionError> {
-        let restore = self
-            .original
-            .lock()
-            .map_err(|_| SemanticTransitionError::Poisoned)?
-            .checkpoint_restore
-            .clone()
-            .ok_or(SemanticTransitionError::NotBound)?;
-        let proof = restore
-            .lock()
-            .map_err(|_| SemanticTransitionError::Poisoned)?
-            .known_prefill_proof()?;
-        let owner = target
-            .model_context_continuation
-            .as_ref()
-            .ok_or(SemanticTransitionError::NotBound)?;
-        if !std::ptr::eq(self, owner.as_ref()) || !Arc::ptr_eq(&proof.inner.scope, scope) {
-            return Err(SemanticTransitionError::ObservationMismatch);
-        }
-        target.require_restored_model_context_prefill(
-            &SemanticModelContextContinuation {
-                inner: Arc::clone(owner),
-            },
-            &proof,
-        )?;
-        Ok(proof)
-    }
-}
-
-impl SemanticRestoredModelContextPrefill {
-    pub(in crate::semantic_transition) fn take_consumer_batch(
-        &self,
-        occurrence: usize,
-        kind: InitialPrefillCaptureKind,
-        content: &TensorContentBuffers,
-    ) -> Result<native_work_bound::OriginalContentBatch, SemanticTransitionError> {
-        self.require_consumer_content_slot(occurrence, kind, content)?;
-        let mut slots = self
-            .inner
-            .consumer_batches
-            .lock()
-            .map_err(|_| SemanticTransitionError::Poisoned)?;
-        let slot = slots
-            .get_mut(occurrence)
-            .ok_or(SemanticTransitionError::ObservationMismatch)?;
-        if slot.as_ref().is_none_or(|batch| {
-            batch.cursor != 0
-                || batch
-                    .commands
-                    .iter()
-                    .any(|command| command.submitted || command.completed)
-        }) {
-            return Err(SemanticTransitionError::ObservationMismatch);
-        }
-        slot.take().ok_or(SemanticTransitionError::NotBound)
-    }
-
-    pub(in crate::semantic_transition) fn retain_completed_consumer_batch(
-        &self,
-        occurrence: usize,
-        content: &TensorContentBuffers,
-    ) -> Result<(), SemanticTransitionError> {
-        let mut original = content
-            .original_cold
-            .lock()
-            .map_err(|_| SemanticTransitionError::Poisoned)?;
-        let batch = original.as_ref().ok_or(SemanticTransitionError::NotBound)?;
-        if !batch.verify
-            || batch.context_prefill_occurrence != Some(occurrence)
-            || batch.cursor != batch.commands.len()
-            || batch
-                .commands
-                .iter()
-                .any(|command| !command.submitted || !command.completed)
-        {
-            return Err(SemanticTransitionError::ObservationMismatch);
-        }
-        let mut slots = self
-            .inner
-            .consumer_batches
-            .lock()
-            .map_err(|_| SemanticTransitionError::Poisoned)?;
-        let slot = slots
-            .get_mut(occurrence)
-            .ok_or(SemanticTransitionError::ObservationMismatch)?;
-        if slot.is_some() {
-            return Err(SemanticTransitionError::ObservationMismatch);
-        }
-        *slot = original.take();
-        Ok(())
-    }
-
-    pub(super) fn require_consumers_completed(&self) -> Result<(), SemanticTransitionError> {
-        let slots = self
-            .inner
-            .consumer_batches
-            .lock()
-            .map_err(|_| SemanticTransitionError::Poisoned)?;
-        if slots.len() != 5
-            || slots.iter().enumerate().any(|(ordinal, slot)| {
-                slot.as_ref().is_none_or(|batch| {
-                    !batch.verify
-                        || batch.context_prefill_occurrence != Some(ordinal)
-                        || batch.cursor != batch.commands.len()
-                        || batch
-                            .commands
-                            .iter()
-                            .any(|command| !command.submitted || !command.completed)
-                })
-            })
-        {
-            return Err(SemanticTransitionError::ObservationMismatch);
-        }
-        Ok(())
-    }
-
-    fn consumer_completion_pending(&self) -> Result<bool, SemanticTransitionError> {
-        let missing = {
-            let slots = self
-                .inner
-                .consumer_batches
-                .lock()
-                .map_err(|_| SemanticTransitionError::Poisoned)?;
-            if slots.iter().flatten().any(|batch| {
-                batch
-                    .commands
-                    .iter()
-                    .any(OriginalNativeCommand::completion_pending)
-            }) {
-                return Ok(true);
-            }
-            slots.iter().any(Option::is_none)
-        };
-        if !missing {
-            return Ok(false);
-        }
-        let owner = self
-            .inner
-            .continuation
-            .upgrade()
-            .ok_or(SemanticTransitionError::NotBound)?;
-        owner.with_dormant_prefill_stage(&self.inner.issuer, &self.inner.scope, |stage| {
-            for content in [&stage.model_content, &stage.output_content]
-                .into_iter()
-                .flatten()
-            {
-                if content
-                    .original_cold
-                    .lock()
-                    .map_err(|_| SemanticTransitionError::Poisoned)?
-                    .as_ref()
-                    .is_some_and(|batch| {
-                        batch
-                            .commands
-                            .iter()
-                            .any(OriginalNativeCommand::completion_pending)
-                    })
-                {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
-        })
-    }
-
-    pub(in crate::semantic_transition) fn require_consumer_content_slot(
-        &self,
-        occurrence: usize,
-        kind: InitialPrefillCaptureKind,
-        content: &TensorContentBuffers,
-    ) -> Result<(), SemanticTransitionError> {
-        let group = match (occurrence, kind) {
-            (0..=3, InitialPrefillCaptureKind::Model) => 0,
-            (4, InitialPrefillCaptureKind::Outputs) => 1,
-            _ => return Err(SemanticTransitionError::ObservationMismatch),
-        };
-        let cells = self
-            .inner
-            ._seal_cells
-            .get(group)
-            .ok_or(SemanticTransitionError::NotBound)?;
-        let TensorContentSeals::Captured(digests) = &content.seals else {
-            return Err(SemanticTransitionError::ObservationMismatch);
-        };
-        if content.tensors.is_empty() || digests.len() != content.tensors.len()
-            || digests.iter().enumerate().any(|(ordinal, digest)| {
-                !matches!(digest, CapturedTensorDigest::Tensor { cells: actual, offset, producer_sealed: true }
-                    if Arc::ptr_eq(actual, cells) && *offset == ordinal * 4)
-            })
-            || content.tensors.iter().any(|tensor| {
-                if group == 0 { tensor.layout.role != 0 && !matches!(tensor.layout.role, 18..=25) }
-                else { !matches!(tensor.layout.role, 4..=13) }
-            })
-        {
-            return Err(SemanticTransitionError::ObservationMismatch);
-        }
-        Ok(())
-    }
 }
 
 /// Authenticated completed-prefill geometry before restoration initializes
@@ -947,26 +527,10 @@ pub struct SemanticModelContextPrefillRestoreDeclaration {
     inner: Arc<ModelContextPrefillRestoreDeclarationOwner>,
 }
 
-type RestoredPrefillGeometryEvent = (
-    bool,
-    Vec<source_content_occurrences::SemanticSourceTensorDescriptor>,
-    Vec<
-        source_content_occurrences::SemanticSourceAllocationDescriptor<
-            source_content_occurrences::SemanticSourceContentAllocation,
-        >,
-    >,
-);
-
-struct DeclaredRestoreFactoryGeometry {
-    events: Vec<RestoredPrefillGeometryEvent>,
-    _reservation: SemanticReplayMaterialReservation,
-}
-
 struct ModelContextPrefillRestoreDeclarationOwner {
     scope: Arc<()>,
     source_publication: Arc<PublicationStorage>,
     source_models: Vec<Arc<ModelGenerationOwner>>,
-    factory_geometry: Mutex<Option<DeclaredRestoreFactoryGeometry>>,
     layout: SemanticInitialSourceLayout,
     lineage: (
         SemanticPublishedIdentity,
@@ -982,199 +546,6 @@ struct ModelContextPrefillRestoreDeclarationOwner {
 }
 
 impl SemanticModelContextPrefillRestoreDeclaration {
-    pub fn bind_geometry(
-        &self,
-        declarations: &[(
-            bool,
-            Vec<source_content_occurrences::SemanticSourceTensorDescriptor>,
-            Vec<
-                source_content_occurrences::SemanticSourceAllocationDescriptor<
-                    source_content_occurrences::SemanticSourceContentAllocation,
-                >,
-            >,
-        )],
-    ) -> Result<(), SemanticTransitionError> {
-        if declarations.len() != 5 {
-            return Err(SemanticTransitionError::ObservationMismatch);
-        }
-        let mut bound = self
-            .inner
-            .factory_geometry
-            .lock()
-            .map_err(|_| SemanticTransitionError::Poisoned)?;
-        if bound.is_some() {
-            return Err(publication_input_error(
-                "restore factory geometry is declared once",
-            ));
-        }
-        let count = declarations
-            .iter()
-            .try_fold(0usize, |count, (_, tensors, allocations)| {
-                count
-                    .checked_add(tensors.len())
-                    .and_then(|count| count.checked_add(allocations.len()))
-                    .ok_or(SemanticTransitionError::GenerationExhausted)
-            })?;
-        let bytes = count
-            .checked_mul(
-                4 * (size_of::<source_content_occurrences::SemanticSourceTensorDescriptor>()
-                    + size_of::<
-                        source_content_occurrences::SemanticSourceAllocationDescriptor<
-                            source_content_occurrences::SemanticSourceContentAllocation,
-                        >,
-                    >()),
-            )
-            .and_then(|bytes| bytes.checked_add(5 * size_of::<usize>() * 6))
-            .and_then(|bytes| u64::try_from(bytes).ok())
-            .ok_or(SemanticTransitionError::GenerationExhausted)?;
-        let reservation = self.material_budget().reserve_auxiliary(bytes)?;
-        let mut storage = BTreeMap::<
-            u64,
-            (
-                prepared_source_content::SemanticSourceGeometryAllocation,
-                u64,
-                SemanticTensorLayout,
-                u64,
-                u64,
-                Option<u64>,
-            ),
-        >::new();
-        let mut allocation_slots =
-            BTreeMap::<u64, prepared_source_content::SemanticSourceGeometryAllocation>::new();
-        for (ordinal, (verify, tensors, allocations)) in declarations.iter().enumerate() {
-            let rows = &self.inner.rows[usize::from(ordinal == 4)];
-            if !*verify || tensors.len() != rows.len() {
-                return Err(SemanticTransitionError::ObservationMismatch);
-            }
-            let mut seen = BTreeSet::new();
-            let mut used = BTreeSet::new();
-            for allocation in allocations {
-                if !seen.insert(allocation.slot) || allocation.native_allocation.is_none() {
-                    return Err(SemanticTransitionError::ObservationMismatch);
-                }
-            }
-            for (tensor, row) in tensors.iter().zip(rows) {
-                if tensor.layout != row.layout
-                    || tensor.logical_begin != row.logical_begin
-                    || tensor.logical_end != row.logical_end
-                    || tensor.byte_offset != row.byte_offset
-                {
-                    return Err(SemanticTransitionError::ObservationMismatch);
-                }
-                let allocation = allocations
-                    .iter()
-                    .find(|allocation| allocation.slot == tensor.allocation_slot)
-                    .ok_or(SemanticTransitionError::ObservationMismatch)?;
-                if allocation.span_bytes != row.allocation.span_bytes() {
-                    return Err(SemanticTransitionError::ObservationMismatch);
-                }
-                match allocation
-                    .native_allocation
-                    .as_ref()
-                    .ok_or(SemanticTransitionError::ObservationMismatch)?
-                {
-                    source_content_occurrences::SemanticSourceContentAllocation::Geometry(
-                        actual,
-                    ) => {
-                        if !actual.same_handle(&row.allocation)
-                            || actual.span_bytes() != allocation.span_bytes
-                        {
-                            return Err(SemanticTransitionError::ObservationMismatch);
-                        }
-                    }
-                    source_content_occurrences::SemanticSourceContentAllocation::Native(actual) => {
-                        if ordinal == 4 {
-                            return Err(SemanticTransitionError::ObservationMismatch);
-                        }
-                        let model = if row.layout.role == 0 {
-                            usize::try_from(row.layout.index)
-                                .map_err(|_| SemanticTransitionError::ObservationMismatch)?
-                        } else {
-                            self.inner
-                                .source_publication
-                                .model_memory
-                                .location(row.layout.role, row.layout.index)?
-                                .0
-                        };
-                        let expected = self
-                            .inner
-                            .source_models
-                            .get(model)
-                            .ok_or(SemanticTransitionError::ObservationMismatch)?
-                            .allocation
-                            .view()
-                            .allocation_provenance()
-                            .ok_or(SemanticTransitionError::ObservationMismatch)?;
-                        if !expected.same_allocation(actual)
-                            || expected.allocation_bytes() != actual.allocation_bytes()
-                            || actual.allocation_bytes() as u64 != allocation.span_bytes
-                            || expected.byte_offset() != actual.byte_offset()
-                            || expected.view_bytes() != actual.view_bytes()
-                        {
-                            return Err(SemanticTransitionError::ObservationMismatch);
-                        }
-                    }
-                }
-                used.insert(allocation.slot);
-                if allocation_slots
-                    .get(&allocation.slot)
-                    .is_some_and(|original| !original.same_handle(&row.allocation))
-                {
-                    return Err(SemanticTransitionError::ObservationMismatch);
-                }
-                allocation_slots.insert(allocation.slot, row.allocation.clone());
-                if let Some((allocation, offset, layout, begin, end, version)) =
-                    storage.get(&tensor.storage_slot)
-                {
-                    if !allocation.same_handle(&row.allocation)
-                        || *offset != row.byte_offset
-                        || *layout != row.layout
-                        || *begin != row.logical_begin
-                        || *end != row.logical_end
-                        || *version != tensor.version_slot
-                    {
-                        return Err(SemanticTransitionError::ObservationMismatch);
-                    }
-                } else {
-                    storage.insert(
-                        tensor.storage_slot,
-                        (
-                            row.allocation.clone(),
-                            row.byte_offset,
-                            row.layout,
-                            row.logical_begin,
-                            row.logical_end,
-                            tensor.version_slot,
-                        ),
-                    );
-                }
-            }
-            if used.len() != allocations.len() {
-                return Err(SemanticTransitionError::ObservationMismatch);
-            }
-        }
-        *bound = Some(DeclaredRestoreFactoryGeometry {
-            events: declarations.to_vec(),
-            _reservation: reservation,
-        });
-        Ok(())
-    }
-
-    fn require_factory_geometry(&self) -> Result<(), SemanticTransitionError> {
-        let geometry = self
-            .inner
-            .factory_geometry
-            .lock()
-            .map_err(|_| SemanticTransitionError::Poisoned)?;
-        if geometry
-            .as_ref()
-            .is_none_or(|geometry| geometry.events.len() != 5)
-        {
-            return Err(SemanticTransitionError::NotBound);
-        }
-        Ok(())
-    }
-
     pub fn same_handle(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
@@ -1364,8 +735,10 @@ impl SemanticModelContextPrefillRestoreDeclaration {
         Ok(expected.same_allocation(actual)
             && expected.allocation_bytes() == actual.allocation_bytes())
     }
-    fn bind(&self, groups: [&TensorContentBuffers; 2]) -> Result<(), SemanticTransitionError> {
-        self.require_factory_geometry()?;
+    fn bind(
+        &self,
+        groups: [&InitialPrefillTensorOwners; 2],
+    ) -> Result<(), SemanticTransitionError> {
         let mut binding = self
             .inner
             .binding
@@ -1415,13 +788,7 @@ pub(super) struct OriginalRestoredModelContextPrefill {
     section: Option<SemanticReplayLoadedMaterial>,
     reservation: Arc<SemanticReplayMaterialReservation>,
     copy_reservation: Arc<SemanticReplayMaterialReservation>,
-    consumer_batches: Vec<Option<native_work_bound::OriginalContentBatch>>,
-    verification_inputs: [Vec<PreparedSemanticTensor>; 2],
-    consumer_reservation: Arc<SemanticReplayMaterialReservation>,
     stage: Option<InitialPrefillStage>,
-    seal_uploads: Vec<state_restoration::OriginalDeviceWrite>,
-    upload_cursor: usize,
-    content_cursor: usize,
     storage: Option<Arc<PublicationStorage>>,
     allowance: Option<Arc<Mutex<native_work_bound::ColdNativeAllowance>>>,
     work: Option<SemanticColdModelWork>,
@@ -1432,12 +799,8 @@ pub(super) struct OriginalRestoredModelContextPrefill {
 fn require_prefill_roster(
     material: &OwnedPublicationMaterial,
     groups: &[Vec<PrefillTensorGeometry>; 2],
-    record: &DecodedInitialPrefillContent,
 ) -> Result<(), SemanticTransitionError> {
-    for (model, geometry, seals) in [
-        (true, &groups[0], &record.model),
-        (false, &groups[1], &record.output),
-    ] {
+    for (model, geometry) in [(true, &groups[0]), (false, &groups[1])] {
         let expected = material
             .layouts
             .keys()
@@ -1459,14 +822,14 @@ fn require_prefill_roster(
             )
             .collect::<BTreeSet<_>>();
         let mut seen = BTreeSet::new();
-        if geometry.len() != seals.len() || geometry.len() != expected.len() {
+        if geometry.len() != expected.len() {
             return Err(publication_input_error(
                 "restored prefill requires the full original tensor roster",
             ));
         }
-        for (geometry, (role, index, _)) in geometry.iter().zip(seals) {
+        for geometry in geometry {
             let key = (geometry.layout.role, geometry.layout.index);
-            if key != (*role, *index) || !expected.contains(&key) || !seen.insert(key) {
+            if !expected.contains(&key) || !seen.insert(key) {
                 return Err(publication_input_error(
                     "restored prefill changed its tensor coordinates",
                 ));
@@ -1649,9 +1012,8 @@ impl OriginalRestoredModelContextPrefill {
                     size_of::<Self>()
                         + size_of::<RestoredModelContextPrefillOwner>()
                         + 8 * size_of::<usize>()
-                        + 3 * state_restoration::OriginalDeviceWrite::metadata_allocation_bytes::<
-                            u64,
-                        >(),
+                        + state_restoration::OriginalDeviceWrite::metadata_allocation_bytes::<u64>(
+                        ),
                 )
             })
             .and_then(|bytes| u64::try_from(bytes).ok())
@@ -1663,7 +1025,7 @@ impl OriginalRestoredModelContextPrefill {
             .take(CheckpointInitialPrefill::MAGIC.len())
             .map_err(SemanticTransitionError::Semantic)?
             != CheckpointInitialPrefill::MAGIC
-            || reader.u64().map_err(SemanticTransitionError::Semantic)? != 2
+            || reader.u64().map_err(SemanticTransitionError::Semantic)? != 4
             || reader.u8().map_err(SemanticTransitionError::Semantic)? != 1
             || decode_publication_identity(&mut reader)? != source_parent.1
             || prefill_identity(&mut reader)? != source_native_digest
@@ -1755,7 +1117,7 @@ impl OriginalRestoredModelContextPrefill {
             task_content,
             native.bank.header.prefix_extent,
         )?;
-        require_prefill_roster(native, &geometry, &record)?;
+        require_prefill_roster(native, &geometry)?;
         require_prefill_source_layout(native, &layout, &record)?;
         let declaration_scratch = geometry[0]
             .len()
@@ -1880,7 +1242,6 @@ impl OriginalRestoredModelContextPrefill {
                 scope,
                 source_publication: Arc::clone(&continuation.inner.source_publication),
                 source_models: continuation.inner.models.clone(),
-                factory_geometry: Mutex::new(None),
                 layout: layout.clone(),
                 lineage: (
                     source_parent.1,
@@ -1895,44 +1256,7 @@ impl OriginalRestoredModelContextPrefill {
                 _reservation: declaration_reservation,
             }),
         };
-        let consumer_count = geometry[0]
-            .len()
-            .checked_mul(4)
-            .and_then(|count| count.checked_add(geometry[1].len()))
-            .ok_or(SemanticTransitionError::GenerationExhausted)?;
-        let consumer_bound = consumer_count
-            .checked_mul(
-                size_of::<OriginalNativeCommand>()
-                    + 2 * size_of::<cudarc::driver::CudaEvent>()
-                    + 2 * size_of::<PreparedSemanticTensor>()
-                    + size_of::<SemanticTensorInput>(),
-            )
-            .and_then(|bytes| {
-                bytes.checked_add(5 * size_of::<Option<native_work_bound::OriginalContentBatch>>())
-            })
-            .and_then(|bytes| u64::try_from(bytes).ok())
-            .ok_or(SemanticTransitionError::GenerationExhausted)?;
-        budget.require_host_allocation(consumer_bound)?;
-        let consumer_reservation = Arc::new(budget.reserve_auxiliary(consumer_bound)?);
-        let consumer_batches = (0..5)
-            .map(|occurrence| {
-                let count = geometry[usize::from(occurrence == 4)].len();
-                native_work_bound::OriginalContentBatch::new(&target.domain, true, count).map(Some)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut verification_inputs = [Vec::new(), Vec::new()];
-        for (group, inputs) in verification_inputs.iter_mut().enumerate() {
-            inputs
-                .try_reserve_exact(
-                    geometry[group]
-                        .len()
-                        .checked_mul(if group == 0 { 4 } else { 1 })
-                        .ok_or(SemanticTransitionError::GenerationExhausted)?,
-                )
-                .map_err(|_| {
-                    publication_input_error("prefill consumer alias custody allocation failed")
-                })?;
-        }
+
         let copy_rows = geometry[1].iter().try_fold(0usize, |rows, geometry| {
             let layout = native
                 .layouts
@@ -1992,13 +1316,7 @@ impl OriginalRestoredModelContextPrefill {
             section: Some(section),
             reservation,
             copy_reservation,
-            consumer_batches,
-            verification_inputs,
-            consumer_reservation,
             stage: None,
-            seal_uploads: Vec::new(),
-            upload_cursor: 0,
-            content_cursor: 0,
             storage: None,
             allowance: None,
             work: None,
@@ -2008,20 +1326,7 @@ impl OriginalRestoredModelContextPrefill {
     }
 
     pub(super) fn native_ceilings(&self) -> Result<([u64; 9], [u64; 9]), SemanticTransitionError> {
-        let count = self.geometry[0]
-            .len()
-            .checked_add(self.geometry[1].len())
-            .ok_or(SemanticTransitionError::GenerationExhausted)?;
-        let bytes = count
-            .checked_mul(4 * size_of::<u64>())
-            .and_then(|bytes| {
-                bytes.checked_add(self.record.tokens.len().checked_mul(size_of::<u64>())?)
-            })
-            .and_then(|bytes| u64::try_from(bytes).ok())
-            .ok_or(SemanticTransitionError::GenerationExhausted)?;
-        let mut dma = [0; 9];
-        dma[0] = 3;
-        dma[8] = bytes;
+        let mut dma = [0u64; 9];
         for (_, _, bytes) in self.copy_plans.iter().flatten() {
             dma[0] = dma[0]
                 .checked_add(1)
@@ -2030,66 +1335,14 @@ impl OriginalRestoredModelContextPrefill {
                 .checked_add(*bytes as u64)
                 .ok_or(SemanticTransitionError::GenerationExhausted)?;
         }
-        let mut total = dma;
-        for (group, geometry) in self.geometry.iter().enumerate() {
-            for geometry in geometry {
-                let verification = native_work_bound::tensor_layout_native_work_ceiling(
-                    &geometry.layout,
-                    geometry.logical_begin,
-                    geometry.logical_end,
-                    geometry.physical_bytes,
-                    true,
-                )?;
-                // One restore verification, then four declared Model checks or
-                // one Outputs check share the exact original SOURCE tally.
-                for _ in 0..(if group == 0 { 5 } else { 2 }) {
-                    native_work_bound::add_native_work_ceiling(&mut total, verification)?;
-                }
-            }
-        }
-        Ok((dma, total))
+        Ok((dma, dma))
     }
 
     pub(super) fn completion_pending(&self) -> Result<bool, SemanticTransitionError> {
-        if self
-            .seal_uploads
+        Ok(self
+            .cache_copies
             .iter()
-            .any(state_restoration::OriginalDeviceWrite::completion_pending)
-            || self
-                .cache_copies
-                .iter()
-                .any(crate::device::RetainedDeviceMemoryCommand::completion_pending)
-            || self
-                .stage
-                .as_ref()
-                .and_then(|stage| stage.token_write.as_ref())
-                .is_some_and(state_restoration::OriginalDeviceWrite::completion_pending)
-        {
-            return Ok(true);
-        }
-        if let Some(stage) = &self.stage {
-            for content in [&stage.model_content, &stage.output_content]
-                .into_iter()
-                .flatten()
-            {
-                let original = content
-                    .original_cold
-                    .lock()
-                    .map_err(|_| SemanticTransitionError::Poisoned)?;
-                if original.as_ref().is_some_and(|batch| {
-                    batch
-                        .commands
-                        .iter()
-                        .any(OriginalNativeCommand::completion_pending)
-                }) {
-                    return Ok(true);
-                }
-            }
-        }
-        if let Some(proof) = &self.result {
-            return proof.consumer_completion_pending();
-        }
-        Ok(false)
+            .any(crate::device::RetainedDeviceMemoryCommand::completion_pending))
     }
 
     pub(super) fn proof(
@@ -2102,10 +1355,6 @@ impl OriginalRestoredModelContextPrefill {
         &self,
     ) -> Result<SemanticModelContextPrefillRestoreDeclaration, SemanticTransitionError> {
         Ok(self.declaration.clone())
-    }
-
-    pub(super) fn require_factory_geometry(&self) -> Result<(), SemanticTransitionError> {
-        self.declaration.require_factory_geometry()
     }
 
     pub(super) fn take_verified_stage(
@@ -2219,10 +1468,6 @@ impl SemanticTransitionSession {
     ) -> Result<SemanticRestoredModelContextPrefill, SemanticTransitionError> {
         let owner = &continuation.inner;
         let allowance = self.require_dormant_model_context_restore_work(continuation, work)?;
-        let native_work = self
-            .graph
-            .active_cold_work()
-            .ok_or(SemanticTransitionError::NotBound)?;
         if !original.continuation.ptr_eq(&Arc::downgrade(owner))
             || original.source_parent != source_parent
             || original.source_native_digest != source_native_digest
@@ -2271,17 +1516,7 @@ impl SemanticTransitionSession {
         original.work = Some(work.clone());
         if original.stage.is_none() {
             let scope = Arc::clone(&original.declaration.inner.scope);
-            let expected_tokens =
-                allocate_publication(&self.provider, original.record.tokens.len())?;
-            let token_write = state_restoration::OriginalDeviceWrite::new_with_owner(
-                &self.stream,
-                &original.record.tokens,
-                expected_tokens.view(),
-                true,
-                Some(Arc::clone(&original.reservation)),
-            )?;
             let mut contents = Vec::with_capacity(2);
-            let mut uploads = Vec::with_capacity(2);
             if original
                 .cache_copies
                 .iter()
@@ -2290,12 +1525,7 @@ impl SemanticTransitionSession {
                 return Err(SemanticTransitionError::ObservationMismatch);
             }
             original.cache_copies.clear();
-            for (group, (geometry, seals)) in original
-                .geometry
-                .iter()
-                .zip([&original.record.model, &original.record.output])
-                .enumerate()
-            {
+            for (group, geometry) in original.geometry.iter().enumerate() {
                 let mut tensors = geometry
                     .iter()
                     .map(|geometry| restored_prefill_tensor(geometry, &storage, owner))
@@ -2357,84 +1587,21 @@ impl SemanticTransitionSession {
                         };
                     }
                 }
-                let cells = Arc::new(allocate_publication(
-                    &self.provider,
-                    seals
-                        .len()
-                        .checked_mul(4)
-                        .ok_or(SemanticTransitionError::GenerationExhausted)?,
-                )?);
-                let words = seals
-                    .iter()
-                    .flat_map(|(_, _, digest)| *digest)
-                    .collect::<Vec<_>>();
-                uploads.push(state_restoration::OriginalDeviceWrite::new_with_owner(
-                    &self.stream,
-                    &words,
-                    cells.view(),
-                    true,
-                    Some(Arc::clone(&original.reservation)),
-                )?);
-                let digests = (0..tensors.len())
-                    .map(|ordinal| CapturedTensorDigest::Tensor {
-                        cells: Arc::clone(&cells),
-                        offset: ordinal * 4,
-                        producer_sealed: true,
-                    })
-                    .collect();
-                contents.push(TensorContentBuffers {
-                    tensors,
-                    seals: TensorContentSeals::Captured(digests),
-                    verification_inputs: std::mem::take(&mut original.verification_inputs[group]),
-                    original_cold: Mutex::new(None),
-                });
+                contents.push(InitialPrefillTensorOwners { tensors });
             }
             let output_content = contents.pop().expect("two restored content groups");
             let model_content = contents.pop().expect("two restored content groups");
-            original.seal_uploads = uploads;
             original.stage = Some(InitialPrefillStage {
                 scope,
                 task_identity: original.record.task_identity,
                 task_epoch: original.record.task_epoch,
                 model_generation: original.record.model_generation,
                 layout: original.layout.clone(),
-                expected_tokens,
-                token_write: Some(token_write),
                 input: None,
-                input_guard: None,
                 model_content: Some(model_content),
                 output_content: Some(output_content),
-                captured_content: Vec::new(),
                 consumer_stream: None,
-                context_content_cursor: 0,
             });
-        }
-        let stage = original
-            .stage
-            .as_mut()
-            .expect("retained fresh native prefill stage");
-        stage
-            .token_write
-            .as_mut()
-            .expect("retained native token metadata")
-            .resolve_with_dma(
-                &self.domain,
-                &self.stream,
-                &self.provider,
-                &mut original.poisoned,
-                true,
-                Some(&allowance),
-            )?;
-        while original.upload_cursor < original.seal_uploads.len() {
-            original.seal_uploads[original.upload_cursor].resolve_with_dma(
-                &self.domain,
-                &self.stream,
-                &self.provider,
-                &mut original.poisoned,
-                true,
-                Some(&allowance),
-            )?;
-            original.upload_cursor += 1;
         }
         while original.copy_cursor < original.cache_copies.len() {
             let copy = &mut original.cache_copies[original.copy_cursor];
@@ -2471,66 +1638,21 @@ impl SemanticTransitionSession {
             original.copy_cursor += 1;
             original.copy_dma_recorded = false;
         }
-        let execute = self
-            .provider
-            .device()
-            .inner()
-            .get_func(
-                "xlog_semantic_transition",
-                "semantic_tensor_content_witness",
-            )
-            .ok_or_else(|| runtime_error("kernel lookup", "tensor content witness unavailable"))?;
+        let stage = original
+            .stage
+            .as_ref()
+            .expect("retained restored prefill stage");
         let groups = [
             stage
                 .model_content
                 .as_ref()
-                .expect("restored original model seal"),
+                .expect("restored original model owner"),
             stage
                 .output_content
                 .as_ref()
-                .expect("restored original output seal"),
+                .expect("restored original output owner"),
         ];
-        while original.content_cursor < groups.len() {
-            let content = groups[original.content_cursor];
-            content.enqueue_with_custody(
-                &self.domain,
-                &mut original.poisoned,
-                &execute,
-                true,
-                None,
-                false,
-                Some(&native_work),
-                false,
-                Some(&allowance),
-            )?;
-            require_completed_prefill_content(content, true)?;
-            original.content_cursor += 1;
-        }
         original.declaration.bind(groups)?;
-        let mut completed = Vec::with_capacity(2);
-        let mut seal_cells = Vec::with_capacity(2);
-        for content in groups {
-            let mut batch = content
-                .original_cold
-                .lock()
-                .map_err(|_| SemanticTransitionError::Poisoned)?;
-            completed.push(
-                batch
-                    .take()
-                    .ok_or(SemanticTransitionError::ObservationMismatch)?,
-            );
-            for (_, _, cells, _) in initial_prefill_seal_sources(content)? {
-                if !seal_cells.iter().any(|actual| Arc::ptr_eq(actual, &cells)) {
-                    seal_cells.push(cells);
-                }
-            }
-        }
-        let output = completed
-            .pop()
-            .expect("two completed native verification batches");
-        let model = completed
-            .pop()
-            .expect("two completed native verification batches");
         let proof = SemanticRestoredModelContextPrefill {
             inner: Arc::new(RestoredModelContextPrefillOwner {
                 continuation: Arc::downgrade(owner),
@@ -2546,12 +1668,7 @@ impl SemanticTransitionSession {
                 target_native_digest: original.target_native_digest,
                 layout: stage.layout.clone(),
                 output_tensors: groups[1].tensors.clone(),
-                verifications: [model, output],
-                consumer_batches: Mutex::new(std::mem::take(&mut original.consumer_batches)),
-                _consumer_reservation: Arc::clone(&original.consumer_reservation),
                 declaration: original.declaration.clone(),
-                _seal_uploads: std::mem::take(&mut original.seal_uploads),
-                _seal_cells: seal_cells,
                 _cache_copies: std::mem::take(&mut original.cache_copies),
                 _section: original
                     .section
@@ -2563,106 +1680,6 @@ impl SemanticTransitionSession {
         };
         original.result = Some(proof.clone());
         Ok(proof)
-    }
-
-    pub(super) fn require_restored_model_context_prefill_consumers_complete(
-        &self,
-        continuation: &SemanticModelContextContinuation,
-        proof: &SemanticRestoredModelContextPrefill,
-    ) -> Result<(), SemanticTransitionError> {
-        self.require_restored_model_context_prefill(continuation, proof)?;
-        proof.require_consumers_completed()?;
-        continuation.inner.with_dormant_prefill_stage(
-            &self.publication_issuer,
-            &proof.inner.scope,
-            |stage| {
-                if stage.context_content_cursor != 5 {
-                    return Err(SemanticTransitionError::ObservationMismatch);
-                }
-                Ok(())
-            },
-        )
-    }
-
-    pub fn restored_model_context_prefill_consumer_commands_pending(
-        &self,
-        continuation: &SemanticModelContextContinuation,
-        proof: &SemanticRestoredModelContextPrefill,
-    ) -> Result<bool, SemanticTransitionError> {
-        self.require_restored_model_context_prefill(continuation, proof)?;
-        let pending = proof.consumer_completion_pending()?;
-        if pending {
-            let original = self
-                .model_context_material_work
-                .as_ref()
-                .ok_or(SemanticTransitionError::NotBound)?;
-            self.require_dormant_model_context_restore_work(continuation, &original.work)?;
-        }
-        Ok(pending)
-    }
-
-    pub fn resolve_restored_model_context_prefill_consumer_commands(
-        &mut self,
-        continuation: &SemanticModelContextContinuation,
-        proof: &SemanticRestoredModelContextPrefill,
-    ) -> Result<(), SemanticTransitionError> {
-        self.require_restored_model_context_prefill(continuation, proof)?;
-        let occurrence = continuation.inner.with_dormant_prefill_stage(
-            &self.publication_issuer,
-            &proof.inner.scope,
-            |stage| {
-                let occurrence = stage.context_content_cursor;
-                let content = if occurrence < 4 {
-                    stage.model_content.as_ref()
-                } else if occurrence == 4 {
-                    stage.output_content.as_ref()
-                } else {
-                    None
-                };
-                let Some(content) = content else {
-                    return Ok(None);
-                };
-                let original = content
-                    .original_cold
-                    .lock()
-                    .map_err(|_| SemanticTransitionError::Poisoned)?;
-                let pending = original.as_ref().is_some_and(|batch| {
-                    batch.context_prefill_occurrence == Some(occurrence)
-                        && batch
-                            .commands
-                            .iter()
-                            .any(OriginalNativeCommand::completion_pending)
-                });
-                Ok(pending.then_some(occurrence))
-            },
-        )?;
-        let Some(occurrence) = occurrence else {
-            return Ok(());
-        };
-        let execute = self
-            .provider
-            .device()
-            .inner()
-            .get_func(
-                "xlog_semantic_transition",
-                "semantic_tensor_content_witness",
-            )
-            .ok_or_else(|| runtime_error("kernel lookup", "tensor content witness unavailable"))?;
-        let lease = SemanticInitialPrefillLease {
-            issuer: Arc::clone(&self.publication_issuer),
-            scope: Arc::clone(&proof.inner.scope),
-        };
-        self.enqueue_initial_prefill_content(
-            &lease,
-            if occurrence < 4 {
-                InitialPrefillCaptureKind::Model
-            } else {
-                InitialPrefillCaptureKind::Outputs
-            },
-            0,
-            &execute,
-            true,
-        )
     }
 
     pub fn require_restored_model_context_prefill(
@@ -2738,14 +1755,6 @@ impl SemanticTransitionSession {
             || self.task_epoch != actual.task_epoch
             || original.refused
             || !activated_basis
-            || actual.verifications.iter().any(|batch| {
-                !batch.verify
-                    || batch.cursor != batch.commands.len()
-                    || batch
-                        .commands
-                        .iter()
-                        .any(|command| !command.submitted || !command.completed)
-            })
         {
             return Err(publication_input_error(
                 "restored prefill proof belongs to another native owner or task boundary",
@@ -2763,21 +1772,11 @@ impl SemanticTransitionSession {
             SemanticInitialPrefillLease,
             Arc<()>,
             SemanticInitialSourceLayout,
-            SemanticInitialPrefillContentWitness,
-            SemanticInitialPrefillContentWitness,
         ),
         SemanticTransitionError,
     > {
         self.require_restored_model_context_prefill(continuation, proof)?;
         let owner = &proof.inner;
-        let witness = |slot| SemanticInitialPrefillContentWitness {
-            issuer: Arc::clone(&owner.issuer),
-            scope: Arc::clone(&owner.scope),
-            task_identity: owner.task_identity,
-            task_epoch: owner.task_epoch,
-            model_generation: owner.model_generation,
-            slot,
-        };
         Ok((
             SemanticInitialPrefillLease {
                 issuer: Arc::clone(&owner.issuer),
@@ -2785,8 +1784,6 @@ impl SemanticTransitionSession {
             },
             Arc::clone(&owner.scope),
             owner.layout.clone(),
-            witness(InitialPrefillContentSlot::Model),
-            witness(InitialPrefillContentSlot::Outputs),
         ))
     }
 

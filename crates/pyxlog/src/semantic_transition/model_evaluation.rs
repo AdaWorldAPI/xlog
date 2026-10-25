@@ -138,19 +138,17 @@ pub(crate) struct PySemanticModelEvaluation {
     cohort: Py<PySemanticEvaluationCohort>,
     pub(super) binding: (Option<String>, Vec<u8>),
     closed: AtomicBool,
-    output: Mutex<Option<Py<PySemanticTensorContentWitness>>>,
+    output: Mutex<Option<Py<PySemanticTensorOwner>>>,
     completed: Mutex<Option<Py<PySemanticCompletedModelEvaluation>>>,
     cancelled: Mutex<Option<SemanticCancelledModelEvaluation>>,
     cancel_entered: AtomicBool,
     capture_owners: Mutex<Option<Arc<EvaluationCaptureOwners>>>,
-    cold_content_producers: Mutex<Option<(Py<PyAny>, Vec<Py<PyAny>>)>>,
-    cold_content_entered: AtomicBool,
 }
 
 struct EvaluationCaptureOwners {
     _enqueue: Py<PyAny>,
     _memory_scope: Py<PyAny>,
-    output: Py<PySemanticTensorContentWitness>,
+    output: Py<PySemanticTensorOwner>,
 }
 
 pub(super) struct PendingEvaluationPreparation {
@@ -255,80 +253,6 @@ impl PySemanticModelEvaluation {
             .export_evaluation_model_work_buffer_port(&*parent.lease()?, port, &self.inner)
             .map_err(xlog_err)?;
         Ok((result, parent.session.clone_ref(py)))
-    }
-
-    pub(in crate::semantic_transition) fn prepare_cold_content(
-        &self,
-        py: Python<'_>,
-        value: &Bound<'_, PyAny>,
-    ) -> PyResult<xlog_cuda::SemanticColdEvaluationContent> {
-        if !value.is_exact_instance_of::<PyTuple>() || value.cast::<PyTuple>()?.len() != 2 {
-            return Err(invalid(
-                "evaluation_content requires the original output and objective tuples",
-            ));
-        }
-        self.cold_content_entered
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| {
-                invalid(
-                    "original evaluation content handoff cannot repeat or reenter its producers",
-                )
-            })?;
-        let parent = self.parent.borrow(py);
-        let session = parent.session.borrow(py);
-        session.require_creator()?;
-        let stream = {
-            let owner = session.owner()?;
-            self.check(py, &owner)?;
-            owner.evaluation_stream(&self.inner).map_err(xlog_err)?
-        };
-        let check = || -> PyResult<()> {
-            let owner = session.owner()?;
-            self.check(py, &owner)
-        };
-        let mut budget = 16 * 1024 * 1024;
-        let rows = value.cast::<PyTuple>()?;
-        let ParsedTensorInputs {
-            handoff: output,
-            producers: mut producers,
-        } = parse_tensor_inputs_guarded(
-            &rows.get_item(0)?,
-            &mut budget,
-            session.device_ordinal,
-            stream,
-            &check,
-        )?;
-        let ParsedTensorInputs {
-            handoff: objective,
-            producers: objective_producers,
-        } = parse_tensor_inputs_guarded(
-            &rows.get_item(1)?,
-            &mut budget,
-            session.device_ordinal,
-            stream,
-            &check,
-        )?;
-        producers.extend(objective_producers);
-        check()?;
-        let result = {
-            let owner = session.owner()?;
-            self.check(py, &owner)?;
-            owner
-                .prepare_cold_evaluation_content(
-                    &*parent.lease()?,
-                    [output.into_native(), objective.into_native()],
-                )
-                .map_err(xlog_err)?
-        };
-        let mut retained = self
-            .cold_content_producers
-            .lock()
-            .map_err(|_| invalid("original evaluation content producer custody is poisoned"))?;
-        if retained.is_some() {
-            return Err(invalid("original evaluation content is admitted only once"));
-        }
-        *retained = Some((value.clone().unbind(), producers));
-        Ok(result)
     }
 
     fn phase_cold_boundary(
@@ -724,15 +648,17 @@ impl PySemanticModelEvaluation {
     }
 
     /// Capture the one original forward/objective body, never launch it.
-    #[pyo3(signature = (enqueue, *, memory_scope, output_witness, consumer_streams))]
+    #[pyo3(signature = (enqueue, *, memory_scope, output_owner, consumer_streams))]
     fn capture(
         &self,
         py: Python<'_>,
         enqueue: Py<PyAny>,
         memory_scope: Py<PyAny>,
-        output_witness: Py<PySemanticTensorContentWitness>,
+        output_owner: Py<PySemanticTensorOwner>,
         consumer_streams: &Bound<'_, PyAny>,
     ) -> PyResult<(u64, u64, u64)> {
+        let _operation =
+            TensorProducerOperation::begin(&self.parent.borrow(py).session.borrow(py))?;
         let streams = ColdValue::read(consumer_streams, &mut 4096, 0)?;
         let streams = streams
             .sequence()?
@@ -743,19 +669,19 @@ impl PySemanticModelEvaluation {
         let session = parent.session.borrow(py);
         session.require_creator()?;
         self.check(py, &*session.owner()?)?;
-        let witness = output_witness.borrow(py);
-        if witness.session.as_ptr() != parent.session.as_ptr()
-            || !matches!(&witness.parent, ContentStepOwner::Published(original)
+        let tensor_owner = output_owner.borrow(py);
+        if tensor_owner.session.as_ptr() != parent.session.as_ptr()
+            || !matches!(&tensor_owner.parent, ContentStepOwner::Published(original)
                 if original.as_ptr() == self.parent.as_ptr())
         {
             return Err(invalid(
-                "evaluation capture requires its exact original published output witness",
+                "evaluation capture requires its exact original published output owner",
             ));
         }
         let resources = Arc::new(EvaluationCaptureOwners {
             _enqueue: enqueue.clone_ref(py),
             _memory_scope: memory_scope.clone_ref(py),
-            output: output_witness.clone_ref(py),
+            output: output_owner.clone_ref(py),
         });
         {
             let mut retained = self
@@ -793,7 +719,7 @@ impl PySemanticModelEvaluation {
                     .begin_model_evaluation_capture(
                         &*parent.lease()?,
                         &self.inner,
-                        &witness.inner,
+                        &tensor_owner.inner,
                         &streams,
                     )
                     .map_err(xlog_err)?
@@ -809,7 +735,7 @@ impl PySemanticModelEvaluation {
                         Ok(())
                     })?;
                     session.owner()?.record_model_evaluation_output(
-                        &*parent.lease()?, &self.inner, &witness.inner,
+                        &*parent.lease()?, &self.inner, &tensor_owner.inner,
                     ).map_err(xlog_err)
                 })();
                 if let Err(error) = result {
@@ -920,14 +846,14 @@ impl PySemanticModelEvaluation {
             .map_err(xlog_err)
     }
 
-    /// Output witness belongs to the original PublishedParent: three tensor
+    /// Output ownership belongs to the original PublishedParent: three tensor
     /// rows in order, FP32[6], Bool[1], UInt8[slab_bytes]. No Python loss, work
     /// or memory total is accepted. This is cold completion, outside residency.
-    #[pyo3(signature = (output_witness, *, consumer_streams))]
+    #[pyo3(signature = (output_owner, *, consumer_streams))]
     fn finish(
         &self,
         py: Python<'_>,
-        output_witness: Py<PySemanticTensorContentWitness>,
+        output_owner: Py<PySemanticTensorOwner>,
         consumer_streams: &Bound<'_, PyAny>,
     ) -> PyResult<Py<PySemanticCompletedModelEvaluation>> {
         let streams = ColdValue::read(consumer_streams, &mut 4096, 0)?;
@@ -938,9 +864,9 @@ impl PySemanticModelEvaluation {
             .collect::<PyResult<Vec<_>>>()?;
         let parent = self.parent.borrow(py);
         let session = parent.session.borrow(py);
-        let witness = output_witness.borrow(py);
-        if witness.session.as_ptr() != parent.session.as_ptr()
-            || !matches!(&witness.parent, ContentStepOwner::Published(original) if original.as_ptr() == self.parent.as_ptr())
+        let tensor_owner = output_owner.borrow(py);
+        if tensor_owner.session.as_ptr() != parent.session.as_ptr()
+            || !matches!(&tensor_owner.parent, ContentStepOwner::Published(original) if original.as_ptr() == self.parent.as_ptr())
         {
             return Err(invalid(
                 "evaluation outputs require the exact original published-parent content owner",
@@ -965,13 +891,13 @@ impl PySemanticModelEvaluation {
             .lock()
             .map_err(|_| invalid("evaluation capture owner is poisoned"))?
             .as_ref()
-            .is_none_or(|original| original.output.as_ptr() != output_witness.as_ptr())
+            .is_none_or(|original| original.output.as_ptr() != output_owner.as_ptr())
         {
             return Err(invalid(
-                "evaluation finish cannot substitute its captured output witness",
+                "evaluation finish cannot substitute its captured output owner",
             ));
         }
-        *retained = Some(output_witness.clone_ref(py));
+        *retained = Some(output_owner.clone_ref(py));
         drop(retained);
         use learning_phase::phase_evaluation::EvaluationColdStage;
         self.phase_cold_boundary(
@@ -982,7 +908,12 @@ impl PySemanticModelEvaluation {
         let mut owner = session.owner()?;
         self.check(py, &owner)?;
         let result = owner
-            .finish_model_evaluation(&*parent.lease()?, &self.inner, &witness.inner, &streams)
+            .finish_model_evaluation(
+                &*parent.lease()?,
+                &self.inner,
+                &tensor_owner.inner,
+                &streams,
+            )
             .map_err(xlog_err);
         drop(owner);
         result
@@ -1316,8 +1247,6 @@ impl PySemanticTransitionController {
                     cancelled: Mutex::new(None),
                     cancel_entered: AtomicBool::new(false),
                     capture_owners: Mutex::new(None),
-                    cold_content_producers: Mutex::new(None),
-                    cold_content_entered: AtomicBool::new(false),
                 },
             )?);
         }

@@ -54,7 +54,7 @@ const _: () = assert!(std::mem::offset_of!(PublicationReplayDeliveryInput, recei
 const _: () = assert!(std::mem::offset_of!(PublicationReplayDeliveryInput, rows) == 144);
 const _: () = assert!(std::mem::offset_of!(PublicationReplayDeliveryInput, observations) == 192);
 const _: () = assert!(std::mem::offset_of!(PublicationReplayDeliveryInput, native_work) == 224);
-const _: () = assert!(size_of::<PublicationReplayDeliveryRow>() == 1128);
+const _: () = assert!(size_of::<PublicationReplayDeliveryRow>() == 936);
 
 type LoadedReplayDeliveryAcquisition<V> = (
     SemanticReplayMaterial,
@@ -1058,9 +1058,6 @@ impl SemanticTransitionSession {
             capacity: original.capacity,
             bytes,
         };
-        if material.original_record_digest() != material.range.digest {
-            return Err(SemanticTransitionError::ObservationMismatch);
-        }
         Ok(material)
     }
 
@@ -2921,7 +2918,6 @@ impl SemanticTransitionSession {
             instance: header.instance,
             word: header.publication_word,
             logical_digest: header.logical_digest,
-            state_digest: header.state_digest,
         };
         #[cfg(feature = "semantic-policy")]
         if let Some(edge) = self

@@ -356,11 +356,11 @@ impl PySemanticModelForwardStream {
         .map_err(xlog_err)
     }
 
-    #[pyo3(signature = (*, allocation_witness=None, consumer_stream))]
+    #[pyo3(signature = (*, allocation_owner=None, consumer_stream))]
     fn finish(
         &self,
         py: Python<'_>,
-        allocation_witness: Option<&PySemanticTensorContentWitness>,
+        allocation_owner: Option<&PySemanticTensorOwner>,
         consumer_stream: &Bound<'_, PyAny>,
     ) -> PyResult<PySemanticModelForwardWitness> {
         let stream = parse_witness_consumer_stream(consumer_stream, &mut 128)?;
@@ -373,14 +373,14 @@ impl PySemanticModelForwardStream {
                 .finish_model_forward_stream(
                     &step.borrow(py).inner,
                     &self.inner,
-                    allocation_witness.map(|witness| &witness.inner),
+                    allocation_owner.map(|owner| &owner.inner),
                     stream,
                 )
                 .map_err(xlog_err)?,
             ModelForwardSource::Evaluation(evaluation) => {
-                if allocation_witness.is_some() {
+                if allocation_owner.is_some() {
                     return Err(invalid(
-                        "evaluation forward finish does not read an output-content witness",
+                        "evaluation forward finish does not accept an allocation owner",
                     ));
                 }
                 let evaluation = evaluation.borrow(py);

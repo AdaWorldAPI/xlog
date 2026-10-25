@@ -2120,19 +2120,19 @@ impl PySemanticLearningPhaseTransition {
             .owner()?
             .cold_model_work_plan_quantities(&work)
             .map_err(xlog_err)?;
-        let cold_content = self
+        let cold_native = self
             .source
             .borrow(py)
             .owner()?
-            .cold_model_work_content_ceiling(&work)
+            .cold_model_work_native_ceiling(&work)
             .map_err(xlog_err)?;
-        let cold_content = cold_content
+        let cold_native = cold_native
             .into_iter()
             .try_fold(0u64, |sum, value| sum.checked_add(value))
-            .ok_or_else(|| invalid("evaluation's frozen cold content ceiling overflowed"))?;
+            .ok_or_else(|| invalid("evaluation's frozen native work ceiling overflowed"))?;
         let known_bound = quantities[0]
             .checked_add(cold[0])
-            .and_then(|bound| bound.checked_add(cold_content))
+            .and_then(|bound| bound.checked_add(cold_native))
             .and_then(|bound| bound.checked_add(captured_native))
             .ok_or_else(|| invalid("evaluation's original model work bounds overflowed"))?;
         let calls = quantities[2]
@@ -2148,64 +2148,53 @@ impl PySemanticLearningPhaseTransition {
         Ok(())
     }
 
-    pub(in crate::semantic_transition) fn evaluation_cold_content_owner(
-        &self,
-        py: Python<'_>,
-        work: &SemanticColdModelWork,
-    ) -> PyResult<Py<PySemanticModelEvaluation>> {
-        let retained = self.phase_evaluations()?;
-        let current = retained
-            .last()
-            .ok_or_else(|| invalid("cold content lost its original evaluation phase"))?;
-        Self::require_evaluation_entry(py, current)?;
-        if !current
-            .work
-            .as_ref()
-            .is_some_and(|original| original.same_invocation(work))
-        {
-            return Err(invalid(
-                "cold content changed its original signed evaluation report",
-            ));
-        }
-        current
-            .native_evaluation
-            .as_ref()
-            .map(|original| original.clone_ref(py))
-            .ok_or_else(|| invalid("cold content precedes its original issued evaluation"))
-    }
-
-    pub(in crate::semantic_transition) fn admit_evaluation_cold_content(
+    pub(in crate::semantic_transition) fn admit_evaluation_cold_plan(
         &self,
         py: Python<'_>,
         work: &SemanticColdModelWork,
     ) -> PyResult<()> {
-        self.evaluation_cold_content_owner(py, work)?;
-        let budget = self
-            .phase_evaluations()?
-            .last()
-            .expect("retained original evaluation")
-            .budget;
+        let budget = {
+            let retained = self.phase_evaluations()?;
+            let Some(current) = retained.last() else {
+                return Ok(());
+            };
+            if !current
+                .work
+                .as_ref()
+                .is_some_and(|original| original.same_invocation(work))
+            {
+                return Ok(());
+            }
+            Self::require_evaluation_entry(py, current)?;
+            if current.native_evaluation.is_none() {
+                return Err(invalid(
+                    "cold model plan precedes its original issued evaluation",
+                ));
+            }
+            current.budget
+        };
         let source = self.source.borrow(py);
         let owner = source.owner()?;
         let model = owner
             .cold_model_work_plan_quantities(work)
             .map_err(xlog_err)?;
         let native = owner
-            .cold_model_work_content_ceiling(work)
+            .cold_model_work_native_ceiling(work)
             .map_err(xlog_err)?;
         let native = native
             .into_iter()
             .try_fold(0u64, |sum, value| sum.checked_add(value))
-            .ok_or_else(|| invalid("original evaluation content ceiling overflowed"))?;
+            .ok_or_else(|| invalid("original evaluation native work ceiling overflowed"))?;
         let units = model[0]
             .checked_add(native)
             .ok_or_else(|| invalid("original evaluation cold producer ceiling overflowed"))?;
         if units > budget[0] || model[2] > budget[2] {
-            return Err(invalid("original evaluation cold content and model plan exceed their signed budget before work"));
+            return Err(invalid(
+                "original evaluation model plan exceeds its signed budget before work",
+            ));
         }
         Ok(())
     }
-
     pub(in crate::semantic_transition) fn evaluation_cold_boundary(
         &self,
         py: Python<'_>,
@@ -2814,7 +2803,6 @@ impl PySemanticLearningPhaseTransition {
             (
                 native.model_generation,
                 PyBytes::new(py, native.model_geometry_digest.as_bytes()),
-                PyBytes::new(py, native.model_numerical_digest.as_bytes()),
             ),
         )?;
         arguments.set_item(

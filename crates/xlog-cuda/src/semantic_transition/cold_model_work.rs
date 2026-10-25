@@ -299,36 +299,6 @@ impl SemanticColdResidentRestorationPrelude {
     }
 }
 
-/// Actual model and native components, not the complete operation's
-/// native work or physical peak. Other cold producers remain independent.
-#[derive(Clone, Copy, Debug)]
-pub struct SemanticColdModelWorkResult {
-    pub model_work: u64,
-    pub operation_count: u64,
-    pub work_bound: u64,
-    pub model_calls: u64,
-    pub native_work: u64,
-    pub native_events: [u64; 9],
-}
-
-impl SemanticColdModelWorkResult {
-    fn include(&mut self, other: Self) -> Result<(), SemanticTransitionError> {
-        let add = |left: u64, right: u64| {
-            left.checked_add(right)
-                .ok_or(SemanticTransitionError::GenerationExhausted)
-        };
-        self.model_work = add(self.model_work, other.model_work)?;
-        self.operation_count = add(self.operation_count, other.operation_count)?;
-        self.work_bound = add(self.work_bound, other.work_bound)?;
-        self.model_calls = add(self.model_calls, other.model_calls)?;
-        self.native_work = add(self.native_work, other.native_work)?;
-        for (total, actual) in self.native_events.iter_mut().zip(other.native_events) {
-            *total = add(*total, actual)?;
-        }
-        Ok(())
-    }
-}
-
 pub(super) struct CompletedModelContextColdResult {
     instruction: Arc<[u8]>,
     result: SemanticColdModelWorkResult,
@@ -427,95 +397,6 @@ enum ColdWorkAdmission<'a> {
         ModelContextColdKind,
         Option<SemanticColdModelWorkResult>,
     ),
-}
-
-pub(super) struct ModelContextPrefillContentBinding {
-    context: SemanticModelContextContinuation,
-    scope: Arc<()>,
-    occurrence: usize,
-    kind: InitialPrefillCaptureKind,
-    verify: bool,
-    activating: bool,
-    restored: Option<SemanticRestoredModelContextPrefill>,
-    allowance: Arc<Mutex<native_work_bound::ColdNativeAllowance>>,
-}
-
-impl ModelContextPrefillContentBinding {
-    pub(super) fn bind(
-        &self,
-        domain: &ResidentExecutionDomain,
-        tensors: &TensorContentBuffers,
-    ) -> Result<(), SemanticTransitionError> {
-        let mut original = tensors
-            .original_cold
-            .lock()
-            .map_err(|_| publication_input_error("imported prefill content custody is poisoned"))?;
-        if let Some(batch) = original.as_ref() {
-            let same_allowance = batch
-                .allowance
-                .as_ref()
-                .and_then(std::sync::Weak::upgrade)
-                .is_some_and(|owner| Arc::ptr_eq(&owner, &self.allowance));
-            if !same_allowance && (!self.activating || batch.cursor != batch.commands.len()) {
-                return Err(SemanticTransitionError::ObservationMismatch);
-            }
-            if same_allowance && batch.context_prefill_occurrence == Some(self.occurrence) {
-                if batch.verify != self.verify {
-                    return Err(SemanticTransitionError::ObservationMismatch);
-                }
-                return Ok(());
-            }
-            if batch.context_prefill_occurrence.is_none() || batch.cursor != batch.commands.len() {
-                return Err(publication_input_error(
-                    "context prefill cannot replace an unresolved original content occurrence",
-                ));
-            }
-        }
-        let count = tensors
-            .tensors
-            .len()
-            .checked_add(usize::from(matches!(
-                tensors.seals,
-                TensorContentSeals::Model(_)
-            )))
-            .ok_or(SemanticTransitionError::GenerationExhausted)?;
-        let mut batch = if let Some(proof) = &self.restored {
-            proof.take_consumer_batch(self.occurrence, self.kind, tensors)?
-        } else {
-            native_work_bound::OriginalContentBatch::new(domain, self.verify, count)?
-        };
-        if let Some(proof) = &self.restored {
-            if !self.verify {
-                return Err(SemanticTransitionError::ObservationMismatch);
-            }
-            proof.require_consumer_content_slot(self.occurrence, self.kind, tensors)?;
-        } else {
-            self.allowance
-                .lock()
-                .map_err(|_| publication_input_error("imported prefill allowance is poisoned"))?
-                .claim_model_context_prefill_content(
-                    &self.context,
-                    &self.scope,
-                    self.occurrence,
-                    tensors,
-                    self.verify,
-                )?;
-        }
-        batch.allowance = Some(Arc::downgrade(&self.allowance));
-        batch.context_prefill_occurrence = Some(self.occurrence);
-        *original = Some(batch);
-        Ok(())
-    }
-
-    pub(super) fn complete(
-        &self,
-        tensors: &TensorContentBuffers,
-    ) -> Result<(), SemanticTransitionError> {
-        if let Some(proof) = &self.restored {
-            proof.retain_completed_consumer_batch(self.occurrence, tensors)?;
-        }
-        Ok(())
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -658,7 +539,7 @@ impl SemanticColdNativeWorkActivationPermit<'_> {
         callback: &SemanticTransitionSession,
         parent: &SemanticPublishedLease,
     ) -> Result<SemanticColdNativeWorkActivationIdentity, SemanticTransitionError> {
-        callback.require_original_cold_content_reader(parent)?;
+        callback.require_original_cold_reader(parent)?;
         if !Arc::ptr_eq(&self.owner.provider, &callback.provider)
             || self.owner.domain.stream_id() != callback.domain.stream_id()
             || callback
@@ -1052,7 +933,7 @@ impl SemanticTransitionSession {
                         "restoration requires its complete original factory plan before admission",
                     ));
                 }
-                self.admit_cold_model_work_plan_with_sources(work, &[], &[], None, &[], &[])?;
+                self.admit_cold_model_work_plan_with_sources(work, &[], &[], &[], &[])?;
             }
             if self.original_cold_model_work(work)?.state == RecordingState::Waiting {
                 self.begin_cold_model_work(work)?;
@@ -1441,8 +1322,6 @@ impl SemanticTransitionSession {
         parent: &SemanticPublishedLease,
         admission: &SemanticSegmentInstructionAdmission,
         work: &SemanticColdModelWork,
-        declarations: &[native_work_bound::ModelContextPrefillContentGeometry],
-        prefill_token_count: usize,
     ) -> Result<(), SemanticTransitionError> {
         context.inner.require_imported_target(target)?;
         self.require_original_admitted_cold_model_work(admission, parent, work)?;
@@ -1477,30 +1356,7 @@ impl SemanticTransitionSession {
         {
             return Err(SemanticTransitionError::ObservationMismatch);
         }
-        let roster = native_work_bound::FrozenModelContextPrefillRoster::new(
-            context,
-            budget,
-            declarations,
-            prefill_token_count,
-        )?;
-        let bytes = prefill_token_count
-            .checked_mul(size_of::<u64>())
-            .and_then(|bytes| u64::try_from(bytes).ok())
-            .filter(|bytes| *bytes != 0)
-            .ok_or(SemanticTransitionError::GenerationExhausted)?;
-        let dma = [1, 0, 0, 0, 0, 0, 0, 0, bytes];
-        let input_guard = [
-            1,
-            u64::try_from(prefill_token_count)
-                .map_err(|_| SemanticTransitionError::GenerationExhausted)?,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-        ];
+        let roster = native_work_bound::FrozenModelContextPrefillRoster::new(context, budget)?;
         let first = self.admitted_segment_first_program_ordinal(admission)?;
         let budget = self
             .actor_refresh_program
@@ -1514,119 +1370,7 @@ impl SemanticTransitionSession {
             .allowance
             .lock()
             .map_err(|_| publication_input_error("imported prefill allowance is poisoned"))?
-            .freeze_model_context_prefill(roster, dma, input_guard, budget)
-    }
-
-    pub(super) fn prepare_model_context_prefill_content_binding(
-        &self,
-        context: &SemanticModelContextContinuation,
-        initial: &SemanticInitialPrefillLease,
-        occurrence: usize,
-        kind: InitialPrefillCaptureKind,
-        verify: bool,
-    ) -> Result<ModelContextPrefillContentBinding, SemanticTransitionError> {
-        if !Arc::ptr_eq(&initial.issuer, &self.publication_issuer) {
-            return Err(SemanticTransitionError::ObservationMismatch);
-        }
-        let dormant = self.initial_prefill.is_none() && self.retained_initial_prefill.is_none();
-        let restored = if dormant {
-            Some(
-                context
-                    .inner
-                    .restored_prefill_content_proof(self, &initial.scope)?,
-            )
-        } else {
-            None
-        };
-        let activating = if dormant {
-            false
-        } else {
-            let activating = context
-                .inner
-                .require_initial_content_scope(self, &initial.scope)?;
-            let scope = self
-                .initial_prefill
-                .as_ref()
-                .map(|stage| &stage.scope)
-                .or_else(|| {
-                    self.retained_initial_prefill
-                        .as_ref()
-                        .map(|stage| &stage.scope)
-                })
-                .ok_or(SemanticTransitionError::NotBound)?;
-            if !Arc::ptr_eq(scope, &initial.scope) {
-                return Err(SemanticTransitionError::ObservationMismatch);
-            }
-            activating
-        };
-        let allowance = self.graph.cold_work_allowance().ok_or_else(|| {
-            publication_input_error("imported prefill lost its original shared SOURCE allowance")
-        })?;
-        let work = self.graph.active_cold_work().ok_or_else(|| {
-            publication_input_error("imported prefill lost its original shared SOURCE tally")
-        })?;
-        self.graph
-            .require_cold_work_owner(&work, !activating)
-            .map_err(SemanticTransitionError::Semantic)?;
-        if dormant {
-            let original = self
-                .model_context_material_work
-                .as_ref()
-                .ok_or(SemanticTransitionError::NotBound)?;
-            let actual =
-                self.require_dormant_model_context_restore_work(context, &original.work)?;
-            if !Arc::ptr_eq(&allowance, &actual) {
-                return Err(SemanticTransitionError::ObservationMismatch);
-            }
-        }
-        Ok(ModelContextPrefillContentBinding {
-            context: context.clone(),
-            scope: Arc::clone(&initial.scope),
-            occurrence,
-            kind,
-            verify,
-            activating,
-            restored,
-            allowance,
-        })
-    }
-
-    pub(super) fn claim_model_context_prefill_input_guard(
-        &self,
-        context: &SemanticModelContextContinuation,
-        initial: &SemanticInitialPrefillLease,
-    ) -> Result<(), SemanticTransitionError> {
-        context
-            .inner
-            .require_initial_prefill_preparation(self, &initial.scope)?;
-        let stage = self
-            .initial_prefill
-            .as_ref()
-            .ok_or(SemanticTransitionError::NotBound)?;
-        if !Arc::ptr_eq(&initial.issuer, &self.publication_issuer)
-            || !Arc::ptr_eq(&initial.scope, &stage.scope)
-        {
-            return Err(SemanticTransitionError::ObservationMismatch);
-        }
-        let work = self
-            .graph
-            .borrowed_cold_work()
-            .ok_or(SemanticTransitionError::ObservationMismatch)?;
-        self.graph
-            .require_cold_work_owner(&work, true)
-            .map_err(SemanticTransitionError::Semantic)?;
-        let allowance = self
-            .graph
-            .cold_work_allowance()
-            .ok_or(SemanticTransitionError::ObservationMismatch)?;
-        let mut allowance = allowance
-            .lock()
-            .map_err(|_| publication_input_error("context prefill allowance is poisoned"))?;
-        allowance.claim_model_context_prefill_input_guard(
-            context,
-            &initial.scope,
-            stage.layout.prefill_tokens.len(),
-        )
+            .freeze_model_context_prefill(roster, budget)
     }
 
     #[expect(
@@ -3033,87 +2777,6 @@ impl SemanticTransitionSession {
         Ok(work)
     }
 
-    pub(super) fn claim_model_context_prepared_model_roster(
-        &self,
-        context: &SemanticModelContextContinuation,
-        step: &SemanticPreparedStep,
-        work: &SemanticColdModelWork,
-        bank: usize,
-        bytes: usize,
-    ) -> Result<Arc<Mutex<native_work_bound::ColdNativeAllowance>>, SemanticTransitionError> {
-        self.require_frozen_context_cold_model_work(context, step, work)?;
-        let storage = self.original_cold_model_work(work)?;
-        if !matches!(
-            storage.state,
-            RecordingState::Waiting | RecordingState::Recording
-        ) {
-            return Err(SemanticTransitionError::ObservationMismatch);
-        }
-        storage
-            .allowance
-            .lock()
-            .map_err(|_| publication_input_error("prepared context allowance is poisoned"))?
-            .claim_model_context_prepared_model_roster(bank, bytes)?;
-        Ok(Arc::clone(&storage.allowance))
-    }
-
-    pub fn resolve_model_context_prepared_model_rosters(
-        &mut self,
-        context: &SemanticModelContextContinuation,
-        step: &SemanticPreparedStep,
-        work: &SemanticColdModelWork,
-    ) -> Result<(), SemanticTransitionError> {
-        self.require_frozen_context_cold_model_work(context, step, work)?;
-        let scope = Arc::clone(&step.scope);
-        let tokens = self
-            .prepared_segment
-            .as_ref()
-            .ok_or(SemanticTransitionError::NotBound)?
-            .tokens
-            .clone();
-        for token in tokens {
-            let issued = SemanticPreparedStep {
-                issuer: Arc::clone(&self.publication_issuer),
-                scope: Arc::clone(&scope),
-                token,
-            };
-            for content in &self.steps[&token].content {
-                let TensorContentSeals::Model(seals) = &content.seals else {
-                    continue;
-                };
-                let Some(prepared) = &seals.prepared else {
-                    continue;
-                };
-                let mut original = prepared.roster_write.lock().map_err(|_| {
-                    publication_input_error("prepared model roster custody is poisoned")
-                })?;
-                let Some(original) = original.as_mut() else {
-                    continue;
-                };
-                if original.allowance.is_none() {
-                    // The plan derives this exact branch and byte extent before
-                    // admission. Its one claim survives late DMA completion.
-                    original.allowance = Some(self.claim_model_context_prepared_model_roster(
-                        context,
-                        &issued,
-                        work,
-                        prepared.bank,
-                        original.write.dma_bytes(),
-                    )?);
-                }
-                original.write.resolve_original(
-                    &self.domain,
-                    &self.stream,
-                    &self.provider,
-                    &mut self.poisoned,
-                    true,
-                    original.allowance.as_ref(),
-                )?;
-            }
-        }
-        Ok(())
-    }
-
     pub(super) fn prepare_frozen_context_cold_model_work(
         &mut self,
         context: &SemanticModelContextContinuation,
@@ -3499,11 +3162,6 @@ impl SemanticTransitionSession {
         work: &SemanticColdModelWork,
     ) -> Result<(), SemanticTransitionError> {
         self.model_context_activation_native_work(context, work)?;
-        self.original_cold_model_work(work)?
-            .allowance
-            .lock()
-            .map_err(|_| publication_input_error("activation content allowance is poisoned"))?
-            .require_model_context_activation_prefill()?;
         self.continue_cold_model_work_initialization(work)?;
         if self.original_cold_model_work(work)?.state == RecordingState::Waiting {
             self.begin_cold_model_work(work)?;
@@ -3516,41 +3174,6 @@ impl SemanticTransitionSession {
             ));
         }
         Ok(())
-    }
-
-    pub fn freeze_model_context_activation_prefill(
-        &self,
-        context: &SemanticModelContextContinuation,
-        work: &SemanticColdModelWork,
-        declarations: &[SemanticModelContextPrefillContentGeometry],
-    ) -> Result<(), SemanticTransitionError> {
-        self.model_context_activation_native_work(context, work)?;
-        let storage = self.original_cold_model_work(work)?;
-        if storage.state != RecordingState::Recording || storage.plan.is_some() {
-            return Err(publication_input_error(
-                "activation content is structural metadata before the one original admission",
-            ));
-        }
-        if declarations.is_empty() || declarations.iter().any(|declaration| !declaration.verify) {
-            return Err(publication_input_error(
-                "activation must describe actual retained prefill verifications, not a new capture or empty substitute",
-            ));
-        }
-        let budget = self
-            .replay_material_budget
-            .as_ref()
-            .ok_or(SemanticTransitionError::NotBound)?;
-        let roster = native_work_bound::FrozenModelContextPrefillRoster::new(
-            context,
-            budget,
-            declarations,
-            0,
-        )?;
-        storage
-            .allowance
-            .lock()
-            .map_err(|_| publication_input_error("activation content allowance is poisoned"))?
-            .freeze_model_context_activation_prefill(roster)
     }
 
     pub(super) fn finish_model_context_activation_work(
@@ -4893,14 +4516,12 @@ impl SemanticTransitionSession {
         handle: &SemanticColdModelWork,
         operations: &[(ModelWorkKind, Vec<u64>)],
         region_ends: &[usize],
-        evaluation_content: Option<SemanticColdEvaluationContent>,
     ) -> Result<[u64; 3], SemanticTransitionError> {
         self.admit_cold_model_work_plan_in_region(
             handle,
             None,
             operations,
             region_ends,
-            evaluation_content,
             &[],
             &[],
             true,
@@ -4912,14 +4533,12 @@ impl SemanticTransitionSession {
         region: &SemanticColdModelWorkRegion,
         operations: &[(ModelWorkKind, Vec<u64>)],
         region_ends: &[usize],
-        evaluation_content: Option<SemanticColdEvaluationContent>,
     ) -> Result<[u64; 3], SemanticTransitionError> {
         self.admit_cold_model_work_plan_in_region(
             &region.work,
             Some(region),
             operations,
             region_ends,
-            evaluation_content,
             &[],
             &[],
             true,
@@ -4931,7 +4550,6 @@ impl SemanticTransitionSession {
         handle: &SemanticColdModelWork,
         operations: &[(ModelWorkKind, Vec<u64>)],
         region_ends: &[usize],
-        evaluation_content: Option<SemanticColdEvaluationContent>,
         sources: &[SemanticPreparedSourceContent],
         resident_reads: &[(usize, SemanticResidentModelRead)],
     ) -> Result<[u64; 3], SemanticTransitionError> {
@@ -4940,7 +4558,6 @@ impl SemanticTransitionSession {
             None,
             operations,
             region_ends,
-            evaluation_content,
             sources,
             resident_reads,
             true,
@@ -4954,7 +4571,6 @@ impl SemanticTransitionSession {
         handle: &SemanticColdModelWork,
         operations: &[(ModelWorkKind, Vec<u64>)],
         region_ends: &[usize],
-        evaluation_content: Option<SemanticColdEvaluationContent>,
         sources: &[SemanticPreparedSourceContent],
         resident_reads: &[(usize, SemanticResidentModelRead)],
     ) -> Result<[u64; 3], SemanticTransitionError> {
@@ -4963,7 +4579,6 @@ impl SemanticTransitionSession {
             None,
             operations,
             region_ends,
-            evaluation_content,
             sources,
             resident_reads,
             false,
@@ -4975,7 +4590,6 @@ impl SemanticTransitionSession {
         region: &SemanticColdModelWorkRegion,
         operations: &[(ModelWorkKind, Vec<u64>)],
         region_ends: &[usize],
-        evaluation_content: Option<SemanticColdEvaluationContent>,
         sources: &[SemanticPreparedSourceContent],
         resident_reads: &[(usize, SemanticResidentModelRead)],
     ) -> Result<[u64; 3], SemanticTransitionError> {
@@ -4984,7 +4598,6 @@ impl SemanticTransitionSession {
             Some(region),
             operations,
             region_ends,
-            evaluation_content,
             sources,
             resident_reads,
             true,
@@ -4996,7 +4609,6 @@ impl SemanticTransitionSession {
         region: &SemanticColdModelWorkRegion,
         operations: &[(ModelWorkKind, Vec<u64>)],
         region_ends: &[usize],
-        evaluation_content: Option<SemanticColdEvaluationContent>,
         sources: &[SemanticPreparedSourceContent],
         resident_reads: &[(usize, SemanticResidentModelRead)],
     ) -> Result<[u64; 3], SemanticTransitionError> {
@@ -5005,7 +4617,6 @@ impl SemanticTransitionSession {
             Some(region),
             operations,
             region_ends,
-            evaluation_content,
             sources,
             resident_reads,
             false,
@@ -5018,7 +4629,6 @@ impl SemanticTransitionSession {
         region: Option<&SemanticColdModelWorkRegion>,
         operations: &[(ModelWorkKind, Vec<u64>)],
         region_ends: &[usize],
-        evaluation_content: Option<SemanticColdEvaluationContent>,
         sources: &[SemanticPreparedSourceContent],
         resident_reads: &[(usize, SemanticResidentModelRead)],
         initialize: bool,
@@ -5133,19 +4743,6 @@ impl SemanticTransitionSession {
             let mut allowance_guard = allowance.lock().map_err(|_| {
                 publication_input_error("original cold native allowance is poisoned")
             })?;
-            if allowance_guard.is_evaluation() != evaluation_content.is_some() {
-                return Err(publication_input_error(
-                    "the native evaluation purpose requires its original output and objective content",
-                ));
-            }
-            if let Some(content) = evaluation_content {
-                if !Arc::ptr_eq(&allowance, &content.allowance) {
-                    return Err(publication_input_error(
-                        "evaluation content belongs to another original cold report",
-                    ));
-                }
-                allowance_guard.freeze_content(content.content)?;
-            }
             if let Some(source_content) = source_content {
                 allowance_guard.freeze_source_content(source_content)?;
             }
@@ -5167,7 +4764,7 @@ impl SemanticTransitionSession {
             // Validate the whole native-derived union before any original
             // scratch initialization or numerical/control recorder can enter.
             let native =
-                native_work_bound::native_work_ceiling_units(allowance_guard.content_ceiling()?)?;
+                native_work_bound::native_work_ceiling_units(allowance_guard.native_ceiling()?)?;
             allowance_guard.require_model_context_source_budget(quantities)?;
             if let Some(context) = &storage.model_context {
                 let prior = context.prior;
@@ -5264,7 +4861,7 @@ impl SemanticTransitionSession {
     }
 
     /// Original finite content subtotal only, not the whole native lifecycle.
-    pub fn cold_model_work_content_ceiling(
+    pub fn cold_model_work_native_ceiling(
         &self,
         handle: &SemanticColdModelWork,
     ) -> Result<[u64; 9], SemanticTransitionError> {
@@ -5272,7 +4869,7 @@ impl SemanticTransitionSession {
             .allowance
             .lock()
             .map_err(|_| publication_input_error("original cold native allowance is poisoned"))?
-            .content_ceiling()
+            .native_ceiling()
     }
 
     pub fn cold_model_work_buffer(
@@ -6921,17 +6518,6 @@ impl SemanticTransitionSession {
             if let Some(error) = admission_error.take() {
                 return Err(error);
             }
-            let kernel = self
-                .provider
-                .device()
-                .inner()
-                .get_func(
-                    "xlog_semantic_transition",
-                    "semantic_cold_model_work_result",
-                )
-                .ok_or_else(|| {
-                    runtime_error("kernel lookup", "cold model work result unavailable")
-                })?;
             let input = if storage.recorded_events().is_empty() {
                 ModelWorkInput::default()
             } else {
@@ -6941,51 +6527,15 @@ impl SemanticTransitionSession {
             if let Some(work) = &storage.work {
                 work.record_reads(&mut recorder);
             }
-            recorder.read(&storage.native_work);
-            recorder.write(&storage.report);
-            let arguments = (
-                input.events,
-                input.count,
-                input.bound,
-                storage.native_work.device_ptr_value(),
-                storage.report.device_ptr_value(),
-            );
-            completion.command.run(
+            native_work_report::run_native_work_report(
+                &self.provider,
                 &self.domain,
+                &mut completion.command,
                 &mut completion.poisoned,
+                input,
+                &storage.native_work.view(),
+                &storage.report.view(),
                 recorder,
-                |enqueue, entered, submitted| {
-                    let (events, count, bound, native, report) = arguments;
-                    let events = events.into_kernel_param_storage();
-                    let count = count.into_kernel_param_storage();
-                    let bound = bound.into_kernel_param_storage();
-                    let native = native.into_kernel_param_storage();
-                    let report = report.into_kernel_param_storage();
-                    let mut parameters = [
-                        events.as_kernel_param(),
-                        count.as_kernel_param(),
-                        bound.as_kernel_param(),
-                        native.as_kernel_param(),
-                        report.as_kernel_param(),
-                    ];
-                    // SAFETY: all inputs and the report remain in this exact
-                    // original invocation through driver entry and completion.
-                    unsafe {
-                        kernel.launch_raw_in_original(
-                            enqueue,
-                            LaunchConfig {
-                                grid_dim: (1, 1, 1),
-                                block_dim: (1, 1, 1),
-                                shared_mem_bytes: 0,
-                            },
-                            &mut parameters,
-                            false,
-                            entered,
-                            submitted,
-                        )
-                    }
-                    .map_err(|error| XlogError::Kernel(error.to_string()))
-                },
             )?;
         }
         storage.state = RecordingState::Submitted;
@@ -7029,16 +6579,7 @@ impl SemanticTransitionSession {
                 "cold model work report is incomplete; retain its original operation",
             ));
         }
-        let mut result = SemanticColdModelWorkResult {
-            model_work: words[1],
-            operation_count: words[2],
-            work_bound: words[3],
-            model_calls: words[4],
-            native_work: words[5],
-            native_events: words[6..15]
-                .try_into()
-                .expect("checked original native event extent"),
-        };
+        let mut result = SemanticColdModelWorkResult::from_native_report(&words)?;
         storage
             .allowance
             .lock()

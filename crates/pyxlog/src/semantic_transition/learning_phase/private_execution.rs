@@ -4405,8 +4405,8 @@ impl PySemanticLearningPhaseTransition {
             let binding = step
                 .get_item("completed_model_binding")?
                 .expect("original field");
-            if let Some((generation, geometry, numerical)) = observation.inner.model_binding() {
-                if !binding.is_exact_instance_of::<PyDict>() || binding.cast::<PyDict>()?.len() != 5
+            if let Some((generation, geometry)) = observation.inner.model_binding() {
+                if !binding.is_exact_instance_of::<PyDict>() || binding.cast::<PyDict>()?.len() != 4
                 {
                     return Err(invalid(
                         "private step lost its complete acquired native model binding",
@@ -4424,7 +4424,6 @@ impl PySemanticLearningPhaseTransition {
                         ColdValue::Text(hex(value.instance)),
                         ColdValue::Integer(value.word.to_string()),
                         ColdValue::Text(hex(value.logical_digest)),
-                        ColdValue::Text(hex(value.state_digest)),
                     ])
                 };
                 let binding = binding.cast::<PyDict>()?;
@@ -4448,7 +4447,6 @@ impl PySemanticLearningPhaseTransition {
                         ColdValue::Integer(generation.to_string()),
                     ),
                     ("model_geometry_digest", ColdValue::Text(hex(geometry))),
-                    ("model_numerical_digest", ColdValue::Text(hex(numerical))),
                 ] {
                     let reported = binding.get_item(name)?.ok_or_else(|| {
                         invalid("private step lost an acquired model binding field")

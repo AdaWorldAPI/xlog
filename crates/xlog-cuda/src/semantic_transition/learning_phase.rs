@@ -393,7 +393,6 @@ impl SemanticLearningPhaseTransition {
                     instance: header.instance,
                     word: header.publication_word,
                     logical_digest: header.logical_digest,
-                    state_digest: header.state_digest,
                 },
                 model_generation: header.model_generation,
                 completed_updates: updates as u64,
@@ -1716,7 +1715,6 @@ pub(super) fn encode_history(
         for digest in [
             record.predecessor.instance,
             record.predecessor.logical_digest,
-            record.predecessor.state_digest,
             record.recipe_digest,
         ] {
             bytes.extend_from_slice(digest.as_bytes());
@@ -1756,7 +1754,7 @@ pub(super) fn decode_history(
         -> Result<SemanticLearningPhaseAdmission, SemanticTransitionError>,
 ) -> Result<Vec<SemanticLearningPhaseRecord>, SemanticTransitionError> {
     let count = reader
-        .count(7 * 8 + 4 * 32 + 4)
+        .count(7 * 8 + 3 * 32 + 4)
         .map_err(SemanticTransitionError::Semantic)?;
     let mut history = Vec::with_capacity(count);
     for _ in 0..count {
@@ -1779,7 +1777,6 @@ pub(super) fn decode_history(
         };
         let instance = identity()?;
         let logical_digest = identity()?;
-        let state_digest = identity()?;
         let recipe_digest = identity()?;
         let recipe_count = reader
             .count(5 * 8)
@@ -1824,7 +1821,6 @@ pub(super) fn decode_history(
                 instance,
                 word,
                 logical_digest,
-                state_digest,
             },
             model_generation,
             completed_updates,
