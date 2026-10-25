@@ -8245,8 +8245,8 @@ fn read_coding_proposals(
             unique_materials,
             material_sources,
         )?;
-        let predecessor = ReplayMaterial::parse(&predecessor, &BTreeSet::new())?;
-        let action = ReplayMaterial::parse(&action, &BTreeSet::new())?;
+        let predecessor = ReplayMaterial::parse(&predecessor, &BTreeMap::new())?;
+        let action = ReplayMaterial::parse(&action, &BTreeMap::new())?;
         if predecessor.kind != "logical-state"
             || predecessor.identity != before.text()?
             || action.kind != "action"
@@ -8644,14 +8644,11 @@ impl ReplayMaterial {
         })
     }
 
-    fn parse(value: &ColdValue, earlier: &BTreeSet<String>) -> PyResult<Self> {
+    fn parse(value: &ColdValue, earlier: &BTreeMap<String, BTreeSet<String>>) -> PyResult<Self> {
         let pair = value.fields(2)?;
         let fields = pair[0].fields(4)?;
         checked_digest(&fields[0])?;
         let identity = fields[0].text()?.to_owned();
-        if earlier.contains(&identity) {
-            return Err(invalid("duplicate replay material identity"));
-        }
         let kind = fields[1].text()?.to_owned();
         if !matches!(
             kind.as_str(),
@@ -8699,6 +8696,12 @@ impl ReplayMaterial {
         ) {
             return Err(invalid("unknown replay material kind"));
         }
+        if earlier
+            .get(&identity)
+            .is_some_and(|kinds| kinds.contains(&kind))
+        {
+            return Err(invalid("duplicate replay material identity and kind"));
+        }
         let (bytes_sha256, reconstruction, bytes, payload) =
             match (&fields[2], &fields[3], &pair[1]) {
                 (ColdValue::Text(digest), ColdValue::None, ColdValue::Bytes(bytes)) => {
@@ -8729,7 +8732,8 @@ impl ReplayMaterial {
                     let fields = reconstruction.fields(2)?;
                     let operation = fields[0].text()?.to_owned();
                     let inputs = fields[1].strings()?;
-                    if inputs.is_empty() || inputs.iter().any(|value| !earlier.contains(value)) {
+                    if inputs.is_empty() || inputs.iter().any(|value| !earlier.contains_key(value))
+                    {
                         return Err(invalid(
                             "replay reconstruction inputs must name earlier materials",
                         ));
@@ -9556,7 +9560,7 @@ impl ReplayRow {
             let (source, group, task_content) =
                 validate_anchor_admission(identity, &record, &evidence, live)?;
             let transported = fields[3].fields(1)?;
-            let material = ReplayMaterial::parse(&transported[0], &BTreeSet::new())?;
+            let material = ReplayMaterial::parse(&transported[0], &BTreeMap::new())?;
             if material.kind != "training-view"
                 || replay_json_value(replay_json_field(&record, "training_view_identity")?)?
                     != material.identity
@@ -9604,7 +9608,7 @@ impl ReplayRow {
                 "replay material roster is missing or detached from the episode",
             ));
         }
-        let mut earlier = BTreeSet::new();
+        let mut earlier = BTreeMap::new();
         let mut materials = Vec::new();
         for (declared, transported) in declared.iter().zip(transported) {
             let material = ReplayMaterial::parse(transported, &earlier)?;
@@ -9618,7 +9622,10 @@ impl ReplayRow {
                     "replay material order or reference differs from the episode",
                 ));
             }
-            earlier.insert(material.identity.clone());
+            earlier
+                .entry(material.identity.clone())
+                .or_default()
+                .insert(material.kind.clone());
             materials.push(material);
         }
         let require_kind = |raw: &str, kind: &str| -> PyResult<()> {
