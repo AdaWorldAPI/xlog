@@ -429,95 +429,6 @@ enum ColdWorkAdmission<'a> {
     ),
 }
 
-pub(super) struct ModelContextPrefillContentBinding {
-    context: SemanticModelContextContinuation,
-    scope: Arc<()>,
-    occurrence: usize,
-    kind: InitialPrefillCaptureKind,
-    verify: bool,
-    activating: bool,
-    restored: Option<SemanticRestoredModelContextPrefill>,
-    allowance: Arc<Mutex<native_work_bound::ColdNativeAllowance>>,
-}
-
-impl ModelContextPrefillContentBinding {
-    pub(super) fn bind(
-        &self,
-        domain: &ResidentExecutionDomain,
-        tensors: &TensorContentBuffers,
-    ) -> Result<(), SemanticTransitionError> {
-        let mut original = tensors
-            .original_cold
-            .lock()
-            .map_err(|_| publication_input_error("imported prefill content custody is poisoned"))?;
-        if let Some(batch) = original.as_ref() {
-            let same_allowance = batch
-                .allowance
-                .as_ref()
-                .and_then(std::sync::Weak::upgrade)
-                .is_some_and(|owner| Arc::ptr_eq(&owner, &self.allowance));
-            if !same_allowance && (!self.activating || batch.cursor != batch.commands.len()) {
-                return Err(SemanticTransitionError::ObservationMismatch);
-            }
-            if same_allowance && batch.context_prefill_occurrence == Some(self.occurrence) {
-                if batch.verify != self.verify {
-                    return Err(SemanticTransitionError::ObservationMismatch);
-                }
-                return Ok(());
-            }
-            if batch.context_prefill_occurrence.is_none() || batch.cursor != batch.commands.len() {
-                return Err(publication_input_error(
-                    "context prefill cannot replace an unresolved original content occurrence",
-                ));
-            }
-        }
-        let count = tensors
-            .tensors
-            .len()
-            .checked_add(usize::from(matches!(
-                tensors.seals,
-                TensorContentSeals::Model(_)
-            )))
-            .ok_or(SemanticTransitionError::GenerationExhausted)?;
-        let mut batch = if let Some(proof) = &self.restored {
-            proof.take_consumer_batch(self.occurrence, self.kind, tensors)?
-        } else {
-            native_work_bound::OriginalContentBatch::new(domain, self.verify, count)?
-        };
-        if let Some(proof) = &self.restored {
-            if !self.verify {
-                return Err(SemanticTransitionError::ObservationMismatch);
-            }
-            proof.require_consumer_content_slot(self.occurrence, self.kind, tensors)?;
-        } else {
-            self.allowance
-                .lock()
-                .map_err(|_| publication_input_error("imported prefill allowance is poisoned"))?
-                .claim_model_context_prefill_content(
-                    &self.context,
-                    &self.scope,
-                    self.occurrence,
-                    tensors,
-                    self.verify,
-                )?;
-        }
-        batch.allowance = Some(Arc::downgrade(&self.allowance));
-        batch.context_prefill_occurrence = Some(self.occurrence);
-        *original = Some(batch);
-        Ok(())
-    }
-
-    pub(super) fn complete(
-        &self,
-        tensors: &TensorContentBuffers,
-    ) -> Result<(), SemanticTransitionError> {
-        if let Some(proof) = &self.restored {
-            proof.retain_completed_consumer_batch(self.occurrence, tensors)?;
-        }
-        Ok(())
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ModelContextColdKind {
     Preparation,
@@ -1441,7 +1352,6 @@ impl SemanticTransitionSession {
         parent: &SemanticPublishedLease,
         admission: &SemanticSegmentInstructionAdmission,
         work: &SemanticColdModelWork,
-        declarations: &[native_work_bound::ModelContextPrefillContentGeometry],
         prefill_token_count: usize,
     ) -> Result<(), SemanticTransitionError> {
         context.inner.require_imported_target(target)?;
@@ -1480,7 +1390,6 @@ impl SemanticTransitionSession {
         let roster = native_work_bound::FrozenModelContextPrefillRoster::new(
             context,
             budget,
-            declarations,
             prefill_token_count,
         )?;
         let bytes = prefill_token_count
@@ -1515,80 +1424,6 @@ impl SemanticTransitionSession {
             .lock()
             .map_err(|_| publication_input_error("imported prefill allowance is poisoned"))?
             .freeze_model_context_prefill(roster, dma, input_guard, budget)
-    }
-
-    pub(super) fn prepare_model_context_prefill_content_binding(
-        &self,
-        context: &SemanticModelContextContinuation,
-        initial: &SemanticInitialPrefillLease,
-        occurrence: usize,
-        kind: InitialPrefillCaptureKind,
-        verify: bool,
-    ) -> Result<ModelContextPrefillContentBinding, SemanticTransitionError> {
-        if !Arc::ptr_eq(&initial.issuer, &self.publication_issuer) {
-            return Err(SemanticTransitionError::ObservationMismatch);
-        }
-        let dormant = self.initial_prefill.is_none() && self.retained_initial_prefill.is_none();
-        let restored = if dormant {
-            Some(
-                context
-                    .inner
-                    .restored_prefill_content_proof(self, &initial.scope)?,
-            )
-        } else {
-            None
-        };
-        let activating = if dormant {
-            false
-        } else {
-            let activating = context
-                .inner
-                .require_initial_content_scope(self, &initial.scope)?;
-            let scope = self
-                .initial_prefill
-                .as_ref()
-                .map(|stage| &stage.scope)
-                .or_else(|| {
-                    self.retained_initial_prefill
-                        .as_ref()
-                        .map(|stage| &stage.scope)
-                })
-                .ok_or(SemanticTransitionError::NotBound)?;
-            if !Arc::ptr_eq(scope, &initial.scope) {
-                return Err(SemanticTransitionError::ObservationMismatch);
-            }
-            activating
-        };
-        let allowance = self.graph.cold_work_allowance().ok_or_else(|| {
-            publication_input_error("imported prefill lost its original shared SOURCE allowance")
-        })?;
-        let work = self.graph.active_cold_work().ok_or_else(|| {
-            publication_input_error("imported prefill lost its original shared SOURCE tally")
-        })?;
-        self.graph
-            .require_cold_work_owner(&work, !activating)
-            .map_err(SemanticTransitionError::Semantic)?;
-        if dormant {
-            let original = self
-                .model_context_material_work
-                .as_ref()
-                .ok_or(SemanticTransitionError::NotBound)?;
-            let actual =
-                self.require_dormant_model_context_restore_work(context, &original.work)?;
-            if !Arc::ptr_eq(&allowance, &actual) {
-                return Err(SemanticTransitionError::ObservationMismatch);
-            }
-        }
-        Ok(ModelContextPrefillContentBinding {
-            context: context.clone(),
-            scope: Arc::clone(&initial.scope),
-            occurrence,
-            kind,
-            verify,
-            activating,
-            restored,
-            allowance,
-        })
     }
 
     pub(super) fn claim_model_context_prefill_input_guard(
@@ -3499,11 +3334,6 @@ impl SemanticTransitionSession {
         work: &SemanticColdModelWork,
     ) -> Result<(), SemanticTransitionError> {
         self.model_context_activation_native_work(context, work)?;
-        self.original_cold_model_work(work)?
-            .allowance
-            .lock()
-            .map_err(|_| publication_input_error("activation content allowance is poisoned"))?
-            .require_model_context_activation_prefill()?;
         self.continue_cold_model_work_initialization(work)?;
         if self.original_cold_model_work(work)?.state == RecordingState::Waiting {
             self.begin_cold_model_work(work)?;
@@ -3516,41 +3346,6 @@ impl SemanticTransitionSession {
             ));
         }
         Ok(())
-    }
-
-    pub fn freeze_model_context_activation_prefill(
-        &self,
-        context: &SemanticModelContextContinuation,
-        work: &SemanticColdModelWork,
-        declarations: &[SemanticModelContextPrefillContentGeometry],
-    ) -> Result<(), SemanticTransitionError> {
-        self.model_context_activation_native_work(context, work)?;
-        let storage = self.original_cold_model_work(work)?;
-        if storage.state != RecordingState::Recording || storage.plan.is_some() {
-            return Err(publication_input_error(
-                "activation content is structural metadata before the one original admission",
-            ));
-        }
-        if declarations.is_empty() || declarations.iter().any(|declaration| !declaration.verify) {
-            return Err(publication_input_error(
-                "activation must describe actual retained prefill verifications, not a new capture or empty substitute",
-            ));
-        }
-        let budget = self
-            .replay_material_budget
-            .as_ref()
-            .ok_or(SemanticTransitionError::NotBound)?;
-        let roster = native_work_bound::FrozenModelContextPrefillRoster::new(
-            context,
-            budget,
-            declarations,
-            0,
-        )?;
-        storage
-            .allowance
-            .lock()
-            .map_err(|_| publication_input_error("activation content allowance is poisoned"))?
-            .freeze_model_context_activation_prefill(roster)
     }
 
     pub(super) fn finish_model_context_activation_work(

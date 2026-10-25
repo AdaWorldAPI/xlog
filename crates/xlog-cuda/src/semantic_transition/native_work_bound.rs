@@ -63,7 +63,6 @@ pub(super) struct OriginalContentBatch {
     pub(super) verify: bool,
     pub(super) retirement: bool,
     pub(super) cursor: usize,
-    pub(super) context_prefill_occurrence: Option<usize>,
     pub(super) commands: Vec<OriginalNativeCommand>,
     // The original report and child graph retain the strong owner. Keeping
     // only its issued identity here avoids a cohort -> batch -> cohort cycle.
@@ -161,7 +160,6 @@ impl OriginalContentBatch {
             verify,
             retirement: false,
             cursor: 0,
-            context_prefill_occurrence: None,
             commands,
             allowance: None,
             source_occurrence: None,
@@ -499,24 +497,9 @@ pub(crate) struct ColdNativeAllowance {
 pub(super) struct FrozenModelContextPrefillRoster {
     owner: std::sync::Weak<model_context_continuation::ModelContextContinuationOwner>,
     scope: Option<Arc<()>>,
-    occurrences: Vec<(Vec<ModelContextPrefillTensorGeometry>, bool, [u64; 9])>,
-    cursor: usize,
     input_tokens: usize,
     input_guard_claimed: bool,
     _reservation: SemanticReplayMaterialReservation,
-}
-
-#[derive(Clone, Copy)]
-pub struct ModelContextPrefillTensorGeometry {
-    pub layout: SemanticTensorLayout,
-    pub logical_begin: u64,
-    pub logical_end: u64,
-    pub physical_bytes: usize,
-}
-
-pub struct ModelContextPrefillContentGeometry {
-    pub tensors: Vec<ModelContextPrefillTensorGeometry>,
-    pub verify: bool,
 }
 
 /// Structural inference preparation has two original model-roster uploads and
@@ -603,84 +586,16 @@ impl FrozenModelContextPrefillRoster {
     pub(super) fn new(
         context: &SemanticModelContextContinuation,
         budget: &SemanticReplayMaterialBudget,
-        declarations: &[ModelContextPrefillContentGeometry],
         input_tokens: usize,
     ) -> Result<Self, SemanticTransitionError> {
-        let layouts = declarations.iter().try_fold(0usize, |count, declaration| {
-            if declaration.tensors.is_empty() {
-                return Err(SemanticTransitionError::ObservationMismatch);
-            }
-            for tensor in &declaration.tensors {
-                canonical_tensor_layout(tensor.layout)?;
-            }
-            count
-                .checked_add(declaration.tensors.len())
-                .ok_or(SemanticTransitionError::GenerationExhausted)
-        })?;
-        let bytes = declarations
-            .len()
-            .checked_mul(size_of::<(
-                Vec<ModelContextPrefillTensorGeometry>,
-                bool,
-                [u64; 9],
-            )>())
-            .and_then(|bytes| {
-                layouts
-                    .checked_mul(size_of::<ModelContextPrefillTensorGeometry>())
-                    .and_then(|layouts| bytes.checked_add(layouts))
-            })
-            .and_then(|bytes| bytes.checked_add(size_of::<Self>()))
-            .and_then(|bytes| u64::try_from(bytes).ok())
-            .ok_or(SemanticTransitionError::GenerationExhausted)?;
-        let reservation = budget.reserve_auxiliary(bytes)?;
-        let mut occurrences = Vec::new();
-        occurrences
-            .try_reserve_exact(declarations.len())
-            .map_err(|error| runtime_error("context prefill roster allocation", error))?;
-        for declaration in declarations {
-            let mut ceiling = [0; 9];
-            let mut layouts = Vec::new();
-            layouts
-                .try_reserve_exact(declaration.tensors.len())
-                .map_err(|error| {
-                    runtime_error("context prefill tensor geometry allocation", error)
-                })?;
-            for tensor in &declaration.tensors {
-                let geometry = ModelContextPrefillTensorGeometry {
-                    layout: canonical_tensor_layout(tensor.layout)?,
-                    ..*tensor
-                };
-                add_native_work_ceiling(
-                    &mut ceiling,
-                    tensor_layout_native_work_ceiling(
-                        &geometry.layout,
-                        geometry.logical_begin,
-                        geometry.logical_end,
-                        geometry.physical_bytes,
-                        declaration.verify,
-                    )?,
-                )?;
-                layouts.push(geometry);
-            }
-            occurrences.push((layouts, declaration.verify, ceiling));
-        }
+        let reservation = budget.reserve_auxiliary(size_of::<Self>() as u64)?;
         Ok(Self {
             owner: Arc::downgrade(&context.inner),
             scope: None,
-            occurrences,
-            cursor: 0,
             input_tokens,
             input_guard_claimed: false,
             _reservation: reservation,
         })
-    }
-
-    fn ceiling(&self) -> Result<[u64; 9], SemanticTransitionError> {
-        let mut total = [0; 9];
-        for (_, _, ceiling) in &self.occurrences {
-            add_native_work_ceiling(&mut total, *ceiling)?;
-        }
-        Ok(total)
     }
 }
 
@@ -1240,103 +1155,12 @@ impl ColdNativeAllowance {
                 "context prefill requires its unopened original SOURCE preparation allowance",
             ));
         }
-        let mut ceiling = roster.ceiling()?;
-        add_native_work_ceiling(&mut ceiling, dma)?;
+        let mut ceiling = dma;
         add_native_work_ceiling(&mut ceiling, input_guard)?;
         self.freeze_model_context_native_work(ceiling)?;
         add_native_work_ceiling(&mut self.submitted_dma_ceiling, dma)?;
         self.model_context_prefill = Some(roster);
         self.model_context_source_budget = Some(budget);
-        Ok(())
-    }
-
-    pub(super) fn freeze_model_context_activation_prefill(
-        &mut self,
-        roster: FrozenModelContextPrefillRoster,
-    ) -> Result<(), SemanticTransitionError> {
-        if self.purpose != SemanticColdModelWorkPurpose::PrivateModelPreparation
-            || self.model_context_activation_ceiling.is_none()
-            || self.native_initialization_claimed
-            || self.model_context_prefill.is_some()
-        {
-            return Err(publication_input_error(
-                "activation content must precede the original complete plan admission",
-            ));
-        }
-        let mut ceiling = self
-            .model_context_ceiling
-            .ok_or(SemanticTransitionError::ObservationMismatch)?;
-        add_native_work_ceiling(&mut ceiling, roster.ceiling()?)?;
-        native_work_ceiling_units(ceiling)?;
-        self.model_context_ceiling = Some(ceiling);
-        self.model_context_prefill = Some(roster);
-        Ok(())
-    }
-
-    pub(super) fn require_model_context_activation_prefill(
-        &self,
-    ) -> Result<(), SemanticTransitionError> {
-        if self.model_context_prefill.is_none() {
-            return Err(publication_input_error(
-                "activation requires its complete original prefill verification roster",
-            ));
-        }
-        Ok(())
-    }
-
-    pub(super) fn claim_model_context_prefill_content(
-        &mut self,
-        context: &SemanticModelContextContinuation,
-        scope: &Arc<()>,
-        occurrence: usize,
-        tensors: &TensorContentBuffers,
-        verify: bool,
-    ) -> Result<(), SemanticTransitionError> {
-        if !self.model_context_prefill_recording {
-            return Err(publication_input_error(
-                "context prefill content requires its initialized original SOURCE recording report",
-            ));
-        }
-        let roster = self.model_context_prefill.as_mut().ok_or_else(|| {
-            publication_input_error("context prefill precedes its original frozen producer roster")
-        })?;
-        let (layouts, original_verify, ceiling) =
-            roster.occurrences.get(roster.cursor).ok_or_else(|| {
-                publication_input_error("context prefill exceeded its original producer order")
-            })?;
-        if occurrence != roster.cursor
-            || !roster.owner.ptr_eq(&Arc::downgrade(&context.inner))
-            || roster
-                .scope
-                .as_ref()
-                .is_some_and(|original| !Arc::ptr_eq(original, scope))
-            || *original_verify != verify
-            || matches!(tensors.seals, TensorContentSeals::Model(_))
-            || layouts.len() != tensors.tensors.len()
-            || layouts
-                .iter()
-                .zip(&tensors.tensors)
-                .any(|(geometry, tensor)| {
-                    geometry.layout != tensor.layout
-                        || geometry.logical_begin != tensor.logical_begin
-                        || geometry.logical_end != tensor.logical_end
-                        || geometry.physical_bytes
-                            != tensor.source.as_ref().map_or(0, DeviceMemoryView::len)
-                })
-            || tensors
-                .native_work_ceiling(verify)?
-                .iter()
-                .zip(*ceiling)
-                .any(|(actual, upper)| *actual > upper)
-        {
-            return Err(publication_input_error(
-                "context prefill changed its original scope, layout, order or native ceiling",
-            ));
-        }
-        if roster.scope.is_none() {
-            roster.scope = Some(Arc::clone(scope));
-        }
-        roster.cursor += 1;
         Ok(())
     }
 
@@ -1625,9 +1449,11 @@ impl ColdNativeAllowance {
                 "context activation has not entered its original native seal occurrence",
             ));
         }
-        if self.model_context_prefill.as_ref().is_some_and(|roster| {
-            roster.cursor != roster.occurrences.len() || !roster.input_guard_claimed
-        }) {
+        if self
+            .model_context_prefill
+            .as_ref()
+            .is_some_and(|roster| !roster.input_guard_claimed)
+        {
             return Err(publication_input_error(
                 "context prefill has not completed its original frozen producer roster",
             ));

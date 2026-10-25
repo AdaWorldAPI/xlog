@@ -17,9 +17,7 @@ pub(super) struct CheckpointReadbackGeometry {
     role_count_bytes: u64,
     terminal_bytes: u64,
     nonmodels: Vec<(u64, u64, u64, u64)>,
-    prefill: Vec<(u64, u64, usize, usize)>,
     metadata_dma: [u64; 9],
-    prefill_dma: [u64; 9],
     _reservation: SemanticReplayMaterialReservation,
 }
 
@@ -27,13 +25,10 @@ pub(super) struct CheckpointReadbackGeometry {
 impl CheckpointReadbackGeometry {
     pub(super) fn ceilings(
         &self,
-        origin: CheckpointReadbackOrigin,
+        _origin: CheckpointReadbackOrigin,
     ) -> Result<([u64; 9], [u64; 9]), SemanticTransitionError> {
         let mut dma = self.metadata_dma;
         native_work_bound::add_native_work_ceiling(&mut dma, self.graph.dma_ceiling)?;
-        if matches!(origin, CheckpointReadbackOrigin::Selected) {
-            native_work_bound::add_native_work_ceiling(&mut dma, self.prefill_dma)?;
-        }
         let mut total = dma;
         native_work_bound::add_native_work_ceiling(&mut total, self.graph.kernel_ceiling)?;
         Ok((dma, total))
@@ -41,7 +36,7 @@ impl CheckpointReadbackGeometry {
 
     pub(super) fn require_actual(
         &self,
-        origin: CheckpointReadbackOrigin,
+        _origin: CheckpointReadbackOrigin,
         session: &SemanticTransitionSession,
         lease: &SemanticPublishedLease,
     ) -> Result<(), SemanticTransitionError> {
@@ -107,69 +102,8 @@ impl CheckpointReadbackGeometry {
         if nonmodels.next().is_some() {
             return Err(SemanticTransitionError::ObservationMismatch);
         }
-        match origin {
-            CheckpointReadbackOrigin::Restored => {
-                // The original restore installs an authenticated host prefill
-                // reference on its fresh owner, never a new numerical seal.
-                if session.retained_initial_prefill.is_some() {
-                    return Err(publication_input_error(
-                        "restored checkpoint introduced an unissued numerical prefill reader",
-                    ));
-                }
-            }
-            CheckpointReadbackOrigin::Selected => {
-                let actual = session.retained_initial_prefill.as_ref();
-                let mut ordinal = 0usize;
-                if let Some(actual) = actual {
-                    for content in [&actual.model, &actual.output] {
-                        visit_initial_prefill_geometry(content, |role, index, offset, words| {
-                            if self.prefill.get(ordinal).copied()
-                                != Some((role, index, offset, words))
-                            {
-                                return Err(publication_input_error(
-                                    "checkpoint prefill changed its original seal-cell layout",
-                                ));
-                            }
-                            ordinal += 1;
-                            Ok(())
-                        })?;
-                    }
-                }
-                if ordinal != self.prefill.len() {
-                    return Err(SemanticTransitionError::ObservationMismatch);
-                }
-            }
-        }
         Ok(())
     }
-}
-
-#[cfg(feature = "semantic-policy")]
-fn visit_initial_prefill_geometry(
-    content: &TensorContentBuffers,
-    mut visit: impl FnMut(u64, u64, usize, usize) -> Result<(), SemanticTransitionError>,
-) -> Result<(), SemanticTransitionError> {
-    let TensorContentSeals::Captured(digests) = &content.seals else {
-        return Err(SemanticTransitionError::ObservationMismatch);
-    };
-    if content.tensors.len() != digests.len() {
-        return Err(SemanticTransitionError::ObservationMismatch);
-    }
-    for (tensor, digest) in content.tensors.iter().zip(digests) {
-        let CapturedTensorDigest::Tensor { cells, offset, .. } = digest else {
-            return Err(SemanticTransitionError::ObservationMismatch);
-        };
-        if offset.checked_add(4).is_none_or(|end| end > cells.len()) {
-            return Err(SemanticTransitionError::ObservationMismatch);
-        }
-        visit(
-            tensor.layout.role,
-            tensor.layout.index,
-            *offset,
-            cells.len(),
-        )?;
-    }
-    Ok(())
 }
 
 pub(super) struct OriginalPublicationReadback {
@@ -235,23 +169,8 @@ impl SemanticTransitionSession {
         let count = directory
             .iter()
             .filter(|range| !matches!(range.role, 18..=25))
-            .count();
-        let prefill_count = if let Some(prefill) = &self.retained_initial_prefill {
-            prefill
-                .model
-                .tensors
-                .len()
-                .checked_add(prefill.output.tensors.len())
-                .ok_or(SemanticTransitionError::GenerationExhausted)?
-        } else {
-            0
-        };
-        let extent = size_of::<CheckpointReadbackGeometry>()
             .checked_add(2 * size_of::<usize>())
             .and_then(|n| n.checked_add(count.checked_mul(size_of::<(u64, u64, u64, u64)>())?))
-            .and_then(|n| {
-                n.checked_add(prefill_count.checked_mul(size_of::<(u64, u64, usize, usize)>())?)
-            })
             .ok_or(SemanticTransitionError::GenerationExhausted)?;
         let reservation = budget.reserve_auxiliary(
             u64::try_from(extent).map_err(|_| SemanticTransitionError::GenerationExhausted)?,
@@ -259,10 +178,6 @@ impl SemanticTransitionSession {
         let mut nonmodels = Vec::new();
         nonmodels.try_reserve_exact(count).map_err(|_| {
             publication_input_error("checkpoint readback range metadata allocation failed")
-        })?;
-        let mut prefill = Vec::new();
-        prefill.try_reserve_exact(prefill_count).map_err(|_| {
-            publication_input_error("checkpoint prefill metadata allocation failed")
         })?;
         let mut dma = [0; 9];
         let mut add_read = |bytes: u64| {
@@ -315,33 +230,12 @@ impl SemanticTransitionSession {
                 add_read(range.length_bytes)?;
             }
         }
-        let mut prefill_dma = [0; 9];
-        if let Some(retained) = &self.retained_initial_prefill {
-            for content in [&retained.model, &retained.output] {
-                visit_initial_prefill_geometry(content, |role, index, offset, words| {
-                    let bytes = u64::try_from(
-                        words
-                            .checked_mul(size_of::<u64>())
-                            .ok_or(SemanticTransitionError::GenerationExhausted)?,
-                    )
-                    .map_err(|_| SemanticTransitionError::GenerationExhausted)?;
-                    native_work_bound::add_native_work_ceiling(
-                        &mut prefill_dma,
-                        [1, 0, 0, 0, 0, 0, 0, 0, bytes],
-                    )?;
-                    prefill.push((role, index, offset, words));
-                    Ok(())
-                })?;
-            }
-        }
         Ok(Arc::new(CheckpointReadbackGeometry {
             graph,
             role_count_bytes,
             terminal_bytes,
             nonmodels,
-            prefill,
             metadata_dma: dma,
-            prefill_dma,
             _reservation: reservation,
         }))
     }
