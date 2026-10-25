@@ -1309,9 +1309,9 @@ fn pyxlog(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
             .get_type::<semantic_transition::SemanticModelContextFreezePending>(),
     )?;
     m.add(
-        "SemanticImportedTaskReleasePending",
+        "SemanticTaskReleasePending",
         m.py()
-            .get_type::<semantic_transition::SemanticImportedTaskReleasePending>(),
+            .get_type::<semantic_transition::SemanticTaskReleasePending>(),
     )?;
     m.add_class::<semantic_transition::model_work_port::PySemanticModelWorkBufferPort>()?;
     #[cfg(feature = "semantic-policy")]
