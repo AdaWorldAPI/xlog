@@ -1281,7 +1281,6 @@ fn pyxlog(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<semantic_transition::cold_task::PySemanticTransitionFreshParent>()?;
     m.add_class::<semantic_transition::PySemanticTransitionTaskUse>()?;
     m.add_class::<semantic_transition::PySemanticInitialPrefillStage>()?;
-    m.add_class::<semantic_transition::PySemanticInitialPrefillContentWitness>()?;
     m.add_class::<semantic_transition::PySemanticInitialPrefillReceipt>()?;
     m.add_class::<semantic_transition::PySemanticPublishedParent>()?;
     m.add_class::<semantic_transition::material_bytes::PySemanticMaterialBytes>()?;

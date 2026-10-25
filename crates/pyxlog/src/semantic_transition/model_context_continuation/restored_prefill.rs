@@ -2,15 +2,12 @@
 
 use super::*;
 
-/// Shared with the genuine stage and witnesses without retaining either one.
+/// Shared with the original stage without retaining it.
 /// The native proof, current model and continuation survive every projection.
 pub(in crate::semantic_transition) struct RestoredPrefillPythonCustody {
     continuation: xlog_cuda::SemanticModelContextContinuation,
     controller: Py<PySemanticTransitionController>,
     task: Py<PySemanticTransitionTaskUse>,
-    source_controller: Py<PySemanticTransitionController>,
-    source_task: Py<PySemanticTransitionTaskUse>,
-    source_parent: Py<PySemanticPublishedParent>,
     proof: xlog_cuda::SemanticRestoredModelContextPrefill,
     model_owner: Py<PyAny>,
     model_tensors: Py<PyAny>,
@@ -36,41 +33,6 @@ impl RestoredPrefillPythonCustody {
             .map_err(xlog_err)?;
         Ok(())
     }
-
-    pub(in crate::semantic_transition) fn content_error(
-        &self,
-        py: Python<'_>,
-        error: xlog_cuda::SemanticTransitionError,
-    ) -> PyErr {
-        let original = xlog_err(error);
-        let pending = (|| -> PyResult<bool> {
-            self.require_current(py)?;
-            let task = self.task.borrow(py);
-            let session = task.session.borrow(py);
-            let result = session
-                .owner()?
-                .restored_model_context_prefill_consumer_commands_pending(
-                    &self.continuation,
-                    &self.proof,
-                )
-                .map_err(xlog_err);
-            result
-        })();
-        match pending {
-            Ok(true) => {
-                let pending = SemanticModelContextContinuationPending::new_err(
-                    "original restored prefill content completion is pending; resolve its retained consumer commands",
-                );
-                pending.set_cause(py, Some(original));
-                pending
-            }
-            Ok(false) => original,
-            Err(error) => {
-                error.set_cause(py, Some(original));
-                error
-            }
-        }
-    }
 }
 
 #[pyclass(
@@ -82,8 +44,6 @@ pub(crate) struct PySemanticRestoredModelContextPrefill {
     custody: Arc<RestoredPrefillPythonCustody>,
     stage: Py<PySemanticInitialPrefillStage>,
     receipt: Py<PySemanticInitialPrefillReceipt>,
-    model_content_witness: Py<PySemanticInitialPrefillContentWitness>,
-    boundary_witness: Py<PySemanticInitialPrefillContentWitness>,
     source_layout: Py<PyTuple>,
     source_mapping: Py<PyTuple>,
     tensor_layouts: Py<PyTuple>,
@@ -138,18 +98,9 @@ impl PySemanticRestoredModelContextPrefill {
             proof.source_layout_clone_extent().map_err(xlog_err)?,
         )?;
         let metadata = Arc::new(material_bytes::reserve_material_metadata(budget, extent)?);
-        let (
-            lease,
-            scope,
-            layout,
-            model_witness,
-            output_witness,
-            layouts,
-            capacity_metadata,
-            output_metadata,
-        ) = {
+        let (lease, scope, layout, layouts, capacity_metadata, output_metadata) = {
             let owner = session.owner()?;
-            let (lease, scope, layout, model_witness, output_witness) = owner
+            let (lease, scope, layout) = owner
                 .project_restored_model_context_prefill_boundary(&context.inner, &proof)
                 .map_err(xlog_err)?;
             let layouts = owner
@@ -187,8 +138,6 @@ impl PySemanticRestoredModelContextPrefill {
                 lease,
                 scope,
                 layout,
-                model_witness,
-                output_witness,
                 layouts,
                 capacity_metadata,
                 output_metadata,
@@ -269,9 +218,6 @@ impl PySemanticRestoredModelContextPrefill {
             continuation: context.inner.clone(),
             controller: context.target_controller.clone_ref(py),
             task: context.target_task.clone_ref(py),
-            source_controller: context.source_controller.clone_ref(py),
-            source_task: context.source.task().clone_ref(py),
-            source_parent: context.source.parent().clone_ref(py),
             proof,
             model_owner,
             model_tensors,
@@ -303,33 +249,12 @@ impl PySemanticRestoredModelContextPrefill {
                 consumed: AtomicBool::new(true),
             },
         )?;
-        let model_content_witness = Py::new(
-            py,
-            PySemanticInitialPrefillContentWitness {
-                inner: model_witness,
-                _inputs: custody.model_tensors.clone_ref(py),
-                _producers: vec![custody.model_allocations.clone_ref(py)],
-                stage: stage.clone_ref(py),
-            },
-        )?;
-        let boundary_witness = Py::new(
-            py,
-            PySemanticInitialPrefillContentWitness {
-                inner: output_witness,
-                // The genuine stage retains every native restored output owner.
-                _inputs: stage.clone_ref(py).into_any(),
-                _producers: Vec::new(),
-                stage: stage.clone_ref(py),
-            },
-        )?;
         let projected = Py::new(
             py,
             Self {
                 custody,
                 stage: stage.clone_ref(py),
                 receipt,
-                model_content_witness,
-                boundary_witness,
                 source_layout: source_layout.clone_ref(py),
                 source_mapping,
                 tensor_layouts,
@@ -441,24 +366,6 @@ impl PySemanticRestoredModelContextPrefill {
     }
 
     #[getter]
-    fn model_content_witness(
-        &self,
-        py: Python<'_>,
-    ) -> PyResult<Py<PySemanticInitialPrefillContentWitness>> {
-        self.require_current(py)?;
-        Ok(self.model_content_witness.clone_ref(py))
-    }
-
-    #[getter]
-    fn boundary_witness(
-        &self,
-        py: Python<'_>,
-    ) -> PyResult<Py<PySemanticInitialPrefillContentWitness>> {
-        self.require_current(py)?;
-        Ok(self.boundary_witness.clone_ref(py))
-    }
-
-    #[getter]
     fn model_owner(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         self.require_current(py)?;
         Ok(self.custody.model_owner.clone_ref(py))
@@ -503,7 +410,7 @@ impl PySemanticRestoredModelContextPrefill {
 
     #[getter]
     /// Cache rows `(layout, begin, end)` in the original prefill geometry.
-    /// These match the restored boundary witness, including compact attention.
+    /// These describe the restored outputs, including compact attention.
     fn tensor_metadata(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
         self.require_current(py)?;
         Ok(self.tensor_metadata.clone_ref(py))
@@ -528,47 +435,6 @@ impl PySemanticRestoredModelContextPrefill {
     fn restored_source_parent(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
         self.require_current(py)?;
         Ok(self.restored_source_parent.clone_ref(py))
-    }
-
-    /// Join only the original already issued content consumer commands.
-    fn resolve_pending_content(&self, py: Python<'_>) -> PyResult<()> {
-        self.require_current(py)?;
-        let source_task = self.custody.source_task.borrow(py);
-        let source_controller = self.custody.source_controller.borrow(py);
-        source_controller.require_read_issued(&source_task)?;
-        let source = source_task.session.borrow(py);
-        source.require_creator()?;
-        let active = source_task.already_issued_cold_model_work(py)?;
-        let work = active.borrow(py).custody(py)?;
-        if work.parent()?.as_ptr() != self.custody.source_parent.as_ptr() {
-            return Err(invalid(
-                "restored content completion changed its original source callback parent",
-            ));
-        }
-        let target_task = self.custody.task.borrow(py);
-        let target = target_task.session.borrow(py);
-        target.require_creator()?;
-        let source_owner = source.owner()?;
-        source_task.require_current(&source_owner)?;
-        let mut target_owner = target.owner()?;
-        source_owner
-            .require_model_context_material_restore_callback_work(
-                &target_owner,
-                &self.custody.continuation,
-                &*self.custody.source_parent.borrow(py).lease()?,
-                &work.inner,
-                work.region.as_ref().ok_or_else(|| {
-                    invalid("restored content completion lost its original source report region")
-                })?,
-            )
-            .map_err(xlog_err)?;
-        let result = target_owner.resolve_restored_model_context_prefill_consumer_commands(
-            &self.custody.continuation,
-            &self.custody.proof,
-        );
-        drop(target_owner);
-        drop(source_owner);
-        result.map_err(|error| self.custody.content_error(py, error))
     }
 
     fn require_basis(
@@ -615,7 +481,7 @@ impl PySemanticRestoredModelContextPrefill {
     }
 
     #[pyo3(signature = (role, index, *, consumer_stream))]
-    /// Export seal-verified restored outputs in the original prefill geometry.
+    /// Export restored outputs with their original native buffer owners.
     /// The capsule retains their native proof, current model and continuation.
     fn persistent_tensor_view(
         slf: Py<Self>,
@@ -781,14 +647,7 @@ fn projection_extent(
         extent,
         material_bytes::python_instance_extent::<PySemanticInitialPrefillReceipt>(py)?,
     )?;
-    extent = add(
-        extent,
-        multiply(
-            2,
-            material_bytes::python_instance_extent::<PySemanticInitialPrefillContentWitness>(py)?,
-        )?,
-    )?;
-    extent = add(extent, multiply(3, std::mem::size_of::<Py<PyAny>>())?)?;
+    extent = add(extent, multiply(2, std::mem::size_of::<Py<PyAny>>())?)?;
     extent = add(extent, python_metadata_tuple_extent(py, 4)?)?;
     for count in [layout.source.len(), layout.prefix.len()] {
         extent = add(extent, python_metadata_tuple_extent(py, count)?)?;

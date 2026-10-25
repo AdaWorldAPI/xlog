@@ -24,18 +24,17 @@ use xlog_cuda::{CudaKernelProvider, SemanticCapacityRefusalInput};
 use xlog_cuda::{
     DlpackManagedTensor, Identity256, SemanticAdmissionLimits, SemanticAdmissionRecords,
     SemanticArgument, SemanticContinuationInput, SemanticGradientDeliveryBinding,
-    SemanticHypergraphCapacities, SemanticInitialPrefillContentWitness,
-    SemanticInitialPrefillLease, SemanticInitialSourceLayout, SemanticNonterminalIntentBinding,
-    SemanticObservedSource, SemanticParentBinding, SemanticPolarity, SemanticPredicateRecord,
-    SemanticPreparedStep, SemanticProgramAdmission, SemanticPublishedLease, SemanticRecordRole,
-    SemanticReplayAppendBinding, SemanticRngBinding, SemanticSourceMapping, SemanticStateRecord,
-    SemanticStateRole, SemanticSupportRecord, SemanticTaskContentIdentity, SemanticTaskGoalWitness,
-    SemanticTensorContentWitness, SemanticTensorInput, SemanticTensorLayout, SemanticTextSlot,
-    SemanticTrainingCanary, SemanticTrainingCanaryKind, SemanticTrainingDomain,
-    SemanticTrainingManifest, SemanticTrainingObjective, SemanticTrainingObjectiveGroup,
-    SemanticTrainingObjectiveGroupKind, SemanticTrainingViewBasis, SemanticTrainingViewPort,
-    SemanticTrainingViewRow, SemanticTransitionKind, SemanticTransitionSession, SemanticTruth,
-    SemanticTypedRecord,
+    SemanticHypergraphCapacities, SemanticInitialPrefillLease, SemanticInitialSourceLayout,
+    SemanticNonterminalIntentBinding, SemanticObservedSource, SemanticParentBinding,
+    SemanticPolarity, SemanticPredicateRecord, SemanticPreparedStep, SemanticProgramAdmission,
+    SemanticPublishedLease, SemanticRecordRole, SemanticReplayAppendBinding, SemanticRngBinding,
+    SemanticSourceMapping, SemanticStateRecord, SemanticStateRole, SemanticSupportRecord,
+    SemanticTaskContentIdentity, SemanticTaskGoalWitness, SemanticTensorContentWitness,
+    SemanticTensorInput, SemanticTensorLayout, SemanticTextSlot, SemanticTrainingCanary,
+    SemanticTrainingCanaryKind, SemanticTrainingDomain, SemanticTrainingManifest,
+    SemanticTrainingObjective, SemanticTrainingObjectiveGroup, SemanticTrainingObjectiveGroupKind,
+    SemanticTrainingViewBasis, SemanticTrainingViewPort, SemanticTrainingViewRow,
+    SemanticTransitionKind, SemanticTransitionSession, SemanticTruth, SemanticTypedRecord,
 };
 use xlog_cuda::{
     SemanticModelContractLayout, SemanticModelMemory, SemanticModelStorage, SemanticModelView,
@@ -13845,78 +13844,6 @@ pub(crate) struct PySemanticInitialPrefillReceipt {
     consumed: AtomicBool,
 }
 
-/// Original model or transient bytes from one real prefill forward. The
-/// issuing Runtime must retain this complete object through creator cleanup.
-#[pyclass(
-    name = "SemanticInitialPrefillContentWitness",
-    module = "pyxlog._native",
-    frozen
-)]
-pub(crate) struct PySemanticInitialPrefillContentWitness {
-    inner: SemanticInitialPrefillContentWitness,
-    _inputs: Py<PyAny>,
-    _producers: Vec<Py<PyAny>>,
-    stage: Py<PySemanticInitialPrefillStage>,
-}
-
-#[pymethods]
-impl PySemanticInitialPrefillContentWitness {
-    /// Enqueue a check against the same pre-forward or original transient seal.
-    /// No new baseline is created, including after the parent consumes the stage.
-    #[pyo3(signature = (*, tensors, consumer_stream))]
-    fn verify(
-        &self,
-        py: Python<'_>,
-        tensors: &Bound<'_, PyAny>,
-        consumer_stream: &Bound<'_, PyAny>,
-    ) -> PyResult<()> {
-        let stage = self.stage.borrow(py);
-        let session = stage.session.borrow(py);
-        let _operation = InitialPrefillOperation::begin(&session)?;
-        #[cfg(feature = "semantic-policy")]
-        if stage.restored_custody.is_some() {
-            stage.require_active(py)?;
-        }
-        let mut budget = 16 * 1024 * 1024;
-        let stream = parse_witness_consumer_stream(consumer_stream, &mut budget)?;
-        let check = || -> PyResult<()> {
-            #[cfg(feature = "semantic-policy")]
-            if stage.restored_custody.is_some() {
-                stage.require_active(py)?;
-            }
-            let owner = session.witness_owner()?;
-            stage.task_use.borrow(py).require_identity(&owner)
-        };
-        check()?;
-        let parsed = parse_tensor_inputs_guarded(
-            tensors,
-            &mut budget,
-            session.device_ordinal,
-            stream,
-            &check,
-        )?;
-        let mut owner = session.witness_owner()?;
-        stage.task_use.borrow(py).require_identity(&owner)?;
-        let result = owner.verify_initial_prefill_tensor_content(
-            &stage.lease,
-            &self.inner,
-            parsed.handoff.into_native(),
-            stream,
-        );
-        // The restored pending query authenticates through the same Target
-        // owner. Release the verifier mutex before querying its original
-        // command so a typed join does not reenter a held native lock.
-        drop(owner);
-        result.map_err(|error| {
-            #[cfg(feature = "semantic-policy")]
-            if let Some(custody) = &stage.restored_custody {
-                return custody.content_error(py, error);
-            }
-            xlog_err(error)
-        })
-    }
-}
-
 impl PySemanticInitialPrefillStage {
     fn require_active(&self, py: Python<'_>) -> PyResult<()> {
         #[cfg(feature = "semantic-policy")]
@@ -13955,97 +13882,41 @@ impl PySemanticInitialPrefillStage {
         Ok(self.layout.clone_ref(py))
     }
 
-    /// Seal the original complete model tensor and backing allocation rosters
+    /// Retain the original complete model tensor and backing allocation rosters
     /// before the model's prefill forward. Both use bind_parent's typed rows.
     #[pyo3(signature = (*, tensors, model_allocations, consumer_stream))]
     fn bind_model_content(
-        slf: Py<Self>,
+        &self,
         py: Python<'_>,
         tensors: &Bound<'_, PyAny>,
         model_allocations: &Bound<'_, PyAny>,
         consumer_stream: &Bound<'_, PyAny>,
-    ) -> PyResult<Py<PySemanticInitialPrefillContentWitness>> {
-        let stage = slf.borrow(py);
-        let this = &*stage;
-        this.require_wrapper_hook()?;
-        this.require_active(py)?;
-        let _operation = InitialPrefillOperation::begin(&this.session.borrow(py))?;
+    ) -> PyResult<()> {
+        self.require_wrapper_hook()?;
+        self.require_active(py)?;
+        let _operation = InitialPrefillOperation::begin(&self.session.borrow(py))?;
         let mut budget = 16 * 1024 * 1024;
         let stream = parse_witness_consumer_stream(consumer_stream, &mut budget)?;
-        let check = || this.require_active(py);
-        let device = this.session.borrow(py).device_ordinal;
+        let check = || self.require_active(py);
+        let device = self.session.borrow(py).device_ordinal;
         let model = parse_tensor_inputs_guarded(tensors, &mut budget, device, stream, &check)?;
         let allocations =
             parse_tensor_inputs_guarded(model_allocations, &mut budget, device, stream, &check)?;
         let mut inputs = model.handoff.into_native();
         inputs.extend(allocations.handoff.into_native());
         {
-            let mut retained = this.model_producers.lock().map_err(|_| {
+            let mut retained = self.model_producers.lock().map_err(|_| {
                 PyRuntimeError::new_err("initial prefill model custody is poisoned")
             })?;
             retained.extend(model.producers);
             retained.extend(allocations.producers);
         }
-        this.require_active(py)?;
-        let inner = this
-            .session
+        self.require_active(py)?;
+        self.session
             .borrow(py)
             .owner()?
-            .bind_initial_prefill_model_content(&this.lease, inputs, stream)
-            .map_err(xlog_err)?;
-        drop(stage);
-        Py::new(
-            py,
-            PySemanticInitialPrefillContentWitness {
-                inner,
-                _inputs: tensors.clone().unbind(),
-                _producers: Vec::new(),
-                stage: slf,
-            },
-        )
-    }
-
-    /// Capture original pre-call, transient or autograd-saved tensors after
-    /// model binding. Capture closes when record_outputs issues the receipt.
-    #[pyo3(signature = (*, tensors, consumer_stream))]
-    fn capture_tensor_content(
-        slf: Py<Self>,
-        py: Python<'_>,
-        tensors: &Bound<'_, PyAny>,
-        consumer_stream: &Bound<'_, PyAny>,
-    ) -> PyResult<Py<PySemanticInitialPrefillContentWitness>> {
-        let stage = slf.borrow(py);
-        let this = &*stage;
-        this.require_wrapper_hook()?;
-        this.require_active(py)?;
-        let _operation = InitialPrefillOperation::begin(&this.session.borrow(py))?;
-        let mut budget = 16 * 1024 * 1024;
-        let stream = parse_witness_consumer_stream(consumer_stream, &mut budget)?;
-        let check = || this.require_active(py);
-        let device = this.session.borrow(py).device_ordinal;
-        let parsed = parse_tensor_inputs_guarded(tensors, &mut budget, device, stream, &check)?;
-        this.require_active(py)?;
-        let inner = this
-            .session
-            .borrow(py)
-            .owner()?
-            .capture_initial_prefill_tensor_content(
-                &this.lease,
-                parsed.handoff.into_native(),
-                stream,
-            )
-            .map_err(xlog_err)?;
-        let producers = parsed.producers;
-        drop(stage);
-        Py::new(
-            py,
-            PySemanticInitialPrefillContentWitness {
-                inner,
-                _inputs: tensors.clone().unbind(),
-                _producers: producers,
-                stage: slf,
-            },
-        )
+            .bind_initial_prefill_model_content(&self.lease, inputs, stream)
+            .map_err(xlog_err)
     }
 
     /// Authenticate the actual contiguous I64 token tensor at the model's
@@ -14107,7 +13978,7 @@ impl PySemanticInitialPrefillStage {
             .map_err(xlog_err)
     }
 
-    /// Seal all original key/value, recurrent and accumulator outputs at the
+    /// Retain all original key/value, recurrent and accumulator outputs at the
     /// final post-detach wrapper hook, then close this one-use stage for bind.
     #[pyo3(signature = (*, tensors, consumer_stream))]
     fn record_outputs(
