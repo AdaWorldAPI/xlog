@@ -40521,7 +40521,7 @@ impl SemanticTransitionSession {
             if let Some(status) = failure {
                 command.submission_failure = Some(status);
             }
-            if let Err(error) = dispatched {
+            let uncertain_submission = if let Err(error) = dispatched {
                 let status = failure.or(command.submission_failure);
                 if !matches!(
                     status,
@@ -40535,7 +40535,10 @@ impl SemanticTransitionSession {
                         None => error,
                     });
                 }
-            }
+                status
+            } else {
+                None
+            };
             self.stream
                 .context()
                 .bind_to_thread()
@@ -40559,8 +40562,12 @@ impl SemanticTransitionSession {
                 });
             }
             if control.word != expected_word {
-                return Err(SemanticTransitionError::NativeCompletionPending {
-                    operation: "original training roster publication",
+                return Err(match uncertain_submission {
+                    Some(status) if control.word == base.word => native_runtime_error(
+                        "original training roster publication",
+                        cudarc::driver::DriverError(status),
+                    ),
+                    _ => SemanticTransitionError::ObservationMismatch,
                 });
             }
             if pending.work.header.is_none() {

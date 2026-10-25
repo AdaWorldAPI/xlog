@@ -550,8 +550,8 @@ struct TrainingOriginalMaterializationInput {
     uint64_t lease,source,source_bytes,destinations[7],lengths[7],original_count,original_prefix_identity[4];
 };
 static_assert(sizeof(TrainingOriginalMaterializationInput)==176,"original training materialization ABI");
-static_assert(sizeof(SemanticTrainingReplayAppendHeader)==128 && sizeof(SemanticTrainingReplayAppendEntry)==480 &&
-    sizeof(PublicationReplayDeliveryRow)==1128 && sizeof(PublicationReplayDeliveryInput)==232,
+static_assert(sizeof(SemanticTrainingReplayAppendHeader)==128 && sizeof(SemanticTrainingReplayAppendEntry)==384 &&
+    sizeof(PublicationReplayDeliveryRow)==936 && sizeof(PublicationReplayDeliveryInput)==232,
     "replay append queue ABI");
 static_assert(offsetof(PublicationReplayDeliveryInput,receiver_outcome)==88 &&
     offsetof(PublicationReplayDeliveryInput,rows)==144 &&
@@ -1202,7 +1202,7 @@ static_assert(sizeof(SemanticTrainingViewOriginRecord)==256,"training view origi
 static_assert(sizeof(SemanticTrainingViewSelection)==472,"training view selection ABI");
 static_assert(sizeof(SemanticTrainingObjectiveRecord)==296,"training objective ABI");
 static_assert(sizeof(SemanticTrainingObjectiveGroupRecord)==32,"training objective group ABI");
-static_assert(sizeof(SemanticTrainingRosterRow)==512,"training roster row ABI");
+static_assert(sizeof(SemanticTrainingRosterRow)==416,"training roster row ABI");
 static_assert(sizeof(SemanticTrainingCanaryRecord)==216,"training canary ABI");
 static_assert(sizeof(SemanticTrainingCanaryResultRecord)==96,"training canary result ABI");
 static_assert(sizeof(SemanticTrainingCanaryRefusalRecord)==152,"training canary refusal ABI");
@@ -3033,16 +3033,17 @@ __device__ uint64_t publication_apply_continuation(const PublicationControl& con
             }
             uint8_t* output=publication_range_bytes(control,*destination);if(!output)return 1;
             for(uint64_t cell=0;cell<byte_count/source_layout->element_bytes;++cell) {
-                uint64_t rest=cell,offset=0;
+                uint64_t rest=cell,offset=0,source_offset=0;
                 for(int axis=int(source_layout->rank)-1;axis>=0;--axis) {
                     uint64_t coordinate=rest%view.dimensions[axis];rest/=view.dimensions[axis];
-                    if((source.role==4 || source.role==5) && pending.transition_kind!=4 &&
-                       uint64_t(axis)==source_layout->logical_axis)coordinate+=base.header.prefix_extent;
                     if(source.role>=51 && source.role<=54 && uint64_t(axis)==source_layout->logical_axis)
                         coordinate=pending_table.rows[coordinate].physical_row;
+                    source_offset+=coordinate*source_layout->strides_bytes[axis];
+                    if((source.role==4 || source.role==5) && pending.transition_kind!=4 &&
+                       uint64_t(axis)==source_layout->logical_axis)coordinate+=base.header.prefix_extent;
                     offset+=coordinate*destination_layout->strides_bytes[axis];
                 }
-                publication_copy_bytes(output+offset,bytes+view.offset(cell),source_layout->element_bytes,work);
+                publication_copy_bytes(output+offset,bytes+source_offset,source_layout->element_bytes,work);
             }
             destination->logical_begin=(source.role==4 || source.role==5) ? 0 : source.logical_begin;
             destination->logical_end=source.logical_end;

@@ -338,7 +338,7 @@ impl OriginalTrainingMaterializationWork {
             &report,
             session.domain.new_strict_recorder(),
         );
-        if let Err(error) = dispatched {
+        let unresolved_submission = if let Err(error) = dispatched {
             if !matches!(
                 error,
                 SemanticTransitionError::NativeExecutionFailure {
@@ -354,11 +354,20 @@ impl OriginalTrainingMaterializationWork {
                 .bind_to_thread()
                 .and_then(|_| session.stream.context().synchronize())
                 .map_err(|error| native_runtime_error("original arena report completion", error))?;
-        }
+            Some(error)
+        } else {
+            None
+        };
         let words = session.resolve_publication_read_with_poison(
             self.report_read.as_mut().expect("original report read"),
             &mut self.poisoned,
         )?;
+        // An untouched report does not resolve the original uncertain submission.
+        if words.iter().all(|word| *word == u64::MAX) {
+            if let Some(error) = unresolved_submission {
+                return Err(error);
+            }
+        }
         let result = SemanticColdModelWorkResult::from_native_report(&words)?;
         let result = self
             .accounting

@@ -631,7 +631,7 @@ stream_kernel_parameter!(pub(super) ModelForwardStreamInputs, ModelForwardStream
 stream_kernel_parameter!(ModelCanaryStreamInputs, ModelCanaryStreamParameter);
 
 const _: () = assert!(size_of::<ModelForwardStreamState>() == 296);
-const _: () = assert!(size_of::<ModelForwardStreamInputs>() == 176);
+const _: () = assert!(size_of::<ModelForwardStreamInputs>() == 160);
 const _: () = assert!(size_of::<ModelStreamLeaf>() == 128);
 const _: () = assert!(size_of::<ModelCanaryStreamRow>() == 192);
 const _: () = assert!(size_of::<ModelCanaryStreamState>() == 1160);
