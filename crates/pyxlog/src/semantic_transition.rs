@@ -149,7 +149,13 @@ fn finish_training_arena_handoff(
         let _operation = TensorProducerOperation::begin(&session)?;
         let source = parent.borrow();
         let issued = source.task_use.borrow(py);
-        controlled.require_issued(&issued)?;
+        controlled.require_read_issued(&issued)?;
+        #[cfg(feature = "semantic-policy")]
+        if issued.frozen_model_context.load(Ordering::Acquire) {
+            return Err(invalid(
+                "frozen future context grants no live task operation",
+            ));
+        }
         source.require_task(py, &issued)?;
         if !matches!(issued.state()?.phase, TaskUsePhase::ArenaPreparing(_)) {
             return Err(invalid(
