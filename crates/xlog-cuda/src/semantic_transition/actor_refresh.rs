@@ -193,7 +193,7 @@ impl OriginalEditDemonstration {
             .take(magic.len())
             .map_err(SemanticTransitionError::Semantic)?
             != magic
-            || reader.u64().map_err(SemanticTransitionError::Semantic)? != 5
+            || reader.u64().map_err(SemanticTransitionError::Semantic)? != 6
         {
             return Err(SemanticTransitionError::ObservationMismatch);
         }
@@ -234,7 +234,7 @@ fn completed_child_payload<'a>(
         .take(magic.len())
         .map_err(SemanticTransitionError::Semantic)?
         != magic
-        || reader.u64().map_err(SemanticTransitionError::Semantic)? != 1
+        || reader.u64().map_err(SemanticTransitionError::Semantic)? != 2
         || reader.take(32).map_err(SemanticTransitionError::Semantic)? != owner.as_bytes()
         || reader.u64().map_err(SemanticTransitionError::Semantic)? != kind.len() as u64
         || reader

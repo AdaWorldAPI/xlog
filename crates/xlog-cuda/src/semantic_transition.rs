@@ -8511,7 +8511,7 @@ const COMPLETED_COMPONENT_RECEIPT_BYTES: usize = (2 + 9 + 2 + 4 + 4 + 4 + 4 * 3 
 #[cfg(feature = "semantic-policy")]
 fn completed_action_child_identity(owner: Identity256, kind: &[u8], ordinal: u64) -> Identity256 {
     let mut hash = Sha256::new();
-    hash.update(b"xlog.completed-action-child.v1\0");
+    hash.update(b"xlog.completed-action-child.v2\0");
     hash.update(owner.as_bytes());
     hash.update((kind.len() as u64).to_le_bytes());
     hash.update(kind);
@@ -8535,7 +8535,7 @@ fn completed_action_child_material(
             + payload.len(),
     );
     bytes.extend_from_slice(b"XLOG-COMPLETED-ACTION-CHILD\0");
-    material_u64(&mut bytes, 1);
+    material_u64(&mut bytes, 2);
     bytes.extend_from_slice(owner.as_bytes());
     material_u64(&mut bytes, kind.len() as u64);
     bytes.extend_from_slice(kind);
@@ -9610,7 +9610,7 @@ impl SemanticReplayMaterial {
             .take(magic.len())
             .map_err(SemanticTransitionError::Semantic)?
             != magic
-            || reader.u64().map_err(SemanticTransitionError::Semantic)? != 1
+            || reader.u64().map_err(SemanticTransitionError::Semantic)? != 2
         {
             return Err(publication_input_error(
                 "completed action child has another envelope",
@@ -9633,7 +9633,7 @@ impl SemanticReplayMaterial {
                 "completed action child has another kind or ordinal",
             ));
         }
-        let mut binding = b"xlog.completed-action-child.v1\0".to_vec();
+        let mut binding = b"xlog.completed-action-child.v2\0".to_vec();
         binding.extend_from_slice(owner);
         material_u64(&mut binding, kind.len() as u64);
         binding.extend_from_slice(kind);
@@ -10012,7 +10012,7 @@ impl SemanticReplayMaterial {
             .and_then(|n| n.checked_add(section_bytes))
             .and_then(|n| {
                 n.checked_add(
-                    2 * (b"xlog.completed-action-child.v1\0".len()
+                    2 * (b"xlog.completed-action-child.v2\0".len()
                         + 32
                         + 8
                         + b"initial-prefill".len()
@@ -26761,7 +26761,7 @@ impl SemanticTransitionSession {
         }
 
         let mut owner_binding = Vec::new();
-        owner_binding.extend_from_slice(b"xlog.completed-step-witness-owner.v1\0");
+        owner_binding.extend_from_slice(b"xlog.completed-step-witness-owner.v2\0");
         encode_publication_identity(&mut owner_binding, binding.0);
         material_u64(&mut owner_binding, u64::from(binding.1.is_some()));
         if let Some(successor) = binding.1 {
@@ -26775,7 +26775,7 @@ impl SemanticTransitionSession {
 
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"XLOG-COMPLETED-STEP-WITNESSES\0");
-        material_u64(&mut bytes, 1);
+        material_u64(&mut bytes, 2);
         material_u64(&mut bytes, transition);
         encode_publication_identity(&mut bytes, binding.0);
         material_u64(&mut bytes, u64::from(binding.1.is_some()));
@@ -26870,7 +26870,7 @@ impl SemanticTransitionSession {
         }
 
         let mut owner_binding = Vec::new();
-        owner_binding.extend_from_slice(b"xlog.completed-action-witness-owner.v1\0");
+        owner_binding.extend_from_slice(b"xlog.completed-action-witness-owner.v2\0");
         encode_publication_identity(&mut owner_binding, binding.0);
         encode_publication_identity(
             &mut owner_binding,
@@ -26886,7 +26886,7 @@ impl SemanticTransitionSession {
 
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"XLOG-COMPLETED-ACTION-WITNESSES\0");
-        material_u64(&mut bytes, 1);
+        material_u64(&mut bytes, 2);
         encode_publication_identity(&mut bytes, binding.0);
         encode_publication_identity(
             &mut bytes,
@@ -28043,7 +28043,7 @@ impl SemanticTransitionSession {
             });
         let mut ground_bytes = Vec::new();
         ground_bytes.extend_from_slice(b"XLOG-COMPLETED-TASK-GROUND\0");
-        material_u64(&mut ground_bytes, 5);
+        material_u64(&mut ground_bytes, 6);
         let structural_cost = objective_law.structural_cost;
         ground_bytes.extend_from_slice(structural_cost.unit.as_bytes());
         material_u64(&mut ground_bytes, structural_cost.cap);
@@ -28469,7 +28469,7 @@ impl SemanticTransitionSession {
             .1
             .ok_or(SemanticTransitionError::ObservationMismatch)?;
         let mut owner_binding = Vec::new();
-        owner_binding.extend_from_slice(b"xlog.completed-numerical-realization-owner.v2\0");
+        owner_binding.extend_from_slice(b"xlog.completed-numerical-realization-owner.v3\0");
         encode_publication_identity(&mut owner_binding, binding.0);
         encode_publication_identity(&mut owner_binding, successor);
         owner_binding.extend_from_slice(work.identity.as_bytes());
@@ -28484,7 +28484,7 @@ impl SemanticTransitionSession {
 
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"XLOG-COMPLETED-NUMERICAL-REALIZATION\0");
-        material_u64(&mut bytes, 2);
+        material_u64(&mut bytes, 3);
         material_u64(&mut bytes, graph.len() as u64);
         bytes.extend_from_slice(&graph);
         material_u64(&mut bytes, work.bytes.len() as u64);
@@ -28536,7 +28536,7 @@ impl SemanticTransitionSession {
             .1
             .ok_or(SemanticTransitionError::ObservationMismatch)?;
         let mut owner_binding = Vec::new();
-        owner_binding.extend_from_slice(b"xlog.completed-logits-owner.v1\0");
+        owner_binding.extend_from_slice(b"xlog.completed-logits-owner.v2\0");
         encode_publication_identity(&mut owner_binding, binding.0);
         encode_publication_identity(&mut owner_binding, successor);
         material_u64(&mut owner_binding, step.token);
@@ -28615,7 +28615,7 @@ impl SemanticTransitionSession {
         }
 
         let mut owner_binding = Vec::new();
-        owner_binding.extend_from_slice(b"xlog.completed-random-state-owner.v1\0");
+        owner_binding.extend_from_slice(b"xlog.completed-random-state-owner.v2\0");
         encode_publication_identity(&mut owner_binding, binding.0);
         material_u64(&mut owner_binding, step.token);
         let mut owner_hash = Sha256::new();

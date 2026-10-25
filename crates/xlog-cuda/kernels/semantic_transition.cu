@@ -1275,7 +1275,7 @@ static_assert(sizeof(PublicationRange)==64,"publication range ABI");
 static_assert(sizeof(PublicationHeader)==424,"publication header ABI");
 static_assert(sizeof(PublicationControl)==144,"publication control ABI");
 static_assert(sizeof(PublicationBank)==47128,"publication bank ABI");
-static_assert(sizeof(ModelContractLayout)==48,"model contract byte layout ABI");
+static_assert(sizeof(ModelContractLayout)==40,"model contract byte layout ABI");
 static_assert(sizeof(PublicationContract)==416,"publication contract ABI");
 static_assert(sizeof(PendingContinuation)==360 && alignof(PendingContinuation)==8 &&
     offsetof(PendingContinuation,capacity_refusal)==352,"pending continuation ABI");
