@@ -2095,7 +2095,7 @@ impl SemanticTransitionSession {
                         .as_ref()
                         .ok_or(SemanticTransitionError::ObservationMismatch)?;
                     self.steps[&stream.reader_token].content[witness.index]
-                        .record_uses(&mut recorder);
+                        .record_uses(&mut recorder)?;
                 }
             }
             ModelForwardStreamOrigin::Evaluation(handle) => {
