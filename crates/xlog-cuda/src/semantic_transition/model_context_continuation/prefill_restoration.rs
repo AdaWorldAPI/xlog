@@ -319,7 +319,7 @@ impl SemanticTransitionSession {
         let extent = CheckpointInitialPrefill::MAGIC.len()
             + 1
             + 5 * 8
-            + 5 * 32
+            + 4 * 32
             + original.content.bytes.len()
             + (original.geometry[0].len() + original.geometry[1].len()) * 17 * 8;
         bytes
