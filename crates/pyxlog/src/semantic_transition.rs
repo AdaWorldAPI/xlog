@@ -141,88 +141,156 @@ fn finish_training_arena_handoff(
     pending: PyErr,
 ) -> PyResult<Py<PySemanticPublishedParent>> {
     let mut known_refusal = false;
+    let mut terminal_failure = false;
     let result = (|| -> PyResult<Py<PySemanticPublishedParent>> {
         let controlled = controller.borrow();
-        controlled.session.borrow(py).require_creator()?;
+        let session = controlled.session.borrow(py);
+        session.require_creator()?;
+        let _operation = TensorProducerOperation::begin(&session)?;
         let source = parent.borrow();
         let issued = source.task_use.borrow(py);
         controlled.require_issued(&issued)?;
         source.require_task(py, &issued)?;
+        if !matches!(issued.state()?.phase, TaskUsePhase::ArenaPreparing(_)) {
+            return Err(invalid(
+                "original training admission lost its retained phase",
+            ));
+        }
+        let (successor, observation, streams) = {
+            let roster = issued
+                .checkpoint
+                .original_training_roster
+                .lock()
+                .map_err(|_| invalid("original training roster owner mutex is poisoned"))?;
+            if roster
+                .source
+                .as_ref()
+                .is_none_or(|original| !original.bind(py).is(parent))
+            {
+                return Err(invalid(
+                    "training admission requires its retained original parent",
+                ));
+            }
+            (
+                roster
+                    .handoff
+                    .as_ref()
+                    .ok_or_else(|| invalid("task has no original pending training admission"))?
+                    .clone_ref(py),
+                Arc::clone(roster.observation.as_ref().ok_or_else(|| {
+                    invalid("training admission lost its original resource observation")
+                })?),
+                roster.consumer_streams.clone(),
+            )
+        };
+        let (acquired, reported, refused) = {
+            let state = observation.state()?;
+            if let Some(error) = &state.terminal_error {
+                terminal_failure = true;
+                return Err(error.clone_ref(py));
+            }
+            (
+                state.acquired,
+                state.report.is_some(),
+                state
+                    .native_refusal
+                    .as_ref()
+                    .map(|error| error.clone_ref(py)),
+            )
+        };
+        if !reported && refused.is_none() {
+            let mut owner = session.owner()?;
+            let handoff = successor.borrow(py);
+            if !acquired {
+                if let Err(error) = owner
+                    .acquire_training_arena_completion(&*source.lease()?, &mut *handoff.lease()?)
+                {
+                    let error = xlog_err(error);
+                    if owner.training_arena_pending() {
+                        return Err(error);
+                    }
+                    observation.state()?.native_refusal = Some(error);
+                } else {
+                    observation.state()?.acquired = true;
+                }
+            }
+            if observation.state()?.native_refusal.is_none() {
+                let report = owner
+                    .acknowledge_training_arena_completion(
+                        &mut *source.lease()?,
+                        &*handoff.lease()?,
+                        &streams,
+                    )
+                    .map_err(xlog_err)?;
+                observation.state()?.report = Some(report);
+                drop(handoff);
+                drop(owner);
+                // The native report includes the original source release.
+                // Foreign producer finalizers run outside every state/native lock.
+                source.release_continuation_producers();
+            }
+        }
+        let finish = {
+            let mut state = observation.state()?;
+            if state.finish_attempted {
+                false
+            } else {
+                state.finish_attempted = true;
+                true
+            }
+        };
+        if finish {
+            observation.observer.finish(py)?;
+        }
+        let peak = observation.observer.backing_peak(py)?;
+        observation.state()?.backing_peak = Some(peak);
+        if let Err(error) = observation.observer.release(py) {
+            observation.state()?.terminal_error = Some(error.clone_ref(py));
+            terminal_failure = true;
+            return Err(error);
+        }
+        let refusal = observation
+            .state()?
+            .native_refusal
+            .as_ref()
+            .map(|error| error.clone_ref(py));
         let mut roster = issued
             .checkpoint
             .original_training_roster
             .lock()
             .map_err(|_| invalid("original training roster owner mutex is poisoned"))?;
         if roster
-            .source
+            .observation
             .as_ref()
-            .is_none_or(|original| !original.bind(py).is(parent))
+            .is_none_or(|original| !Arc::ptr_eq(original, &observation))
         {
             return Err(invalid(
-                "training admission requires its retained original parent",
+                "training admission replaced its original observation",
             ));
         }
-        let successor = roster
-            .handoff
-            .as_ref()
-            .ok_or_else(|| invalid("task has no original pending training admission"))?
-            .clone_ref(py);
         let mut state = issued.state()?;
-        let original_phase = match &state.phase {
-            TaskUsePhase::ArenaPreparing(original) => *original.clone(),
-            _ => {
-                return Err(invalid(
-                    "original training admission lost its retained phase",
-                ))
-            }
-        };
-        let completion = (|| -> PyResult<()> {
-            let session = controlled.session.borrow(py);
-            let mut owner = session.owner()?;
-            let handoff = successor.borrow(py);
-            if let Err(error) =
-                owner.acquire_training_arena_completion(&*source.lease()?, &mut *handoff.lease()?)
-            {
-                known_refusal = !owner.training_arena_pending();
-                return Err(xlog_err(error));
-            }
-            let result = owner
-                .acknowledge_training_arena_completion(
-                    &mut *source.lease()?,
-                    &*handoff.lease()?,
-                    &roster.consumer_streams,
-                )
-                .map_err(xlog_err);
-            result
-        })();
-        if let Err(error) = completion {
-            if known_refusal {
-                roster.projection = roster.previous.take().ok_or_else(|| {
-                    invalid("original training admission lost its unmaterialized roster")
-                })?;
-                roster.handoff = None;
-                roster.source = None;
-                roster.pending = None;
-                roster.consumer_streams.clear();
-                state.phase = original_phase;
-            }
-            return Err(error);
+        let mut measured = observation.state()?;
+        state.finish_arena_preparation()?;
+        if refusal.is_some() {
+            roster.projection = roster.previous.take().ok_or_else(|| {
+                invalid("original training admission lost its unmaterialized roster")
+            })?;
+        } else {
+            roster.previous = None;
+            measured.complete = true;
         }
-        // No fallible construction or lock acquisition follows source release.
-        roster.previous = None;
         roster.handoff = None;
         roster.source = None;
         roster.pending = None;
         roster.consumer_streams.clear();
-        state.phase = original_phase;
-        drop(state);
-        drop(roster);
-        drop(issued);
-        source.release_continuation_producers();
+        if let Some(error) = refusal {
+            known_refusal = true;
+            return Err(error);
+        }
         Ok(successor)
     })();
     result.map_err(|error| {
-        if known_refusal {
+        if known_refusal || terminal_failure {
             error
         } else {
             pending.set_cause(py, Some(error));
@@ -12362,6 +12430,80 @@ impl std::ops::Deref for EncodedTaskCheckpoint {
     }
 }
 
+struct TrainingArenaObservation {
+    observer: learning_phase::ResourceObserver,
+    issuance: TaskIssuance,
+    state: Mutex<TrainingArenaObservationState>,
+}
+
+#[derive(Default)]
+struct TrainingArenaObservationState {
+    acquired: bool,
+    report: Option<xlog_cuda::SemanticColdModelWorkResult>,
+    native_refusal: Option<PyErr>,
+    finish_attempted: bool,
+    backing_peak: Option<u64>,
+    complete: bool,
+    terminal_error: Option<PyErr>,
+}
+
+impl TrainingArenaObservation {
+    fn state(&self) -> PyResult<MutexGuard<'_, TrainingArenaObservationState>> {
+        self.state
+            .lock()
+            .map_err(|_| invalid("original training arena observation is poisoned"))
+    }
+}
+
+#[pymethods]
+impl PySemanticTransitionTaskUse {
+    #[getter]
+    fn training_arena_result(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.session.borrow(py).require_creator()?;
+        let observation = self
+            .checkpoint
+            .original_training_roster
+            .lock()
+            .map_err(|_| invalid("original training roster owner mutex is poisoned"))?
+            .observation
+            .as_ref()
+            .map(Arc::clone);
+        let Some(observation) = observation else {
+            return Ok(py.None());
+        };
+        if !observation.issuance.same_as(&self.issuance) {
+            return Err(invalid(
+                "training arena result belongs to another original task issuance",
+            ));
+        }
+        let state = observation.state()?;
+        if !state.complete {
+            return Ok(py.None());
+        }
+        let report = state
+            .report
+            .ok_or_else(|| invalid("completed training arena lost its native work report"))?;
+        let peak = state
+            .backing_peak
+            .ok_or_else(|| invalid("completed training arena lost its observed backing peak"))?;
+        drop(state);
+        Ok((
+            (
+                report.model_work,
+                report.operation_count,
+                report.work_bound,
+                report.model_calls,
+                report.native_work,
+                PyTuple::new(py, report.native_events)?,
+            ),
+            peak,
+        )
+            .into_pyobject(py)?
+            .into_any()
+            .unbind())
+    }
+}
+
 struct OriginalTrainingRoster {
     projection: ColdValue,
     previous: Option<ColdValue>,
@@ -12369,6 +12511,7 @@ struct OriginalTrainingRoster {
     source: Option<Py<PySemanticPublishedParent>>,
     pending: Option<PyErr>,
     consumer_streams: Vec<u64>,
+    observation: Option<Arc<TrainingArenaObservation>>,
 }
 
 impl OriginalTrainingRoster {
@@ -12380,6 +12523,7 @@ impl OriginalTrainingRoster {
             source: None,
             pending: None,
             consumer_streams: Vec::new(),
+            observation: None,
         }
     }
 }
@@ -23720,7 +23864,7 @@ impl PySemanticTransitionController {
 
     /// Materialize the genuine original roster once in the first import's
     /// finite reservation, preserving Session, task authority and model owners.
-    #[pyo3(signature = (task_use, *, parent, consumer_streams, snapshot, replay_rows, material_source, training_objective, training_domain, refresh_snapshot, resolve_checkpoint=None, max_checkpoint_bytes=None, max_total_checkpoint_bytes=None))]
+    #[pyo3(signature = (task_use, *, parent, consumer_streams, resource_observer, snapshot, replay_rows, material_source, training_objective, training_domain, refresh_snapshot, resolve_checkpoint=None, max_checkpoint_bytes=None, max_total_checkpoint_bytes=None))]
     #[expect(
         clippy::too_many_arguments,
         reason = "original arena admission binds genuine rows and current authority"
@@ -23731,6 +23875,7 @@ impl PySemanticTransitionController {
         task_use: &Bound<'_, PySemanticTransitionTaskUse>,
         parent: &Bound<'_, PySemanticPublishedParent>,
         consumer_streams: &Bound<'_, PyAny>,
+        resource_observer: &Bound<'_, PyAny>,
         snapshot: &Bound<'_, PyAny>,
         replay_rows: &Bound<'_, PyAny>,
         material_source: &Bound<'_, PyAny>,
@@ -23849,6 +23994,22 @@ impl PySemanticTransitionController {
                 },
             )?
         };
+        let observation = {
+            let session = controlled.session.borrow(py);
+            let device_identity = session
+                .owner()?
+                .resource_device_identity()
+                .map_err(xlog_err)?;
+            Arc::new(TrainingArenaObservation {
+                observer: learning_phase::ResourceObserver::capture(
+                    resource_observer.cast::<pyo3::types::PyCapsule>()?,
+                    device_identity,
+                )?,
+                issuance: issued.issuance.clone(),
+                state: Mutex::new(TrainingArenaObservationState::default()),
+            })
+        };
+        let operation = TensorProducerOperation::begin(&controlled.session.borrow(py))?;
         {
             let mut roster = issued
                 .checkpoint
@@ -23869,6 +24030,11 @@ impl PySemanticTransitionController {
             roster.source = Some(parent.clone().unbind());
             roster.pending = Some(pending.clone_ref(py));
             roster.consumer_streams = streams.clone();
+            roster.observation = Some(Arc::clone(&observation));
+        }
+        if let Err(error) = observation.observer.begin(py, 0) {
+            observation.state()?.terminal_error = Some(error.clone_ref(py));
+            return Err(error);
         }
         let mut native_pending = false;
         let result = (|| -> PyResult<_> {
@@ -23888,22 +24054,9 @@ impl PySemanticTransitionController {
                 pending.set_cause(py, Some(original));
                 return Err(pending);
             }
-            let mut roster = issued
-                .checkpoint
-                .original_training_roster
-                .lock()
-                .map_err(|_| invalid("original training roster owner mutex is poisoned"))?;
-            roster.projection = roster
-                .previous
-                .take()
-                .expect("retained original unmaterialized roster");
-            roster.handoff = None;
-            roster.source = None;
-            roster.pending = None;
-            roster.consumer_streams.clear();
-            issued.state()?.finish_arena_preparation()?;
-            return Err(original);
+            observation.state()?.native_refusal = Some(original);
         }
+        drop(operation);
         drop(acquired);
         drop(issued);
         drop(controlled);
