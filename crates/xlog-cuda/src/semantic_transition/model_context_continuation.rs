@@ -692,25 +692,6 @@ impl SemanticTransitionSession {
             {
                 return Ok(true);
             }
-            for content in stage
-                .model_content
-                .iter()
-                .chain(&stage.output_content)
-                .chain(&stage.captured_content)
-            {
-                let batch = content
-                    .original_cold
-                    .lock()
-                    .map_err(|_| SemanticTransitionError::Poisoned)?;
-                if batch.as_ref().is_some_and(|batch| {
-                    batch
-                        .commands
-                        .iter()
-                        .any(OriginalNativeCommand::completion_pending)
-                }) {
-                    return Ok(true);
-                }
-            }
         }
         if self
             .publication_preparation
@@ -1600,8 +1581,6 @@ impl SemanticTransitionSession {
                     tokens: stage.layout.prefill_tokens,
                     mapping: stage.layout.prefill_mapping,
                 },
-                captured: stage.captured_content,
-                context_content_cursor: 0,
             });
         }
         original.poisoned = false;
@@ -2082,7 +2061,6 @@ impl SemanticTransitionSession {
         source_work: &SemanticColdModelWork,
         layout: SemanticInitialSourceLayout,
         model_generation: u64,
-        geometry: &[SemanticModelContextPrefillContentGeometry],
     ) -> Result<SemanticInitialPrefillLease, SemanticTransitionError> {
         continuation.inner.require_imported_target(self)?;
         if model_generation != continuation.inner.source_header.model_generation {
@@ -2094,7 +2072,6 @@ impl SemanticTransitionSession {
             source_parent,
             source_admission,
             source_work,
-            geometry,
             layout.prefill_tokens.len(),
         )?;
         self.attach_model_context_prefill_work(

@@ -1114,7 +1114,6 @@ impl SemanticTransitionSession {
         if restoration.completed {
             let proof = restoration.known_prefill_proof()?;
             drop(restoration);
-            self.resolve_restored_model_context_prefill_consumer_commands(continuation, &proof)?;
             return Ok(proof);
         }
         let allowance = Arc::clone(
@@ -1295,7 +1294,7 @@ impl SemanticTransitionSession {
             return Err(SemanticTransitionError::ObservationMismatch);
         }
         let proof = restoration.known_prefill_proof()?;
-        self.require_restored_model_context_prefill_consumers_complete(continuation, &proof)?;
+        self.require_restored_model_context_prefill(continuation, &proof)?;
         if !restoration.report_completed {
             source.finish_model_context_material_work(
                 self,
@@ -1452,10 +1451,6 @@ impl SemanticTransitionSession {
             .ok_or(SemanticTransitionError::GenerationExhausted)?;
         let mut total = dma;
         native_work_bound::add_native_work_ceiling(&mut total, graph.kernel_ceiling)?;
-        let (prefill_dma, prefill_total) =
-            self.dormant_prefill_checkpoint_native_ceilings(continuation)?;
-        native_work_bound::add_native_work_ceiling(&mut dma, prefill_dma)?;
-        native_work_bound::add_native_work_ceiling(&mut total, prefill_total)?;
         Ok((dma, total))
     }
 

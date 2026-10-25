@@ -114,10 +114,6 @@ pub use model_evaluation::{
     SemanticModelEvaluation, SemanticModelEvaluationResult,
 };
 #[cfg(feature = "semantic-policy")]
-pub use native_work_bound::{
-    ModelContextPrefillContentGeometry as SemanticModelContextPrefillContentGeometry,
-    ModelContextPrefillTensorGeometry as SemanticModelContextPrefillTensorGeometry,
-};
 #[cfg(feature = "semantic-policy")]
 pub use prepared_replay::SemanticCompletedReplayMaterials;
 use prepared_replay::{PreparedReplayCustody, PreparedReplayDescriptor};
@@ -3255,6 +3251,10 @@ pub struct SemanticInitialSourceLayout {
 
 /// One imported task's pre-parent model input. Its source and owner are fixed
 /// before the actual model call; no second stage can be issued on this Session.
+struct InitialPrefillTensorOwners {
+    tensors: Vec<PreparedSemanticTensor>,
+}
+
 struct InitialPrefillStage {
     scope: Arc<()>,
     task_identity: Identity256,
@@ -3266,29 +3266,23 @@ struct InitialPrefillStage {
     token_write: Option<state_restoration::OriginalDeviceWrite>,
     input: Option<PreparedSemanticTensor>,
     input_guard: Option<OriginalNativeCommand>,
-    model_content: Option<TensorContentBuffers>,
-    output_content: Option<TensorContentBuffers>,
-    captured_content: Vec<TensorContentBuffers>,
+    model_content: Option<InitialPrefillTensorOwners>,
+    output_content: Option<InitialPrefillTensorOwners>,
     consumer_stream: Option<u64>,
-    #[cfg(feature = "semantic-policy")]
-    context_content_cursor: usize,
 }
 
-/// Content needed by the original forward after the one-use prefill stage has
+/// Storage needed by the original forward after the one-use prefill stage has
 /// joined its parent. The Session owns it until its final stream-safe release.
 struct RetainedInitialPrefillContent {
     scope: Arc<()>,
     task_identity: Identity256,
     task_epoch: u64,
     model_generation: u64,
-    model: TensorContentBuffers,
+    model: InitialPrefillTensorOwners,
     #[cfg(feature = "semantic-policy")]
-    output: TensorContentBuffers,
+    output: InitialPrefillTensorOwners,
     #[cfg(feature = "semantic-policy")]
     record: InitialPrefillRecord,
-    captured: Vec<TensorContentBuffers>,
-    #[cfg(feature = "semantic-policy")]
-    context_content_cursor: usize,
 }
 
 #[cfg(feature = "semantic-policy")]
@@ -3304,12 +3298,12 @@ struct InitialPrefillRecord {
     mapping: Vec<SemanticSourceMapping>,
 }
 
-type PrefillSeal = (u64, u64, [u64; 4]);
+type PrefillTensorCoordinate = (u64, u64);
 
 /// The one content grammar for published and dormant completed prefills.
 struct DecodedInitialPrefillContent {
     token_count: usize,
-    seal_counts: [usize; 2],
+    tensor_counts: [usize; 2],
     semantic_root: Identity256,
     model_generation: u64,
     task_identity: Identity256,
@@ -3317,8 +3311,8 @@ struct DecodedInitialPrefillContent {
     task_content: SemanticTaskContentIdentity,
     tokens: Vec<u64>,
     mapping: Vec<SemanticSourceMapping>,
-    model: Vec<PrefillSeal>,
-    output: Vec<PrefillSeal>,
+    model: Vec<PrefillTensorCoordinate>,
+    output: Vec<PrefillTensorCoordinate>,
 }
 
 impl DecodedInitialPrefillContent {
@@ -3338,7 +3332,7 @@ impl DecodedInitialPrefillContent {
             || self.task_content != task_content
             || self.token_count as u64 != prefix_extent
             || self.token_count == 0
-            || self.seal_counts.contains(&0)
+            || self.tensor_counts.contains(&0)
         {
             return Err(publication_input_error(
                 "checkpoint initial prefill differs from its native task or parent",
@@ -3445,19 +3439,19 @@ impl CheckpointInitialPrefill {
             }
         }
         let mut groups = [Vec::new(), Vec::new()];
-        let mut seal_counts = [0; 2];
+        let mut tensor_counts = [0; 2];
         for (group, model) in [true, false].into_iter().enumerate() {
             let count = prefill_extent(&mut reader)?;
-            if count == 0 || count > bytes.len() / (6 * size_of::<u64>()) {
+            if count == 0 || count > bytes.len() / (2 * size_of::<u64>()) {
                 return Err(publication_input_error(
-                    "checkpoint initial prefill has an empty seal group",
+                    "checkpoint initial prefill has an empty tensor group",
                 ));
             }
-            seal_counts[group] = count;
-            let seals = &mut groups[group];
+            tensor_counts[group] = count;
+            let coordinates = &mut groups[group];
             if retain {
-                seals.try_reserve_exact(count).map_err(|_| {
-                    publication_input_error("initial prefill seal roster allocation failed")
+                coordinates.try_reserve_exact(count).map_err(|_| {
+                    publication_input_error("initial prefill tensor roster allocation failed")
                 })?;
             }
             let mut seen = BTreeSet::new();
@@ -3471,15 +3465,11 @@ impl CheckpointInitialPrefill {
                 }) || (retain && !seen.insert((role, index)))
                 {
                     return Err(publication_input_error(
-                        "checkpoint initial prefill seal role is invalid",
+                        "checkpoint initial prefill tensor role is invalid",
                     ));
                 }
-                let mut digest = [0; 4];
-                for word in &mut digest {
-                    *word = reader.u64().map_err(SemanticTransitionError::Semantic)?;
-                }
                 if retain {
-                    seals.push((role, index, digest));
+                    coordinates.push((role, index));
                 }
             }
         }
@@ -3492,7 +3482,7 @@ impl CheckpointInitialPrefill {
             task_epoch,
             task_content,
             token_count,
-            seal_counts,
+            tensor_counts,
             tokens,
             mapping,
             model,
@@ -3504,10 +3494,10 @@ impl CheckpointInitialPrefill {
 #[cfg(feature = "semantic-policy")]
 fn encode_initial_prefill_record_prefix(
     record: &InitialPrefillRecord,
-    model_seals: usize,
-    output_seals: usize,
+    model_tensors: usize,
+    output_tensors: usize,
 ) -> Result<Vec<u8>, SemanticTransitionError> {
-    let extent = initial_prefill_content_extent(record, model_seals, output_seals)?;
+    let extent = initial_prefill_content_extent(record, model_tensors, output_tensors)?;
     let mut bytes = Vec::new();
     bytes
         .try_reserve_exact(extent)
@@ -3541,8 +3531,8 @@ fn encode_initial_prefill_record_prefix(
 fn initial_prefill_geometry_content_extent(
     tokens: &[u64],
     mapping: &[SemanticSourceMapping],
-    model_seals: usize,
-    output_seals: usize,
+    model_tensors: usize,
+    output_tensors: usize,
 ) -> Result<usize, SemanticTransitionError> {
     let extent = (5usize * 32 + 6 * 8)
         .checked_add(
@@ -3552,7 +3542,11 @@ fn initial_prefill_geometry_content_extent(
                 .ok_or(SemanticTransitionError::GenerationExhausted)?,
         )
         .and_then(|size| {
-            size.checked_add(model_seals.checked_add(output_seals)?.checked_mul(6 * 8)?)
+            size.checked_add(
+                model_tensors
+                    .checked_add(output_tensors)?
+                    .checked_mul(2 * 8)?,
+            )
         })
         .ok_or(SemanticTransitionError::GenerationExhausted)?;
     mapping.iter().try_fold(extent, |size, row| {
@@ -3569,22 +3563,8 @@ struct CheckpointInitialPrefill {
 }
 
 #[cfg(feature = "semantic-policy")]
-enum OriginalInitialPrefillPart {
-    Count(u64),
-    Digest {
-        role: u64,
-        index: u64,
-        offset: usize,
-        read: PublicationRead<u64>,
-    },
-}
-
-#[cfg(feature = "semantic-policy")]
 struct OriginalInitialPrefillContent {
     predecessor: SemanticPublishedIdentity,
-    scope: Arc<()>,
-    reads: Vec<OriginalInitialPrefillPart>,
-    cursor: usize,
     bytes: Vec<u8>,
     installed: bool,
 }
@@ -3604,14 +3584,14 @@ pub struct SemanticCheckpointInitialPrefillObservation {
 #[cfg(feature = "semantic-policy")]
 fn initial_prefill_content_extent(
     record: &InitialPrefillRecord,
-    model_seals: usize,
-    output_seals: usize,
+    model_tensors: usize,
+    output_tensors: usize,
 ) -> Result<usize, SemanticTransitionError> {
     initial_prefill_geometry_content_extent(
         &record.tokens,
         &record.mapping,
-        model_seals,
-        output_seals,
+        model_tensors,
+        output_tensors,
     )
 }
 
@@ -3631,7 +3611,7 @@ impl CheckpointInitialPrefill {
             .try_reserve_exact(extent)
             .map_err(|_| publication_input_error("initial prefill section allocation failed"))?;
         bytes.extend_from_slice(Self::MAGIC);
-        material_u64(&mut bytes, 1);
+        material_u64(&mut bytes, 3);
         if let Some(value) = value {
             bytes.push(1);
             encode_publication_identity(&mut bytes, value.original);
@@ -3653,7 +3633,7 @@ impl CheckpointInitialPrefill {
             .take(Self::MAGIC.len())
             .map_err(SemanticTransitionError::Semantic)?
             != Self::MAGIC
-            || reader.u64().map_err(SemanticTransitionError::Semantic)? != 1
+            || reader.u64().map_err(SemanticTransitionError::Semantic)? != 3
         {
             return Err(publication_input_error(
                 "checkpoint initial prefill has another domain or version",
@@ -3737,57 +3717,6 @@ impl CheckpointInitialPrefill {
 pub struct SemanticInitialPrefillLease {
     issuer: Arc<()>,
     scope: Arc<()>,
-}
-
-#[derive(Clone, Copy)]
-enum InitialPrefillContentSlot {
-    Model,
-    #[cfg(feature = "semantic-policy")]
-    Outputs,
-    Captured(usize),
-}
-
-#[derive(Clone, Copy)]
-enum InitialPrefillCaptureKind {
-    Model,
-    Outputs,
-    Captured,
-}
-
-/// Exact content captured by one imported task's original model prefill.
-/// This handle never creates a new baseline during verification.
-#[derive(Clone)]
-pub struct SemanticInitialPrefillContentWitness {
-    issuer: Arc<()>,
-    scope: Arc<()>,
-    task_identity: Identity256,
-    task_epoch: u64,
-    model_generation: u64,
-    slot: InitialPrefillContentSlot,
-}
-
-impl SemanticInitialPrefillContentWitness {
-    fn matches(
-        &self,
-        issuer: &Arc<()>,
-        scope: &Arc<()>,
-        task_identity: Identity256,
-        task_epoch: u64,
-        model_generation: u64,
-        captured_count: usize,
-    ) -> bool {
-        Arc::ptr_eq(&self.issuer, issuer)
-            && Arc::ptr_eq(&self.scope, scope)
-            && self.task_identity == task_identity
-            && self.task_epoch == task_epoch
-            && self.model_generation == model_generation
-            && match self.slot {
-                InitialPrefillContentSlot::Model => true,
-                #[cfg(feature = "semantic-policy")]
-                InitialPrefillContentSlot::Outputs => true,
-                InitialPrefillContentSlot::Captured(index) => index < captured_count,
-            }
-    }
 }
 
 fn validate_initial_prefill_input_layout(
@@ -9888,7 +9817,7 @@ impl SemanticReplayMaterial {
             .take(magic.len())
             .map_err(SemanticTransitionError::Semantic)?
             != magic
-            || payload.u64().map_err(SemanticTransitionError::Semantic)? != 2
+            || payload.u64().map_err(SemanticTransitionError::Semantic)? != 3
         {
             return Err(publication_input_error(
                 "initial prefill child has another body version",
@@ -16396,39 +16325,6 @@ impl SemanticModelForwardWitness {
     }
 }
 
-fn retain_initial_prefill_verification_inputs(
-    content: &mut TensorContentBuffers,
-    prepared: Vec<PreparedSemanticTensor>,
-    bounded: bool,
-) -> Result<(), SemanticTransitionError> {
-    if bounded
-        && content
-            .verification_inputs
-            .len()
-            .checked_add(prepared.len())
-            .is_none_or(|len| len > content.verification_inputs.capacity())
-    {
-        return Err(publication_input_error(
-            "prefill verification exceeded its original alias custody declaration",
-        ));
-    }
-    let offset = content.verification_inputs.len();
-    content.verification_inputs.extend(prepared);
-    let actual = &content.verification_inputs[offset..];
-    if actual.len() != content.tensors.len()
-        || content
-            .tensors
-            .iter()
-            .zip(actual)
-            .any(|(expected, actual)| !same_tensor_content_owner(expected, actual))
-    {
-        return Err(publication_input_error(
-            "prefill content verification requires the original storage, layout and interval",
-        ));
-    }
-    Ok(())
-}
-
 struct TensorContentBuffers {
     tensors: Vec<PreparedSemanticTensor>,
     seals: TensorContentSeals,
@@ -17497,40 +17393,6 @@ impl TensorContentBuffers {
         *retained = None;
         Ok(())
     }
-}
-
-#[cfg(feature = "semantic-policy")]
-type InitialPrefillSealSource = (u64, u64, Arc<TrackedCudaSlice<u64>>, usize);
-
-#[cfg(feature = "semantic-policy")]
-fn initial_prefill_seal_sources(
-    content: &TensorContentBuffers,
-) -> Result<Vec<InitialPrefillSealSource>, SemanticTransitionError> {
-    let TensorContentSeals::Captured(digests) = &content.seals else {
-        return Err(SemanticTransitionError::ObservationMismatch);
-    };
-    if content.tensors.len() != digests.len() {
-        return Err(SemanticTransitionError::ObservationMismatch);
-    }
-    let mut sources = Vec::new();
-    sources
-        .try_reserve_exact(content.tensors.len())
-        .map_err(|_| publication_input_error("initial prefill seal roster allocation failed"))?;
-    for (tensor, digest) in content.tensors.iter().zip(digests) {
-        let CapturedTensorDigest::Tensor { cells, offset, .. } = digest else {
-            return Err(SemanticTransitionError::ObservationMismatch);
-        };
-        if offset.checked_add(4).is_none_or(|end| end > cells.len()) {
-            return Err(SemanticTransitionError::ObservationMismatch);
-        }
-        sources.push((
-            tensor.layout.role,
-            tensor.layout.index,
-            Arc::clone(cells),
-            *offset,
-        ));
-    }
-    Ok(sources)
 }
 
 fn model_content_ranges(
@@ -28830,7 +28692,7 @@ impl SemanticTransitionSession {
         task_identity: Identity256,
         task_content: SemanticTaskContentIdentity,
     ) -> Result<Option<Vec<u8>>, SemanticTransitionError> {
-        let Some(mut original) = self.stage_original_initial_prefill_content(
+        let Some(original) = self.stage_original_initial_prefill_content(
             predecessor,
             semantic_root,
             prefix_extent,
@@ -28842,56 +28704,10 @@ impl SemanticTransitionSession {
         else {
             return Ok(None);
         };
-        self.resolve_original_initial_prefill_content(&mut original)?;
         Ok(Some(original.bytes))
     }
 
     #[cfg(feature = "semantic-policy")]
-    fn resolve_original_initial_prefill_content(
-        &mut self,
-        original: &mut OriginalInitialPrefillContent,
-    ) -> Result<(), SemanticTransitionError> {
-        if self
-            .retained_initial_prefill
-            .as_ref()
-            .is_none_or(|retained| {
-                !Arc::ptr_eq(&original.scope, &retained.scope)
-                    || original.predecessor != retained.record.predecessor
-            })
-        {
-            return Err(SemanticTransitionError::ObservationMismatch);
-        }
-        while original.cursor < original.reads.len() {
-            match &mut original.reads[original.cursor] {
-                OriginalInitialPrefillPart::Count(count) => {
-                    material_u64(&mut original.bytes, *count)
-                }
-                OriginalInitialPrefillPart::Digest {
-                    role,
-                    index,
-                    offset,
-                    read,
-                } => {
-                    let mut poisoned = self.poisoned;
-                    let result = self.resolve_publication_read_with_poison(read, &mut poisoned);
-                    self.poisoned |= poisoned;
-                    let digest = result?;
-                    let end = offset
-                        .checked_add(4)
-                        .filter(|&end| end <= digest.len())
-                        .ok_or(SemanticTransitionError::ObservationMismatch)?;
-                    material_u64(&mut original.bytes, *role);
-                    material_u64(&mut original.bytes, *index);
-                    for word in &digest[*offset..end] {
-                        material_u64(&mut original.bytes, *word);
-                    }
-                }
-            }
-            original.cursor += 1;
-        }
-        Ok(())
-    }
-
     #[cfg(feature = "semantic-policy")]
     fn stage_original_initial_prefill_content(
         &mut self,
@@ -28928,45 +28744,21 @@ impl SemanticTransitionSession {
             self.poisoned = true;
             return Err(SemanticTransitionError::ObservationMismatch);
         }
-        let model_seals = initial_prefill_seal_sources(&retained.model)?;
-        let output_seals = initial_prefill_seal_sources(&retained.output)?;
-        if model_seals.is_empty()
-            || output_seals.is_empty()
-            || model_seals
-                .iter()
-                .any(|(role, _, _, _)| !matches!(role, 0 | 18..=25))
-            || output_seals
-                .iter()
-                .any(|(role, _, _, _)| !matches!(role, 4..=13))
-        {
-            self.poisoned = true;
-            return Err(SemanticTransitionError::ObservationMismatch);
-        }
-        let bytes =
-            encode_initial_prefill_record_prefix(&record, model_seals.len(), output_seals.len())?;
-        let mut reads = Vec::new();
-        reads
-            .try_reserve_exact(model_seals.len() + output_seals.len() + 2)
-            .map_err(|_| {
-                publication_input_error("initial prefill read roster allocation failed")
-            })?;
-        for seals in [model_seals, output_seals] {
-            reads.push(OriginalInitialPrefillPart::Count(seals.len() as u64));
-            for (role, index, cells, offset) in seals {
-                reads.push(OriginalInitialPrefillPart::Digest {
-                    role,
-                    index,
-                    offset,
-                    read: self
-                        .stage_publication_read_with_owner(cells.view(), reservation.clone())?,
-                });
+        let mut bytes = encode_initial_prefill_record_prefix(
+            &record,
+            retained.model.tensors.len(),
+            retained.output.tensors.len(),
+        )?;
+        for group in [&retained.model, &retained.output] {
+            material_u64(&mut bytes, group.tensors.len() as u64);
+            for tensor in &group.tensors {
+                material_u64(&mut bytes, tensor.layout.role);
+                material_u64(&mut bytes, tensor.layout.index);
             }
         }
+        let _ = reservation;
         Ok(Some(OriginalInitialPrefillContent {
             predecessor,
-            scope: Arc::clone(&retained.scope),
-            reads,
-            cursor: 0,
             bytes,
             installed: false,
         }))
@@ -29033,7 +28825,7 @@ impl SemanticTransitionSession {
             };
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"XLOG-INITIAL-PREFILL\0");
-        material_u64(&mut bytes, 2);
+        material_u64(&mut bytes, 3);
         encode_publication_identity(&mut bytes, original);
         encode_publication_identity(&mut bytes, predecessor);
         if let Some(referent) = recovery_referent {
@@ -29143,14 +28935,8 @@ impl SemanticTransitionSession {
                 2 * 8,
                 repeated_material_extent(record.tokens.len(), 8)?,
                 2 * 8,
-                repeated_material_extent(
-                    initial_prefill_seal_sources(&retained.model)?.len(),
-                    6 * 8,
-                )?,
-                repeated_material_extent(
-                    initial_prefill_seal_sources(&retained.output)?.len(),
-                    6 * 8,
-                )?,
+                repeated_material_extent(retained.model.tensors.len(), 2 * 8)?,
+                repeated_material_extent(retained.output.tensors.len(), 2 * 8)?,
             ])?;
             for row in &record.mapping {
                 content = completed_material_extent(&[content, 3 * 8, row.source.len()])?;
@@ -33887,10 +33673,7 @@ impl SemanticTransitionSession {
             input_guard: None,
             model_content: None,
             output_content: None,
-            captured_content: Vec::new(),
             consumer_stream: None,
-            #[cfg(feature = "semantic-policy")]
-            context_content_cursor: 0,
         });
         let stage = self
             .initial_prefill
@@ -34082,206 +33865,35 @@ impl SemanticTransitionSession {
         result
     }
 
-    /// Seal the original model roster before its prefill forward. The caller
-    /// supplies model tensors followed by their complete original backing
-    /// allocations, exactly as it will supply them to parent binding.
+    /// Retain the original model views and complete backing allocations for
+    /// the actual prefill and its later parent binding.
     pub fn bind_initial_prefill_model_content(
         &mut self,
         lease: &SemanticInitialPrefillLease,
         tensors: Vec<SemanticTensorInput>,
         consumer_stream: u64,
-    ) -> Result<SemanticInitialPrefillContentWitness, SemanticTransitionError> {
-        self.capture_initial_prefill_roster(
-            lease,
-            tensors,
-            consumer_stream,
-            InitialPrefillCaptureKind::Model,
-        )?
-        .ok_or(SemanticTransitionError::ObservationMismatch)
+    ) -> Result<(), SemanticTransitionError> {
+        self.retain_initial_prefill_roster(lease, tensors, consumer_stream, true)
     }
 
-    /// Capture original pre-call, transient or saved tensors after the model
-    /// roster is sealed, before any dependent read may change their bytes.
-    /// Pre-call capture does not replace the actual input pre-hook.
-    pub fn capture_initial_prefill_tensor_content(
-        &mut self,
-        lease: &SemanticInitialPrefillLease,
-        tensors: Vec<SemanticTensorInput>,
-        consumer_stream: u64,
-    ) -> Result<SemanticInitialPrefillContentWitness, SemanticTransitionError> {
-        self.capture_initial_prefill_roster(
-            lease,
-            tensors,
-            consumer_stream,
-            InitialPrefillCaptureKind::Captured,
-        )?
-        .ok_or(SemanticTransitionError::ObservationMismatch)
-    }
-
-    /// Seal the original model outputs at the post-detach wrapper boundary.
-    /// Every prefill cache/state tensor later supplied to parent binding must
-    /// be this exact allocation, layout and logical interval.
+    /// Join the actual key/value, recurrent and accumulator outputs to their
+    /// original prefill owner before the parent takes custody.
     pub fn record_initial_prefill_outputs(
         &mut self,
         lease: &SemanticInitialPrefillLease,
         tensors: Vec<SemanticTensorInput>,
         consumer_stream: u64,
     ) -> Result<(), SemanticTransitionError> {
-        self.capture_initial_prefill_roster(
-            lease,
-            tensors,
-            consumer_stream,
-            InitialPrefillCaptureKind::Outputs,
-        )?;
-        Ok(())
+        self.retain_initial_prefill_roster(lease, tensors, consumer_stream, false)
     }
 
-    fn enqueue_initial_prefill_content(
-        &mut self,
-        lease: &SemanticInitialPrefillLease,
-        kind: InitialPrefillCaptureKind,
-        index: usize,
-        execute: &CudaFunction,
-        verify: bool,
-    ) -> Result<(), SemanticTransitionError> {
-        #[cfg(feature = "semantic-policy")]
-        let context = self
-            .model_context_continuation
-            .as_ref()
-            .filter(|owner| Arc::ptr_eq(&owner.target_issuer, &self.publication_issuer))
-            .map(|owner| SemanticModelContextContinuation {
-                inner: Arc::clone(owner),
-            });
-        #[cfg(feature = "semantic-policy")]
-        let work = self.graph.active_cold_work();
-        #[cfg(feature = "semantic-policy")]
-        let allowance = self.graph.cold_work_allowance();
-        #[cfg(feature = "semantic-policy")]
-        if self.initial_prefill.is_none() && self.retained_initial_prefill.is_none() {
-            let context = context.as_ref().ok_or(SemanticTransitionError::NotBound)?;
-            let cursor = context.inner.with_dormant_prefill_stage(
-                &self.publication_issuer,
-                &lease.scope,
-                |stage| Ok(stage.context_content_cursor),
-            )?;
-            // Authenticate before taking the stage mutex: the canonical
-            // binder must not recursively lock the continuation.
-            let binding = self.prepare_model_context_prefill_content_binding(
-                context, lease, cursor, kind, verify,
-            )?;
-            let issuer = Arc::clone(&self.publication_issuer);
-            return context
-                .inner
-                .with_dormant_prefill_stage(&issuer, &lease.scope, |stage| {
-                    let content = match kind {
-                        InitialPrefillCaptureKind::Model => stage.model_content.as_ref(),
-                        InitialPrefillCaptureKind::Outputs => stage.output_content.as_ref(),
-                        InitialPrefillCaptureKind::Captured => stage.captured_content.get(index),
-                    }
-                    .ok_or(SemanticTransitionError::ObservationMismatch)?;
-                    binding.bind(&self.domain, content)?;
-                    content.enqueue_with_custody(
-                        &self.domain,
-                        &mut self.poisoned,
-                        execute,
-                        verify,
-                        None,
-                        false,
-                        work.as_ref(),
-                        false,
-                        allowance.as_ref(),
-                    )?;
-                    binding.complete(content)?;
-                    stage.context_content_cursor = stage
-                        .context_content_cursor
-                        .checked_add(1)
-                        .ok_or(SemanticTransitionError::GenerationExhausted)?;
-                    Ok(())
-                });
-        }
-        let content = if let Some(stage) = &self.initial_prefill {
-            match kind {
-                InitialPrefillCaptureKind::Model => stage.model_content.as_ref(),
-                InitialPrefillCaptureKind::Outputs => stage.output_content.as_ref(),
-                InitialPrefillCaptureKind::Captured => stage.captured_content.get(index),
-            }
-        } else {
-            self.retained_initial_prefill
-                .as_ref()
-                .and_then(|stage| match kind {
-                    InitialPrefillCaptureKind::Model => Some(&stage.model),
-                    #[cfg(feature = "semantic-policy")]
-                    InitialPrefillCaptureKind::Outputs => Some(&stage.output),
-                    #[cfg(not(feature = "semantic-policy"))]
-                    InitialPrefillCaptureKind::Outputs => None,
-                    InitialPrefillCaptureKind::Captured => stage.captured.get(index),
-                })
-        }
-        .ok_or(SemanticTransitionError::ObservationMismatch)?;
-        #[cfg(feature = "semantic-policy")]
-        if let Some(context) = &context {
-            let cursor = self
-                .initial_prefill
-                .as_ref()
-                .map(|stage| stage.context_content_cursor)
-                .or_else(|| {
-                    self.retained_initial_prefill
-                        .as_ref()
-                        .map(|stage| stage.context_content_cursor)
-                })
-                .ok_or(SemanticTransitionError::NotBound)?;
-            self.prepare_model_context_prefill_content_binding(
-                context, lease, cursor, kind, verify,
-            )?
-            .bind(&self.domain, content)?;
-        }
-        #[cfg(feature = "semantic-policy")]
-        let result = if context.is_some() {
-            content.enqueue_with_custody(
-                &self.domain,
-                &mut self.poisoned,
-                execute,
-                verify,
-                None,
-                false,
-                work.as_ref(),
-                false,
-                allowance.as_ref(),
-            )
-        } else {
-            content.enqueue(&self.domain, &mut self.poisoned, execute, verify)
-        };
-        #[cfg(not(feature = "semantic-policy"))]
-        let result = {
-            let _ = lease;
-            content.enqueue(&self.domain, &mut self.poisoned, execute, verify)
-        };
-        result?;
-        #[cfg(feature = "semantic-policy")]
-        if context.is_some() {
-            let cursor = if let Some(stage) = &mut self.initial_prefill {
-                &mut stage.context_content_cursor
-            } else {
-                &mut self
-                    .retained_initial_prefill
-                    .as_mut()
-                    .ok_or(SemanticTransitionError::NotBound)?
-                    .context_content_cursor
-            };
-            *cursor = cursor
-                .checked_add(1)
-                .ok_or(SemanticTransitionError::GenerationExhausted)?;
-        }
-        Ok(())
-    }
-
-    fn capture_initial_prefill_roster(
+    fn retain_initial_prefill_roster(
         &mut self,
         lease: &SemanticInitialPrefillLease,
         tensors: Vec<SemanticTensorInput>,
         consumer_stream: u64,
-        kind: InitialPrefillCaptureKind,
-    ) -> Result<Option<SemanticInitialPrefillContentWitness>, SemanticTransitionError> {
+        model: bool,
+    ) -> Result<(), SemanticTransitionError> {
         self.ensure_quiescent()?;
         dlpack_consumer_stream(consumer_stream)?;
         let stage = self
@@ -34296,18 +33908,12 @@ impl SemanticTransitionSession {
             || stage
                 .consumer_stream
                 .is_some_and(|stream| stream != consumer_stream)
-            || match kind {
-                InitialPrefillCaptureKind::Model => {
-                    stage.model_content.is_some() || stage.input.is_some()
-                }
-                InitialPrefillCaptureKind::Outputs => {
-                    stage.model_content.is_none()
-                        || stage.input.is_none()
-                        || stage.output_content.is_some()
-                }
-                InitialPrefillCaptureKind::Captured => {
-                    stage.model_content.is_none() || stage.output_content.is_some()
-                }
+            || if model {
+                stage.model_content.is_some() || stage.input.is_some()
+            } else {
+                stage.model_content.is_none()
+                    || stage.input.is_none()
+                    || stage.output_content.is_some()
             }
         {
             return Err(publication_input_error(
@@ -34315,327 +33921,54 @@ impl SemanticTransitionSession {
             ));
         }
         if tensors.is_empty()
-            || tensors.iter().any(|tensor| match kind {
-                InitialPrefillCaptureKind::Model => !matches!(tensor.layout.role, 0 | 18..=25),
-                InitialPrefillCaptureKind::Outputs => !matches!(tensor.layout.role, 4..=13),
-                InitialPrefillCaptureKind::Captured => false,
+            || tensors.iter().any(|tensor| {
+                if model {
+                    !matches!(tensor.layout.role, 0 | 18..=25)
+                } else {
+                    !matches!(tensor.layout.role, 4..=13)
+                }
             })
         {
             return Err(publication_input_error(
                 "initial prefill model or output roster has missing or foreign tensor roles",
             ));
         }
-        let prepared = prepare_semantic_tensors(&self.provider, tensors)?;
+        let tensors = prepare_semantic_tensors(&self.provider, tensors)?;
+        let private_prefix = if model {
+            tensors
+                .iter()
+                .filter(|tensor| tensor.layout.role != 0)
+                .count()
+        } else {
+            0
+        };
+        validate_content_coordinates_after(
+            tensors
+                .iter()
+                .map(|tensor| (tensor.layout.role, tensor.layout.index)),
+            private_prefix,
+        )?;
         let stage = self
             .initial_prefill
             .as_mut()
-            .expect("checked prefill stage");
-        let content = TensorContentBuffers {
-            tensors: prepared,
-            seals: TensorContentSeals::Captured(Vec::new()),
-            verification_inputs: Vec::new(),
-            #[cfg(feature = "semantic-policy")]
-            original_cold: Mutex::new(None),
-        };
-        let slot = match kind {
-            InitialPrefillCaptureKind::Model => {
-                stage.model_content = Some(content);
-                Some(InitialPrefillContentSlot::Model)
-            }
-            InitialPrefillCaptureKind::Outputs => {
-                stage.output_content = Some(content);
-                None
-            }
-            InitialPrefillCaptureKind::Captured => {
-                let index = stage.captured_content.len();
-                stage.captured_content.push(content);
-                Some(InitialPrefillContentSlot::Captured(index))
-            }
-        };
-        stage.consumer_stream = Some(consumer_stream);
-        let witness = slot.map(|slot| SemanticInitialPrefillContentWitness {
-            issuer: Arc::clone(&self.publication_issuer),
-            scope: Arc::clone(&stage.scope),
-            task_identity: stage.task_identity,
-            task_epoch: stage.task_epoch,
-            model_generation: stage.model_generation,
-            slot,
-        });
-        let result = (|| {
-            self.order_tensor_producer_inputs(consumer_stream)?;
-            let stage = self
-                .initial_prefill
-                .as_ref()
-                .expect("retained prefill stage");
-            let content = match kind {
-                InitialPrefillCaptureKind::Model => stage
-                    .model_content
-                    .as_ref()
-                    .expect("retained model content"),
-                InitialPrefillCaptureKind::Outputs => stage
-                    .output_content
-                    .as_ref()
-                    .expect("retained output content"),
-                InitialPrefillCaptureKind::Captured => stage
-                    .captured_content
-                    .last()
-                    .expect("retained transient content"),
-            };
-            // Model views precede their backing allocations. Role-zero indices
-            // name allocation ordinals, unlike private capture positions.
-            let private_prefix = if matches!(kind, InitialPrefillCaptureKind::Model) {
-                content
-                    .tensors
-                    .iter()
-                    .filter(|tensor| tensor.layout.role != 0)
-                    .count()
-            } else {
-                0
-            };
-            validate_content_coordinates_after(
-                content
-                    .tensors
-                    .iter()
-                    .map(|tensor| (tensor.layout.role, tensor.layout.index)),
-                private_prefix,
-            )?;
-            let digests = content
-                .tensors
-                .iter()
-                .map(|tensor| {
-                    tensor_content_range(
-                        &tensor.layout,
-                        tensor.logical_begin,
-                        tensor.logical_end,
-                        tensor.source.as_ref().map_or(0, DeviceMemoryView::len),
-                    )?;
-                    Ok(CapturedTensorDigest::Tensor {
-                        cells: Arc::new(allocate_publication(&self.provider, 4)?),
-                        offset: 0,
-                        producer_sealed: false,
-                    })
-                })
-                .collect::<Result<Vec<_>, SemanticTransitionError>>()?;
-            let stage = self
-                .initial_prefill
-                .as_mut()
-                .expect("retained prefill stage");
-            let content = match kind {
-                InitialPrefillCaptureKind::Model => stage
-                    .model_content
-                    .as_mut()
-                    .expect("retained model content"),
-                InitialPrefillCaptureKind::Outputs => stage
-                    .output_content
-                    .as_mut()
-                    .expect("retained output content"),
-                InitialPrefillCaptureKind::Captured => stage
-                    .captured_content
-                    .last_mut()
-                    .expect("retained transient content"),
-            };
-            content.seals = TensorContentSeals::Captured(digests);
-            let stage = self
-                .initial_prefill
-                .as_ref()
-                .expect("retained prefill stage");
-            let execute = self
-                .provider
-                .device()
-                .inner()
-                .get_func(
-                    "xlog_semantic_transition",
-                    "semantic_tensor_content_witness",
-                )
-                .ok_or_else(|| {
-                    runtime_error("kernel lookup", "tensor content witness unavailable")
-                })?;
-            let index = if matches!(kind, InitialPrefillCaptureKind::Captured) {
-                stage.captured_content.len() - 1
-            } else {
-                0
-            };
-            self.enqueue_initial_prefill_content(lease, kind, index, &execute, false)?;
-            self.order_content_consumers(consumer_stream)
-        })();
-        if result.is_err() {
-            self.poisoned = true;
-        }
-        result.map(|()| witness)
-    }
-
-    /// Check the same original prefill seal before a dependent model or saved
-    /// tensor read, including after the parent has consumed the one-use stage.
-    pub fn verify_initial_prefill_tensor_content(
-        &mut self,
-        lease: &SemanticInitialPrefillLease,
-        witness: &SemanticInitialPrefillContentWitness,
-        tensors: Vec<SemanticTensorInput>,
-        consumer_stream: u64,
-    ) -> Result<(), SemanticTransitionError> {
-        let mut handoff = RetainedTensorAdmission {
-            inputs: Some(tensors),
-            stream: Arc::clone(self.provider.device().inner().stream()),
-            consumer_stream: None,
-            ready: false,
-        };
-        if self.is_poisoned() {
-            return Err(SemanticTransitionError::Poisoned);
-        }
-        dlpack_consumer_stream(consumer_stream)?;
-        let (scope, task_identity, task_epoch, model_generation, captured_count) =
-            if let Some(stage) = self.initial_prefill.as_ref() {
-                (
-                    Arc::clone(&stage.scope),
-                    stage.task_identity,
-                    stage.task_epoch,
-                    stage.model_generation,
-                    stage.captured_content.len(),
-                )
-            } else if let Some(retained) = self.retained_initial_prefill.as_ref() {
-                (
-                    Arc::clone(&retained.scope),
-                    retained.task_identity,
-                    retained.task_epoch,
-                    retained.model_generation,
-                    retained.captured.len(),
-                )
-            } else {
-                #[cfg(feature = "semantic-policy")]
-                {
-                    let owner = self
-                        .model_context_continuation
-                        .as_ref()
-                        .ok_or(SemanticTransitionError::NotBound)?;
-                    owner.with_dormant_prefill_stage(
-                        &self.publication_issuer,
-                        &lease.scope,
-                        |stage| {
-                            Ok((
-                                Arc::clone(&stage.scope),
-                                stage.task_identity,
-                                stage.task_epoch,
-                                stage.model_generation,
-                                stage.captured_content.len(),
-                            ))
-                        },
-                    )?
-                }
-                #[cfg(not(feature = "semantic-policy"))]
-                {
-                    return Err(SemanticTransitionError::NotBound);
-                }
-            };
-        if !Arc::ptr_eq(&self.publication_issuer, &lease.issuer)
-            || !Arc::ptr_eq(&scope, &lease.scope)
-            || self.task_epoch != task_epoch
-            || self.task_evaluation_identity() != Some(task_identity)
-            || !witness.matches(
-                &self.publication_issuer,
-                &scope,
-                task_identity,
-                task_epoch,
-                model_generation,
-                captured_count,
-            )
-        {
-            return Err(publication_input_error(
-                "initial prefill content witness belongs to another task, stream or stage",
-            ));
-        }
-        let _ordinary = crate::cuda_graph::reserve_uncaptured_stream(&self.stream)
-            .map_err(|error| runtime_error("prefill content stream admission", error))?;
-        let prepared = prepare_semantic_tensors(
-            &self.provider,
-            handoff
-                .inputs
-                .take()
-                .expect("retained original prefill verification inputs"),
-        )?;
-        if self.initial_prefill.is_some() || self.retained_initial_prefill.is_some() {
-            let content = if let Some(stage) = self.initial_prefill.as_mut() {
-                match witness.slot {
-                    InitialPrefillContentSlot::Model => stage.model_content.as_mut(),
-                    #[cfg(feature = "semantic-policy")]
-                    InitialPrefillContentSlot::Outputs => stage.output_content.as_mut(),
-                    InitialPrefillContentSlot::Captured(index) => {
-                        stage.captured_content.get_mut(index)
-                    }
-                }
-            } else {
-                self.retained_initial_prefill
-                    .as_mut()
-                    .and_then(|retained| match witness.slot {
-                        InitialPrefillContentSlot::Model => Some(&mut retained.model),
-                        #[cfg(feature = "semantic-policy")]
-                        InitialPrefillContentSlot::Outputs => Some(&mut retained.output),
-                        InitialPrefillContentSlot::Captured(index) => {
-                            retained.captured.get_mut(index)
-                        }
-                    })
-            }
-            .ok_or(SemanticTransitionError::ObservationMismatch)?;
-            retain_initial_prefill_verification_inputs(content, prepared, false)?;
+            .expect("retained prefill stage");
+        let owner = InitialPrefillTensorOwners { tensors };
+        if model {
+            stage.model_content = Some(owner);
         } else {
-            #[cfg(feature = "semantic-policy")]
-            {
-                let owner = Arc::clone(
-                    self.model_context_continuation
-                        .as_ref()
-                        .ok_or(SemanticTransitionError::NotBound)?,
-                );
-                owner.with_dormant_prefill_stage(
-                    &self.publication_issuer,
-                    &lease.scope,
-                    |stage| {
-                        let content = match witness.slot {
-                            InitialPrefillContentSlot::Model => stage.model_content.as_mut(),
-                            InitialPrefillContentSlot::Outputs => stage.output_content.as_mut(),
-                            InitialPrefillContentSlot::Captured(index) => {
-                                stage.captured_content.get_mut(index)
-                            }
-                        }
-                        .ok_or(SemanticTransitionError::ObservationMismatch)?;
-                        retain_initial_prefill_verification_inputs(content, prepared, true)
-                    },
-                )?;
-            }
-            #[cfg(not(feature = "semantic-policy"))]
-            {
-                return Err(SemanticTransitionError::NotBound);
-            }
+            stage.output_content = Some(owner);
         }
-        let result = (|| {
-            self.order_tensor_producer_inputs(consumer_stream)?;
-            let execute = self
-                .provider
-                .device()
-                .inner()
-                .get_func(
-                    "xlog_semantic_transition",
-                    "semantic_tensor_content_witness",
-                )
-                .ok_or_else(|| {
-                    runtime_error("kernel lookup", "tensor content witness unavailable")
-                })?;
-            let (kind, index) = match witness.slot {
-                InitialPrefillContentSlot::Model => (InitialPrefillCaptureKind::Model, 0),
-                #[cfg(feature = "semantic-policy")]
-                InitialPrefillContentSlot::Outputs => (InitialPrefillCaptureKind::Outputs, 0),
-                InitialPrefillContentSlot::Captured(index) => {
-                    (InitialPrefillCaptureKind::Captured, index)
-                }
-            };
-            self.enqueue_initial_prefill_content(lease, kind, index, &execute, true)?;
-            self.order_content_consumers(consumer_stream)
-        })();
+        stage.consumer_stream = Some(consumer_stream);
+        let result = self
+            .order_tensor_producer_inputs(consumer_stream)
+            .and_then(|()| self.order_content_consumers(consumer_stream));
         if result.is_err() {
             self.poisoned = true;
         }
         result
     }
 
-    fn verify_initial_prefill_parent(
+    fn join_initial_prefill_parent(
         &mut self,
         parent: &SemanticParentBinding,
         tensors: &[PreparedSemanticTensor],
@@ -34707,48 +34040,7 @@ impl SemanticTransitionSession {
                 "initial parent changed its admitted source, model or original prefill outputs",
             ));
         }
-        let stream = stage.consumer_stream.expect("checked prefill stream");
-        let result = (|| {
-            self.order_tensor_producer_inputs(stream)?;
-            let stage = self
-                .initial_prefill
-                .as_ref()
-                .expect("retained prefill stage");
-            let execute = self
-                .provider
-                .device()
-                .inner()
-                .get_func(
-                    "xlog_semantic_transition",
-                    "semantic_tensor_content_witness",
-                )
-                .ok_or_else(|| {
-                    runtime_error("kernel lookup", "tensor content witness unavailable")
-                })?;
-            let lease = SemanticInitialPrefillLease {
-                issuer: Arc::clone(&self.publication_issuer),
-                scope: Arc::clone(&stage.scope),
-            };
-            self.enqueue_initial_prefill_content(
-                &lease,
-                InitialPrefillCaptureKind::Model,
-                0,
-                &execute,
-                true,
-            )?;
-            self.enqueue_initial_prefill_content(
-                &lease,
-                InitialPrefillCaptureKind::Outputs,
-                0,
-                &execute,
-                true,
-            )?;
-            self.order_content_consumers(stream)
-        })();
-        if result.is_err() {
-            self.poisoned = true;
-        }
-        result
+        Ok(())
     }
 
     /// Snapshot every supplied cold owner into fixed publication storage, then
@@ -34793,7 +34085,7 @@ impl SemanticTransitionSession {
                 &allocations,
             )?;
         }
-        self.verify_initial_prefill_parent(&parent, &tensors, &allocations)?;
+        self.join_initial_prefill_parent(&parent, &tensors, &allocations)?;
         self.ensure_rebindable_with_prefill()?;
         if self.publication.is_some() {
             return Err(publication_input_error(
@@ -35234,8 +34526,8 @@ impl SemanticTransitionSession {
             #[cfg(feature = "semantic-policy")]
             let predecessor = *_predecessor;
             // Publication joins the original model and output snapshots. Only
-            // their one-use stage closes: the model and transient seals remain
-            // owned by this Session for late original-forward/autograd reads.
+            // their one-use stage closes: the actual model and output owners remain
+            // retained by this Session until stream-safe release.
             self.retained_initial_prefill =
                 self.initial_prefill
                     .take()
@@ -35261,9 +34553,6 @@ impl SemanticTransitionSession {
                             tokens: stage.layout.prefill_tokens,
                             mapping: stage.layout.prefill_mapping,
                         },
-                        captured: stage.captured_content,
-                        #[cfg(feature = "semantic-policy")]
-                        context_content_cursor: stage.context_content_cursor,
                     });
         } else {
             self.poisoned = true;
@@ -35601,34 +34890,11 @@ impl SemanticTransitionSession {
                             .checked_mul(size_of::<SemanticSourceMapping>())?,
                     )
                 })
-                .and_then(|size| size.checked_add(2 * size_of::<OriginalInitialPrefillPart>()))
                 .ok_or(SemanticTransitionError::GenerationExhausted)?;
             for row in &record.mapping {
                 extent = extent
                     .checked_add(row.source.len())
                     .ok_or(SemanticTransitionError::GenerationExhausted)?;
-            }
-            for content in [&retained.model, &retained.output] {
-                let TensorContentSeals::Captured(digests) = &content.seals else {
-                    return Err(SemanticTransitionError::ObservationMismatch);
-                };
-                if content.tensors.len() != digests.len() {
-                    return Err(SemanticTransitionError::ObservationMismatch);
-                }
-                for digest in digests {
-                    let CapturedTensorDigest::Tensor { cells, .. } = digest else {
-                        return Err(SemanticTransitionError::ObservationMismatch);
-                    };
-                    extent = extent
-                        .checked_add(
-                            size_of::<InitialPrefillSealSource>()
-                                + size_of::<OriginalInitialPrefillPart>(),
-                        )
-                        .and_then(|size| {
-                            size.checked_add(cells.len().checked_mul(2 * size_of::<u64>())?)
-                        })
-                        .ok_or(SemanticTransitionError::GenerationExhausted)?;
-                }
             }
         }
         u64::try_from(extent).map_err(|_| SemanticTransitionError::GenerationExhausted)
@@ -35645,7 +34911,6 @@ impl SemanticTransitionSession {
         }
         #[cfg(feature = "semantic-policy")]
         if let Some(content) = &mut original.content {
-            self.resolve_original_initial_prefill_content(content)?;
             if let Some(saved) = &self.checkpoint_initial_prefill {
                 if saved.original != content.predecessor
                     || (!content.installed && saved.content != content.bytes)
@@ -56528,33 +55793,6 @@ mod text_parent_tests {
             assert!(validate_initial_prefill_input_layout(&changed, 8).is_err());
         }
         assert!(validate_initial_prefill_input_layout(&expected, 0).is_err());
-    }
-
-    #[test]
-    fn initial_prefill_content_witness_rejects_foreign_or_stale_owners() {
-        let issuer = Arc::new(());
-        let scope = Arc::new(());
-        let identity = Identity256::from_bytes([7; 32]);
-        let witness = SemanticInitialPrefillContentWitness {
-            issuer: Arc::clone(&issuer),
-            scope: Arc::clone(&scope),
-            task_identity: identity,
-            task_epoch: 3,
-            model_generation: 5,
-            slot: InitialPrefillContentSlot::Captured(1),
-        };
-        assert!(witness.matches(&issuer, &scope, identity, 3, 5, 2));
-        assert!(!witness.matches(&Arc::new(()), &scope, identity, 3, 5, 2));
-        assert!(!witness.matches(&issuer, &Arc::new(()), identity, 3, 5, 2));
-        assert!(!witness.matches(&issuer, &scope, Identity256::from_bytes([8; 32]), 3, 5, 2,));
-        assert!(!witness.matches(&issuer, &scope, identity, 4, 5, 2));
-        assert!(!witness.matches(&issuer, &scope, identity, 3, 6, 2));
-        assert!(!witness.matches(&issuer, &scope, identity, 3, 5, 1));
-        let model = SemanticInitialPrefillContentWitness {
-            slot: InitialPrefillContentSlot::Model,
-            ..witness
-        };
-        assert!(model.matches(&issuer, &scope, identity, 3, 5, 0));
     }
 
     #[test]
