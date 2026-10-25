@@ -172,23 +172,32 @@ struct StreamCaptureRegistry {
     active: HashSet<StreamCaptureKey>,
     modules: BTreeMap<(usize, u64), CaptureSubmissionEntry>,
     deferred: VecDeque<DeferredRetirement>,
+    // Keep callable owners with an entered release of unknown outcome. Ordinary
+    // lifecycle drains cannot establish new proof and must not invoke them again.
+    retained_unknown: VecDeque<DeferredRetirement>,
     retiring: bool,
     capture_exclusions: usize,
 }
 
+pub(crate) enum RetirementDisposition {
+    Complete,
+    Pending,
+    RetainUnknown,
+}
+
 enum DeferredRetirement {
     Once(Option<Box<dyn FnOnce() + Send>>),
-    Retry(Box<dyn FnMut() -> bool + Send>),
+    Retry(Box<dyn FnMut() -> RetirementDisposition + Send>),
 }
 
 impl DeferredRetirement {
-    fn attempt(&mut self) -> bool {
+    fn attempt(&mut self) -> RetirementDisposition {
         match self {
             Self::Once(retire) => {
                 if let Some(retire) = retire.take() {
                     retire();
                 }
-                true
+                RetirementDisposition::Complete
             }
             Self::Retry(retire) => retire(),
         }
@@ -578,6 +587,7 @@ struct DriverMutationReservation {
     active: bool,
     current: Option<DeferredRetirement>,
     retry: VecDeque<DeferredRetirement>,
+    retained_unknown: VecDeque<DeferredRetirement>,
 }
 
 impl Drop for DriverMutationReservation {
@@ -588,6 +598,7 @@ impl Drop for DriverMutationReservation {
             // destructor or driver operation runs under this mutex.
             let mut registry = stream_capture_registry();
             registry.deferred.append(&mut self.retry);
+            registry.retained_unknown.append(&mut self.retained_unknown);
             if matches!(self.current, Some(DeferredRetirement::Retry(_))) {
                 registry
                     .deferred
@@ -679,11 +690,12 @@ pub fn retire_after_stream_captures(retire: impl FnOnce() + Send + 'static) {
     enqueue_retirement(DeferredRetirement::Once(Some(Box::new(retire))));
 }
 
-/// Retain an actual resource until its release can be proved. A false result
-/// leaves this same callable owner queued for the next cold lifecycle drain;
-/// it is never retried in a tight loop. Unwind preserves it for a later drain.
+/// Retain an actual resource until its release can be proved. Pending work keeps
+/// the same callable owner for the next cold drain; an unknown entered release
+/// retains its owner without another attempt. Unwind preserves the executing
+/// owner for a later drain.
 pub(crate) fn retry_retirement_after_stream_captures(
-    retire: impl FnMut() -> bool + Send + 'static,
+    retire: impl FnMut() -> RetirementDisposition + Send + 'static,
 ) {
     enqueue_retirement(DeferredRetirement::Retry(Box::new(retire)));
 }
@@ -719,10 +731,14 @@ fn drain_capture_retirements(mut registry: std::sync::MutexGuard<'static, Stream
         active: true,
         current: None,
         retry: VecDeque::new(),
+        retained_unknown: VecDeque::new(),
     };
     loop {
         let Some(retire) = registry.deferred.pop_front() else {
             registry.deferred.append(&mut reservation.retry);
+            registry
+                .retained_unknown
+                .append(&mut reservation.retained_unknown);
             registry.retiring = false;
             reservation.active = false;
             return;
@@ -731,7 +747,7 @@ fn drain_capture_retirements(mut registry: std::sync::MutexGuard<'static, Stream
         // reservation excludes begin-capture across this unlock/relock window.
         drop(registry);
         reservation.current = Some(retire);
-        let completed = reservation
+        let disposition = reservation
             .current
             .as_mut()
             .expect("executing retirement present")
@@ -740,10 +756,12 @@ fn drain_capture_retirements(mut registry: std::sync::MutexGuard<'static, Stream
             .current
             .take()
             .expect("executing retirement present");
-        if completed {
-            drop(retire);
-        } else {
-            reservation.retry.push_back(retire);
+        match disposition {
+            RetirementDisposition::Complete => drop(retire),
+            RetirementDisposition::Pending => reservation.retry.push_back(retire),
+            RetirementDisposition::RetainUnknown => {
+                reservation.retained_unknown.push_back(retire);
+            }
         }
         registry = stream_capture_registry();
     }
@@ -2880,20 +2898,20 @@ pub(crate) fn retire_resources_after_completion<T: Send + 'static, E: std::fmt::
     let mut destroyed = false;
     retry_retirement_after_stream_captures(move || {
         let Some(resources) = pending.as_ref() else {
-            return true;
+            return RetirementDisposition::Complete;
         };
         if !destroyed {
             if let Err(error) = ready(resources) {
                 // Do not reinsert this error into the context: bind_to_thread
                 // consumes stored errors, so reinsertion prevents later retry.
                 eprintln!("CUDA resource retirement prerequisites incomplete: {error}");
-                return false;
+                return RetirementDisposition::Pending;
             }
             let mut resources =
                 mem::ManuallyDrop::new(pending.take().expect("retirement owns its resources"));
             if let Err(error) = destroy(&mut resources) {
                 retain_failed_resources(resources, |resources| diagnose(resources, error));
-                return true;
+                return RetirementDisposition::Complete;
             }
             // Restore the capsule before retryable publication, including its
             // unwind path. Consumed owners must be taken out by `destroy`.
@@ -2902,10 +2920,10 @@ pub(crate) fn retire_resources_after_completion<T: Send + 'static, E: std::fmt::
         }
         if let Err(error) = finish(pending.as_mut().expect("retirement owns its resources")) {
             eprintln!("CUDA resource release publication incomplete: {error}");
-            return false;
+            return RetirementDisposition::Pending;
         }
         drop(pending.take());
-        true
+        RetirementDisposition::Complete
     });
 }
 
@@ -3172,9 +3190,9 @@ mod tests {
                 retire_after_stream_captures(move || {
                     nested.fetch_add(1, Ordering::SeqCst);
                 });
-                return false;
+                return RetirementDisposition::Pending;
             }
-            true
+            RetirementDisposition::Complete
         });
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
         assert_eq!(completed.load(Ordering::SeqCst), 1);
@@ -3204,7 +3222,11 @@ mod tests {
         let observed_ready = ready.clone();
         retry_retirement_after_stream_captures(move || {
             assert_eq!(earlier[0], 3);
-            observed_ready.load(Ordering::SeqCst)
+            if observed_ready.load(Ordering::SeqCst) {
+                RetirementDisposition::Complete
+            } else {
+                RetirementDisposition::Pending
+            }
         });
         let allocation = Arc::new(vec![7_u8; 32].into_boxed_slice());
         let observer = Arc::downgrade(&allocation);
@@ -3222,7 +3244,7 @@ mod tests {
                     });
                     panic!("reclamation fence wait unwound");
                 }
-                true
+                RetirementDisposition::Complete
             });
         });
         assert!(failed.is_err());

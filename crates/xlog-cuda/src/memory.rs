@@ -12,6 +12,7 @@ use xlog_core::{resolve_bool, MemoryBudget, Result, Schema, XlogError};
 
 use crate::arrow_device::ArrowDeviceImport;
 use crate::cuda_compat::{AsKernelParam, DeviceParamStorage, IntoKernelParamStorage};
+use crate::cuda_graph::RetirementDisposition;
 use crate::device_runtime::resource::{
     block_use_registry, Access, AllocationAccounting, AllocationRequest, BlockUseRegistry,
     DeviceAccessDependencies, MemoryStorageOwner, MemoryUse, MemoryUseGroup, RetainedAllocation,
@@ -581,7 +582,11 @@ impl Drop for ResourceBlockRetirement {
             };
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 crate::cuda_graph::retry_retirement_after_stream_captures(move || {
-                    owner.release().is_ok()
+                    if owner.release().is_ok() {
+                        RetirementDisposition::Complete
+                    } else {
+                        RetirementDisposition::Pending
+                    }
                 });
             }));
         }
@@ -1417,26 +1422,38 @@ impl Drop for RawDeviceAllocation {
                 payload: Some(payload),
                 reclamation_admission: self.reclamation_admission.take(),
             };
+            let mut failure_reported = false;
             // The canonical cold queue retains this callable physical owner
             // across errors and unwind. Even a final Drop must not turn a
             // retryable fence failure into an unreachable ManuallyDrop leak.
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 crate::cuda_graph::retry_retirement_after_stream_captures(move || {
                     if let Err(error) = owner.release() {
-                        if let Some(manager) = owner
-                            .payload
-                            .as_ref()
-                            .filter(|p| !p.reclamation.was_released())
-                            .and_then(|p| p.manager.as_ref())
-                        {
-                            manager.record_deallocation_failure(owner.len() as u64);
+                        let disposition = if owner.payload.as_ref().is_some_and(|payload| {
+                            payload.free_state == DriverReleaseState::OutcomeUnknown
+                                || payload.backing_release == DriverReleaseState::OutcomeUnknown
+                        }) {
+                            RetirementDisposition::RetainUnknown
+                        } else {
+                            RetirementDisposition::Pending
+                        };
+                        if !failure_reported {
+                            failure_reported = true;
+                            if let Some(manager) = owner
+                                .payload
+                                .as_ref()
+                                .filter(|p| !p.reclamation.was_released())
+                                .and_then(|p| p.manager.as_ref())
+                            {
+                                manager.record_deallocation_failure(owner.len() as u64);
+                            }
+                            eprintln!(
+                                "CUDA allocation cleanup incomplete; retaining unresolved memory or handle ownership in the cold reaper: {error}"
+                            );
                         }
-                        eprintln!(
-                            "CUDA allocation cleanup incomplete; retaining unresolved memory or handle ownership in the cold reaper: {error}"
-                        );
-                        return false;
+                        return disposition;
                     }
-                    true
+                    RetirementDisposition::Complete
                 });
             }));
         }
@@ -5203,11 +5220,11 @@ mod tests {
                 let releases = Arc::clone(&self.releases);
                 crate::cuda_graph::retry_retirement_after_stream_captures(move || {
                     if !completed.load(Ordering::Acquire) {
-                        return false;
+                        return RetirementDisposition::Pending;
                     }
                     drop(storage.take());
                     releases.fetch_add(1, Ordering::SeqCst);
-                    true
+                    RetirementDisposition::Complete
                 });
             }
         }
