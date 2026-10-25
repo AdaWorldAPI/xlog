@@ -79,7 +79,11 @@ impl SemanticTransitionSession {
                     ));
                 }
                 for (lease, consumer_streams) in releases.iter() {
+                    for &stream in consumer_streams.iter() {
+                        dlpack_consumer_stream(stream)?;
+                    }
                     if self.steps.contains_key(&lease.token) {
+                        self.step_consumer_streams(lease.token, consumer_streams)?;
                         self.require_step_content_retirement(lease)?;
                         if let Some(original) = &self.steps[&lease.token].consumer_completion {
                             let original = original.lock().map_err(|_| {
@@ -128,36 +132,44 @@ impl SemanticTransitionSession {
                 ));
             }
         }
-        self.synchronize_task_release(&kind)?;
-        self.require_completed_graph_retirements()?;
-        for (lease, consumer_streams) in releases.iter_mut() {
-            if let Some(original) = self
-                .steps
-                .get(&lease.token)
-                .and_then(|step| step.consumer_completion.as_ref())
-            {
-                let purpose = original
-                    .lock()
-                    .map_err(|_| publication_input_error("original consumer owner poisoned"))?
-                    .purpose;
-                if purpose == OriginalConsumerPurpose::Observation {
-                    self.complete_original_step_consumers(lease.token, consumer_streams, purpose)?;
-                    self.steps
-                        .get_mut(&lease.token)
-                        .expect("completed original consumer step")
-                        .consumer_completion = None;
+        let result = (|| {
+            self.synchronize_task_release(&kind)?;
+            self.require_completed_graph_retirements()?;
+            for (lease, consumer_streams) in releases.iter_mut() {
+                if let Some(original) = self
+                    .steps
+                    .get(&lease.token)
+                    .and_then(|step| step.consumer_completion.as_ref())
+                {
+                    let purpose = original
+                        .lock()
+                        .map_err(|_| publication_input_error("original consumer owner poisoned"))?
+                        .purpose;
+                    if purpose == OriginalConsumerPurpose::Observation {
+                        self.complete_original_step_consumers(
+                            lease.token,
+                            consumer_streams,
+                            purpose,
+                        )?;
+                        self.steps
+                            .get_mut(&lease.token)
+                            .expect("completed original consumer step")
+                            .consumer_completion = None;
+                    }
+                }
+                if self.steps.contains_key(&lease.token) {
+                    // release() resumes its retained command. A handed-off reader is
+                    // already inactive and only its remaining content is retired.
+                    self.release(lease, consumer_streams)?;
                 }
             }
-            if self.steps.contains_key(&lease.token) {
-                // release() resumes its retained command. A handed-off reader is
-                // already inactive and only its remaining content is retired.
-                self.release(lease, consumer_streams)?;
+            for (lease, _) in releases.iter() {
+                self.require_retired_publication(lease)?;
             }
-        }
-        for (lease, _) in releases.iter() {
-            self.require_retired_publication(lease)?;
-        }
-        self.synchronize_task_release(&kind)?;
+            self.synchronize_task_release(&kind)?;
+            Ok(())
+        })();
+        self.classify_task_release_result(&kind, result)?;
         self.task_release = TaskReleaseState::Joined(kind);
         Ok(())
     }
@@ -197,6 +209,77 @@ impl SemanticTransitionSession {
         )
     }
 
+    fn classify_task_release_result(
+        &mut self,
+        kind: &TaskReleaseKind,
+        result: Result<(), SemanticTransitionError>,
+    ) -> Result<(), SemanticTransitionError> {
+        let Err(error) = result else {
+            return Ok(());
+        };
+        self.poisoned = true;
+        let error = match self.retained_task_release_failure(kind) {
+            Ok(Some(status)) => native_runtime_error(
+                "original task publication completion",
+                cudarc::driver::DriverError(status),
+            ),
+            Ok(None) => error,
+            Err(error) => error,
+        };
+        let pending = match &error {
+            SemanticTransitionError::NativeCompletionPending { .. } => true,
+            SemanticTransitionError::NativeExecutionFailure { status, .. } => {
+                crate::device::known_execution_failure(&cudarc::driver::DriverError(*status))
+                    .is_none()
+                    && matches!(
+                        *status,
+                        sys::CUresult::CUDA_ERROR_UNKNOWN | sys::CUresult::CUDA_ERROR_NOT_READY
+                    )
+            }
+            _ => false,
+        };
+        if !pending {
+            self.task_release = TaskReleaseState::Failed(kind.clone());
+        }
+        Err(error)
+    }
+
+    fn retained_task_release_failure(
+        &self,
+        kind: &TaskReleaseKind,
+    ) -> Result<Option<sys::CUresult>, SemanticTransitionError> {
+        let TaskReleaseKind::Publications(targets) = kind else {
+            return Ok(None);
+        };
+        for target in targets.iter() {
+            let Some(original) = self
+                .readers
+                .get(&target.token)
+                .and_then(|reader| reader.retirement_owner.as_ref())
+            else {
+                continue;
+            };
+            let original = original.lock().map_err(|_| {
+                publication_input_error("original reader retirement owner poisoned")
+            })?;
+            let command_failure = original
+                .command
+                .completion_failure
+                .or_else(|| original.command.completion.known_completion_failure());
+            let read_failure = original
+                .read
+                .lock()
+                .map_err(|_| {
+                    publication_input_error("original reader retirement read owner poisoned")
+                })?
+                .known_completion_failure();
+            if let Some(status) = command_failure.or(read_failure) {
+                return Ok(Some(status));
+            }
+        }
+        Ok(None)
+    }
+
     pub(super) fn synchronize_task_release(
         &mut self,
         kind: &TaskReleaseKind,
@@ -205,14 +288,8 @@ impl SemanticTransitionSession {
             .stream
             .context()
             .bind_to_thread()
-            .and_then(|_| self.stream.context().synchronize());
-        if let Err(error) = result {
-            self.poisoned = true;
-            if crate::device::known_execution_failure(&error).is_some() {
-                self.task_release = TaskReleaseState::Failed(kind.clone());
-            }
-            return Err(runtime_error("original task terminal join", error));
-        }
-        Ok(())
+            .and_then(|_| self.stream.context().synchronize())
+            .map_err(|error| native_runtime_error("original task terminal join", error));
+        self.classify_task_release_result(kind, result)
     }
 }
