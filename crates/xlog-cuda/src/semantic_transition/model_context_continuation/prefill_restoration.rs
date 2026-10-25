@@ -1468,10 +1468,6 @@ impl SemanticTransitionSession {
     ) -> Result<SemanticRestoredModelContextPrefill, SemanticTransitionError> {
         let owner = &continuation.inner;
         let allowance = self.require_dormant_model_context_restore_work(continuation, work)?;
-        let native_work = self
-            .graph
-            .active_cold_work()
-            .ok_or(SemanticTransitionError::NotBound)?;
         if !original.continuation.ptr_eq(&Arc::downgrade(owner))
             || original.source_parent != source_parent
             || original.source_native_digest != source_native_digest
