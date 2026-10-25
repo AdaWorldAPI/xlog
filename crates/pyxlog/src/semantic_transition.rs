@@ -486,11 +486,15 @@ enum TaskReleaseCustody {
     ObservedCold {
         cold_task: Py<cold_task::PySemanticTransitionColdTask>,
     },
-    Publication {
-        parent: Py<PySemanticPublishedParent>,
+    Publications {
+        releases: Vec<PublicationRelease>,
         controller: Py<PySemanticTransitionController>,
-        consumer_streams: Vec<u64>,
     },
+}
+
+struct PublicationRelease {
+    parent: Py<PySemanticPublishedParent>,
+    consumer_streams: Vec<u64>,
 }
 
 impl TaskReleaseCustody {
@@ -519,20 +523,24 @@ impl TaskReleaseCustody {
                 },
             ) => cold_task.as_ptr() == original.as_ptr(),
             (
-                Self::Publication {
-                    parent,
+                Self::Publications {
+                    releases,
                     controller,
-                    consumer_streams,
                 },
-                Self::Publication {
-                    parent: original_parent,
+                Self::Publications {
+                    releases: original_releases,
                     controller: original_controller,
-                    consumer_streams: original_streams,
                 },
             ) => {
-                parent.as_ptr() == original_parent.as_ptr()
-                    && controller.as_ptr() == original_controller.as_ptr()
-                    && consumer_streams == original_streams
+                controller.as_ptr() == original_controller.as_ptr()
+                    && releases.len() == original_releases.len()
+                    && releases
+                        .iter()
+                        .zip(original_releases)
+                        .all(|(release, original)| {
+                            release.parent.as_ptr() == original.parent.as_ptr()
+                                && release.consumer_streams == original.consumer_streams
+                        })
             }
             _ => false,
         }
@@ -892,9 +900,9 @@ impl PySemanticTransitionSession {
                 "close",
                 "retain cold_task, then repeat cold_task.close(); do not import or replace that owner",
             ),
-            TaskReleaseCustody::Publication { .. } => (
-                "close_aborted_publication",
-                "retain controller, parent and consumer_streams, then repeat controller.close_aborted_publication(parent, consumer_streams=consumer_streams); do not replace the original owners or stream roster",
+            TaskReleaseCustody::Publications { .. } => (
+                "close_aborted_publications",
+                "retain controller and releases, then repeat controller.close_aborted_publications(releases); do not replace original parents or consumer-stream rosters",
             ),
         };
         let pending = SemanticTaskReleasePending::new_err(message);
@@ -912,18 +920,25 @@ impl PySemanticTransitionSession {
             TaskReleaseCustody::ObservedCold { cold_task } => {
                 pending.value(py).setattr("cold_task", cold_task.bind(py))?;
             }
-            TaskReleaseCustody::Publication {
-                parent,
+            TaskReleaseCustody::Publications {
+                releases,
                 controller,
-                consumer_streams,
             } => {
-                pending.value(py).setattr("parent", parent.bind(py))?;
+                let original = releases
+                    .iter()
+                    .map(|release| {
+                        Ok((
+                            release.parent.clone_ref(py),
+                            PyTuple::new(py, &release.consumer_streams)?.unbind(),
+                        ))
+                    })
+                    .collect::<PyResult<Vec<_>>>()?;
+                pending
+                    .value(py)
+                    .setattr("releases", PyTuple::new(py, original)?)?;
                 pending
                     .value(py)
                     .setattr("controller", controller.bind(py))?;
-                pending
-                    .value(py)
-                    .setattr("consumer_streams", PyTuple::new(py, consumer_streams)?)?;
             }
         }
         pending.value(py).setattr("operation", operation)?;
@@ -957,12 +972,15 @@ impl PySemanticTransitionSession {
                     TaskReleaseCustody::TaskUse { task_use, .. } => {
                         task_use.borrow(py).require_original_identity(live)?;
                     }
-                    TaskReleaseCustody::Publication { parent, .. } => {
-                        parent
-                            .borrow(py)
-                            .task_use
-                            .borrow(py)
-                            .require_original_identity(live)?;
+                    TaskReleaseCustody::Publications { releases, .. } => {
+                        for release in releases {
+                            release
+                                .parent
+                                .borrow(py)
+                                .task_use
+                                .borrow(py)
+                                .require_original_identity(live)?;
+                        }
                     }
                     TaskReleaseCustody::ObservedCold { .. } => {}
                 }
@@ -982,14 +1000,24 @@ impl PySemanticTransitionSession {
                         TaskReleaseKind::Aborted => live.join_aborted_task_release(),
                     },
                     TaskReleaseCustody::ObservedCold { .. } => live.join_observed_cold_release(),
-                    TaskReleaseCustody::Publication {
-                        parent,
-                        consumer_streams,
-                        ..
-                    } => live.join_aborted_publication_release(
-                        &mut *parent.borrow(py).lease()?,
-                        consumer_streams,
-                    ),
+                    TaskReleaseCustody::Publications { releases, .. } => {
+                        let parents = releases
+                            .iter()
+                            .map(|release| release.parent.borrow(py))
+                            .collect::<Vec<_>>();
+                        let mut leases = parents
+                            .iter()
+                            .map(|parent| parent.lease())
+                            .collect::<PyResult<Vec<_>>>()?;
+                        let mut native = leases
+                            .iter_mut()
+                            .zip(releases)
+                            .map(|(lease, release)| {
+                                (&mut **lease, release.consumer_streams.as_slice())
+                            })
+                            .collect::<Vec<_>>();
+                        live.join_aborted_publication_release(&mut native)
+                    }
                 };
                 if let Err(original) = joined {
                     let original = xlog_err(original);
@@ -1015,20 +1043,25 @@ impl PySemanticTransitionSession {
                 .as_mut()
                 .expect("retained original task custody")
                 .owner = Some(owner);
-            let publication = match &retained
+            let publications = match &retained
                 .as_ref()
                 .expect("retained original task custody")
                 .custody
             {
-                TaskReleaseCustody::Publication { parent, .. } => Some(parent.clone_ref(py)),
-                _ => None,
+                TaskReleaseCustody::Publications { releases, .. } => releases
+                    .iter()
+                    .map(|release| release.parent.clone_ref(py))
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
             };
-            if let Some(parent) = publication {
+            if !publications.is_empty() {
                 // The native lease has fully released. Producer finalizers may
                 // reenter Python only outside native/state locks; the original
                 // retirement guard excludes a second close or allocator resolve.
                 drop(retained);
-                parent.borrow(py).release_continuation_producers();
+                for parent in publications {
+                    parent.borrow(py).release_continuation_producers();
+                }
                 retained = self.task_release.try_lock().map_err(|_| {
                     invalid("terminal task release lost its original retirement custody")
                 })?;
@@ -23215,40 +23248,72 @@ impl PySemanticTransitionController {
         Self::close_task(slf, py, task_use, TaskReleaseKind::Aborted)
     }
 
-    /// Terminally join and release an aborted task's original selected or retired
-    /// publication. This does not grant execution or replace outstanding owners.
-    /// An unknown join retains this parent and the exact consumer-stream roster;
-    /// repeat only this operation with the original handles.
-    #[pyo3(signature = (parent, *, consumer_streams))]
-    fn close_aborted_publication(
+    /// Terminally join and release the complete original publication roster of
+    /// an aborted task. Each entry retains its exact parent and consumer streams.
+    /// An unknown join must repeat this operation with the same complete roster.
+    fn close_aborted_publications(
         slf: &Bound<'_, Self>,
         py: Python<'_>,
-        parent: Bound<'_, PySemanticPublishedParent>,
-        consumer_streams: &Bound<'_, PyAny>,
+        releases: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let controlled = slf.borrow();
-        let published = parent.borrow();
-        let issued = published.task_use.borrow(py);
         let session = controlled.session.borrow(py);
         session.require_creator()?;
-        if published.session.as_ptr() != controlled.session.as_ptr()
-            || !Arc::ptr_eq(&controlled.identity, &issued.controller)
-        {
+        if !releases.is_exact_instance_of::<PyTuple>() {
             return Err(invalid(
-                "terminal publication release requires its original controller and parent",
+                "terminal publication release requires its exact immutable roster",
             ));
         }
+        let mut roster: Vec<PublicationRelease> = Vec::new();
         let mut budget = 4096;
-        let streams = ColdValue::read(consumer_streams, &mut budget, 0)?;
-        let streams = streams
-            .sequence()?
-            .iter()
-            .map(ColdValue::unsigned)
-            .collect::<PyResult<Vec<_>>>()?;
-        let custody = TaskReleaseCustody::Publication {
-            parent: parent.clone().unbind(),
+        for entry in releases.cast::<PyTuple>()?.iter() {
+            if !entry.is_exact_instance_of::<PyTuple>() || entry.cast::<PyTuple>()?.len() != 2 {
+                return Err(invalid(
+                    "terminal publication release requires original parent and stream pairs",
+                ));
+            }
+            let entry = entry.cast::<PyTuple>()?;
+            let parent = entry
+                .get_item(0)?
+                .extract::<Py<PySemanticPublishedParent>>()?;
+            let published = parent.borrow(py);
+            let issued = published.task_use.borrow(py);
+            if published.session.as_ptr() != controlled.session.as_ptr()
+                || !Arc::ptr_eq(&controlled.identity, &issued.controller)
+            {
+                return Err(invalid(
+                    "terminal publication release requires its original controller and parents",
+                ));
+            }
+            if roster.iter().any(|original| {
+                original.parent.as_ptr() == parent.as_ptr()
+                    || Arc::ptr_eq(&original.parent.borrow(py).inner, &published.inner)
+            }) {
+                return Err(invalid(
+                    "terminal publication release repeats an original lease",
+                ));
+            }
+            let streams = ColdValue::read(&entry.get_item(1)?, &mut budget, 0)?;
+            let streams = streams
+                .sequence()?
+                .iter()
+                .map(ColdValue::unsigned)
+                .collect::<PyResult<Vec<_>>>()?;
+            drop(issued);
+            drop(published);
+            roster.push(PublicationRelease {
+                parent,
+                consumer_streams: streams,
+            });
+        }
+        if roster.is_empty() {
+            return Err(invalid(
+                "terminal publication release requires original parents",
+            ));
+        }
+        let custody = TaskReleaseCustody::Publications {
+            releases: roster,
             controller: slf.clone().unbind(),
-            consumer_streams: streams,
         };
         if session
             .task_release
@@ -23260,7 +23325,11 @@ impl PySemanticTransitionController {
         {
             return session.release_task(py, custody);
         }
-        controlled.require_read_issued(&issued)?;
+        if let TaskReleaseCustody::Publications { releases, .. } = &custody {
+            for release in releases {
+                controlled.require_read_issued(&release.parent.borrow(py).task_use.borrow(py))?;
+            }
+        }
         session.require_task_release_idle()?;
         session.release_task(py, custody)
     }
