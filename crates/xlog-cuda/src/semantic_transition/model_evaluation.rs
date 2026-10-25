@@ -115,8 +115,6 @@ impl SemanticEvaluationCohort {
     pub(super) fn content_tensors(&self) -> &[PreparedSemanticTensor] {
         &self.content.tensors
     }
-
-
 }
 
 /// Session-issued invocation handle, not an Update or a publication capability.
@@ -339,7 +337,8 @@ impl SemanticTransitionSession {
         // Prove the entire finite geometry before reserving either allocation.
         let mut complete = native_work_ceiling;
         native_work_bound::add_native_work_ceiling(
-            &mut complete, evaluation_forward_binding_native_work_ceiling()?,
+            &mut complete,
+            evaluation_forward_binding_native_work_ceiling()?,
         )?;
         native_work_bound::native_work_ceiling_units(complete)?;
         self.require_model_stream_cold_allowance_token(handle.token)?;
@@ -394,7 +393,91 @@ impl SemanticTransitionSession {
             .as_mut()
             .expect("checked original evaluation")
             .forward_binding = Some(binding);
+        self.freeze_evaluation_native_preparation_if_ready(lease, handle)?;
         Ok(stream)
+    }
+
+    fn freeze_evaluation_native_preparation_if_ready(
+        &self,
+        lease: &SemanticPublishedLease,
+        handle: &SemanticModelEvaluation,
+    ) -> Result<(), SemanticTransitionError> {
+        let Some(allowance) = self.cold_native_allowance(lease.token)? else {
+            return Ok(());
+        };
+        let evaluation = self.original_evaluation(handle)?;
+        let (Some(plan), Some(forward)) = (&evaluation.plan, &evaluation.forward_stream) else {
+            return Ok(());
+        };
+        if evaluation.forward_binding.is_none() {
+            return Err(SemanticTransitionError::ObservationMismatch);
+        }
+        let storage = self
+            .publication
+            .as_ref()
+            .ok_or(SemanticTransitionError::NotBound)?;
+        let step_input_preparation = if self.steps[&lease.token].inputs.is_none() {
+            let plans = native_work_bound::step_input_plans(storage, &lease.directory)?;
+            Some((
+                native_work_bound::step_input_producer_native_work_ceiling(
+                    storage,
+                    &plans,
+                    &lease.directory,
+                )?,
+                native_work_bound::step_input_dma_ceiling(plans.len())?,
+            ))
+        } else {
+            None
+        };
+        let mut ceiling = self.graph.snapshot_native_work_ceiling();
+        native_work_bound::add_native_work_ceiling(
+            &mut ceiling,
+            self.graph.snapshot_native_work_ceiling(),
+        )?;
+        native_work_bound::add_native_work_ceiling(
+            &mut ceiling,
+            native_work_bound::model_scratch_native_work_ceiling(
+                usize::try_from(plan.quantities()[1])
+                    .map_err(|_| SemanticTransitionError::GenerationExhausted)?,
+                true,
+            )?,
+        )?;
+        native_work_bound::add_native_work_ceiling(&mut ceiling, forward.native_work_ceiling())?;
+        native_work_bound::add_native_work_ceiling(
+            &mut ceiling,
+            evaluation_forward_binding_native_work_ceiling()?,
+        )?;
+        if let Some((native, dma)) = step_input_preparation {
+            native_work_bound::add_native_work_ceiling(&mut ceiling, native)?;
+            native_work_bound::add_native_work_ceiling(&mut ceiling, dma)?;
+        }
+        let preparation = self.steps[&handle.token]
+            .evaluation_preparation
+            .as_ref()
+            .ok_or(SemanticTransitionError::ObservationMismatch)?
+            .lock()
+            .map_err(|_| SemanticTransitionError::Poisoned)?;
+        if preparation.requested_cohort.is_none() {
+            let selection = self
+                .training_views
+                .as_ref()
+                .ok_or(SemanticTransitionError::NotBound)?
+                .selection_native_work_ceiling(self.training_origins.as_deref())?;
+            native_work_bound::add_native_work_ceiling(&mut ceiling, selection)?;
+        }
+        drop(preparation);
+        allowance
+            .lock()
+            .map_err(|_| SemanticTransitionError::Poisoned)?
+            .freeze_evaluation_preparation(
+                native_work_bound::FrozenEvaluationNativePreparation {
+                    invocation: Arc::clone(&evaluation.invocation),
+                    ceiling,
+                    available: true,
+                    step_input_preparation,
+                },
+            )?;
+        Ok(())
     }
 
     pub fn check_evaluation_model_forward_stream(
@@ -531,7 +614,9 @@ impl SemanticTransitionSession {
     ) -> Result<ModelEvaluationStreamInputs, SemanticTransitionError> {
         let evaluation = self.original_evaluation(handle)?;
         let stream = evaluation.forward_stream.as_ref().ok_or_else(|| {
-            publication_input_error("evaluation completion requires its original complete model stream")
+            publication_input_error(
+                "evaluation completion requires its original complete model stream",
+            )
         })?;
         stream.require_finished_scratch()?;
         if !stream.belongs_to_evaluation(handle)
@@ -541,14 +626,20 @@ impl SemanticTransitionSession {
         {
             return Err(SemanticTransitionError::ObservationMismatch);
         }
-        let binding = evaluation.forward_binding.as_ref()
+        let binding = evaluation
+            .forward_binding
+            .as_ref()
             .ok_or(SemanticTransitionError::ObservationMismatch)?;
         if binding.output_recorded {
-            return Err(publication_input_error("evaluation completes its original output once"));
+            return Err(publication_input_error(
+                "evaluation completes its original output once",
+            ));
         }
         let content = &self.steps[&handle.token].content[owner.index];
         if content.tensors.len() != 3 {
-            return Err(publication_input_error("evaluation requires its three original output tensors"));
+            return Err(publication_input_error(
+                "evaluation requires its three original output tensors",
+            ));
         }
         let cold = self.cold_native_work(handle.token)?.ok_or_else(|| {
             publication_input_error("evaluation stream lost its original native tally")
@@ -573,8 +664,7 @@ impl SemanticTransitionSession {
         owner: &SemanticTensorOwner,
     ) -> Result<(), SemanticTransitionError> {
         let mut recorder = self.domain.new_strict_recorder();
-        let inputs =
-            self.evaluation_stream_binding_inputs(handle, owner, &mut recorder)?;
+        let inputs = self.evaluation_stream_binding_inputs(handle, owner, &mut recorder)?;
         let evaluation = self.original_evaluation(handle)?;
         let execute = evaluation
             .forward_binding
@@ -622,8 +712,6 @@ impl SemanticTransitionSession {
             .output_recorded = true;
         Ok(())
     }
-
-
 
     /// Original immutable port metadata, without selecting, exporting, or
     /// reading device extents. Numerical owners can reserve their empty outputs
@@ -673,7 +761,7 @@ impl SemanticTransitionSession {
             .get(&lease.token)
             .is_some_and(|step| step.evaluation_preparation.is_some())
         {
-            let step = self.require_original_cold_content_reader(lease)?;
+            let step = self.require_original_cold_reader(lease)?;
             let original = step
                 .evaluation_preparation
                 .as_ref()
@@ -771,7 +859,7 @@ impl SemanticTransitionSession {
         &self,
         lease: &SemanticPublishedLease,
     ) -> Result<Option<SemanticPublishedIdentity>, SemanticTransitionError> {
-        self.require_original_cold_content_reader(lease)?
+        self.require_original_cold_reader(lease)?
             .evaluation_preparation
             .as_ref()
             .map(|original| {
@@ -1080,6 +1168,7 @@ impl SemanticTransitionSession {
             .expect("original evaluation owner")
             .plan = Some(plan);
         self.materialize_model_evaluation_plan(lease, handle)?;
+        self.freeze_evaluation_native_preparation_if_ready(lease, handle)?;
         Ok(quantities)
     }
 
@@ -1251,8 +1340,6 @@ impl SemanticTransitionSession {
         self.original_evaluation(handle)
     }
 
-
-
     /// Complete the one original terminal source observation, shared by the
     /// mutually exclusive completed and cancelled evaluation paths. The owner
     /// stays installed during every potentially entered stage, including unwind.
@@ -1337,7 +1424,7 @@ impl SemanticTransitionSession {
             .selected
             .port(port)?;
         dlpack_consumer_stream(stream)?;
-        let guard = Arc::clone(&self.require_original_cold_content_reader(lease)?.aliases);
+        let guard = Arc::clone(&self.require_original_cold_reader(lease)?.aliases);
         self.steps
             .get_mut(&lease.token)
             .expect("original evaluation reader")
@@ -1457,7 +1544,7 @@ impl SemanticTransitionSession {
             .ok_or(SemanticTransitionError::ObservationMismatch)?;
         let capacity = (evaluation.work()?.actual.len() / 3) as i64;
         let scratch = Arc::clone(&evaluation.work_aliases);
-        let reader = Arc::clone(&self.require_original_cold_content_reader(lease)?.aliases);
+        let reader = Arc::clone(&self.require_original_cold_reader(lease)?.aliases);
         self.export_owned_view(
             view,
             vec![capacity, 3],
@@ -2183,8 +2270,13 @@ impl SemanticTransitionSession {
             )
             .ok_or_else(|| runtime_error("kernel lookup", "model evaluation result unavailable"))?;
         let mut recorder = self.domain.new_strict_recorder();
-        let gate = self.original_evaluation(handle)?
-            .forward_binding.as_ref().expect("checked original binding").gate.view();
+        let gate = self
+            .original_evaluation(handle)?
+            .forward_binding
+            .as_ref()
+            .expect("checked original binding")
+            .gate
+            .view();
         recorder.read(&gate);
         let evaluation = self
             .steps
