@@ -149,7 +149,13 @@ fn finish_training_arena_handoff(
         let _operation = TensorProducerOperation::begin(&session)?;
         let source = parent.borrow();
         let issued = source.task_use.borrow(py);
-        controlled.require_issued(&issued)?;
+        controlled.require_read_issued(&issued)?;
+        #[cfg(feature = "semantic-policy")]
+        if issued.frozen_model_context.load(Ordering::Acquire) {
+            return Err(invalid(
+                "frozen future context grants no live task operation",
+            ));
+        }
         source.require_task(py, &issued)?;
         if !matches!(issued.state()?.phase, TaskUsePhase::ArenaPreparing(_)) {
             return Err(invalid(
@@ -209,19 +215,33 @@ fn finish_training_arena_handoff(
                     if owner.training_arena_pending() {
                         return Err(error);
                     }
+                    if owner.training_arena_started() {
+                        observation.state()?.terminal_error = Some(error.clone_ref(py));
+                        terminal_failure = true;
+                        return Err(error);
+                    }
                     observation.state()?.native_refusal = Some(error);
                 } else {
                     observation.state()?.acquired = true;
                 }
             }
             if observation.state()?.native_refusal.is_none() {
-                let report = owner
-                    .acknowledge_training_arena_completion(
-                        &mut *source.lease()?,
-                        &*handoff.lease()?,
-                        &streams,
-                    )
-                    .map_err(xlog_err)?;
+                let report = match owner.acknowledge_training_arena_completion(
+                    &mut *source.lease()?,
+                    &*handoff.lease()?,
+                    &streams,
+                ) {
+                    Ok(report) => report,
+                    Err(error) => {
+                        let retryable = owner.training_arena_pending();
+                        let error = xlog_err(error);
+                        if !retryable {
+                            observation.state()?.terminal_error = Some(error.clone_ref(py));
+                            terminal_failure = true;
+                        }
+                        return Err(error);
+                    }
+                };
                 observation.state()?.report = Some(report);
                 drop(handoff);
                 drop(owner);
@@ -24044,6 +24064,7 @@ impl PySemanticTransitionController {
             return Err(error);
         }
         let mut native_pending = false;
+        let mut native_started = false;
         let result = (|| -> PyResult<_> {
             let session = controlled.session.borrow(py);
             let mut owner = session.owner()?;
@@ -24054,12 +24075,17 @@ impl PySemanticTransitionController {
                 &streams,
             );
             native_pending = owner.training_arena_pending();
+            native_started = owner.training_arena_started();
             result.map_err(xlog_err)
         })();
         if let Err(original) = result {
             if native_pending {
                 pending.set_cause(py, Some(original));
                 return Err(pending);
+            }
+            if native_started {
+                observation.state()?.terminal_error = Some(original.clone_ref(py));
+                return Err(original);
             }
             observation.state()?.native_refusal = Some(original);
         }
