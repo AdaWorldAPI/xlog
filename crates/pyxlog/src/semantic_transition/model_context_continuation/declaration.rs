@@ -183,76 +183,6 @@ impl PySemanticModelContextPrefillRestoreDeclaration {
     ) -> PyResult<()> {
         self.inner.require_bound(proof).map_err(xlog_err)
     }
-
-    pub(in crate::semantic_transition) fn bind_geometry(
-        &self,
-        py: Python<'_>,
-        geometry: &Bound<'_, PyAny>,
-    ) -> PyResult<()> {
-        self.require_current(py)?;
-        let mut transport = 16 * 1024 * 1024;
-        let rows = source_content_occurrences::exact_tuple(geometry, Some(5), &mut transport)?;
-        let mut extent = rows
-            .len()
-            .checked_mul(std::mem::size_of::<RestoreFactoryGeometryGroup>())
-            .ok_or_else(|| invalid("restore factory geometry extent overflow"))?;
-        for row in rows.iter() {
-            let row = source_content_occurrences::exact_tuple(&row, Some(3), &mut transport)?;
-            for (index, bytes) in [
-                (
-                    1,
-                    std::mem::size_of::<xlog_cuda::SemanticSourceTensorDescriptor>(),
-                ),
-                (
-                    2,
-                    std::mem::size_of::<
-                        xlog_cuda::SemanticSourceAllocationDescriptor<
-                            xlog_cuda::SemanticSourceContentAllocation,
-                        >,
-                    >(),
-                ),
-            ] {
-                let count = source_content_occurrences::exact_tuple(
-                    &row.get_item(index)?,
-                    None,
-                    &mut transport,
-                )?
-                .len();
-                extent = add(
-                    extent,
-                    count
-                        .checked_mul(bytes)
-                        .ok_or_else(|| invalid("restore factory geometry extent overflow"))?,
-                )?;
-            }
-        }
-        let _metadata =
-            material_bytes::reserve_material_metadata(self.inner.material_budget(), extent)?;
-        let mut transport = 16 * 1024 * 1024;
-        let rows = source_content_occurrences::exact_tuple(geometry, Some(5), &mut transport)?;
-        let mut groups = Vec::with_capacity(rows.len());
-        for row in rows.iter() {
-            let row = source_content_occurrences::exact_tuple(&row, Some(3), &mut transport)?;
-            let verify = row.get_item(0)?;
-            if !verify.is_exact_instance_of::<PyBool>() || !verify.extract::<bool>()? {
-                return Err(invalid(
-                    "restore factory geometry requires five exact verification groups",
-                ));
-            }
-            groups.push((
-                verify.extract::<bool>()?,
-                source_content_occurrences::parse_tensor_descriptors(
-                    &row.get_item(1)?,
-                    &mut transport,
-                )?,
-                source_content_occurrences::parse_allocation_descriptors(
-                    &row.get_item(2)?,
-                    &mut transport,
-                )?,
-            ));
-        }
-        self.inner.bind_geometry(&groups).map_err(xlog_err)
-    }
 }
 
 #[pymethods]
@@ -311,12 +241,6 @@ type TensorGeometryRow = (
     u64,
     xlog_cuda::SemanticSourceGeometryAllocation,
     u64,
-);
-
-type RestoreFactoryGeometryGroup = (
-    bool,
-    Vec<xlog_cuda::SemanticSourceTensorDescriptor>,
-    Vec<xlog_cuda::SemanticSourceAllocationDescriptor<xlog_cuda::SemanticSourceContentAllocation>>,
 );
 
 fn project_tensor_rows(

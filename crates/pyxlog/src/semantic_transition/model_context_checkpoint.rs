@@ -316,22 +316,14 @@ pub(super) fn resolve_model_context_restore(
                 &registrar,
                 work.clone_ref(py),
             )?;
-            let returned = callback.bind(py).call1((
-                checkpoint.clone_ref(py),
-                declaration.clone_ref(py),
-                work.clone_ref(py),
-            ))?;
-            if !returned.is_exact_instance_of::<PyTuple>() || returned.cast::<PyTuple>()?.len() != 2
-            {
-                return Err(invalid(
-                    "model context preparation must return its original context and full geometry",
-                ));
-            }
-            let fields = returned.cast::<PyTuple>()?;
-            declaration
-                .borrow(py)
-                .bind_geometry(py, &fields.get_item(1)?)?;
-            Ok(fields.get_item(0)?.unbind())
+            callback
+                .bind(py)
+                .call1((
+                    checkpoint.clone_ref(py),
+                    declaration.clone_ref(py),
+                    work.clone_ref(py),
+                ))
+                .map(Bound::unbind)
         })();
         let mut state = restored
             .model_context_restore
