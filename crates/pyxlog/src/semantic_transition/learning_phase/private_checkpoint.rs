@@ -769,11 +769,7 @@ impl PySemanticLearningPhaseTransition {
         arguments.set_item("parent", parent.borrow(py).identity(py)?)?;
         arguments.set_item(
             "model_binding",
-            (
-                binding.1,
-                PyBytes::new(py, binding.3 .0.as_bytes()),
-                PyBytes::new(py, binding.3 .1.as_bytes()),
-            ),
+            (binding.1, PyBytes::new(py, binding.3.as_bytes())),
         )?;
         arguments.set_item("full_checkpoint", saved.bind(py))?;
         arguments.set_item("resource_usage", (work, peak, report.model_calls))?;

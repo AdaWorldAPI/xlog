@@ -32,7 +32,7 @@ const ORIGIN_KEYS: [&str; 12] = [
     "action_receipt_digest",
     "origin_logical_digest",
     "successor_logical_digest",
-    "authority_closure_digest",
+    "authority_closure_origin",
     "record_digest",
 ];
 
@@ -217,7 +217,7 @@ pub(super) fn inspect(
             ("action_receipt_digest", record.action_receipt_digest),
             ("origin_logical_digest", record.origin_logical_digest),
             ("successor_logical_digest", record.successor_logical_digest),
-            ("authority_closure_digest", record.authority_closure_digest),
+            ("authority_closure_origin", record.authority_closure_origin),
             ("record_digest", record.record_digest),
         ] {
             origin.set_item(name, PyBytes::new(py, identity.as_bytes()))?;

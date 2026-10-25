@@ -37,7 +37,6 @@ pub(super) struct OriginalCheckpointExport {
         Option<xlog_cuda::SemanticPublishedIdentity>,
         u64,
         Identity256,
-        Identity256,
     )>,
     pub(super) observation: Option<xlog_cuda::SemanticPublishedStateObservation>,
     pub(super) prefill_observation: Option<xlog_cuda::SemanticCheckpointInitialPrefillObservation>,
