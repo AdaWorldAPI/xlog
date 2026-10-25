@@ -1642,6 +1642,10 @@ impl SemanticTransitionSession {
             original.copy_cursor += 1;
             original.copy_dma_recorded = false;
         }
+        let stage = original
+            .stage
+            .as_ref()
+            .expect("retained restored prefill stage");
         let groups = [
             stage
                 .model_content

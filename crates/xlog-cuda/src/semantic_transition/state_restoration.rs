@@ -1806,14 +1806,14 @@ impl<T: DeviceRepr + Send + Sync> OriginalTypedWrite for TypedOriginalWrite<T> {
         let mut failure = None;
         let result = enqueue_recorded(domain, poisoned, recorder, |enqueue| {
             self.write.enqueue_admitted(enqueue).map_err(|error| {
-                failure = Some(error.0);
+                failure = error.driver_error();
                 error
             })
         });
         match failure {
-            Some(status) => Err(native_runtime_error(
+            Some(error) => Err(native_runtime_error(
                 "original device write submission",
-                cudarc::driver::DriverError(status),
+                error,
             )),
             None => result,
         }

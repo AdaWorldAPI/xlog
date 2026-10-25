@@ -672,15 +672,6 @@ impl SemanticTransitionSession {
                 return Ok(true);
             }
         }
-        if let Some(stage) = &self.initial_prefill {
-            if stage
-                .token_write
-                .as_ref()
-                .is_some_and(state_restoration::OriginalDeviceWrite::completion_pending)
-            {
-                return Ok(true);
-            }
-        }
         if self
             .publication_preparation
             .as_ref()
@@ -931,7 +922,9 @@ impl SemanticTransitionSession {
             || self.task_evaluation_identity() != Some(retained.task_identity)
             || retained.model_generation != parent.header.model_generation
         {
-            return Err(publication_input_error("initial prefill basis changed its original stage, task or complete neural generation"));
+            return Err(publication_input_error(
+                "initial prefill basis changed its original stage, task or complete neural generation",
+            ));
         }
         Ok(())
     }
@@ -2034,24 +2027,6 @@ impl SemanticTransitionSession {
         continuation
             .inner
             .require_initial_prefill_preparation(self, &stage.scope)?;
-        let allowance = self.graph.cold_work_allowance();
-        let stage = self
-            .initial_prefill
-            .as_mut()
-            .expect("same original prefill stage");
-        stage
-            .token_write
-            .as_mut()
-            .ok_or(SemanticTransitionError::NotBound)?
-            .resolve_original(
-                &self.domain,
-                &self.stream,
-                &self.provider,
-                &mut self.poisoned,
-                false,
-                allowance.as_ref(),
-            )?;
-        self.poisoned = false;
         Ok(SemanticInitialPrefillLease {
             issuer: Arc::clone(&self.publication_issuer),
             scope: Arc::clone(&stage.scope),
@@ -2104,7 +2079,9 @@ impl SemanticTransitionSession {
             || self.pending_replay_delivery.is_some()
             || self.model_owners.is_empty()
         {
-            return Err(publication_input_error("model continuation must freeze once from the original imported contexts before drawing"));
+            return Err(publication_input_error(
+                "model continuation must freeze once from the original imported contexts before drawing",
+            ));
         }
         let storage = Arc::clone(
             self.publication

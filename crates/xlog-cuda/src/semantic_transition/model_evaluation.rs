@@ -502,7 +502,8 @@ impl SemanticTransitionSession {
                 .is_none_or(|binding| binding.output_recorded)
         {
             return Err(publication_input_error(
-                "evaluation stream requires its original invocation, unique forward and active capture"));
+                "evaluation stream requires its original invocation, unique forward and active capture",
+            ));
         }
         Ok(())
     }
@@ -621,7 +622,15 @@ impl SemanticTransitionSession {
         stream.require_finished_scratch()?;
         if !stream.belongs_to_evaluation(handle)
             || evaluation.output_owner.as_ref().is_none_or(|original| {
-                original.index != owner.index || !Arc::ptr_eq(&original._owner, &owner._owner)
+                !Arc::ptr_eq(&original.issuer, &owner.issuer)
+                    || original.reader_token != owner.reader_token
+                    || original.index != owner.index
+                    || original.tensors.len() != owner.tensors.len()
+                    || original
+                        .tensors
+                        .iter()
+                        .zip(&owner.tensors)
+                        .any(|(expected, actual)| !same_tensor_content_owner(expected, actual))
             })
         {
             return Err(SemanticTransitionError::ObservationMismatch);
@@ -926,7 +935,6 @@ impl SemanticTransitionSession {
             original.started = true;
         }
         let cold_work = self.cold_native_work(lease.token)?;
-        let allowance = self.cold_native_allowance(lease.token)?;
         if original.cohort.is_none() {
             let (arena, selected_view) = self.training_view_selection_basis(lease)?;
             let selected =

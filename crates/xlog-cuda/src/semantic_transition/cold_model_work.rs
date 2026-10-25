@@ -933,7 +933,7 @@ impl SemanticTransitionSession {
                         "restoration requires its complete original factory plan before admission",
                     ));
                 }
-                self.admit_cold_model_work_plan_with_sources(work, &[], &[], None, &[], &[])?;
+                self.admit_cold_model_work_plan_with_sources(work, &[], &[], &[], &[])?;
             }
             if self.original_cold_model_work(work)?.state == RecordingState::Waiting {
                 self.begin_cold_model_work(work)?;

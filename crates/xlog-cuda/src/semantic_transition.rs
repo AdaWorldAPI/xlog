@@ -13927,7 +13927,6 @@ impl PreparedStepInputs {
                         header,
                         source,
                         ranges,
-                        digests,
                         tally,
                     ) = arguments;
                     let control = control.into_kernel_param_storage();
@@ -13938,7 +13937,6 @@ impl PreparedStepInputs {
                     let header = header.into_kernel_param_storage();
                     let source = source.into_kernel_param_storage();
                     let ranges = ranges.into_kernel_param_storage();
-                    let digests = digests.into_kernel_param_storage();
                     let tally = tally.into_kernel_param_storage();
                     let mut parameters = [
                         control.as_kernel_param(),
@@ -13949,7 +13947,6 @@ impl PreparedStepInputs {
                         header.as_kernel_param(),
                         source.as_kernel_param(),
                         ranges.as_kernel_param(),
-                        digests.as_kernel_param(),
                         tally.as_kernel_param(),
                     ];
                     // SAFETY: the original owner retains both fixed metadata banks,
@@ -23716,7 +23713,6 @@ impl SemanticTransitionSession {
                 )?;
             }
             for bank in 0..2 {
-                let mut ceiling = ceiling;
                 work.register(
                     bank,
                     policy_work::PolicyWorkKey::ModelScratch,
@@ -30991,7 +30987,7 @@ impl SemanticTransitionSession {
         if retired_preparation.is_none() {
             self.reclaim_model_generations()?;
         }
-        let mut resources = std::mem::take(&mut self.prepared_resources);
+        let resources = std::mem::take(&mut self.prepared_resources);
         // An original catalogue retired without a result does not establish
         // which storage Control selected. Keep both catalogues terminally
         // pinned rather than interpreting it for another preparation.
@@ -32685,7 +32681,6 @@ impl SemanticTransitionSession {
             }
             return result;
         }
-        let mut launch = launch;
         let result = enqueue_recorded(&self.domain, poisoned, recorder, |stream| {
             launch(stream, &mut false, &mut false)
         });
@@ -33359,8 +33354,11 @@ impl SemanticTransitionSession {
                             &mut reader.materialization_initialization_dma_recorded,
                         )?;
                     }
-                    submission.map_err(|error| {
-                        native_runtime_error("publication lease initialization upload", error)
+                    submission.map_err(|error| match error.driver_error() {
+                        Some(driver) => {
+                            native_runtime_error("publication lease initialization upload", driver)
+                        }
+                        None => runtime_error("publication lease initialization upload", error),
                     })?;
                 }
                 initialization.resolve().map_err(|error| {
@@ -34063,13 +34061,6 @@ impl SemanticTransitionSession {
                 return Err(SemanticTransitionError::Poisoned);
             }
             return Ok(Arc::clone(inputs));
-        }
-        #[cfg(feature = "semantic-policy")]
-        if let Some(allowance) = self.cold_native_allowance(lease.token)? {
-            allowance
-                .lock()
-                .map_err(|_| publication_input_error("original step input allowance is poisoned"))?
-                .content_ceiling()?;
         }
         let _ordinary = crate::cuda_graph::reserve_uncaptured_stream(&self.stream)
             .map_err(|error| runtime_error("step input preparation stream admission", error))?;
