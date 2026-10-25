@@ -18075,7 +18075,6 @@ impl PySemanticPreparedStep {
                     record.capacity_bytes,
                     record.logical_begin,
                     record.logical_end,
-                    PyBytes::new(py, record.identity.as_bytes()),
                     PyBytes::new(py, &record.bytes),
                 )
             }),
