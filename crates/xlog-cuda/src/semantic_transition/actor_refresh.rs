@@ -395,7 +395,7 @@ pub(super) struct PreparedActorRefreshDevice {
 // SAFETY: the padding-free C representation contains only initialized integers.
 unsafe impl DeviceRepr for PreparedActorRefreshDevice {}
 
-const _: () = assert!(size_of::<PreparedActorRefreshDevice>() == 1688);
+const _: () = assert!(size_of::<PreparedActorRefreshDevice>() == 1560);
 
 pub(super) struct StagedActorRefresh {
     pub(super) proof: SemanticPreparedActorRefresh,

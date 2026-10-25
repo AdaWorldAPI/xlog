@@ -489,6 +489,7 @@ impl ResidentModelExportOwner {
                 _generation: Some(Arc::clone(&self.generation)),
                 _view: self.view.clone(),
                 _publication: None,
+                _guard: None,
                 event,
                 stream: Arc::clone(stream),
                 consumer_stream,

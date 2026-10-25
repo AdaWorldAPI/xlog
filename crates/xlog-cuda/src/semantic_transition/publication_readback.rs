@@ -169,6 +169,8 @@ impl SemanticTransitionSession {
         let count = directory
             .iter()
             .filter(|range| !matches!(range.role, 18..=25))
+            .count();
+        let extent = size_of::<CheckpointReadbackGeometry>()
             .checked_add(2 * size_of::<usize>())
             .and_then(|n| n.checked_add(count.checked_mul(size_of::<(u64, u64, u64, u64)>())?))
             .ok_or(SemanticTransitionError::GenerationExhausted)?;
