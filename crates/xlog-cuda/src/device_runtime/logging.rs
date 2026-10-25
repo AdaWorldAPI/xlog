@@ -103,7 +103,7 @@ fn classify_error(e: &ResourceError) -> &'static str {
     match e {
         ResourceError::AllocationRetained(_) => "AllocationRetained",
         ResourceError::OutOfBudget { .. } => "OutOfBudget",
-        ResourceError::Driver(_) => "Driver",
+        ResourceError::CudaDriver(_) | ResourceError::Driver(_) => "Driver",
         ResourceError::StreamMisuse(_) => "StreamMisuse",
         ResourceError::UseAfterFree { .. } => "UseAfterFree",
         ResourceError::OutOfBounds { .. } => "OutOfBounds",

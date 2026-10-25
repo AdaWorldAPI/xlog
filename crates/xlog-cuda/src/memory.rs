@@ -2661,7 +2661,11 @@ fn with_memory_operation<T>(
             MemoryOperationOwner::synchronize,
             MemoryOperationOwner::cancel,
         )
-        .map_err(|error| ResourceError::Driver(error.to_string()))?;
+        .map_err(|error| match error {
+            crate::launch::LaunchEnqueueError::Operation(error)
+            | crate::launch::LaunchEnqueueError::Preparation(error) => error,
+            error => ResourceError::Driver(error.to_string()),
+        })?;
     guard.transaction.commit_with(
         MemoryOperationOwner::finish,
         MemoryOperationOwner::synchronize,
