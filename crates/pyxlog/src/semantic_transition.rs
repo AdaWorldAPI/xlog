@@ -486,6 +486,11 @@ enum TaskReleaseCustody {
     ObservedCold {
         cold_task: Py<cold_task::PySemanticTransitionColdTask>,
     },
+    Publication {
+        parent: Py<PySemanticPublishedParent>,
+        controller: Py<PySemanticTransitionController>,
+        consumer_streams: Vec<u64>,
+    },
 }
 
 impl TaskReleaseCustody {
@@ -513,6 +518,22 @@ impl TaskReleaseCustody {
                     cold_task: original,
                 },
             ) => cold_task.as_ptr() == original.as_ptr(),
+            (
+                Self::Publication {
+                    parent,
+                    controller,
+                    consumer_streams,
+                },
+                Self::Publication {
+                    parent: original_parent,
+                    controller: original_controller,
+                    consumer_streams: original_streams,
+                },
+            ) => {
+                parent.as_ptr() == original_parent.as_ptr()
+                    && controller.as_ptr() == original_controller.as_ptr()
+                    && consumer_streams == original_streams
+            }
             _ => false,
         }
     }
@@ -853,6 +874,10 @@ impl PySemanticTransitionSession {
     }
 
     fn release_task(&self, py: Python<'_>, custody: TaskReleaseCustody) -> PyResult<()> {
+        self.retiring
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| invalid("terminal task release cannot interrupt original retirement"))?;
+        let _retirement = PreparedRetirementGuard(&self.retiring);
         // Allocate Python custody before entering the terminal native wait.
         let (operation, message) = match &custody {
             TaskReleaseCustody::TaskUse { kind: TaskReleaseKind::Imported, .. } => (
@@ -866,6 +891,10 @@ impl PySemanticTransitionSession {
             TaskReleaseCustody::ObservedCold { .. } => (
                 "close",
                 "retain cold_task, then repeat cold_task.close(); do not import or replace that owner",
+            ),
+            TaskReleaseCustody::Publication { .. } => (
+                "close_aborted_publication",
+                "retain controller, parent and consumer_streams, then repeat controller.close_aborted_publication(parent, consumer_streams=consumer_streams); do not replace the original owners or stream roster",
             ),
         };
         let pending = SemanticTaskReleasePending::new_err(message);
@@ -882,6 +911,19 @@ impl PySemanticTransitionSession {
             }
             TaskReleaseCustody::ObservedCold { cold_task } => {
                 pending.value(py).setattr("cold_task", cold_task.bind(py))?;
+            }
+            TaskReleaseCustody::Publication {
+                parent,
+                controller,
+                consumer_streams,
+            } => {
+                pending.value(py).setattr("parent", parent.bind(py))?;
+                pending
+                    .value(py)
+                    .setattr("controller", controller.bind(py))?;
+                pending
+                    .value(py)
+                    .setattr("consumer_streams", PyTuple::new(py, consumer_streams)?)?;
             }
         }
         pending.value(py).setattr("operation", operation)?;
@@ -911,8 +953,18 @@ impl PySemanticTransitionSession {
                 let live = guard
                     .as_mut()
                     .ok_or_else(|| invalid("native Session was already released"))?;
-                if let TaskReleaseCustody::TaskUse { task_use, .. } = &custody {
-                    task_use.borrow(py).require_original_identity(live)?;
+                match &custody {
+                    TaskReleaseCustody::TaskUse { task_use, .. } => {
+                        task_use.borrow(py).require_original_identity(live)?;
+                    }
+                    TaskReleaseCustody::Publication { parent, .. } => {
+                        parent
+                            .borrow(py)
+                            .task_use
+                            .borrow(py)
+                            .require_original_identity(live)?;
+                    }
+                    TaskReleaseCustody::ObservedCold { .. } => {}
                 }
                 if retained.is_none() {
                     *retained = Some(TaskRelease {
@@ -930,6 +982,14 @@ impl PySemanticTransitionSession {
                         TaskReleaseKind::Aborted => live.join_aborted_task_release(),
                     },
                     TaskReleaseCustody::ObservedCold { .. } => live.join_observed_cold_release(),
+                    TaskReleaseCustody::Publication {
+                        parent,
+                        consumer_streams,
+                        ..
+                    } => live.join_aborted_publication_release(
+                        &mut *parent.borrow(py).lease()?,
+                        consumer_streams,
+                    ),
                 };
                 if let Err(original) = joined {
                     let original = xlog_err(original);
@@ -955,6 +1015,24 @@ impl PySemanticTransitionSession {
                 .as_mut()
                 .expect("retained original task custody")
                 .owner = Some(owner);
+            let publication = match &retained
+                .as_ref()
+                .expect("retained original task custody")
+                .custody
+            {
+                TaskReleaseCustody::Publication { parent, .. } => Some(parent.clone_ref(py)),
+                _ => None,
+            };
+            if let Some(parent) = publication {
+                // The native lease has fully released. Producer finalizers may
+                // reenter Python only outside native/state locks; the original
+                // retirement guard excludes a second close or allocator resolve.
+                drop(retained);
+                parent.borrow(py).release_continuation_producers();
+                retained = self.task_release.try_lock().map_err(|_| {
+                    invalid("terminal task release lost its original retirement custody")
+                })?;
+            }
         }
         // A late deallocation error retains allocator custody. Its retry only
         // resolves retirement and cannot reenter the completed terminal join.
@@ -23135,6 +23213,56 @@ impl PySemanticTransitionController {
         task_use: Bound<'_, PySemanticTransitionTaskUse>,
     ) -> PyResult<()> {
         Self::close_task(slf, py, task_use, TaskReleaseKind::Aborted)
+    }
+
+    /// Terminally join and release an aborted task's original selected or retired
+    /// publication. This does not grant execution or replace outstanding owners.
+    /// An unknown join retains this parent and the exact consumer-stream roster;
+    /// repeat only this operation with the original handles.
+    #[pyo3(signature = (parent, *, consumer_streams))]
+    fn close_aborted_publication(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        parent: Bound<'_, PySemanticPublishedParent>,
+        consumer_streams: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let controlled = slf.borrow();
+        let published = parent.borrow();
+        let issued = published.task_use.borrow(py);
+        let session = controlled.session.borrow(py);
+        session.require_creator()?;
+        if published.session.as_ptr() != controlled.session.as_ptr()
+            || !Arc::ptr_eq(&controlled.identity, &issued.controller)
+        {
+            return Err(invalid(
+                "terminal publication release requires its original controller and parent",
+            ));
+        }
+        let mut budget = 4096;
+        let streams = ColdValue::read(consumer_streams, &mut budget, 0)?;
+        let streams = streams
+            .sequence()?
+            .iter()
+            .map(ColdValue::unsigned)
+            .collect::<PyResult<Vec<_>>>()?;
+        let custody = TaskReleaseCustody::Publication {
+            parent: parent.clone().unbind(),
+            controller: slf.clone().unbind(),
+            consumer_streams: streams,
+        };
+        if session
+            .task_release
+            .try_lock()
+            .map_err(|_| {
+                invalid("terminal task release is already active or its custody is poisoned")
+            })?
+            .is_some()
+        {
+            return session.release_task(py, custody);
+        }
+        controlled.require_read_issued(&issued)?;
+        session.require_task_release_idle()?;
+        session.release_task(py, custody)
     }
 
     /// Terminally release a Session only after its original publication,
