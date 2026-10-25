@@ -786,13 +786,6 @@ impl PySemanticModelContextContinuation {
             state.consumer_streams = streams.to_vec();
         }
         let mut owner = session.owner()?;
-        owner
-            .resolve_model_context_prepared_model_rosters(
-                &self.inner,
-                &steps[0].borrow(py).inner,
-                &native_work,
-            )
-            .map_err(xlog_err)?;
         if !owner
             .cold_model_work_report_cursor(&native_work, None)
             .map_err(xlog_err)?
