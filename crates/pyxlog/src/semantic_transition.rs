@@ -29,8 +29,8 @@ use xlog_cuda::{
     SemanticPolarity, SemanticPredicateRecord, SemanticPreparedStep, SemanticProgramAdmission,
     SemanticPublishedLease, SemanticRecordRole, SemanticReplayAppendBinding, SemanticRngBinding,
     SemanticSourceMapping, SemanticStateRecord, SemanticStateRole, SemanticSupportRecord,
-    SemanticTaskContentIdentity, SemanticTaskGoalWitness, SemanticTensorContentWitness,
-    SemanticTensorInput, SemanticTensorLayout, SemanticTextSlot, SemanticTrainingCanary,
+    SemanticTaskContentIdentity, SemanticTaskGoalWitness, SemanticTensorInput,
+    SemanticTensorLayout, SemanticTensorOwner, SemanticTextSlot, SemanticTrainingCanary,
     SemanticTrainingCanaryKind, SemanticTrainingDomain, SemanticTrainingManifest,
     SemanticTrainingObjective, SemanticTrainingObjectiveGroup, SemanticTrainingObjectiveGroupKind,
     SemanticTrainingViewBasis, SemanticTrainingViewPort, SemanticTrainingViewRow,
@@ -77,9 +77,6 @@ pub(crate) mod resident_model_memory;
 pub(crate) mod source_content_geometry;
 #[cfg(feature = "semantic-policy")]
 pub(crate) mod source_content_occurrences;
-#[cfg(feature = "semantic-policy")]
-use source_content_occurrences::PySemanticSourceContentOccurrence;
-
 pyo3::create_exception!(
     pyxlog._native,
     SemanticReplayDeliveryPending,
@@ -261,7 +258,6 @@ fn replay_delivery_identity_result(
         PyBytes::new(py, identity.instance.as_bytes()),
         identity.word,
         PyBytes::new(py, identity.logical_digest.as_bytes()),
-        PyBytes::new(py, identity.state_digest.as_bytes()),
     )
         .into_pyobject(py)
     {
@@ -422,12 +418,13 @@ fn task_content_read(
 /// descriptors against its empty base. It does not insert supplied supports into
 /// that base or grant task execution, publication, inference, or training authority.
 /// Public orchestration and reads belong to the constructing Python thread.
-/// The trusted Runtime must retain every issued witness and policy invocation,
+/// The trusted Runtime must retain every tensor owner and policy invocation,
 /// their original producers, callbacks and saved autograd payloads through the
 /// original backward call, then perform one guaranteed creator-thread cleanup.
 /// External aliases require their owning Runtime to remain alive until release.
 /// Transferable native ownership does not make arbitrary Python finalizers safe
-/// on workers. Only a retained content witness may verify from a worker thread.
+/// on workers. Native completion retains serialized access without running
+/// arbitrary Python finalizers.
 #[pyclass(name = "SemanticTransitionSession", module = "pyxlog._native", frozen)]
 pub(crate) struct PySemanticTransitionSession {
     inner: Arc<Mutex<Option<SemanticTransitionSession>>>,
@@ -444,9 +441,7 @@ pub(crate) struct PySemanticTransitionSession {
     learning_transition: Mutex<Option<Py<learning_phase::PySemanticLearningPhaseTransition>>>,
     checkpoint_custody: Mutex<Option<learning_phase::cold_restore::CheckpointCustody>>,
     task_release: Mutex<Option<TaskRelease>>,
-    prefill_operation: Arc<AtomicBool>,
-    #[cfg(feature = "semantic-policy")]
-    pending_content_binding: Mutex<Option<PendingPythonContentBinding>>,
+    producer_operation: Arc<AtomicBool>,
     #[cfg(feature = "semantic-policy")]
     pending_evaluation_preparation: Mutex<Option<model_evaluation::PendingEvaluationPreparation>>,
     #[cfg(feature = "semantic-policy")]
@@ -487,6 +482,15 @@ enum TaskReleaseCustody {
     ObservedCold {
         cold_task: Py<cold_task::PySemanticTransitionColdTask>,
     },
+    Publications {
+        releases: Vec<PublicationRelease>,
+        controller: Py<PySemanticTransitionController>,
+    },
+}
+
+struct PublicationRelease {
+    parent: Py<PySemanticPublishedParent>,
+    consumer_streams: Vec<u64>,
 }
 
 impl TaskReleaseCustody {
@@ -514,6 +518,26 @@ impl TaskReleaseCustody {
                     cold_task: original,
                 },
             ) => cold_task.as_ptr() == original.as_ptr(),
+            (
+                Self::Publications {
+                    releases,
+                    controller,
+                },
+                Self::Publications {
+                    releases: original_releases,
+                    controller: original_controller,
+                },
+            ) => {
+                controller.as_ptr() == original_controller.as_ptr()
+                    && releases.len() == original_releases.len()
+                    && releases
+                        .iter()
+                        .zip(original_releases)
+                        .all(|(release, original)| {
+                            release.parent.as_ptr() == original.parent.as_ptr()
+                                && release.consumer_streams == original.consumer_streams
+                        })
+            }
             _ => false,
         }
     }
@@ -525,19 +549,19 @@ struct TaskRelease {
 }
 
 // Producer callbacks must return before terminal cleanup may detach their Session.
-struct InitialPrefillOperation(Arc<AtomicBool>);
+struct TensorProducerOperation(Arc<AtomicBool>);
 
-impl InitialPrefillOperation {
+impl TensorProducerOperation {
     fn begin(session: &PySemanticTransitionSession) -> PyResult<Self> {
         session
-            .prefill_operation
+            .producer_operation
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| invalid("initial prefill is already in an original operation"))?;
-        Ok(Self(Arc::clone(&session.prefill_operation)))
+            .map_err(|_| invalid("tensor producer is already in an original operation"))?;
+        Ok(Self(Arc::clone(&session.producer_operation)))
     }
 }
 
-impl Drop for InitialPrefillOperation {
+impl Drop for TensorProducerOperation {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
     }
@@ -715,16 +739,16 @@ impl PySemanticTransitionSession {
         if !self.recording.load(Ordering::Acquire) {
             drain_export_owners();
         }
-        self.witness_owner()
+        self.serialized_owner()
     }
 
-    // Only content verification enters this lock from an autograd worker.
+    // Native completion may enter without the Python interpreter lock.
     // Do not drain creator-owned Python references or run callbacks here.
-    fn witness_owner(&self) -> PyResult<SemanticSessionGuard<'_>> {
+    fn serialized_owner(&self) -> PyResult<SemanticSessionGuard<'_>> {
         // Python allocation/finalization can reenter a creator-thread getter.
         // Waiting on this thread's own native operation would deadlock while
-        // holding the GIL. Content-verification workers retain normal serialized
-        // access; a creator reentry must leave the original operation untouched.
+        // holding the GIL. Native completion retains serialized access;
+        // creator reentry must leave the original operation untouched.
         let owner = if std::thread::current().id() == self.owner_thread {
             self.inner.try_lock().map_err(|error| match error {
                 std::sync::TryLockError::WouldBlock => {
@@ -757,7 +781,7 @@ impl PySemanticTransitionSession {
         }
         if self.importing.load(Ordering::Acquire)
             || self.recording.load(Ordering::Acquire)
-            || self.prefill_operation.load(Ordering::Acquire)
+            || self.producer_operation.load(Ordering::Acquire)
             || self.retiring.load(Ordering::Acquire)
             || self.learning_preparing.load(Ordering::Acquire)
             || self
@@ -801,11 +825,6 @@ impl PySemanticTransitionSession {
                 .prepared_task_import
                 .lock()
                 .map_err(|_| invalid("prepared import custody mutex is poisoned"))?
-                .is_some()
-            || self
-                .pending_content_binding
-                .lock()
-                .map_err(|_| invalid("pending content custody mutex is poisoned"))?
                 .is_some()
             || self
                 .pending_evaluation_preparation
@@ -854,6 +873,10 @@ impl PySemanticTransitionSession {
     }
 
     fn release_task(&self, py: Python<'_>, custody: TaskReleaseCustody) -> PyResult<()> {
+        self.retiring
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| invalid("terminal task release cannot interrupt original retirement"))?;
+        let _retirement = PreparedRetirementGuard(&self.retiring);
         // Allocate Python custody before entering the terminal native wait.
         let (operation, message) = match &custody {
             TaskReleaseCustody::TaskUse { kind: TaskReleaseKind::Imported, .. } => (
@@ -867,6 +890,10 @@ impl PySemanticTransitionSession {
             TaskReleaseCustody::ObservedCold { .. } => (
                 "close",
                 "retain cold_task, then repeat cold_task.close(); do not import or replace that owner",
+            ),
+            TaskReleaseCustody::Publications { .. } => (
+                "close_aborted_publications",
+                "retain controller and releases, then repeat controller.close_aborted_publications(releases); do not replace original parents or consumer-stream rosters",
             ),
         };
         let pending = SemanticTaskReleasePending::new_err(message);
@@ -883,6 +910,26 @@ impl PySemanticTransitionSession {
             }
             TaskReleaseCustody::ObservedCold { cold_task } => {
                 pending.value(py).setattr("cold_task", cold_task.bind(py))?;
+            }
+            TaskReleaseCustody::Publications {
+                releases,
+                controller,
+            } => {
+                let original = releases
+                    .iter()
+                    .map(|release| {
+                        Ok((
+                            release.parent.clone_ref(py),
+                            PyTuple::new(py, &release.consumer_streams)?.unbind(),
+                        ))
+                    })
+                    .collect::<PyResult<Vec<_>>>()?;
+                pending
+                    .value(py)
+                    .setattr("releases", PyTuple::new(py, original)?)?;
+                pending
+                    .value(py)
+                    .setattr("controller", controller.bind(py))?;
             }
         }
         pending.value(py).setattr("operation", operation)?;
@@ -912,8 +959,21 @@ impl PySemanticTransitionSession {
                 let live = guard
                     .as_mut()
                     .ok_or_else(|| invalid("native Session was already released"))?;
-                if let TaskReleaseCustody::TaskUse { task_use, .. } = &custody {
-                    task_use.borrow(py).require_original_identity(live)?;
+                match &custody {
+                    TaskReleaseCustody::TaskUse { task_use, .. } => {
+                        task_use.borrow(py).require_original_identity(live)?;
+                    }
+                    TaskReleaseCustody::Publications { releases, .. } => {
+                        for release in releases {
+                            release
+                                .parent
+                                .borrow(py)
+                                .task_use
+                                .borrow(py)
+                                .require_original_identity(live)?;
+                        }
+                    }
+                    TaskReleaseCustody::ObservedCold { .. } => {}
                 }
                 if retained.is_none() {
                     *retained = Some(TaskRelease {
@@ -931,6 +991,24 @@ impl PySemanticTransitionSession {
                         TaskReleaseKind::Aborted => live.join_aborted_task_release(),
                     },
                     TaskReleaseCustody::ObservedCold { .. } => live.join_observed_cold_release(),
+                    TaskReleaseCustody::Publications { releases, .. } => {
+                        let parents = releases
+                            .iter()
+                            .map(|release| release.parent.borrow(py))
+                            .collect::<Vec<_>>();
+                        let mut leases = parents
+                            .iter()
+                            .map(|parent| parent.lease())
+                            .collect::<PyResult<Vec<_>>>()?;
+                        let mut native = leases
+                            .iter_mut()
+                            .zip(releases)
+                            .map(|(lease, release)| {
+                                (&mut **lease, release.consumer_streams.as_slice())
+                            })
+                            .collect::<Vec<_>>();
+                        live.join_aborted_publication_release(&mut native)
+                    }
                 };
                 if let Err(original) = joined {
                     let original = xlog_err(original);
@@ -938,11 +1016,13 @@ impl PySemanticTransitionSession {
                         pending.set_cause(py, Some(original));
                         return Err(pending);
                     }
-                    // A known admission rejection did not begin terminal release.
-                    let rejected = retained.take();
-                    drop(guard);
-                    drop(retained);
-                    drop(rejected);
+                    if !live.task_release_started() {
+                        // A known admission rejection did not begin terminal release.
+                        let rejected = retained.take();
+                        drop(guard);
+                        drop(retained);
+                        drop(rejected);
+                    }
                     return Err(original);
                 }
                 // Invalidate task aliases before detached producer finalizers can reenter.
@@ -954,6 +1034,29 @@ impl PySemanticTransitionSession {
                 .as_mut()
                 .expect("retained original task custody")
                 .owner = Some(owner);
+            let publications = match &retained
+                .as_ref()
+                .expect("retained original task custody")
+                .custody
+            {
+                TaskReleaseCustody::Publications { releases, .. } => releases
+                    .iter()
+                    .map(|release| release.parent.clone_ref(py))
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            };
+            if !publications.is_empty() {
+                // The native lease has fully released. Producer finalizers may
+                // reenter Python only outside native/state locks; the original
+                // retirement guard excludes a second close or allocator resolve.
+                drop(retained);
+                for parent in publications {
+                    parent.borrow(py).release_continuation_producers();
+                }
+                retained = self.task_release.try_lock().map_err(|_| {
+                    invalid("terminal task release lost its original retirement custody")
+                })?;
+            }
         }
         // A late deallocation error retains allocator custody. Its retry only
         // resolves retirement and cannot reenter the completed terminal join.
@@ -1187,9 +1290,7 @@ impl PySemanticTransitionSession {
                 learning_phase::cold_restore::CheckpointCustody::issue(),
             )),
             task_release: Mutex::new(None),
-            prefill_operation: Arc::new(AtomicBool::new(false)),
-            #[cfg(feature = "semantic-policy")]
-            pending_content_binding: Mutex::new(None),
+            producer_operation: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "semantic-policy")]
             pending_evaluation_preparation: Mutex::new(None),
             #[cfg(feature = "semantic-policy")]
@@ -1493,10 +1594,9 @@ enum CheckpointReferentPhase {
 struct CheckpointReferent {
     checkpoint_digest: [u8; 32],
     checkpoint_bytes: u64,
-    publication: [u8; 104],
+    publication: [u8; 72],
     semantic_root: [u8; 32],
     model_generation: u64,
-    model_digest: [u8; 32],
     task: TaskCheckpointBinding,
     scope_digest: [u8; 32],
     authority_root: [u8; 32],
@@ -1506,7 +1606,7 @@ struct CheckpointReferent {
 
 impl CheckpointReferent {
     const MAGIC: &'static [u8] = b"XLOG-CHECKPOINT-REFERENT\0";
-    const VERSION: u32 = 2;
+    const VERSION: u32 = 3;
     const BYTES: usize = SemanticTransitionSession::CHECKPOINT_REFERENT_BYTES;
 
     fn encode(&self) -> Vec<u8> {
@@ -1518,7 +1618,6 @@ impl CheckpointReferent {
         bytes.extend_from_slice(&self.publication);
         bytes.extend_from_slice(&self.semantic_root);
         bytes.extend_from_slice(&self.model_generation.to_le_bytes());
-        bytes.extend_from_slice(&self.model_digest);
         bytes.extend_from_slice(&self.task.identity);
         bytes.extend_from_slice(&self.task.epoch.to_le_bytes());
         for digest in &self.task.content {
@@ -1567,7 +1666,7 @@ impl CheckpointReferent {
         if checkpoint_bytes == 0 {
             return Err(invalid("checkpoint referent has an empty source"));
         }
-        let publication = take(&mut cursor, 104)
+        let publication = take(&mut cursor, 72)
             .try_into()
             .expect("fixed referent extent");
         let semantic_root = digest(&mut cursor);
@@ -1576,7 +1675,6 @@ impl CheckpointReferent {
                 .try_into()
                 .expect("fixed referent extent"),
         );
-        let model_digest = digest(&mut cursor);
         let identity = digest(&mut cursor);
         let epoch = u64::from_le_bytes(
             take(&mut cursor, 8)
@@ -1601,7 +1699,6 @@ impl CheckpointReferent {
             publication,
             semantic_root,
             model_generation,
-            model_digest,
             task: TaskCheckpointBinding {
                 identity,
                 epoch,
@@ -1697,7 +1794,6 @@ impl CheckpointReferent {
             publication: checkpoint_publication_bytes(native.publication),
             semantic_root: *native.semantic_root.as_bytes(),
             model_generation: native.model_generation,
-            model_digest: Sha256::digest(&manifest.model).into(),
             task,
             scope_digest: checkpoint_scope_digest(&authority.scope),
             authority_root: *authority.authority_root().as_bytes(),
@@ -1804,12 +1900,11 @@ fn selected_checkpoint_referents(
     Ok(referents)
 }
 
-fn checkpoint_publication_bytes(identity: xlog_cuda::SemanticPublishedIdentity) -> [u8; 104] {
-    let mut bytes = [0u8; 104];
+fn checkpoint_publication_bytes(identity: xlog_cuda::SemanticPublishedIdentity) -> [u8; 72] {
+    let mut bytes = [0u8; 72];
     bytes[..32].copy_from_slice(identity.instance.as_bytes());
     bytes[32..40].copy_from_slice(&identity.word.to_le_bytes());
     bytes[40..72].copy_from_slice(identity.logical_digest.as_bytes());
-    bytes[72..].copy_from_slice(identity.state_digest.as_bytes());
     bytes
 }
 
@@ -2735,7 +2830,6 @@ impl PySemanticTransitionSession {
         )?;
         fields.set_item("semantic_root", PyBytes::new(py, &record.semantic_root))?;
         fields.set_item("model_generation", record.model_generation)?;
-        fields.set_item("model_state_sha256", PyBytes::new(py, &record.model_digest))?;
         fields.set_item("task_identity", PyBytes::new(py, &record.task.identity))?;
         fields.set_item("task_epoch", record.task.epoch)?;
         fields.set_item(
@@ -4569,7 +4663,6 @@ fn update_measurements_report(
             PyBytes::new(py, value.instance.as_bytes()),
             value.word,
             PyBytes::new(py, value.logical_digest.as_bytes()),
-            PyBytes::new(py, value.state_digest.as_bytes()),
         )
     };
     let report = PyDict::new(py);
@@ -4581,10 +4674,6 @@ fn update_measurements_report(
     report.set_item(
         "model_geometry_digest",
         PyBytes::new(py, observation.model_geometry_digest.as_bytes()),
-    )?;
-    report.set_item(
-        "model_numerical_digest",
-        PyBytes::new(py, observation.model_numerical_digest.as_bytes()),
     )?;
     report.set_item("transition_status", observation.transition_status)?;
     report.set_item(
@@ -4640,12 +4729,9 @@ fn update_measurements_report(
         ("lineage_instance", origin.lineage_instance),
         ("predecessor_instance", origin.predecessor_instance),
         ("predecessor_logical", origin.predecessor_logical),
-        ("predecessor_state", origin.predecessor_state),
         ("successor_instance", origin.successor_instance),
         ("successor_logical", origin.successor_logical),
-        ("successor_state", origin.successor_state),
         ("model_geometry_digest", origin.model_geometry_digest),
-        ("model_numerical_digest", origin.model_numerical_digest),
     ] {
         source.set_item(name, PyTuple::new(py, value)?)?;
     }
@@ -4724,10 +4810,6 @@ fn update_measurements_report(
                 payload.set_item(
                     "model_geometry_digest",
                     PyBytes::new(py, receipt.model_geometry_digest.as_bytes()),
-                )?;
-                payload.set_item(
-                    "model_numerical_digest",
-                    PyBytes::new(py, receipt.model_numerical_digest.as_bytes()),
                 )?;
                 payload.set_item(
                     "logits_digest",
@@ -5512,7 +5594,6 @@ impl PySemanticSegmentInstructionAdmission {
             PyBytes::new(py, identity.instance.as_bytes()),
             identity.word,
             PyBytes::new(py, identity.logical_digest.as_bytes()),
-            PyBytes::new(py, identity.state_digest.as_bytes()),
         )
             .into_pyobject(py)?
             .unbind())
@@ -6956,29 +7037,6 @@ fn tensor_metadata_value(
         .unbind())
 }
 
-fn parse_content_ranges(value: &ColdValue) -> PyResult<Vec<(SemanticStateRole, u64)>> {
-    let rows = value.sequence()?;
-    if rows.is_empty() {
-        return Err(invalid(
-            "content guard requires at least one published range",
-        ));
-    }
-    let mut seen = BTreeSet::new();
-    rows.iter()
-        .map(|row| {
-            let fields = row.fields(2)?;
-            let code = fields[0].unsigned()?;
-            let role = SemanticStateRole::from_code(code)
-                .ok_or_else(|| invalid("unknown native publication content role"))?;
-            let index = fields[1].unsigned()?;
-            if !seen.insert((code, index)) {
-                return Err(invalid("content guard repeats a published range"));
-            }
-            Ok((role, index))
-        })
-        .collect()
-}
-
 // Before native admission joins producer streams, any failed Python handoff
 // must retain previously consumed capsules. Guessing producer completion on an
 // exception or a reentrant authority change would permit use-after-free.
@@ -7434,8 +7492,8 @@ fn parse_parent(
     // the complete canonical contribution, and requires lossless cold restore
     // before admitting it; a payload hash is not reconstructible metadata.
     ColdValue::from_canonical_bytes(&model_numerical_mode)?;
-    let [schema_begin, schema_bytes, schema_digest_offset, generation_offset, numerical_digest_offset, identity_offset] =
-        unsigned_array::<6>(&metadata_value(
+    let [schema_begin, schema_bytes, schema_digest_offset, generation_offset, identity_offset] =
+        unsigned_array::<5>(&metadata_value(
             metadata,
             "model_contract_layout",
             &mut budget,
@@ -7445,7 +7503,6 @@ fn parse_parent(
         schema_bytes,
         schema_digest_offset,
         generation_offset,
-        numerical_digest_offset,
         identity_offset,
     };
     let nonterminal_intent = metadata
@@ -13894,7 +13951,7 @@ impl PySemanticInitialPrefillStage {
     ) -> PyResult<()> {
         self.require_wrapper_hook()?;
         self.require_active(py)?;
-        let _operation = InitialPrefillOperation::begin(&self.session.borrow(py))?;
+        let _operation = TensorProducerOperation::begin(&self.session.borrow(py))?;
         let mut budget = 16 * 1024 * 1024;
         let stream = parse_witness_consumer_stream(consumer_stream, &mut budget)?;
         let check = || self.require_active(py);
@@ -13930,7 +13987,7 @@ impl PySemanticInitialPrefillStage {
     ) -> PyResult<()> {
         self.require_wrapper_hook()?;
         self.require_active(py)?;
-        let _operation = InitialPrefillOperation::begin(&self.session.borrow(py))?;
+        let _operation = TensorProducerOperation::begin(&self.session.borrow(py))?;
         let mut budget = 16 * 1024 * 1024;
         let stream = parse_witness_consumer_stream(consumer_stream, &mut budget)?;
         let check = || self.require_active(py);
@@ -13991,7 +14048,7 @@ impl PySemanticInitialPrefillStage {
         let this = &*stage;
         this.require_wrapper_hook()?;
         this.require_active(py)?;
-        let _operation = InitialPrefillOperation::begin(&this.session.borrow(py))?;
+        let _operation = TensorProducerOperation::begin(&this.session.borrow(py))?;
         let mut budget = 16 * 1024 * 1024;
         let stream = parse_witness_consumer_stream(consumer_stream, &mut budget)?;
         let check = || this.require_active(py);
@@ -14224,7 +14281,7 @@ pub(crate) struct PySemanticPublishedParent {
     task_use: Py<PySemanticTransitionTaskUse>,
     inner: Arc<Mutex<SemanticPublishedLease>>,
     // Policy invocations retain this actual parent through late backward. Keep
-    // original autograd producers without a parent-to-witness ownership cycle.
+    // original autograd producers without a parent-to-owner custody cycle.
     continuation_producers: Mutex<Vec<Py<PyAny>>>,
 }
 
@@ -14625,7 +14682,6 @@ fn completed_publication_identity(
         PyBytes::new(py, value.instance.as_bytes()),
         value.word,
         PyBytes::new(py, value.logical_digest.as_bytes()),
-        PyBytes::new(py, value.state_digest.as_bytes()),
     )
         .into_pyobject(py)?
         .unbind())
@@ -17454,25 +17510,6 @@ impl PySemanticPreparedStep {
             .collect())
     }
 
-    #[pyo3(signature = (*, ranges, consumer_stream))]
-    fn guard_content(
-        &self,
-        py: Python<'_>,
-        ranges: &Bound<'_, PyAny>,
-        consumer_stream: &Bound<'_, PyAny>,
-    ) -> PyResult<()> {
-        self.session.borrow(py).require_creator()?;
-        let mut budget = 16 * 1024 * 1024;
-        let ranges = parse_content_ranges(&ColdValue::read(ranges, &mut budget, 0)?)?;
-        let stream = parse_witness_consumer_stream(consumer_stream, &mut budget)?;
-        let session = self.session.borrow(py);
-        let mut owner = session.owner()?;
-        self.content_binding_with_owner(py, &owner)?;
-        owner
-            .guard_prepared_content(&self.inner, &ranges, stream)
-            .map_err(xlog_err)
-    }
-
     /// Immutable admitted topology/table identities, generation and capacities.
     /// Dynamic parent epochs, words, extents and terminal state are device ports.
     fn model_geometry(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
@@ -17531,7 +17568,6 @@ impl PySemanticPreparedStep {
                             PyBytes::new(py, value.instance.as_bytes()),
                             value.word,
                             PyBytes::new(py, value.logical_digest.as_bytes()),
-                            PyBytes::new(py, value.state_digest.as_bytes()),
                         )
                     };
                     Ok((
@@ -17787,9 +17823,9 @@ impl PySemanticPreparedStep {
 
     /// Cold authenticated binding of this completed step's original model.
     /// Returns (predecessor_identity, successor_identity_or_None, model_generation,
-    /// model_geometry_digest, model_numerical_digest, carrier_or_None). The
+    /// model_geometry_digest, carrier_or_None). The
     /// immutable successful-Proposal carrier exposes numerical_realization, logits and random_state as
-    /// (native_owner_identity, canonical_bytes). Identities have the same four
+    /// (native_owner_identity, canonical_bytes). Identities have the same three
     /// fields as PublishedParent.identity(); they are not live readers.
     /// Join every original consumer stream. Read record 44 and complete model
     /// allocations through this step's existing exports, then call again after
@@ -17829,13 +17865,12 @@ impl PySemanticPreparedStep {
                     "completed model binding changed while serializing its carrier",
                 ));
             }
-            let (predecessor, successor, generation, geometry, numerical) = binding;
+            let (predecessor, successor, generation, geometry) = binding;
             let identity = |value: xlog_cuda::SemanticPublishedIdentity| {
                 (
                     PyBytes::new(py, value.instance.as_bytes()),
                     value.word,
                     PyBytes::new(py, value.logical_digest.as_bytes()),
-                    PyBytes::new(py, value.state_digest.as_bytes()),
                 )
             };
             Ok((
@@ -17843,7 +17878,6 @@ impl PySemanticPreparedStep {
                 successor.map(identity),
                 generation,
                 PyBytes::new(py, geometry.as_bytes()),
-                PyBytes::new(py, numerical.as_bytes()),
                 carrier
                     .map(|inner| Py::new(py, PySemanticCompletedModelCarrier { inner }))
                     .transpose()?,
@@ -18029,7 +18063,6 @@ impl PySemanticPreparedStep {
                 PyBytes::new(py, value.instance.as_bytes()),
                 value.word,
                 PyBytes::new(py, value.logical_digest.as_bytes()),
-                PyBytes::new(py, value.state_digest.as_bytes()),
             )
         };
         let records = PyTuple::new(
@@ -18164,17 +18197,17 @@ impl PySemanticPreparedStep {
     fn record_saved_tensor_work(
         &self,
         py: Python<'_>,
-        witness: PyRef<'_, PySemanticTensorContentWitness>,
+        tensor_owner: PyRef<'_, PySemanticTensorOwner>,
     ) -> PyResult<()> {
         self.session.borrow(py).require_creator()?;
-        if witness.session.as_ptr() != self.session.as_ptr() {
+        if tensor_owner.session.as_ptr() != self.session.as_ptr() {
             return Err(invalid("saved work belongs to another Session"));
         }
         let session = self.session.borrow(py);
         let mut owner = session.owner()?;
         self.content_binding_with_owner(py, &owner)?;
         owner
-            .record_saved_tensor_work(&self.inner, &witness.inner)
+            .record_saved_tensor_work(&self.inner, &tensor_owner.inner)
             .map_err(xlog_err)
     }
 
@@ -18222,107 +18255,9 @@ enum ContentStepRef<'a> {
     Prepared(&'a PySemanticPreparedStep),
 }
 
-enum TensorContentBinding {
-    Capture,
+enum TensorOwnerBinding {
+    Tensors,
     Model(Option<usize>),
-}
-
-#[cfg(feature = "semantic-policy")]
-struct PendingPythonContentBinding {
-    parent: Py<PySemanticPublishedParent>,
-    inputs: Py<PyAny>,
-    producers: Vec<Py<PyAny>>,
-    consumer_stream: u64,
-    model: bool,
-    occurrence: Option<Py<PyAny>>,
-    authority: (Option<String>, Vec<u8>),
-    geometry: Vec<(
-        SemanticTensorLayout,
-        u64,
-        u64,
-        Option<DeviceAllocationProvenance>,
-    )>,
-}
-
-fn original_source_content_occurrence(
-    occurrence: Option<&Bound<'_, PyAny>>,
-) -> PyResult<Option<Py<PyAny>>> {
-    let Some(occurrence) = occurrence else {
-        return Ok(None);
-    };
-    #[cfg(not(feature = "semantic-policy"))]
-    return Err(invalid(
-        "source content occurrences require semantic policy support",
-    ));
-    #[cfg(feature = "semantic-policy")]
-    {
-        occurrence.extract::<PyRef<'_, PySemanticSourceContentOccurrence>>()?;
-        Ok(Some(occurrence.clone().unbind()))
-    }
-}
-
-#[cfg(feature = "semantic-policy")]
-fn same_original_source_content_occurrence(
-    expected: Option<&Py<PyAny>>,
-    actual: Option<&Py<PyAny>>,
-) -> bool {
-    match (expected, actual) {
-        (None, None) => true,
-        (Some(expected), Some(actual)) => expected.as_ptr() == actual.as_ptr(),
-        _ => false,
-    }
-}
-
-#[cfg(feature = "semantic-policy")]
-fn cold_content_pending(py: Python<'_>, original: PyErr) -> PyErr {
-    let pending = model_evaluation::SemanticModelEvaluationPending::new_err(
-        "original cold content producer is retained; resume the same binding without repeating producer callbacks or numerical work",
-    );
-    pending.set_cause(py, Some(original));
-    pending
-}
-
-#[cfg(feature = "semantic-policy")]
-fn check_retained_content_inputs(
-    actual: &Bound<'_, PyAny>,
-    original: &PendingPythonContentBinding,
-    budget: &mut usize,
-) -> PyResult<()> {
-    let rows = object_sequence(actual, budget)?;
-    if rows.len() != original.geometry.len() || rows.len() != original.producers.len() {
-        return Err(invalid(
-            "original content continuation changed its tensor roster",
-        ));
-    }
-    for ((row, expected), producer) in rows.iter().zip(&original.geometry).zip(&original.producers)
-    {
-        let fields = object_sequence(row, budget)?;
-        if fields.len() != 5
-            || parse_tensor_layout(&ColdValue::read(&fields[0], budget, 0)?)? != expected.0
-            || ColdValue::read(&fields[1], budget, 0)?.unsigned()? != expected.1
-            || ColdValue::read(&fields[2], budget, 0)?.unsigned()? != expected.2
-            || fields[3].as_ptr() != producer.as_ptr()
-        {
-            return Err(invalid(
-                "original content continuation changed its geometry or actual producer",
-            ));
-        }
-        let same_allocation = match (&expected.3, fields[4].is_none()) {
-            (None, true) => true,
-            (Some(expected), false) => expected.same_allocation(
-                &fields[4]
-                    .extract::<PyRef<'_, PyNativeTensorAllocation>>()?
-                    .provenance,
-            ),
-            _ => false,
-        };
-        if !same_allocation {
-            return Err(invalid(
-                "original content continuation changed its native allocation custody",
-            ));
-        }
-    }
-    Ok(())
 }
 
 impl ContentStepOwner {
@@ -18379,29 +18314,18 @@ impl ContentStepOwner {
     }
 }
 
-/// Private content witness for one acquired parent and its original producers.
-/// Transient capture proves stability; model binding compares the original
-/// publication baseline. Neither proves derivation, provenance, replay or
-/// permission to execute. Only the privileged controller can issue one.
-/// The issuing Runtime must retain this complete object until its guaranteed
-/// creator-thread cleanup after the original backward, not just save its native
-/// aliases. Arbitrary retained Python producers must not be last-dropped by a
-/// worker; thread-safe native ownership is not a producer-finalizer guarantee.
-#[pyclass(
-    name = "SemanticTensorContentWitness",
-    module = "pyxlog._native",
-    frozen
-)]
-pub(crate) struct PySemanticTensorContentWitness {
+/// Actual tensor storage and Python producer custody for one original step.
+/// Retain the complete owner through creator-thread cleanup after backward.
+/// This is not a content validator or permission to execute.
+#[pyclass(name = "SemanticTensorOwner", module = "pyxlog._native", frozen)]
+pub(crate) struct PySemanticTensorOwner {
     // Drop native ownership before the retained Python producers and Session.
-    inner: SemanticTensorContentWitness,
+    inner: SemanticTensorOwner,
     _inputs: Py<PyAny>,
     _producers: Vec<Py<PyAny>>,
     parent: ContentStepOwner,
     session: Py<PySemanticTransitionSession>,
     model_binding: bool,
-    #[cfg(feature = "semantic-policy")]
-    pending_verification: Mutex<Option<PendingPythonContentBinding>>,
 }
 
 #[cfg(feature = "semantic-policy")]
@@ -18415,85 +18339,8 @@ pub(crate) struct PySemanticModelForwardWitness {
     _session: Py<PySemanticTransitionSession>,
 }
 
-#[cfg(feature = "semantic-policy")]
-impl PySemanticTensorContentWitness {
-    fn resume_retained_verification(
-        &self,
-        py: Python<'_>,
-        tensors: &Bound<'_, PyAny>,
-        stream: u64,
-        budget: &mut usize,
-        occurrence: Option<&Py<PyAny>>,
-    ) -> PyResult<bool> {
-        let Some(original) = self
-            .pending_verification
-            .lock()
-            .map_err(|_| invalid("original content verification retention mutex is poisoned"))?
-            .take()
-        else {
-            return Ok(false);
-        };
-        let mut native_pending = false;
-        let result = (|| {
-            let ContentStepOwner::Published(parent) = &self.parent else {
-                return Err(invalid(
-                    "retained content verification requires its actual acquired parent",
-                ));
-            };
-            if parent.as_ptr() != original.parent.as_ptr()
-                || stream != original.consumer_stream
-                || !same_original_source_content_occurrence(
-                    original.occurrence.as_ref(),
-                    occurrence,
-                )
-            {
-                return Err(invalid(
-                    "content verification continuation changed its original parent or stream",
-                ));
-            }
-            check_retained_content_inputs(tensors, &original, budget)?;
-            let session = self.session.borrow(py);
-            let mut owner = session.witness_owner()?;
-            let parent = parent.borrow(py);
-            let task_use = parent.task_use.borrow(py);
-            task_use.require_current(&owner)?;
-            let state = task_use.state()?;
-            if state.content_handoff_binding()? != original.authority {
-                return Err(invalid(
-                    "content verification continuation changed its admitted authority",
-                ));
-            }
-            let lease = parent.lease()?;
-            if owner
-                .pending_content_verification_stream(&lease, &self.inner)
-                .map_err(xlog_err)?
-                != Some(stream)
-            {
-                return Err(invalid(
-                    "content verification lost its original native command owner",
-                ));
-            }
-            native_pending = true;
-            owner
-                .resolve_pending_content_verification(&lease, &self.inner, stream)
-                .map_err(xlog_err)
-        })();
-        if let Err(error) = result {
-            *self.pending_verification.lock().map_err(|_| {
-                invalid("original content verification retention mutex is poisoned")
-            })? = Some(original);
-            return Err(if native_pending {
-                cold_content_pending(py, error)
-            } else {
-                error
-            });
-        }
-        Ok(true)
-    }
-}
-
 #[pymethods]
-impl PySemanticTensorContentWitness {
+impl PySemanticTensorOwner {
     /// Cold projection from this actual model-content owner. An ordinary
     /// model or the held original source has no private feedback intervention;
     /// an unbound private child must never be treated as that ordinary case.
@@ -18503,257 +18350,10 @@ impl PySemanticTensorContentWitness {
         session.require_creator()?;
         if !self.model_binding {
             return Err(invalid(
-                "feedback intervention projection requires its original model-content witness",
+                "feedback intervention projection requires its original model tensor owner",
             ));
         }
         self.parent.feedback_intervention(py, &session, false)
-    }
-
-    /// Enqueue verification against this witness's original content baseline.
-    /// Native checks their original pointers, metadata and device bytes. DLPack
-    /// callbacks run without Session, reader or task-state locks; their complete
-    /// handoff must leave the task and admitted authority snapshot unchanged.
-    ///
-    /// Call after hooks and before the first dependent read. All preceding writes
-    /// must be ordered on the declared stream, with no concurrent writes through
-    /// the final dependent use. A byte mismatch fatally invalidates the CUDA
-    /// context. Returning None means only that the guard was enqueued; the
-    /// original cold observation must propagate any device error before accepting
-    /// results. Do not reset or retry a failed task. No digest or status is copied
-    /// to the host, and verification grants no replay or import authority.
-    /// Workers may call this one method while the issuing Runtime retains the
-    /// complete witness and original graph through guaranteed creator cleanup.
-    /// Use the actual consumer stream or legacy default stream 1. Per-thread
-    /// default stream 2 is rejected on every thread before producer handoff.
-    #[pyo3(signature = (*, tensors, consumer_stream, occurrence=None, recording_step=None))]
-    fn verify(
-        &self,
-        py: Python<'_>,
-        tensors: &Bound<'_, PyAny>,
-        consumer_stream: &Bound<'_, PyAny>,
-        occurrence: Option<&Bound<'_, PyAny>>,
-        recording_step: Option<Py<PySemanticPreparedStep>>,
-    ) -> PyResult<()> {
-        #[cfg(not(feature = "semantic-policy"))]
-        if recording_step.is_some() {
-            return Err(invalid("recorded content requires semantic-policy support"));
-        }
-        #[cfg(feature = "semantic-policy")]
-        if recording_step.is_some() && !matches!(self.parent, ContentStepOwner::Prepared(_)) {
-            return Err(invalid(
-                "recorded content requires its original prepared witness",
-            ));
-        }
-        let occurrence = original_source_content_occurrence(occurrence)?;
-        let session = self.session.borrow(py);
-        let mut budget = 16 * 1024 * 1024;
-        let stream = parse_witness_consumer_stream(consumer_stream, &mut budget)?;
-        #[cfg(feature = "semantic-policy")]
-        if self.resume_retained_verification(
-            py,
-            tensors,
-            stream,
-            &mut budget,
-            occurrence.as_ref(),
-        )? {
-            return Ok(());
-        }
-        let binding = {
-            let owner = session.witness_owner()?;
-            self.parent.binding(py, &owner, true)?
-        };
-        let device = session.device_ordinal;
-        let check = || -> PyResult<()> {
-            let owner = session.witness_owner()?;
-            if self.parent.binding(py, &owner, true)? != binding {
-                return Err(invalid(
-                    "tensor content authority changed during producer callback",
-                ));
-            }
-            self.parent.check_producer_stream(py, &owner, stream)?;
-            #[cfg(feature = "semantic-policy")]
-            if let Some(recording_step) = &recording_step {
-                let recording_step = recording_step.borrow(py);
-                let recording = recording_step.session.borrow(py);
-                recording.require_creator()?;
-                if !recording.recording.load(Ordering::Acquire)
-                    || !matches!(self.parent, ContentStepOwner::Prepared(_))
-                {
-                    return Err(invalid(
-                        "recorded content requires its original prepared witness and recorder",
-                    ));
-                }
-                if recording_step.session.as_ptr() == self.session.as_ptr() {
-                    recording_step.content_binding_with_owner(py, &owner)?;
-                    owner
-                        .require_prepared_tensor_content_recorder(&recording_step.inner)
-                        .map_err(xlog_err)?;
-                } else {
-                    let (custody, source_bank) =
-                        session.actor_refresh_custody()?.ok_or_else(|| {
-                            invalid("foreign prepared content has no original parent custody")
-                        })?;
-                    let recording_owner = recording.owner()?;
-                    recording_step.content_binding_with_owner(py, &recording_owner)?;
-                    let bank = recording_owner
-                        .require_prepared_tensor_content_recorder(&recording_step.inner)
-                        .map_err(xlog_err)?;
-                    if bank != source_bank || occurrence.is_some() {
-                        return Err(invalid(
-                            "foreign content changed its original bank or SOURCE authority",
-                        ));
-                    }
-                    custody.require_update(py, &recording_step, bank)?;
-                }
-            }
-            Ok(())
-        };
-        check()?;
-        #[cfg(feature = "semantic-policy")]
-        let original_inputs = tensors.clone().unbind();
-        let ParsedTensorInputs {
-            handoff: tensors,
-            producers,
-        } = parse_tensor_inputs_guarded(tensors, &mut budget, device, stream, &check)?;
-        #[cfg(feature = "semantic-policy")]
-        let geometry = tensors
-            .0
-            .iter()
-            .map(|input| {
-                (
-                    input.layout,
-                    input.logical_begin,
-                    input.logical_end,
-                    input.native_allocation.clone(),
-                )
-            })
-            .collect();
-        #[cfg(not(feature = "semantic-policy"))]
-        let _producers = producers;
-        let mut owner = session.witness_owner()?;
-        match &self.parent {
-            ContentStepOwner::Published(parent) => {
-                let parent = parent.borrow(py);
-                let task_use = parent.task_use.borrow(py);
-                task_use.require_current(&owner)?;
-                let state = task_use.state()?;
-                let (operation, snapshot) = state.content_handoff_binding()?;
-                if (operation, snapshot) != binding {
-                    return Err(invalid(
-                        "tensor content authority changed during producer handoff",
-                    ));
-                }
-                let lease = parent.lease()?;
-                owner.retained_step_identity(&lease).map_err(xlog_err)?;
-                #[cfg(feature = "semantic-policy")]
-                let result = if let Some(occurrence) = occurrence.as_ref() {
-                    let occurrence = occurrence
-                        .bind(py)
-                        .extract::<PyRef<'_, PySemanticSourceContentOccurrence>>()?;
-                    owner.verify_tensor_content_with_occurrence(
-                        &lease,
-                        &self.inner,
-                        tensors.into_native(),
-                        stream,
-                        &occurrence.inner,
-                    )
-                } else {
-                    owner.verify_tensor_content(&lease, &self.inner, tensors.into_native(), stream)
-                };
-                #[cfg(not(feature = "semantic-policy"))]
-                let result =
-                    owner.verify_tensor_content(&lease, &self.inner, tensors.into_native(), stream);
-                #[cfg(feature = "semantic-policy")]
-                if result.is_err()
-                    && owner
-                        .pending_content_verification_stream(&lease, &self.inner)
-                        .map_err(xlog_err)?
-                        == Some(stream)
-                {
-                    let ContentStepOwner::Published(actual) = &self.parent else {
-                        unreachable!()
-                    };
-                    *self.pending_verification.lock().map_err(|_| {
-                        invalid("original content verification retention mutex is poisoned")
-                    })? = Some(PendingPythonContentBinding {
-                        parent: actual.clone_ref(py),
-                        inputs: original_inputs,
-                        producers,
-                        consumer_stream: stream,
-                        model: self.model_binding,
-                        occurrence,
-                        authority: binding,
-                        geometry,
-                    });
-                    return Err(cold_content_pending(
-                        py,
-                        xlog_err(result.err().expect("retained original verification error")),
-                    ));
-                }
-                result.map_err(xlog_err)
-            }
-            ContentStepOwner::Prepared(step) => {
-                let step = step.borrow(py);
-                let task_use = step.task_use.borrow(py);
-                task_use.require_identity(&owner)?;
-                let state = task_use.state()?;
-                if state.prepared_content_binding(&step.scope)? != binding {
-                    return Err(invalid(
-                        "tensor content authority changed during producer handoff",
-                    ));
-                }
-                #[cfg(feature = "semantic-policy")]
-                let occurrence = occurrence
-                    .as_ref()
-                    .map(|occurrence| {
-                        occurrence
-                            .bind(py)
-                            .extract::<PyRef<'_, PySemanticSourceContentOccurrence>>()
-                    })
-                    .transpose()?;
-                #[cfg(feature = "semantic-policy")]
-                let result = if let Some(recording_step) = recording_step.as_ref() {
-                    let recording_step = recording_step.borrow(py);
-                    if recording_step.session.as_ptr() == self.session.as_ptr() {
-                        owner.verify_prepared_tensor_content_in_recording_step(
-                            &recording_step.inner,
-                            &step.inner,
-                            &self.inner,
-                            tensors.into_native(),
-                            stream,
-                            occurrence.as_ref().map(|occurrence| &occurrence.inner),
-                        )
-                    } else {
-                        let recording = recording_step.session.borrow(py);
-                        let mut recording_owner = recording.owner()?;
-                        recording_owner.verify_prepared_foreign_tensor_content(
-                            &recording_step.inner,
-                            &mut owner,
-                            &step.inner,
-                            &self.inner,
-                            tensors.into_native(),
-                            stream,
-                        )
-                    }
-                } else {
-                    owner.verify_prepared_tensor_content(
-                        &step.inner,
-                        &self.inner,
-                        tensors.into_native(),
-                        stream,
-                        occurrence.as_ref().map(|occurrence| &occurrence.inner),
-                    )
-                };
-                #[cfg(not(feature = "semantic-policy"))]
-                let result = owner.verify_prepared_tensor_content(
-                    &step.inner,
-                    &self.inner,
-                    tensors.into_native(),
-                    stream,
-                );
-                result.map_err(xlog_err)
-            }
-        }
     }
 }
 
@@ -20010,40 +19610,6 @@ impl PySemanticPublishedParent {
 
 #[pymethods]
 impl PySemanticPublishedParent {
-    /// Enqueue fatal device guards for the original sealed native ranges.
-    /// ``ranges`` is an exact tuple/list of exact ``(role, index)`` rows. Role 1
-    /// checks the original raw prefix range. Arbitrary aliases outside these
-    /// ranges are not attested. Use the same acquired parent throughout.
-    ///
-    /// Call after hooks and before the first dependent read, ordering all prior
-    /// writes on ``consumer_stream`` and preventing concurrent writes through
-    /// final use. The Session joins the named stream, guards the sealed bytes,
-    /// then joins guard completion back to the consumer without a host copy or
-    /// synchronization. A mismatch fatally invalidates the CUDA context; returning
-    /// None only means enqueue succeeded. The original cold observation must
-    /// propagate failure before accepting results. Never reset or retry that task.
-    #[pyo3(signature = (*, ranges, consumer_stream))]
-    fn guard_content(
-        &self,
-        py: Python<'_>,
-        ranges: &Bound<'_, PyAny>,
-        consumer_stream: &Bound<'_, PyAny>,
-    ) -> PyResult<()> {
-        self.session.borrow(py).require_creator()?;
-        let mut budget = 16 * 1024 * 1024;
-        let ranges = parse_content_ranges(&ColdValue::read(ranges, &mut budget, 0)?)?;
-        let stream = ColdValue::read(consumer_stream, &mut budget, 0)?.unsigned()?;
-        let session = self.session.borrow(py);
-        let mut owner = session.owner()?;
-        let task_use = self.task_use.borrow(py);
-        task_use.require_current(&owner)?;
-        let state = task_use.state()?;
-        state.content_handoff_binding()?;
-        owner
-            .guard_published_content(&*self.lease()?, &ranges, stream)
-            .map_err(xlog_err)
-    }
-
     /// The sealed identity returned by this lease's single native Acquire.
     fn identity(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
         self.session.borrow(py).require_creator()?;
@@ -20057,7 +19623,6 @@ impl PySemanticPublishedParent {
             PyBytes::new(py, identity.instance.as_bytes()),
             identity.word,
             PyBytes::new(py, identity.logical_digest.as_bytes()),
-            PyBytes::new(py, identity.state_digest.as_bytes()),
         )
             .into_pyobject(py)?
             .unbind())
@@ -20085,8 +19650,8 @@ impl PySemanticPublishedParent {
     }
 
     /// Project model metadata from this exact acquired parent. Returns:
-    /// (parent_identity, descriptor_digest, semantic_root, prefix, ring,
-    /// generations, contracts, capacities, numerical_state).
+    /// (parent_identity, semantic_root, prefix, ring,
+    /// generations, contracts, capacities, model_geometry_digest).
     ///
     /// ``semantic_root`` is (owner, slot, generation, digest, extents), with
     /// statement/support/version extents. It identifies the acquired XLOG root;
@@ -20097,13 +19662,10 @@ impl PySemanticPublishedParent {
     /// ``generations`` is (model, neural_bank, neural, cache, authority).
     /// ``contracts`` is (topology_identity, position_table_identity).
     /// ``capacities`` is (prefix, feedback, exclusive_position_bound).
-    /// ``numerical_state`` is (model_geometry_digest, model_numerical_digest),
-    /// both 32-byte identities from this same acquired header. The first binds
-    /// full allocation/storage/view geometry and model layouts; the second
-    /// folds that identity with actual typed and full-backing seals for roles
-    /// 18..25. Neither substitutes for the full ModelContract or parent identity.
-    /// Other digests are 32-byte bytes. The descriptor digest binds the publication
-    /// instance/word; it is not the action catalogue's descriptor identity.
+    /// ``model_geometry_digest`` is the 32-byte identity of the complete
+    /// allocation/storage/view geometry and model layouts in this acquired header.
+    /// The original ModelContract and parent retain their ownership authority.
+    /// Geometry and source identities use their original 32-byte encoding.
     ///
     /// The retained parent remains the owner: matching these values does not
     /// authenticate unrelated model inputs or issue a new use permission. Device
@@ -20137,9 +19699,7 @@ impl PySemanticPublishedParent {
                 PyBytes::new(py, parent.instance.as_bytes()),
                 parent.word,
                 PyBytes::new(py, parent.logical_digest.as_bytes()),
-                PyBytes::new(py, parent.state_digest.as_bytes()),
             ),
-            PyBytes::new(py, context.descriptor_digest.as_bytes()),
             (
                 root.0,
                 root.1,
@@ -20155,17 +19715,14 @@ impl PySemanticPublishedParent {
                 PyBytes::new(py, context.table_identity.as_bytes()),
             ),
             context.capacities,
-            (
-                PyBytes::new(py, context.numerical_state.0.as_bytes()),
-                PyBytes::new(py, context.numerical_state.1.as_bytes()),
-            ),
+            PyBytes::new(py, context.model_geometry_digest.as_bytes()),
         )
             .into_pyobject(py)?
             .unbind())
     }
 
     /// Export the exact selected resident neural bank without a device copy.
-    /// Returns (parent_identity, generations, numerical_state, allocations,
+    /// Returns (parent_identity, generations, model_geometry_digest, allocations,
     /// storages, views). Each allocation row is (native_provenance, U8 DLPack)
     /// and occurs exactly once. Storage rows are (allocation, byte_offset,
     /// span_bytes). View rows are (role, index, storage, byte_offset, layout),
@@ -20285,7 +19842,6 @@ impl PySemanticPublishedParent {
             PyBytes::new(py, identity.instance.as_bytes()),
             identity.word,
             PyBytes::new(py, identity.logical_digest.as_bytes()),
-            PyBytes::new(py, identity.state_digest.as_bytes()),
         );
         Ok((
             parent_identity,
@@ -20397,7 +19953,7 @@ impl PySemanticPublishedParent {
     /// recomputed, provenance_record). Kind is FILLED=1; provenance preserves
     /// SOURCE=1 or GENERATED=2, and provenance_record is its retained native ledger
     /// index, not an authority bit. Flags remain u64 values, not a numeric cast.
-    /// The identity is exactly the four-component tuple returned by identity().
+    /// The identity is exactly the three-component tuple returned by identity().
     ///
     /// Only [0, prefix_extent) is committed; even an empty prefix retains its
     /// cold capacity shape. Unused rows must not enter model computation.
@@ -20420,7 +19976,6 @@ impl PySemanticPublishedParent {
             PyBytes::new(py, identity.instance.as_bytes()),
             identity.word,
             PyBytes::new(py, identity.logical_digest.as_bytes()),
-            PyBytes::new(py, identity.state_digest.as_bytes()),
         );
         let tensor = retain_export_owner(tensor, self.session.clone_ref(py), session.owner_thread)?;
         Ok((
@@ -20601,7 +20156,6 @@ impl PySemanticPublishedParent {
             PyBytes::new(py, identity.instance.as_bytes()),
             identity.word,
             PyBytes::new(py, identity.logical_digest.as_bytes()),
-            PyBytes::new(py, identity.state_digest.as_bytes()),
         );
         let schema = feedback_schema_object(py, &feedback.schema)?;
         let [features, device_validity, queries, originals, offsets, supports] =
@@ -20640,11 +20194,11 @@ impl PySemanticPublishedParent {
     /// Join the actual bank consumers and retire only this exact bank reader.
     /// Every active bank/output alias must have returned its managed owner.
     /// Passive numerical model exports retain independent allocation owners.
-    /// Original private witnesses, model baselines, feedback outputs, continuation
-    /// producers and the original autograd graph remain owned for late verification/backward.
-    /// No further publication reads are allowed through this parent; original
-    /// witnesses and policy final use still require current task authority.
-    /// Finish with ``release`` after all late consumers and witnesses are gone.
+    /// Actual model storage, feedback outputs, continuation producers and the
+    /// original autograd graph remain owned through late backward.
+    /// No further publication reads are allowed through this parent; policy
+    /// final use still requires current task authority.
+    /// Finish with ``release`` after all late consumers and aliases are gone.
     /// Failure preserves native and Python custody; never retry an uncertain use.
     #[pyo3(signature = (*, consumer_streams))]
     fn release_reader(&self, py: Python<'_>, consumer_streams: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -20653,7 +20207,7 @@ impl PySemanticPublishedParent {
 
     /// Join all named consumer streams and finally release this original step.
     /// Accepts either a live bank reader or one retired by ``release_reader``.
-    /// Outstanding content witnesses or active DLPack aliases refuse without
+    /// Active DLPack aliases refuse without
     /// destroying retained custody. Passive numerical model exports retain their
     /// exact allocations without pinning this reader. A failed device release is
     /// quarantined by Session, never retried automatically.
@@ -21272,17 +20826,14 @@ impl PySemanticTransitionController {
         )
     }
 
-    /// Seal counts and ordered tensor-content descriptors from the one complete
-    /// pre-effect plan. All Capture/Verify calls share one ordered roster;
-    /// SOURCE occurrences additionally retain their original frozen handles.
+    /// Freeze actual model-work capacities for the complete original step roster.
     #[cfg(feature = "semantic-policy")]
-    #[pyo3(signature = (task_use, *, layouts, receiver_links=None))]
+    #[pyo3(signature = (task_use, *, layouts))]
     fn finalize_segment_layout(
         &self,
         py: Python<'_>,
         task_use: Py<PySemanticTransitionTaskUse>,
         layouts: &Bound<'_, PyAny>,
-        receiver_links: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         let session = self.session.borrow(py);
         session.require_creator()?;
@@ -21290,7 +20841,7 @@ impl PySemanticTransitionController {
         self.require_read_issued(&issued)?;
         if issued.session.as_ptr() != self.session.as_ptr()
             || !session.recording.load(Ordering::Acquire)
-            || layouts.get_type().as_ptr() != py.get_type::<PyTuple>().as_ptr()
+            || !layouts.is_exact_instance_of::<PyTuple>()
         {
             return Err(invalid(
                 "segment layout requires its original recording TaskUse and exact tuple roster",
@@ -21314,101 +20865,27 @@ impl PySemanticTransitionController {
             }
         }
         let pool = session.material_sources.native_budget()?;
-        let mut transport = 16 * 1024 * 1024;
-        let receiver_links = receiver_links
-            .map(|value| source_content_occurrences::exact_tuple(value, None, &mut transport))
-            .transpose()?;
-        let receiver_count = receiver_links.as_ref().map_or(0, |links| links.len());
-        let receiver_bytes = receiver_count
-            .checked_mul(std::mem::size_of::<
-                xlog_cuda::SemanticPreparedTensorContentReceiver,
-            >())
-            .ok_or_else(|| invalid("segment external receiver extent overflow"))?;
-        let _receiver_metadata = pool
-            .reserve_auxiliary(
-                u64::try_from(receiver_bytes)
-                    .map_err(|_| invalid("segment external receiver extent exceeds u64"))?,
-            )
-            .map_err(xlog_err)?;
-        let mut receivers = Vec::new();
-        receivers
-            .try_reserve_exact(receiver_count)
-            .map_err(|_| invalid("segment external receiver reservation failed"))?;
-        // Issue immutable source proofs before entering the current native
-        // owner. Each child has already finalized its own original plan.
-        if let Some(links) = receiver_links {
-            for link in links.iter() {
-                let link = source_content_occurrences::exact_tuple(&link, Some(3), &mut transport)?;
-                let slot = ColdValue::read(&link.get_item(0)?, &mut 128, 0)?.unsigned()?;
-                let source_value = link.get_item(1)?;
-                let source_step = source_value.extract::<PyRef<'_, PySemanticPreparedStep>>()?;
-                if source_step.session.as_ptr() == self.session.as_ptr() {
-                    return Err(invalid(
-                        "same-session receivers use their original complete segment roster",
-                    ));
-                }
-                let bank =
-                    usize::try_from(ColdValue::read(&link.get_item(2)?, &mut 128, 0)?.unsigned()?)
-                        .map_err(|_| {
-                            invalid("external receiver bank exceeds native address space")
-                        })?;
-                if bank > 1 {
-                    return Err(invalid("external receiver requires an original bank"));
-                }
-                let source = source_step.session.borrow(py);
-                let source_owner = source.owner()?;
-                source_step.content_binding_with_owner(py, &source_owner)?;
-                receivers.push(
-                    source_owner
-                        .prepared_tensor_content_receiver(&source_step.inner, bank, slot)
-                        .map_err(xlog_err)?,
-                );
-            }
-        }
-        let row_bytes = std::mem::size_of::<(
-            SemanticPreparedStep,
-            usize,
-            usize,
-            [Vec<xlog_cuda::SemanticPreparedTensorContentEvent>; 2],
-            [xlog_cuda::SemanticPreparedTensorContentBindings; 2],
-        )>();
-        let reservation_bytes = std::mem::size_of::<xlog_cuda::SemanticReplayMaterialReservation>();
-        let metadata_bytes = row_bytes
-            .checked_add(
-                reservation_bytes
-                    .checked_mul(2)
-                    .ok_or_else(|| invalid("segment tensor-content reservation extent overflow"))?,
-            )
-            .and_then(|bytes| bytes.checked_mul(layouts.len()))
-            .ok_or_else(|| invalid("segment tensor-content input extent overflow"))?;
+        let bytes = layouts
+            .len()
+            .checked_mul(std::mem::size_of::<(SemanticPreparedStep, usize)>())
+            .ok_or_else(|| invalid("segment model-work input extent overflow"))?;
         let _rows_metadata = pool
             .reserve_auxiliary(
-                u64::try_from(metadata_bytes)
-                    .map_err(|_| invalid("segment tensor-content input extent exceeds u64"))?,
+                u64::try_from(bytes)
+                    .map_err(|_| invalid("segment model-work input extent exceeds u64"))?,
             )
             .map_err(xlog_err)?;
-        // Descriptors drop before the reservations that account for their backing.
-        let mut input_metadata = Vec::new();
-        input_metadata
-            .try_reserve_exact(
-                layouts
-                    .len()
-                    .checked_mul(2)
-                    .ok_or_else(|| invalid("segment tensor-content bank count overflow"))?,
-            )
-            .map_err(|_| invalid("segment tensor-content reservation roster allocation failed"))?;
         let mut rows = Vec::new();
         rows.try_reserve_exact(layouts.len())
             .map_err(|_| invalid("original segment layout roster reservation failed"))?;
         let mut owner = session.owner()?;
         for row in layouts.iter() {
-            if row.get_type().as_ptr() != py.get_type::<PyTuple>().as_ptr() {
-                return Err(invalid("segment layout rows must be exact original tuples"));
+            if !row.is_exact_instance_of::<PyTuple>() || row.cast::<PyTuple>()?.len() != 2 {
+                return Err(invalid(
+                    "segment layout rows require (original step, model work capacity)",
+                ));
             }
             let row = row.cast::<PyTuple>()?;
-            if row.len() != 5 {
-                return Err(invalid("segment layout rows require (original step, capture rows, bank event capacity, paired content rosters, paired witness bindings)"));
-            }
             let step_value = row.get_item(0)?;
             let step = step_value.extract::<PyRef<'_, PySemanticPreparedStep>>()?;
             if step.session.as_ptr() != self.session.as_ptr()
@@ -21419,31 +20896,13 @@ impl PySemanticTransitionController {
                 ));
             }
             step.content_binding_with_owner(py, &owner)?;
-            let tensors =
+            let capacity =
                 usize::try_from(ColdValue::read(&row.get_item(1)?, &mut 128, 0)?.unsigned()?)
-                    .map_err(|_| invalid("capture row count exceeds native address space"))?;
-            let events =
-                usize::try_from(ColdValue::read(&row.get_item(2)?, &mut 128, 0)?.unsigned()?)
-                    .map_err(|_| invalid("bank event count exceeds native address space"))?;
-            let mut transport = 16 * 1024 * 1024;
-            let banks = source_content_occurrences::exact_tuple(
-                &row.get_item(3)?,
-                Some(2),
-                &mut transport,
-            )?;
-            let mut content = [Vec::new(), Vec::new()];
-            for (bank, content) in content.iter_mut().enumerate() {
-                let descriptors = banks.get_item(bank)?;
-                input_metadata.push(source_content_occurrences::reserve_events::<
-                    xlog_cuda::SemanticPreparedTensorContentEvent,
-                >(&descriptors, &pool)?);
-                *content = source_content_occurrences::parse_prepared_events(&descriptors)?;
-            }
-            let bindings = source_content_occurrences::parse_prepared_bindings(&row.get_item(4)?)?;
-            rows.push((step.inner.clone(), tensors, events, content, bindings));
+                    .map_err(|_| invalid("model-work capacity exceeds native address space"))?;
+            rows.push((step.inner.clone(), capacity));
         }
         owner
-            .finalize_prepared_segment_layout(&rows, &receivers)
+            .finalize_prepared_segment_layout(&rows)
             .map_err(xlog_err)
     }
 
@@ -21456,7 +20915,7 @@ impl PySemanticTransitionController {
     /// the count-derived native layout under the original immutable byte limits.
     /// memory_scope spans allocation/recording through EndCapture/instantiate;
     /// enqueue_step records both fixed bank branches per slot and returns None.
-    /// Each bank binds its own original model witness, continuation, policy and
+    /// Each bank binds its own original model owner, continuation, policy and
     /// update outputs through this controller. Device admission selects exactly
     /// one retained branch; no branch aliases the other's primal or tape owners.
     /// Python receives neither the graph nor authority to report its completion.
@@ -23174,6 +22633,92 @@ impl PySemanticTransitionController {
         Self::close_task(slf, py, task_use, TaskReleaseKind::Aborted)
     }
 
+    /// Terminally join and release the complete original publication roster of
+    /// an aborted task. Each entry retains its exact parent and consumer streams.
+    /// An unknown join must repeat this operation with the same complete roster.
+    fn close_aborted_publications(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        releases: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let controlled = slf.borrow();
+        let session = controlled.session.borrow(py);
+        session.require_creator()?;
+        if !releases.is_exact_instance_of::<PyTuple>() {
+            return Err(invalid(
+                "terminal publication release requires its exact immutable roster",
+            ));
+        }
+        let mut roster: Vec<PublicationRelease> = Vec::new();
+        let mut budget = 4096;
+        for entry in releases.cast::<PyTuple>()?.iter() {
+            if !entry.is_exact_instance_of::<PyTuple>() || entry.cast::<PyTuple>()?.len() != 2 {
+                return Err(invalid(
+                    "terminal publication release requires original parent and stream pairs",
+                ));
+            }
+            let entry = entry.cast::<PyTuple>()?;
+            let parent = entry
+                .get_item(0)?
+                .extract::<Py<PySemanticPublishedParent>>()?;
+            let published = parent.borrow(py);
+            let issued = published.task_use.borrow(py);
+            if published.session.as_ptr() != controlled.session.as_ptr()
+                || !Arc::ptr_eq(&controlled.identity, &issued.controller)
+            {
+                return Err(invalid(
+                    "terminal publication release requires its original controller and parents",
+                ));
+            }
+            if roster.iter().any(|original| {
+                original.parent.as_ptr() == parent.as_ptr()
+                    || Arc::ptr_eq(&original.parent.borrow(py).inner, &published.inner)
+            }) {
+                return Err(invalid(
+                    "terminal publication release repeats an original lease",
+                ));
+            }
+            let streams = ColdValue::read(&entry.get_item(1)?, &mut budget, 0)?;
+            let streams = streams
+                .sequence()?
+                .iter()
+                .map(ColdValue::unsigned)
+                .collect::<PyResult<Vec<_>>>()?;
+            drop(issued);
+            drop(published);
+            roster.push(PublicationRelease {
+                parent,
+                consumer_streams: streams,
+            });
+        }
+        if roster.is_empty() {
+            return Err(invalid(
+                "terminal publication release requires original parents",
+            ));
+        }
+        let custody = TaskReleaseCustody::Publications {
+            releases: roster,
+            controller: slf.clone().unbind(),
+        };
+        if session
+            .task_release
+            .try_lock()
+            .map_err(|_| {
+                invalid("terminal task release is already active or its custody is poisoned")
+            })?
+            .is_some()
+        {
+            return session.release_task(py, custody);
+        }
+        if let TaskReleaseCustody::Publications { releases, .. } = &custody {
+            for release in releases {
+                controlled.require_read_issued(&release.parent.borrow(py).task_use.borrow(py))?;
+            }
+        }
+        session.require_task_release_idle()?;
+        session.release_task(py, custody)
+    }
+
     /// Terminally release a Session only after its original publication,
     /// segments, executables and external aliases have fully retired. This
     /// performs the existing joined native deallocation; abort is not release.
@@ -23539,14 +23084,14 @@ impl PySemanticTransitionController {
     /// original_model_output) runs once after proposal policy snapshots are bound,
     /// before capture/launch, and returns (text_rows, text_row_count, selected_text,
     /// active_rows, active_row_count, numerical_admissibility, tensors,
-    /// producer_witness) for a non-drawing transition. A proposal inserts original numerical_blocks,
+    /// tensor_owner) for a non-drawing transition. A proposal inserts original numerical_blocks,
     /// model_schema_digest and model_identity before tensors. Its seventh CUDA
     /// service is FP64[N,2,3], covered by the same transient witness; the two
     /// identities are bytes from the original sealed model contract.
     /// For a proposal, pack_policy(task_use, restored_parent, original_model_output)
     /// returns (binding, text_logits, parameters, product_support,
     /// component_baselines, parameter_errors, baseline_errors, parameter_domains,
-    /// text_domains, baseline_domains, producer_witness), computed by the same
+    /// text_domains, baseline_domains, tensor_owner), computed by the same
     /// Runtime before the final continuation is captured. For
     /// recompute/drain pack_policy must be None; no policy draw is synthesized.
     /// These callbacks receive genuine task-bound readers only within a dynamic
@@ -25048,7 +24593,6 @@ impl PySemanticTransitionController {
                 PyBytes::new(py, value.instance.as_bytes()),
                 value.word,
                 PyBytes::new(py, value.logical_digest.as_bytes()),
-                PyBytes::new(py, value.state_digest.as_bytes()),
             )
         };
         Ok((
@@ -25142,80 +24686,30 @@ impl PySemanticTransitionController {
         })
     }
 
-    /// Capture the current bytes of real original tensors for this same parent.
-    /// ``tensors`` uses the original typed layout/interval/producer rows accepted
-    /// by bind_parent, including I64=7, Bool8=8 and F64=9. Original Python producers and
-    /// their autograd objects remain retained independently of mutable input rows.
-    /// Role 0 is the private transient namespace, never a publication role.
-    /// Its index is the operand's ordinal in the complete supplied roster,
-    /// including repeated operands; it is not derived from values or storage.
-    /// Nonpositional operands use logical_axis=u64::MAX and interval (0, 0).
-    /// Verification requires the same complete roster and original storage.
-    ///
-    /// The trusted controller must call immediately after its real forward or
-    /// transform and before public hooks, then bind the private witness to that
-    /// original execution. Capture proves later content stability; it does not
-    /// establish derivation, provenance or permission to import/replay a model.
-    /// The issuing Runtime must retain this complete witness and every issued
-    /// policy invocation, original producer, callback and saved autograd payload
-    /// through native cotangents and the original Python backward. One guaranteed
-    /// creating-thread cleanup must release that custody after backward finishes.
-    /// External aliases require an explicit owner kept alive through their last
-    /// use. Worker access does not make arbitrary Python finalizers thread-safe;
-    /// neither a native alias alone nor a future deferred-release drain suffices.
-    /// The witness retains the step, so final release refuses until it is destroyed.
-    /// Bank-only retirement does not destroy its original baseline or producers.
-    /// Producer and consumer streams join through the Session without a host
-    /// payload/digest/status copy or synchronization. Verification and every
-    /// dependent forward/backward/result/publication must preserve that ordering.
-    /// Capture and verification require legacy default stream 1 or an explicit
-    /// consumer stream; per-thread default stream 2 is rejected before handoff.
-    /// Capture requires CUDA stream-ordered allocation support; native refuses
-    /// a context that would require a synchronizing allocation fallback.
-    /// Native feedback outputs already carry their producer's original seal.
-    /// Capturing those aliases verifies that seal and requires their original
-    /// type, shape, interval and roster coordinate; it never reseals changed bytes.
-
-    #[pyo3(signature = (task_use, *, parent, tensors, consumer_stream, occurrence=None))]
-    fn capture_tensor_content(
+    /// Retain original tensor storage and its Python producers for this step.
+    #[pyo3(signature = (task_use, *, parent, tensors, consumer_stream))]
+    fn retain_tensor_owners(
         &self,
         py: Python<'_>,
         task_use: &PySemanticTransitionTaskUse,
         parent: &Bound<'_, PyAny>,
         tensors: &Bound<'_, PyAny>,
         consumer_stream: &Bound<'_, PyAny>,
-        occurrence: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<PySemanticTensorContentWitness> {
-        self.bind_tensor_content(
+    ) -> PyResult<PySemanticTensorOwner> {
+        self.retain_step_tensor_owners(
             py,
             task_use,
             ContentStepOwner::from_python(parent)?,
             tensors,
             consumer_stream,
-            TensorContentBinding::Capture,
-            occurrence,
+            TensorOwnerBinding::Tensors,
         )
     }
 
-    /// Bind all actual model tensors to the original native model baseline.
-    /// ``tensors`` has the existing typed layout/interval/producer rows, covering
-    /// exactly roles 18/19/20 present in the acquired parent. Optional adapters
-    /// must be present exactly when the original roster contains them. Native
-    /// checks the admitted generation and sealed model contract (role 44).
-    /// Expected content comes from the original device publication seals, never
-    /// from a new capture of current model bytes. Initial producer addresses and
-    /// valid physical strides may differ; type, shape and logical interval may
-    /// not. Later witness.verify requires these same live storage/layout owners.
-    /// A prepared parent requires ``bank`` so each recorded branch seals the
-    /// resident model storage that its producer actually reads. Published parents
-    /// reject ``bank``. Call before model reads and verify after callbacks and
-    /// before late backward. This does not certify Python identity, hooks,
-    /// configuration or numerical derivation; those remain the model owner's
-    /// checks. Successful return is stream-ordered enqueue, not GPU acceptance.
-    /// Retain the complete witness through creator-thread cleanup, as for
-    /// capture_tensor_content; no first-reader lifetime is used as a baseline.
-    #[pyo3(signature = (task_use, *, parent, tensors, consumer_stream, bank=None, occurrence=None))]
-    fn bind_model_content(
+    /// Retain actual model storage and its original Python/autograd producers.
+    /// A prepared parent requires its original bank; a published parent rejects it.
+    #[pyo3(signature = (task_use, *, parent, tensors, consumer_stream, bank=None))]
+    fn retain_model_tensor_owners(
         &self,
         py: Python<'_>,
         task_use: &PySemanticTransitionTaskUse,
@@ -25223,8 +24717,7 @@ impl PySemanticTransitionController {
         tensors: &Bound<'_, PyAny>,
         consumer_stream: &Bound<'_, PyAny>,
         bank: Option<usize>,
-        occurrence: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<Py<PySemanticTensorContentWitness>> {
+    ) -> PyResult<Py<PySemanticTensorOwner>> {
         let parent = ContentStepOwner::from_python(parent)?;
         #[cfg(feature = "semantic-policy")]
         let prepared = if bank.is_none() {
@@ -25237,23 +24730,22 @@ impl PySemanticTransitionController {
         } else {
             None
         };
-        let witness = self.bind_tensor_content(
+        let owner = self.retain_step_tensor_owners(
             py,
             task_use,
             parent,
             tensors,
             consumer_stream,
-            TensorContentBinding::Model(bank),
-            occurrence,
+            TensorOwnerBinding::Model(bank),
         )?;
-        let witness = Py::new(py, witness)?;
+        let owner = Py::new(py, owner)?;
         #[cfg(feature = "semantic-policy")]
         if let Some(prepared) = prepared {
             prepared
                 .borrow(py)
-                .retain_source_witness(py, witness.clone_ref(py))?;
+                .retain_source_owner(py, owner.clone_ref(py))?;
         }
-        Ok(witness)
+        Ok(owner)
     }
 
     /// Retain the actual original-forward outputs for this acquired parent.
@@ -25264,16 +24756,16 @@ impl PySemanticTransitionController {
     /// Selection is indexed by original source slot. Active rows contain
     /// (physical_row, source_slot, logical_position, kind), with FILLED=1,
     /// MASK=2 and FEEDBACK=3; invalid feedback slots leave physical gaps.
-    /// The original transient ``producer_witness`` captures model tensors in
+    /// The original transient ``tensor_owner`` retains model tensors in
     /// their original order followed by these services at role 0 indices
     /// N through N+5. A model with a sealed physical-parameter roster must
     /// also supply FP64[N_physical,2,3] numerical_blocks for Proposal/replay,
     /// at index N+6. Acquired replay supplies its verified schema digest and
     /// model identity; a prepared branch instead supplies the same bank's
-    /// ``model_content_witness`` and no host identities. Native retains its
+    /// ``model_owner`` and no host identities. Native retains its
     /// private acquired model-contract snapshot and reads it on each replay. Both
     /// actor-reference and full-objective rows contain B, ordinary and U;
-    /// Update has no pre-draw block tensor. Model-content witnesses cannot
+    /// Update has no pre-draw block tensor. Model storage owners cannot
     /// substitute for this capture.
     /// ``consumer_stream`` is explicit (or legacy stream 1); 0 and 2 are refused.
     /// Native validation checks the acquired source, prefix, services and
@@ -25282,10 +24774,10 @@ impl PySemanticTransitionController {
     /// each recorded branch; published parents reject it. Update capacity
     /// evidence requires the original cause, full payload, explicit payload
     /// anchor and allocation ordinal together.
-    #[pyo3(signature = (task_use, *, parent, text_rows, text_row_count, selected_text, active_rows, active_row_count, numerical_admissibility, tensors, producer_witness, consumer_stream, bank=None, numerical_blocks=None, model_schema_digest=None, model_identity=None, model_content_witness=None, capacity_refusal=None, capacity_payload=None, capacity_payload_anchor=None, capacity_allocation_ordinal=None))]
+    #[pyo3(signature = (task_use, *, parent, text_rows, text_row_count, selected_text, active_rows, active_row_count, numerical_admissibility, tensors, tensor_owner, consumer_stream, bank=None, numerical_blocks=None, model_schema_digest=None, model_identity=None, model_owner=None, capacity_refusal=None, capacity_payload=None, capacity_payload_anchor=None, capacity_allocation_ordinal=None))]
     #[expect(
         clippy::too_many_arguments,
-        reason = "continuation binding retains each typed producer and its witness"
+        reason = "continuation binding retains each typed producer and its storage owner"
     )]
     fn bind_continuation(
         &self,
@@ -25299,13 +24791,13 @@ impl PySemanticTransitionController {
         active_row_count: &Bound<'_, PyAny>,
         numerical_admissibility: &Bound<'_, PyAny>,
         tensors: &Bound<'_, PyAny>,
-        producer_witness: &PySemanticTensorContentWitness,
+        tensor_owner: &PySemanticTensorOwner,
         consumer_stream: &Bound<'_, PyAny>,
         bank: Option<usize>,
         numerical_blocks: Option<&Bound<'_, PyAny>>,
         model_schema_digest: Option<&Bound<'_, PyAny>>,
         model_identity: Option<&Bound<'_, PyAny>>,
-        model_content_witness: Option<&PySemanticTensorContentWitness>,
+        model_owner: Option<&PySemanticTensorOwner>,
         capacity_refusal: Option<&Bound<'_, PyAny>>,
         capacity_payload: Option<&Bound<'_, PyAny>>,
         capacity_payload_anchor: Option<&Bound<'_, PyAny>>,
@@ -25332,14 +24824,14 @@ impl PySemanticTransitionController {
                     active_row_count,
                     numerical_admissibility,
                     tensors,
-                    producer_witness,
+                    tensor_owner,
                     consumer_stream,
                     None,
                     None,
                     numerical_blocks,
                     model_schema_digest,
                     model_identity,
-                    model_content_witness,
+                    model_owner,
                     capacity_refusal,
                     capacity_payload,
                     capacity_payload_anchor,
@@ -25360,14 +24852,14 @@ impl PySemanticTransitionController {
                     active_row_count,
                     numerical_admissibility,
                     tensors,
-                    producer_witness,
+                    tensor_owner,
                     consumer_stream,
                     Some(bank),
                     None,
                     numerical_blocks,
                     model_schema_digest,
                     model_identity,
-                    model_content_witness,
+                    model_owner,
                     capacity_refusal,
                     capacity_payload,
                     capacity_payload_anchor,
@@ -25389,7 +24881,7 @@ impl PySemanticTransitionController {
     /// XLOG computes every canary measurement, resource tally and refusal on device.
     /// ``bank`` identifies the recorded branch that owns these original outputs.
     #[cfg(feature = "semantic-policy")]
-    #[pyo3(signature = (task_use, *, step, bank, tensors, model_allocations, model_storages, model_views, numerical_admissibility, slab_backing, slab_bytes, baseline_forward, candidate_forward, canary_comparison, allocation_witness, consumer_stream))]
+    #[pyo3(signature = (task_use, *, step, bank, tensors, model_allocations, model_storages, model_views, numerical_admissibility, slab_backing, slab_bytes, baseline_forward, candidate_forward, canary_comparison, allocation_owner, consumer_stream))]
     #[expect(
         clippy::too_many_arguments,
         reason = "prepared update binding retains model geometry and numerical admissibility"
@@ -25410,9 +24902,10 @@ impl PySemanticTransitionController {
         baseline_forward: &PySemanticModelForwardWitness,
         candidate_forward: &PySemanticModelForwardWitness,
         canary_comparison: &PySemanticModelCanaryWitness,
-        allocation_witness: &PySemanticTensorContentWitness,
+        allocation_owner: &PySemanticTensorOwner,
         consumer_stream: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
+        let _operation = TensorProducerOperation::begin(&self.session.borrow(py))?;
         self.session.borrow(py).require_creator()?;
         self.require_read_issued(task_use)?;
         if bank > 1 {
@@ -25434,7 +24927,7 @@ impl PySemanticTransitionController {
             let owner = session.owner()?;
             let state = self.continuation_state(py, task_use, parent, &owner, None)?;
             step.require_recording_stream(&owner, stream)?;
-            self.require_continuation_witness(py, parent, allocation_witness)?;
+            self.require_continuation_owner(py, parent, allocation_owner)?;
             if owner
                 .prepared_transition_kind(&step.inner)
                 .map_err(xlog_err)?
@@ -25451,7 +24944,7 @@ impl PySemanticTransitionController {
             let owner = session.owner()?;
             let state = self.continuation_state(py, task_use, parent, &owner, None)?;
             step.require_recording_stream(&owner, stream)?;
-            self.require_continuation_witness(py, parent, allocation_witness)?;
+            self.require_continuation_owner(py, parent, allocation_owner)?;
             if self.continuation_binding(&state, parent, false)? != expected {
                 return Err(invalid(
                     "prepared update authority changed during producer handoff",
@@ -25465,12 +24958,12 @@ impl PySemanticTransitionController {
             producers: allocation_producers,
         } = parse_tensor_inputs_guarded(model_allocations, &mut budget, device, stream, &check)?;
         let mut producer_owners = TensorHandoff(vec![
-            allocation_witness._inputs.clone_ref(py),
+            allocation_owner._inputs.clone_ref(py),
             model_allocations.clone().unbind(),
             tensors.clone().unbind(),
         ]);
         producer_owners.0.extend(
-            allocation_witness
+            allocation_owner
                 ._producers
                 .iter()
                 .map(|producer| producer.clone_ref(py)),
@@ -25534,7 +25027,7 @@ impl PySemanticTransitionController {
         let session = self.session.borrow(py);
         let mut owner = session.owner()?;
         let state = self.continuation_state(py, task_use, parent, &owner, None)?;
-        self.require_continuation_witness(py, parent, allocation_witness)?;
+        self.require_continuation_owner(py, parent, allocation_owner)?;
         if self.continuation_binding(&state, parent, false)? != expected {
             return Err(invalid(
                 "prepared update authority changed during model output handoff",
@@ -25555,7 +25048,7 @@ impl PySemanticTransitionController {
                 &baseline_forward.inner,
                 &candidate_forward.inner,
                 &canary_comparison.inner,
-                &allocation_witness.inner,
+                &allocation_owner.inner,
                 stream,
             )
             .map_err(xlog_err)?;
@@ -25582,7 +25075,7 @@ impl PySemanticTransitionController {
     /// Policy producers may bind before the original continuation. The native
     /// branch joins both bindings before any transition can execute.
     #[cfg(feature = "semantic-policy")]
-    #[pyo3(signature = (task_use, *, step, bank, binding, model_output, text_logits, product_support, parameters, component_baselines, parameter_errors, baseline_errors, parameter_domains, text_domains, baseline_domains, producer_witness, consumer_stream))]
+    #[pyo3(signature = (task_use, *, step, bank, binding, model_output, text_logits, product_support, parameters, component_baselines, parameter_errors, baseline_errors, parameter_domains, text_domains, baseline_domains, tensor_owner, consumer_stream))]
     #[expect(
         clippy::too_many_arguments,
         reason = "parent binding retains complete publication and model ownership"
@@ -25604,9 +25097,10 @@ impl PySemanticTransitionController {
         parameter_domains: Py<PyAny>,
         text_domains: Py<PyAny>,
         baseline_domains: Py<PyAny>,
-        producer_witness: &PySemanticTensorContentWitness,
+        tensor_owner: &PySemanticTensorOwner,
         consumer_stream: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
+        let _operation = TensorProducerOperation::begin(&self.session.borrow(py))?;
         self.session.borrow(py).require_creator()?;
         if bank > 1 {
             return Err(invalid("prepared policy bank must be zero or one"));
@@ -25629,7 +25123,7 @@ impl PySemanticTransitionController {
             let owner = session.owner()?;
             let state = self.continuation_state(py, task_use, parent, &owner, None)?;
             step.require_recording_stream(&owner, stream)?;
-            self.require_continuation_witness(py, parent, producer_witness)?;
+            self.require_continuation_owner(py, parent, tensor_owner)?;
             if binding != owner.binding() {
                 return Err(invalid("policy packing belongs to another native binding"));
             }
@@ -25663,7 +25157,7 @@ impl PySemanticTransitionController {
             let owner = session.owner()?;
             let state = self.continuation_state(py, task_use, parent, &owner, None)?;
             step.require_recording_stream(&owner, stream)?;
-            self.require_continuation_witness(py, parent, producer_witness)?;
+            self.require_continuation_owner(py, parent, tensor_owner)?;
             if self.continuation_binding(&state, parent, false)? != expected {
                 return Err(invalid(
                     "prepared policy authority changed during producer handoff",
@@ -25682,7 +25176,7 @@ impl PySemanticTransitionController {
         let session = self.session.borrow(py);
         let mut owner = session.owner()?;
         let state = self.continuation_state(py, task_use, parent, &owner, None)?;
-        self.require_continuation_witness(py, parent, producer_witness)?;
+        self.require_continuation_owner(py, parent, tensor_owner)?;
         if self.continuation_binding(&state, parent, false)? != expected {
             return Err(invalid(
                 "prepared policy authority changed during producer handoff",
@@ -25709,7 +25203,7 @@ impl PySemanticTransitionController {
                     text_domains,
                     baseline_domains,
                 ],
-                &producer_witness.inner,
+                &tensor_owner.inner,
                 stream,
             )
             .map_err(xlog_err)?;
@@ -25737,12 +25231,12 @@ impl PySemanticTransitionController {
     /// are F32[32,V], Bool8[support_cells], FP32[P], FP32[1,136], followed by
     /// FP64 envelopes [P,2], [1,136,2] and domains [P,4], [32,V,4], [1,136,4]
     /// in (M,O,U,I) order. Pointwise E differs from preliminary D.O/U.
-    /// Their common witness uses that exact order on ``consumer_stream``.
+    /// Their common tensor owner uses that exact order on ``consumer_stream``.
     /// ``model_output`` is the caller-authenticated original output, retained
     /// without invoking a getter; rows/selected bits come only from the already
     /// admitted continuation. Acquire of the result remains explicit.
     #[cfg(feature = "semantic-policy")]
-    #[pyo3(signature = (task_use, *, parent, binding, model_output, text_logits, product_support, parameters, component_baselines, parameter_errors, baseline_errors, parameter_domains, text_domains, baseline_domains, producer_witness, consumer_stream))]
+    #[pyo3(signature = (task_use, *, parent, binding, model_output, text_logits, product_support, parameters, component_baselines, parameter_errors, baseline_errors, parameter_domains, text_domains, baseline_domains, tensor_owner, consumer_stream))]
     #[expect(
         clippy::too_many_arguments,
         reason = "replay import carries independent material and lifecycle callbacks"
@@ -25763,7 +25257,7 @@ impl PySemanticTransitionController {
         parameter_domains: Py<PyAny>,
         text_domains: Py<PyAny>,
         baseline_domains: Py<PyAny>,
-        producer_witness: &PySemanticTensorContentWitness,
+        tensor_owner: &PySemanticTensorOwner,
         consumer_stream: &Bound<'_, PyAny>,
     ) -> PyResult<PySemanticPolicyInvocation> {
         self.session.borrow(py).require_creator()?;
@@ -25783,7 +25277,7 @@ impl PySemanticTransitionController {
             parameter_domains,
             text_domains,
             baseline_domains,
-            producer_witness,
+            tensor_owner,
             consumer_stream,
             None,
             || Ok(()),
@@ -25808,7 +25302,7 @@ impl PySemanticTransitionController {
 
     /// Materialize the initial native parent before any model continuation.
     /// This cold operation does not consume ``before_segment`` and returns only
-    /// the device-validated ``(instance, word, logical_digest, state_digest)``;
+    /// the native-owned ``(instance, word, logical_key)``;
     /// a model must separately acquire the resulting parent lease.
     ///
     /// ``source`` contains exactly 32 original ring rows and ``prefix`` the
@@ -25908,7 +25402,6 @@ impl PySemanticTransitionController {
             PyBytes::new(py, identity.instance.as_bytes()),
             identity.word,
             PyBytes::new(py, identity.logical_digest.as_bytes()),
-            PyBytes::new(py, identity.state_digest.as_bytes()),
         )
             .into_pyobject(py)?
             .unbind())
@@ -25938,7 +25431,7 @@ impl PySemanticTransitionController {
         >,
     ) -> PyResult<Option<xlog_cuda::SemanticPublishedIdentity>> {
         self.session.borrow(py).require_creator()?;
-        let _operation = InitialPrefillOperation::begin(&self.session.borrow(py))?;
+        let _operation = TensorProducerOperation::begin(&self.session.borrow(py))?;
         self.require_read_issued(task_use)?;
         {
             let session = self.session.borrow(py);
@@ -26485,7 +25978,6 @@ impl PySemanticTransitionController {
                     project_bytes(identity.instance.as_bytes())?.into_any(),
                     word,
                     project_bytes(identity.logical_digest.as_bytes())?.into_any(),
-                    project_bytes(identity.state_digest.as_bytes())?.into_any(),
                 ],
             )?
             .unbind())
@@ -26949,138 +26441,15 @@ impl PySemanticTransitionController {
 }
 
 impl PySemanticTransitionController {
-    #[cfg(feature = "semantic-policy")]
-    fn resolve_retained_content_binding(
-        &self,
-        py: Python<'_>,
-        task_use: &PySemanticTransitionTaskUse,
-        parent: &ContentStepOwner,
-        tensors: &Bound<'_, PyAny>,
-        stream: u64,
-        binding_kind: &TensorContentBinding,
-        occurrence: Option<&Py<PyAny>>,
-    ) -> PyResult<Option<PySemanticTensorContentWitness>> {
-        let session = self.session.borrow(py);
-        let original = session
-            .pending_content_binding
-            .lock()
-            .map_err(|_| invalid("original content binding retention mutex is poisoned"))?
-            .take();
-        let Some(original) = original else {
-            return Ok(None);
-        };
-        let mut native_pending = false;
-        let result = (|| {
-            let ContentStepOwner::Published(actual) = parent else {
-                return Err(invalid(
-                    "original content continuation changed its actual parent owner",
-                ));
-            };
-            let model = matches!(binding_kind, TensorContentBinding::Model(None));
-            if actual.as_ptr() != original.parent.as_ptr()
-                || stream != original.consumer_stream
-                || model != original.model
-                || !same_original_source_content_occurrence(
-                    original.occurrence.as_ref(),
-                    occurrence,
-                )
-                || matches!(binding_kind, TensorContentBinding::Model(Some(_)))
-            {
-                return Err(invalid(
-                    "original content continuation changed its parent, stream or binding mode",
-                ));
-            }
-            check_retained_content_inputs(tensors, &original, &mut (16 * 1024 * 1024))?;
-            let actual = actual.borrow(py);
-            actual.require_task(py, task_use)?;
-            let mut owner = session.owner()?;
-            task_use.require_current(&owner)?;
-            if task_use.state()?.content_handoff_binding()? != original.authority {
-                return Err(invalid(
-                    "original content continuation changed its current task authority",
-                ));
-            }
-            let lease = actual.lease()?;
-            if owner
-                .pending_content_binding_identity(&lease)
-                .map_err(xlog_err)?
-                .is_none()
-            {
-                return Err(invalid(
-                    "original content continuation lost its native producer custody",
-                ));
-            }
-            native_pending = true;
-            owner
-                .resume_original_cold_content_binding(&lease)
-                .map_err(xlog_err)
-        })();
-        match result {
-            Ok(inner) => {
-                if original.model {
-                    let parent = original.parent.borrow(py);
-                    if let Some(prepared) =
-                        self.original_model_import_owner(py, task_use, &parent)?
-                    {
-                        if original.geometry.len() != original.producers.len() {
-                            return Err(invalid(
-                                "original pending SOURCE model ports changed their retained roster",
-                            ));
-                        }
-                        let ports = original
-                            .geometry
-                            .iter()
-                            .zip(&original.producers)
-                            .map(|(geometry, producer)| {
-                                prepared_import::OriginalImportTensorPort::retain_geometry(
-                                    py, geometry, producer,
-                                )
-                            })
-                            .collect();
-                        prepared
-                            .borrow(py)
-                            .retain_source_ports(py, task_use, &parent, ports)?;
-                    }
-                }
-                Ok(Some(PySemanticTensorContentWitness {
-                    inner,
-                    _inputs: original.inputs,
-                    _producers: original.producers,
-                    parent: ContentStepOwner::Published(original.parent),
-                    session: self.session.clone_ref(py),
-                    model_binding: original.model,
-                    pending_verification: Mutex::new(None),
-                }))
-            }
-            Err(error) => {
-                *session.pending_content_binding.lock().map_err(|_| {
-                    invalid("original content binding retention mutex is poisoned")
-                })? = Some(original);
-                Err(if native_pending {
-                    cold_content_pending(py, error)
-                } else {
-                    error
-                })
-            }
-        }
-    }
-
-    fn bind_tensor_content(
+    fn retain_step_tensor_owners(
         &self,
         py: Python<'_>,
         task_use: &PySemanticTransitionTaskUse,
         parent: ContentStepOwner,
         tensors: &Bound<'_, PyAny>,
         consumer_stream: &Bound<'_, PyAny>,
-        binding_kind: TensorContentBinding,
-        occurrence: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<PySemanticTensorContentWitness> {
-        let occurrence = original_source_content_occurrence(occurrence)?;
-        if occurrence.is_some() && matches!(&binding_kind, TensorContentBinding::Model(Some(_))) {
-            return Err(invalid(
-                "CURRENT model content is verified from its original prepared bank, not rebound",
-            ));
-        }
+        binding_kind: TensorOwnerBinding,
+    ) -> PyResult<PySemanticTensorOwner> {
         self.session.borrow(py).require_creator()?;
         self.require_read_issued(task_use)?;
         match &parent {
@@ -27091,23 +26460,12 @@ impl PySemanticTransitionController {
         }
         let mut budget = 16 * 1024 * 1024;
         let stream = parse_witness_consumer_stream(consumer_stream, &mut budget)?;
-        #[cfg(feature = "semantic-policy")]
-        if let Some(retained) = self.resolve_retained_content_binding(
-            py,
-            task_use,
-            &parent,
-            tensors,
-            stream,
-            &binding_kind,
-            occurrence.as_ref(),
-        )? {
-            return Ok(retained);
-        }
         let binding = {
             let session = self.session.borrow(py);
             let owner = session.owner()?;
             parent.binding(py, &owner, false)?
         };
+        let _operation = TensorProducerOperation::begin(&self.session.borrow(py))?;
         let inputs = tensors.clone().unbind();
         let device = self.session.borrow(py).device_ordinal;
         let check = || -> PyResult<()> {
@@ -27115,7 +26473,7 @@ impl PySemanticTransitionController {
             let owner = session.owner()?;
             if parent.binding(py, &owner, false)? != binding {
                 return Err(invalid(
-                    "original content scope changed during producer callback",
+                    "original tensor scope changed during producer callback",
                 ));
             }
             parent.check_producer_stream(py, &owner, stream)
@@ -27124,7 +26482,7 @@ impl PySemanticTransitionController {
         let ParsedTensorInputs { handoff, producers } =
             parse_tensor_inputs_guarded(tensors, &mut budget, device, stream, &check)?;
         #[cfg(feature = "semantic-policy")]
-        let source_ports = if matches!(&binding_kind, TensorContentBinding::Model(None)) {
+        let source_ports = if matches!(&binding_kind, TensorOwnerBinding::Model(None)) {
             match &parent {
                 ContentStepOwner::Published(acquired) => self
                     .original_model_import_owner(py, task_use, &acquired.borrow(py))?
@@ -27148,76 +26506,33 @@ impl PySemanticTransitionController {
         } else {
             None
         };
-        #[cfg(feature = "semantic-policy")]
-        let geometry = handoff
-            .0
-            .iter()
-            .map(|input| {
-                (
-                    input.layout,
-                    input.logical_begin,
-                    input.logical_end,
-                    input.native_allocation.clone(),
-                )
-            })
-            .collect();
+
         let session = self.session.borrow(py);
         let mut owner = session.owner()?;
         task_use.require_identity(&owner)?;
         let state = task_use.state()?;
-        let model_binding = matches!(&binding_kind, TensorContentBinding::Model(_));
-        let result = match &parent {
+        let model_binding = matches!(&binding_kind, TensorOwnerBinding::Model(_));
+        let inner = match &parent {
             ContentStepOwner::Published(acquired) => {
                 let acquired = acquired.borrow(py);
-                let (operation, snapshot) = state.content_handoff_binding()?;
-                if (operation, snapshot) != binding {
+                if state.content_handoff_binding()? != binding {
                     return Err(invalid(
-                        "tensor content authority changed during producer handoff",
+                        "tensor ownership authority changed during producer handoff",
                     ));
                 }
                 let lease = acquired.lease()?;
                 owner.published_identity(&lease).map_err(xlog_err)?;
                 match binding_kind {
-                    TensorContentBinding::Capture => {
-                        #[cfg(feature = "semantic-policy")]
-                        if let Some(occurrence) = occurrence.as_ref() {
-                            let occurrence = occurrence
-                                .bind(py)
-                                .extract::<PyRef<'_, PySemanticSourceContentOccurrence>>()?;
-                            owner.capture_tensor_content_with_occurrence(
-                                &lease,
-                                handoff.into_native(),
-                                stream,
-                                &occurrence.inner,
-                            )
-                        } else {
-                            owner.capture_tensor_content(&lease, handoff.into_native(), stream)
-                        }
-                        #[cfg(not(feature = "semantic-policy"))]
-                        owner.capture_tensor_content(&lease, handoff.into_native(), stream)
+                    TensorOwnerBinding::Tensors => {
+                        owner.retain_tensor_owners(&lease, handoff.into_native(), stream)
                     }
-                    TensorContentBinding::Model(None) => {
-                        #[cfg(feature = "semantic-policy")]
-                        if let Some(occurrence) = occurrence.as_ref() {
-                            let occurrence = occurrence
-                                .bind(py)
-                                .extract::<PyRef<'_, PySemanticSourceContentOccurrence>>()?;
-                            owner.bind_model_content_with_occurrence(
-                                &lease,
-                                handoff.into_native(),
-                                stream,
-                                &occurrence.inner,
-                            )
-                        } else {
-                            owner.bind_model_content(&lease, handoff.into_native(), stream)
-                        }
-                        #[cfg(not(feature = "semantic-policy"))]
-                        owner.bind_model_content(&lease, handoff.into_native(), stream)
+                    TensorOwnerBinding::Model(None) => {
+                        owner.retain_model_tensor_owners(&lease, handoff.into_native(), stream)
                     }
-                    TensorContentBinding::Model(Some(_)) => {
+                    TensorOwnerBinding::Model(Some(_)) => {
                         return Err(invalid(
-                            "published model content does not accept a prepared bank",
-                        ));
+                            "published model ownership does not accept a prepared bank",
+                        ))
                     }
                 }
             }
@@ -27225,100 +26540,31 @@ impl PySemanticTransitionController {
                 let step = step.borrow(py);
                 if state.prepared_content_binding(&step.scope)? != binding {
                     return Err(invalid(
-                        "tensor content authority changed during producer handoff",
+                        "tensor ownership authority changed during producer handoff",
                     ));
                 }
-                #[cfg(feature = "semantic-policy")]
-                let occurrence = occurrence
-                    .as_ref()
-                    .map(|occurrence| {
-                        occurrence
-                            .bind(py)
-                            .extract::<PyRef<'_, PySemanticSourceContentOccurrence>>()
-                    })
-                    .transpose()?;
                 match binding_kind {
-                    TensorContentBinding::Model(Some(bank)) => {
-                        #[cfg(feature = "semantic-policy")]
-                        let result = owner.bind_prepared_model_content(
+                    TensorOwnerBinding::Tensors => owner.retain_prepared_tensor_owners(
+                        &step.inner,
+                        handoff.into_native(),
+                        stream,
+                    ),
+                    TensorOwnerBinding::Model(Some(bank)) => owner
+                        .retain_prepared_model_tensor_owners(
                             &step.inner,
                             bank,
                             handoff.into_native(),
                             stream,
-                            occurrence.as_ref().map(|occurrence| &occurrence.inner),
-                        );
-                        #[cfg(not(feature = "semantic-policy"))]
-                        let result = owner.bind_prepared_model_content(
-                            &step.inner,
-                            bank,
-                            handoff.into_native(),
-                            stream,
-                        );
-                        result
-                    }
-                    TensorContentBinding::Model(None) => {
-                        return Err(invalid("prepared model content requires bank zero or one"));
-                    }
-                    TensorContentBinding::Capture => {
-                        #[cfg(feature = "semantic-policy")]
-                        let result = owner.capture_prepared_tensor_content(
-                            &step.inner,
-                            handoff.into_native(),
-                            stream,
-                            occurrence.as_ref().map(|occurrence| &occurrence.inner),
-                        );
-                        #[cfg(not(feature = "semantic-policy"))]
-                        let result = owner.capture_prepared_tensor_content(
-                            &step.inner,
-                            handoff.into_native(),
-                            stream,
-                        );
-                        result
-                    }
-                }
-            }
-        };
-        #[cfg(feature = "semantic-policy")]
-        if result.is_err() {
-            if let ContentStepOwner::Published(actual) = &parent {
-                let retained = {
-                    let actual = actual.borrow(py);
-                    let present = owner
-                        .pending_content_binding_identity(&*actual.lease()?)
-                        .map_err(xlog_err)?
-                        .is_some();
-                    present
-                };
-                if retained {
-                    let mut pending = session.pending_content_binding.lock().map_err(|_| {
-                        invalid("original content binding retention mutex is poisoned")
-                    })?;
-                    if pending.is_some() {
+                        ),
+                    TensorOwnerBinding::Model(None) => {
                         return Err(invalid(
-                            "another original content binding is still retained",
-                        ));
+                            "prepared model ownership requires bank zero or one",
+                        ))
                     }
-                    *pending = Some(PendingPythonContentBinding {
-                        parent: actual.clone_ref(py),
-                        inputs,
-                        producers,
-                        consumer_stream: stream,
-                        model: model_binding,
-                        occurrence,
-                        authority: binding,
-                        geometry,
-                    });
-                    drop(pending);
-                    drop(state);
-                    drop(owner);
-                    return Err(cold_content_pending(
-                        py,
-                        xlog_err(result.err().expect("original content error")),
-                    ));
                 }
             }
         }
-        let inner = result.map_err(xlog_err)?;
+        .map_err(xlog_err)?;
         drop(state);
         drop(owner);
         #[cfg(feature = "semantic-policy")]
@@ -27332,15 +26578,13 @@ impl PySemanticTransitionController {
                 .borrow(py)
                 .retain_source_ports(py, task_use, &acquired.borrow(py), ports)?;
         }
-        Ok(PySemanticTensorContentWitness {
+        Ok(PySemanticTensorOwner {
             inner,
             _inputs: inputs,
             _producers: producers,
             parent,
             session: self.session.clone_ref(py),
             model_binding,
-            #[cfg(feature = "semantic-policy")]
-            pending_verification: Mutex::new(None),
         })
     }
 
@@ -28045,7 +27289,7 @@ impl PySemanticTransitionController {
                 return Err(cancelled);
             }
             let completion = py.detach(|| {
-                let mut owner = session.witness_owner()?;
+                let mut owner = session.serialized_owner()?;
                 Ok::<_, PyErr>(owner.complete_prepared_segment())
             })?;
             let outcomes = match completion {
@@ -28805,11 +28049,11 @@ impl PySemanticTransitionController {
                 };
                 self.check_import_callback(py, &issued, &acquired, import, &expected)?;
                 let arguments = object_sequence(&continuation, &mut budget)?;
-                let (blocks, schema, identity, tensors_index, witness_index) = if kind
+                let (blocks, schema, identity, tensors_index, owner_index) = if kind
                     == SemanticTransitionKind::Proposal
                 {
                     if arguments.len() != 11 {
-                        return Err(invalid("final proposal continuation requires seven CUDA services, sealed model identities, tensors and its captured producer witness"));
+                        return Err(invalid("final proposal continuation requires seven CUDA services, sealed model identities, tensors and its retained tensor owner"));
                     }
                     (
                         Some(&arguments[6]),
@@ -28820,12 +28064,12 @@ impl PySemanticTransitionController {
                     )
                 } else {
                     if arguments.len() != 8 {
-                        return Err(invalid("final non-drawing continuation requires six CUDA services, tensors and its captured producer witness"));
+                        return Err(invalid("final non-drawing continuation requires six CUDA services, tensors and its retained tensor owner"));
                     }
                     (None, None, None, 6, 7)
                 };
-                let producer_witness = arguments[witness_index]
-                    .extract::<PyRef<'_, PySemanticTensorContentWitness>>()?;
+                let tensor_owner =
+                    arguments[owner_index].extract::<PyRef<'_, PySemanticTensorOwner>>()?;
                 self.bind_continuation_in_execution(
                     py,
                     &issued,
@@ -28837,7 +28081,7 @@ impl PySemanticTransitionController {
                     &arguments[4],
                     &arguments[5],
                     &arguments[tensors_index],
-                    &producer_witness,
+                    &tensor_owner,
                     &consumer_stream,
                     None,
                     Some(import),
@@ -28865,10 +28109,9 @@ impl PySemanticTransitionController {
                     self.check_import_callback(py, &issued, &acquired, import, &expected)?;
                     let policy = object_sequence(&policy, &mut budget)?;
                     if policy.len() != 11 {
-                        return Err(invalid("Runtime replay policy requires binding, text, parameters, product support, baselines, five original numerical views and their common witness"));
+                        return Err(invalid("Runtime replay policy requires binding, text, parameters, product support, baselines, five original numerical views and their common tensor owner"));
                     }
-                    let policy_witness =
-                        policy[10].extract::<PyRef<'_, PySemanticTensorContentWitness>>()?;
+                    let policy_owner = policy[10].extract::<PyRef<'_, PySemanticTensorOwner>>()?;
                     let invocation = self.execute_policy_in_execution(
                         py,
                         task_use.clone_ref(py),
@@ -28884,7 +28127,7 @@ impl PySemanticTransitionController {
                         policy[7].clone().unbind(),
                         policy[8].clone().unbind(),
                         policy[9].clone().unbind(),
-                        &policy_witness,
+                        &policy_owner,
                         &consumer_stream,
                         Some(import),
                         || bind_continuation(budget),
@@ -29083,14 +28326,14 @@ impl PySemanticTransitionController {
                             || prepared.parent.as_ptr() != parent.as_ptr()
                         {
                             return Err(invalid(
-                                "source witness retirement changed its original import",
+                                "source owner retirement changed its original import",
                             ));
                         }
                         prepared.require_completed()?;
                         // Original native FinalUse and Runtime cleanup are
                         // already known. Quiescence itself rejects retained
-                        // content witnesses, before the final P/S comparison.
-                        prepared.retire_source_witness(py)?;
+                        // tensor owners, before the final P/S comparison.
+                        prepared.retire_source_owner(py)?;
                     }
                 }
                 let mut owner = import.session.owner()?;
@@ -29425,19 +28668,20 @@ impl PySemanticTransitionController {
         active_row_count: &Bound<'_, PyAny>,
         numerical_admissibility: &Bound<'_, PyAny>,
         tensors: &Bound<'_, PyAny>,
-        producer_witness: &PySemanticTensorContentWitness,
+        tensor_owner: &PySemanticTensorOwner,
         consumer_stream: &Bound<'_, PyAny>,
         prepared_bank: Option<usize>,
         import: Option<&ColdImportGuard<'_>>,
         numerical_blocks: Option<&Bound<'_, PyAny>>,
         model_schema_digest: Option<&Bound<'_, PyAny>>,
         model_identity: Option<&Bound<'_, PyAny>>,
-        model_content_witness: Option<&PySemanticTensorContentWitness>,
+        model_owner: Option<&PySemanticTensorOwner>,
         capacity_refusal: Option<&Bound<'_, PyAny>>,
         capacity_payload: Option<&Bound<'_, PyAny>>,
         capacity_payload_anchor: Option<&Bound<'_, PyAny>>,
         capacity_allocation_ordinal: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
+        let _operation = TensorProducerOperation::begin(&self.session.borrow(py))?;
         if capacity_refusal.is_some() != capacity_payload.is_some()
             || capacity_refusal.is_some() != capacity_payload_anchor.is_some()
             || capacity_refusal.is_some() != capacity_allocation_ordinal.is_some()
@@ -29457,23 +28701,23 @@ impl PySemanticTransitionController {
             }
             _ => {}
         }
-        if model_content_witness.is_some() && matches!(parent, ContentStepRef::Published(_)) {
-            return Err(invalid("acquired continuation requires its verified host model identities, not a prepared model-content witness"));
+        if model_owner.is_some() && matches!(parent, ContentStepRef::Published(_)) {
+            return Err(invalid("acquired continuation requires its verified host model identities, not a prepared model tensor owner"));
         }
         if matches!(parent, ContentStepRef::Prepared(_))
             && (model_schema_digest.is_some()
                 || model_identity.is_some()
-                || numerical_blocks.is_some() != model_content_witness.is_some())
+                || numerical_blocks.is_some() != model_owner.is_some())
         {
-            return Err(invalid("prepared numerical blocks require their same-bank model-content witness and no host model identities"));
+            return Err(invalid("prepared numerical blocks require their same-bank model tensor owner and no host model identities"));
         }
         let expected = {
             let session = self.session.borrow(py);
             let owner = session.owner()?;
             let state = self.continuation_state(py, task_use, parent, &owner, import)?;
-            self.require_continuation_witness(py, parent, producer_witness)?;
-            if let Some(model_witness) = model_content_witness {
-                self.require_continuation_witness(py, parent, model_witness)?;
+            self.require_continuation_owner(py, parent, tensor_owner)?;
+            if let Some(original_model) = model_owner {
+                self.require_continuation_owner(py, parent, original_model)?;
             }
             self.continuation_binding(&state, parent, import.is_some())?
         };
@@ -29513,19 +28757,19 @@ impl PySemanticTransitionController {
         services.extend(capacity_payload);
         services.extend(capacity_payload_anchor);
         // Retain the original Python producers independently of mutable input
-        // rows. Native code retains the captured witness without a Python cycle.
+        // rows. Native code retains the actual tensor storage without a Python cycle.
         // Any failed callback leaves these original autograd owners quarantined.
-        let mut producer_owners = TensorHandoff(vec![producer_witness._inputs.clone_ref(py)]);
+        let mut producer_owners = TensorHandoff(vec![tensor_owner._inputs.clone_ref(py)]);
         producer_owners.0.extend(
-            producer_witness
+            tensor_owner
                 ._producers
                 .iter()
                 .map(|value| value.clone_ref(py)),
         );
-        if let Some(model_witness) = model_content_witness {
-            producer_owners.0.push(model_witness._inputs.clone_ref(py));
+        if let Some(original_model) = model_owner {
+            producer_owners.0.push(original_model._inputs.clone_ref(py));
             producer_owners.0.extend(
-                model_witness
+                original_model
                     ._producers
                     .iter()
                     .map(|value| value.clone_ref(py)),
@@ -29557,9 +28801,9 @@ impl PySemanticTransitionController {
         let session = self.session.borrow(py);
         let mut owner = session.owner()?;
         let state = self.continuation_state(py, task_use, parent, &owner, import)?;
-        self.require_continuation_witness(py, parent, producer_witness)?;
-        if let Some(model_witness) = model_content_witness {
-            self.require_continuation_witness(py, parent, model_witness)?;
+        self.require_continuation_owner(py, parent, tensor_owner)?;
+        if let Some(original_model) = model_owner {
+            self.require_continuation_owner(py, parent, original_model)?;
         }
         if self.continuation_binding(&state, parent, import.is_some())? != expected {
             return Err(invalid(
@@ -29639,15 +28883,15 @@ impl PySemanticTransitionController {
             ContentStepRef::Published(parent) => owner.bind_continuation(
                 &*parent.lease()?,
                 input,
-                &producer_witness.inner,
+                &tensor_owner.inner,
                 consumer_stream,
             ),
             ContentStepRef::Prepared(step) => owner.bind_prepared_continuation(
                 &step.inner,
                 prepared_bank.expect("validated prepared bank"),
                 input,
-                &producer_witness.inner,
-                model_content_witness.map(|witness| &witness.inner),
+                &tensor_owner.inner,
+                model_owner.map(|owner| &owner.inner),
                 consumer_stream,
             ),
         }
@@ -29672,14 +28916,14 @@ impl PySemanticTransitionController {
         Ok(())
     }
 
-    fn require_continuation_witness(
+    fn require_continuation_owner(
         &self,
         py: Python<'_>,
         parent: ContentStepRef<'_>,
-        witness: &PySemanticTensorContentWitness,
+        tensor_owner: &PySemanticTensorOwner,
     ) -> PyResult<()> {
-        if witness.session.as_ptr() != self.session.as_ptr()
-            || !match (parent, &witness.parent) {
+        if tensor_owner.session.as_ptr() != self.session.as_ptr()
+            || !match (parent, &tensor_owner.parent) {
                 (ContentStepRef::Published(parent), ContentStepOwner::Published(issued)) => {
                     std::ptr::eq(&*issued.borrow(py), parent)
                 }
@@ -29690,7 +28934,7 @@ impl PySemanticTransitionController {
             }
         {
             return Err(invalid(
-                "continuation producer witness belongs to another Session or published parent",
+                "continuation producer owner belongs to another Session or published parent",
             ));
         }
         Ok(())
@@ -29828,7 +29072,7 @@ impl PySemanticTransitionController {
         parameter_domains: Py<PyAny>,
         text_domains: Py<PyAny>,
         baseline_domains: Py<PyAny>,
-        producer_witness: &PySemanticTensorContentWitness,
+        tensor_owner: &PySemanticTensorOwner,
         consumer_stream: &Bound<'_, PyAny>,
         import: Option<&ColdImportGuard<'_>>,
         bind_continuation: impl FnOnce() -> PyResult<()>,
@@ -29886,13 +29130,13 @@ impl PySemanticTransitionController {
         // native binding stages, including an uncertain continuation failure.
         let mut original_owners = TensorHandoff(vec![
             model_output.clone_ref(py),
-            producer_witness._inputs.clone_ref(py),
+            tensor_owner._inputs.clone_ref(py),
         ]);
         original_owners
             .0
             .extend(inputs.iter().map(|input| input.clone_ref(py)));
         original_owners.0.extend(
-            producer_witness
+            tensor_owner
                 ._producers
                 .iter()
                 .map(|input| input.clone_ref(py)),
@@ -29901,10 +29145,10 @@ impl PySemanticTransitionController {
             let session = self.session.borrow(py);
             let owner = session.owner()?;
             let state = self.execution_state(py, &issued, &acquired, &owner, import)?;
-            self.require_continuation_witness(
+            self.require_continuation_owner(
                 py,
                 ContentStepRef::Published(&acquired),
-                producer_witness,
+                tensor_owner,
             )?;
             if Self::execution_binding(&state, import.is_some())? != expected
                 || owner
@@ -29916,6 +29160,7 @@ impl PySemanticTransitionController {
             }
             Ok(())
         };
+        let operation = TensorProducerOperation::begin(&self.session.borrow(py))?;
         for input in &inputs {
             validate_producer_device_guarded(input.bind(py), device, &check)?;
         }
@@ -29938,11 +29183,7 @@ impl PySemanticTransitionController {
         {
             return Err(invalid("policy invocation changed during producer handoff"));
         }
-        self.require_continuation_witness(
-            py,
-            ContentStepRef::Published(&acquired),
-            producer_witness,
-        )?;
+        self.require_continuation_owner(py, ContentStepRef::Published(&acquired), tensor_owner)?;
         let [text, support, parameters, component_baselines, parameter_errors,
             baseline_errors, parameter_domains, text_domains, baseline_domains]: [_; 9] = handoff
             .into_native()
@@ -29964,7 +29205,7 @@ impl PySemanticTransitionController {
                     text_domains,
                     baseline_domains,
                 ],
-                &producer_witness.inner,
+                &tensor_owner.inner,
                 stream,
             )
             .map_err(xlog_err)?;
@@ -29974,6 +29215,7 @@ impl PySemanticTransitionController {
         drop(state);
         drop(owner);
         drop(session);
+        drop(operation);
         bind_continuation()?;
         let session = self.session.borrow(py);
         let mut owner = session.owner()?;
@@ -30219,7 +29461,7 @@ mod tests {
                 learning_phase::cold_restore::CheckpointCustody::issue(),
             )),
             task_release: Mutex::new(None),
-            prefill_operation: Arc::new(AtomicBool::new(false)),
+            producer_operation: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "semantic-policy")]
             active_cold_model_work: Mutex::new(None),
             #[cfg(feature = "semantic-policy")]
@@ -30424,10 +29666,9 @@ mod tests {
         let referent = super::CheckpointReferent {
             checkpoint_digest: [7; 32],
             checkpoint_bytes: 900,
-            publication: [8; 104],
+            publication: [8; 72],
             semantic_root: [9; 32],
             model_generation: 11,
-            model_digest: [10; 32],
             task: binding,
             scope_digest: [11; 32],
             authority_root: [12; 32],
@@ -32539,50 +31780,43 @@ else:
     }
 
     #[test]
-    fn content_witness_requires_native_issuance_and_exposes_only_verification() {
+    fn tensor_owner_requires_native_issuance() {
         run_python(
             r#"
-assert 'SemanticTensorContentWitness' in globals(), 'native content witness type is not exported'
-assert hasattr(SemanticPublishedParent, 'guard_content')
-assert hasattr(SemanticTransitionController, 'capture_tensor_content')
+assert 'SemanticTensorOwner' in globals(), 'native tensor owner type is not exported'
+assert hasattr(SemanticTransitionController, 'retain_tensor_owners')
 import inspect
-assert tuple(inspect.signature(SemanticTransitionController.bind_model_content).parameters) == (
+assert tuple(inspect.signature(SemanticTransitionController.retain_model_tensor_owners).parameters) == (
     'self', 'task_use', 'parent', 'tensors', 'consumer_stream', 'bank')
-model_content = inspect.signature(SemanticTransitionController.bind_model_content)
+model_content = inspect.signature(SemanticTransitionController.retain_model_tensor_owners)
 assert model_content.parameters['bank'].kind is inspect.Parameter.KEYWORD_ONLY
 assert model_content.parameters['bank'].default is None
 continuation = inspect.signature(SemanticTransitionController.bind_continuation)
 assert tuple(continuation.parameters) == (
     'self', 'task_use', 'parent', 'text_rows', 'text_row_count', 'selected_text',
     'active_rows', 'active_row_count', 'numerical_admissibility', 'tensors',
-    'producer_witness', 'consumer_stream', 'bank', 'numerical_blocks',
-    'model_schema_digest', 'model_identity', 'model_content_witness')
+    'tensor_owner', 'consumer_stream', 'bank', 'numerical_blocks',
+    'model_schema_digest', 'model_identity', 'model_owner')
 for name in tuple(continuation.parameters)[2:12]:
     parameter = continuation.parameters[name]
     assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
     assert parameter.default is inspect.Parameter.empty
 assert continuation.parameters['bank'].kind is inspect.Parameter.KEYWORD_ONLY
 assert continuation.parameters['bank'].default is None
-for name in ('numerical_blocks', 'model_schema_digest', 'model_identity', 'model_content_witness'):
+for name in ('numerical_blocks', 'model_schema_digest', 'model_identity', 'model_owner'):
     assert continuation.parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
     assert continuation.parameters[name].default is None
-assert hasattr(SemanticTensorContentWitness, 'verify')
+assert not hasattr(SemanticTensorOwner, 'verify')
 for name in ('digest', 'pointer', 'status', 'identity', 'tensors', 'parent'):
-    assert not hasattr(SemanticTensorContentWitness, name), name
-for construct in (lambda: SemanticTensorContentWitness(),
-                  lambda: object.__new__(SemanticTensorContentWitness)):
+    assert not hasattr(SemanticTensorOwner, name), name
+for construct in (lambda: SemanticTensorOwner(),
+                  lambda: object.__new__(SemanticTensorOwner)):
     try:
         construct()
     except TypeError:
         pass
     else:
-        raise AssertionError('caller constructed a witness without native capture')
-try:
-    SemanticTensorContentWitness.verify(object(), tensors=(), consumer_stream=1)
-except TypeError:
-    pass
-else:
-    raise AssertionError('verification accepted a caller-built witness')
+        raise AssertionError('caller constructed an owner without native retention')
 "#,
         );
     }
@@ -32651,7 +31885,7 @@ else:
         run_python(
             r#"
 try:
-    SemanticTransitionController.bind_prepared_policy(object(), object(), step=object(), bank=0, binding=(1, bytes(32)), model_output=object(), text_logits=object(), product_support=object(), parameters=object(), component_baselines=object(), producer_witness=object(), consumer_stream=1)
+    SemanticTransitionController.bind_prepared_policy(object(), object(), step=object(), bank=0, binding=(1, bytes(32)), model_output=object(), text_logits=object(), product_support=object(), parameters=object(), component_baselines=object(), tensor_owner=object(), consumer_stream=1)
 except TypeError:
     pass
 else:
@@ -33283,10 +32517,7 @@ else:
                 "Parent",
                 worker_payload::<super::PySemanticPublishedParent>(),
             ),
-            (
-                "Witness",
-                worker_payload::<super::PySemanticTensorContentWitness>(),
-            ),
+            ("Witness", worker_payload::<super::PySemanticTensorOwner>()),
             (
                 "PolicyInvocation",
                 worker_payload::<super::PySemanticPolicyInvocation>(),

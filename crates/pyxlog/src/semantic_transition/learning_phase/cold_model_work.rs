@@ -1229,15 +1229,14 @@ impl PySemanticColdModelWork {
     /// Retain the complete physical operation recipe before original recording.
     /// Native returns (work bound, event count, call upper), not a Python estimate.
     #[pyo3(
-        signature = (operations, *, region_ends = Vec::new(), evaluation_content = None, source_content = None, resident_reads = None),
-        text_signature = "($self, operations, *, region_ends=(), evaluation_content=None, source_content=None, resident_reads=None)"
+        signature = (operations, *, region_ends = Vec::new(), source_content = None, resident_reads = None),
+        text_signature = "($self, operations, *, region_ends=(), source_content=None, resident_reads=None)"
     )]
     fn admit_plan(
         &self,
         py: Python<'_>,
         operations: &Bound<'_, PyAny>,
         #[pyo3(from_py_with = cold_region_ends)] region_ends: Vec<usize>,
-        evaluation_content: Option<&Bound<'_, PyAny>>,
         source_content: Option<&Bound<'_, PyAny>>,
         resident_reads: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<(u64, u64, u64)> {
@@ -1312,22 +1311,6 @@ impl PySemanticColdModelWork {
                 sources.push(original);
             }
         }
-        // Invoke original tensor producers before taking either native Session
-        // mutex. The actual evaluation owner guards every producer callback.
-        let (phase, content) = if let Some(value) = evaluation_content {
-            let parent = custody.parent()?.borrow(py);
-            let session = parent.session.borrow(py);
-            let phase = private_execution_owner(py, &session)?.ok_or_else(|| {
-                invalid("evaluation content requires its actual original phase owner")
-            })?;
-            let evaluation = phase
-                .borrow(py)
-                .evaluation_cold_content_owner(py, &custody.inner)?;
-            let content = evaluation.borrow(py).prepare_cold_content(py, value)?;
-            (Some(phase), Some(content))
-        } else {
-            (None, None)
-        };
         let session_handle = custody.session(py);
         let session = session_handle.borrow(py);
         let mut owner = session.owner()?;
@@ -1371,7 +1354,6 @@ impl PySemanticColdModelWork {
                         region,
                         &recipe,
                         &region_ends,
-                        content,
                         &sources,
                         &reads,
                     )
@@ -1380,7 +1362,6 @@ impl PySemanticColdModelWork {
                         region,
                         &recipe,
                         &region_ends,
-                        content,
                         &sources,
                         &reads,
                     )
@@ -1390,7 +1371,6 @@ impl PySemanticColdModelWork {
                     &custody.inner,
                     &recipe,
                     &region_ends,
-                    content,
                     &sources,
                     &reads,
                 )
@@ -1421,10 +1401,10 @@ impl PySemanticColdModelWork {
             }
         }
         let quantities = result?;
-        if let Some(phase) = phase {
+        if let Some(phase) = private_execution_owner(py, &session)? {
             if let Err(error) = phase
                 .borrow(py)
-                .admit_evaluation_cold_content(py, &custody.inner)
+                .admit_evaluation_cold_plan(py, &custody.inner)
             {
                 session.owner()?.fail_cold_model_work(&custody.inner);
                 return Err(error);

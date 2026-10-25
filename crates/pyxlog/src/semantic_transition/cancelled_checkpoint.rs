@@ -583,7 +583,6 @@ pub(super) fn terminal_error(
             PyBytes::new(py, terminal.parent.instance.as_bytes()),
             terminal.parent.word,
             PyBytes::new(py, terminal.parent.logical_digest.as_bytes()),
-            PyBytes::new(py, terminal.parent.state_digest.as_bytes()),
         ),
     )?;
     Ok(error)

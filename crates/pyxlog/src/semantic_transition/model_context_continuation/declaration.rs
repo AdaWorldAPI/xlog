@@ -104,7 +104,6 @@ impl PySemanticModelContextPrefillRestoreDeclaration {
                 PyBytes::new(py, source.instance.as_bytes()),
                 source.word,
                 PyBytes::new(py, source.logical_digest.as_bytes()),
-                PyBytes::new(py, source.state_digest.as_bytes()),
             ),
             PyBytes::new(py, source_digest.as_bytes()),
             PyBytes::new(py, target_digest.as_bytes()),
@@ -416,11 +415,11 @@ fn projection_extent(
         )?,
     )?;
     extent = add(extent, python_metadata_tuple_extent(py, 6)?)?;
-    extent = add(extent, python_metadata_tuple_extent(py, 4)?)?;
+    extent = add(extent, python_metadata_tuple_extent(py, 3)?)?;
     extent = add(
         extent,
         multiply(
-            6,
+            5,
             add(material_bytes::python_instance_extent::<PyBytes>(py)?, 33)?,
         )?,
     )?;

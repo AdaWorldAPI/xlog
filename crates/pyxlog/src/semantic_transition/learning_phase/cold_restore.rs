@@ -25,7 +25,6 @@ pub(super) fn cancelled_evaluation_reason(
             ColdValue::Text(hex(parent.instance.as_bytes())),
             ColdValue::Integer(parent.word.to_string()),
             ColdValue::Text(hex(parent.logical_digest.as_bytes())),
-            ColdValue::Text(hex(parent.state_digest.as_bytes())),
         ]),
         ColdValue::Integer(proof.model_work().to_string()),
         ColdValue::Integer(proof.model_calls().to_string()),
@@ -393,7 +392,6 @@ fn identity_value(identity: xlog_cuda::SemanticPublishedIdentity) -> Value {
         Value::String(hex(identity.instance.as_bytes())),
         Value::from(identity.word),
         Value::String(hex(identity.logical_digest.as_bytes())),
-        Value::String(hex(identity.state_digest.as_bytes())),
     ])
 }
 
@@ -402,7 +400,6 @@ fn identity_material(identity: xlog_cuda::SemanticPublishedIdentity) -> Vec<u8> 
         ColdValue::Bytes(Arc::from(identity.instance.as_bytes().as_slice())),
         ColdValue::Integer(identity.word.to_string()),
         ColdValue::Bytes(Arc::from(identity.logical_digest.as_bytes().as_slice())),
-        ColdValue::Bytes(Arc::from(identity.state_digest.as_bytes().as_slice())),
     ])
     .canonical_bytes()
 }

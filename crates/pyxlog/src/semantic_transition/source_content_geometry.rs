@@ -274,7 +274,6 @@ struct GeometryProjections {
     input_generation: Option<Py<PySemanticModelInputGenerationPort>>,
     context: Option<GeometryTuple>,
     contract: Option<Py<material_bytes::PySemanticMaterialBytes>>,
-    occurrences: Option<source_content_occurrences::OriginalSourceContentOccurrences>,
     content_overlays: [Option<GeometryTuple>; 2],
     content_overlay_backings: [Option<ContentOverlayBacking>; 2],
 }
@@ -797,39 +796,6 @@ impl PySemanticPreparedSourceContentGeometry {
     pub(super) fn native(&self) -> &xlog_cuda::SemanticPreparedSourceContentGeometry {
         &self.inner
     }
-
-    pub(super) fn issued_occurrences(
-        &self,
-        py: Python<'_>,
-        events: &Bound<'_, PyAny>,
-    ) -> PyResult<Py<PyTuple>> {
-        self.require_original(py)?;
-        let mut cache = self
-            .projections
-            .lock()
-            .map_err(|_| invalid("source geometry projection custody is poisoned"))?;
-        let original = cache.occurrences.as_mut().ok_or_else(|| {
-            invalid("SOURCE binding requires its original pre-factory occurrence roster")
-        })?;
-        original.require_events(events)?;
-        original.project(py, &self.inner.material_budget())
-    }
-
-    pub(super) fn phase_occurrences(
-        &self,
-        py: Python<'_>,
-        phase: xlog_cuda::SemanticSourceContentPhase,
-    ) -> PyResult<Py<PyTuple>> {
-        self.require_original(py)?;
-        let mut cache = self
-            .projections
-            .lock()
-            .map_err(|_| invalid("source geometry projection custody is poisoned"))?;
-        let original = cache.occurrences.as_mut().ok_or_else(|| {
-            invalid("SOURCE binding requires its original pre-factory occurrence roster")
-        })?;
-        original.phase_projection(py, &self.inner.material_budget(), phase)
-    }
 }
 
 fn tensor_projection_extent(py: Python<'_>) -> PyResult<usize> {
@@ -1109,67 +1075,6 @@ impl PySemanticPreparedSourceContentGeometry {
                 stream,
             )
             .map_err(xlog_err)
-    }
-
-    #[pyo3(signature = (phase, kind, *, prepared_kind=None, prepared_bank=None))]
-    fn content_family(
-        &self,
-        py: Python<'_>,
-        phase: &Bound<'_, PyAny>,
-        kind: &Bound<'_, PyAny>,
-        prepared_kind: Option<&Bound<'_, PyAny>>,
-        prepared_bank: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<Py<source_content_occurrences::PySemanticSourceContentFamily>> {
-        self.require_original(py)?;
-        let (phase, kind) = source_content_occurrences::family_arguments(phase, kind)?;
-        let section =
-            source_content_occurrences::prepared_section_arguments(prepared_kind, prepared_bank)?;
-        source_content_occurrences::family(
-            py,
-            self.inner
-                .content_family(phase, kind, section)
-                .map_err(xlog_err)?,
-            &self.inner.material_budget(),
-        )
-    }
-
-    #[pyo3(signature = (*, events))]
-    fn freeze_content_occurrences(
-        &self,
-        py: Python<'_>,
-        events: &Bound<'_, PyAny>,
-    ) -> PyResult<Py<PyTuple>> {
-        self.require_original(py)?;
-        let pool = self.inner.material_budget();
-        let mut cache = self
-            .projections
-            .lock()
-            .map_err(|_| invalid("source geometry projection custody is poisoned"))?;
-        if let Some(original) = &cache.occurrences {
-            original.require_events(events)?;
-        }
-        if cache.occurrences.is_none() {
-            let _input = source_content_occurrences::reserve_events::<
-                xlog_cuda::SemanticSourceContentEvent<xlog_cuda::SemanticSourceContentAllocation>,
-            >(events, &pool)?;
-            let events_native = source_content_occurrences::parse_events(events)?;
-            let metadata =
-                source_content_occurrences::reserve_occurrences(events_native.len(), &pool)?;
-            let native = self
-                .inner
-                .freeze_content_occurrences(events_native)
-                .map_err(xlog_err)?;
-            cache.occurrences = Some(
-                source_content_occurrences::OriginalSourceContentOccurrences::new(
-                    events, native, metadata,
-                )?,
-            );
-        }
-        cache
-            .occurrences
-            .as_mut()
-            .expect("original frozen occurrence roster")
-            .project(py, &pool)
     }
 
     fn kind(&self) -> &'static str {
