@@ -102,7 +102,6 @@ pub struct SemanticTrainingViewOrigin {
     pub successor: SemanticPublishedIdentity,
     pub invocation: SemanticRngBinding,
     pub model_geometry_digest: Identity256,
-    pub model_numerical_digest: Identity256,
 }
 
 /// Exact sealed input identity and its four admission caps, in source order:
@@ -494,17 +493,14 @@ pub struct SemanticTrainingViewOriginRecord {
     pub predecessor_instance: [u64; 4],
     pub predecessor_word: u64,
     pub predecessor_logical: [u64; 4],
-    pub predecessor_state: [u64; 4],
     pub successor_instance: [u64; 4],
     pub successor_word: u64,
     pub successor_logical: [u64; 4],
-    pub successor_state: [u64; 4],
     pub model_generation: u64,
     pub stream_serial: u64,
     pub family_id: u64,
     pub proposal: u64,
     pub model_geometry_digest: [u64; 4],
-    pub model_numerical_digest: [u64; 4],
 }
 
 // SAFETY: the fixed CUDA ABI contains only u64 words.
@@ -3176,17 +3172,14 @@ pub(crate) fn origin_record(
         predecessor_instance: identity_words(origin.predecessor.instance),
         predecessor_word: origin.predecessor.word,
         predecessor_logical: identity_words(origin.predecessor.logical_digest),
-        predecessor_state: identity_words(origin.predecessor.state_digest),
         successor_instance: identity_words(origin.successor.instance),
         successor_word: origin.successor.word,
         successor_logical: identity_words(origin.successor.logical_digest),
-        successor_state: identity_words(origin.successor.state_digest),
         model_generation: u64::from(origin.invocation.model_generation),
         stream_serial: origin.invocation.stream_serial,
         family_id: u64::from(origin.invocation.family_id),
         proposal: u64::from(origin.invocation.proposal),
         model_geometry_digest: identity_words(origin.model_geometry_digest),
-        model_numerical_digest: identity_words(origin.model_numerical_digest),
     }
 }
 

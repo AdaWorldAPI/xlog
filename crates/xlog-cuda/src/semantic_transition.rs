@@ -61,8 +61,8 @@ pub use prepared_source_content::{
     SemanticSourceContentRetirement, SemanticSourceGeometryAllocation,
     SemanticSourceGeometryTensor,
 };
-mod replay_verification;
-pub use replay_verification::SemanticReplayPublicationVerification;
+mod replay_join;
+pub use replay_join::SemanticReplayPublicationJoin;
 mod replay_model_backing;
 mod resident_model_memory;
 pub use resident_model_memory::SemanticPreparedResidentModelMemory;
@@ -2687,7 +2687,7 @@ pub struct SemanticStateRecord {
 
 /// Byte spans in the producer's one ModelContract record. The native owner
 /// hashes the immutable schema bytes without interpreting their format, then
-/// binds them to the actual model generation and device numerical identity.
+/// binds them to the actual model generation and original publication instance.
 /// Digest fields are raw 32 bytes; generation is an unaligned little-endian u64.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2696,7 +2696,6 @@ pub struct SemanticModelContractLayout {
     pub schema_bytes: u64,
     pub schema_digest_offset: u64,
     pub generation_offset: u64,
-    pub numerical_digest_offset: u64,
     pub identity_offset: u64,
 }
 
@@ -2706,7 +2705,6 @@ impl SemanticModelContractLayout {
             (self.schema_begin, self.schema_bytes),
             (self.schema_digest_offset, 32),
             (self.generation_offset, 8),
-            (self.numerical_digest_offset, 32),
             (self.identity_offset, 32),
         ];
         for (index, &(begin, bytes)) in spans.iter().enumerate() {
@@ -3292,12 +3290,9 @@ struct InitialPrefillRecord {
     mapping: Vec<SemanticSourceMapping>,
 }
 
-type PrefillTensorCoordinate = (u64, u64);
-
 /// The one content grammar for published and dormant completed prefills.
 struct DecodedInitialPrefillContent {
     token_count: usize,
-    tensor_counts: [usize; 2],
     semantic_root: Identity256,
     model_generation: u64,
     task_identity: Identity256,
@@ -3305,8 +3300,6 @@ struct DecodedInitialPrefillContent {
     task_content: SemanticTaskContentIdentity,
     tokens: Vec<u64>,
     mapping: Vec<SemanticSourceMapping>,
-    model: Vec<PrefillTensorCoordinate>,
-    output: Vec<PrefillTensorCoordinate>,
 }
 
 impl DecodedInitialPrefillContent {
@@ -3326,7 +3319,6 @@ impl DecodedInitialPrefillContent {
             || self.task_content != task_content
             || self.token_count as u64 != prefix_extent
             || self.token_count == 0
-            || self.tensor_counts.contains(&0)
         {
             return Err(publication_input_error(
                 "checkpoint initial prefill differs from its native task or parent",
@@ -3432,43 +3424,7 @@ impl CheckpointInitialPrefill {
                 });
             }
         }
-        let mut groups = [Vec::new(), Vec::new()];
-        let mut tensor_counts = [0; 2];
-        for (group, model) in [true, false].into_iter().enumerate() {
-            let count = prefill_extent(&mut reader)?;
-            if count == 0 || count > bytes.len() / (2 * size_of::<u64>()) {
-                return Err(publication_input_error(
-                    "checkpoint initial prefill has an empty tensor group",
-                ));
-            }
-            tensor_counts[group] = count;
-            let coordinates = &mut groups[group];
-            if retain {
-                coordinates.try_reserve_exact(count).map_err(|_| {
-                    publication_input_error("initial prefill tensor roster allocation failed")
-                })?;
-            }
-            let mut seen = BTreeSet::new();
-            for _ in 0..count {
-                let role = reader.u64().map_err(SemanticTransitionError::Semantic)?;
-                let index = reader.u64().map_err(SemanticTransitionError::Semantic)?;
-                if (if model {
-                    !matches!(role, 0 | 18..=25)
-                } else {
-                    !matches!(role, 4..=13)
-                }) || (retain && !seen.insert((role, index)))
-                {
-                    return Err(publication_input_error(
-                        "checkpoint initial prefill tensor role is invalid",
-                    ));
-                }
-                if retain {
-                    coordinates.push((role, index));
-                }
-            }
-        }
         reader.finish().map_err(SemanticTransitionError::Semantic)?;
-        let [model, output] = groups;
         Ok(DecodedInitialPrefillContent {
             semantic_root,
             model_generation,
@@ -3476,11 +3432,8 @@ impl CheckpointInitialPrefill {
             task_epoch,
             task_content,
             token_count,
-            tensor_counts,
             tokens,
             mapping,
-            model,
-            output,
         })
     }
 }
@@ -3488,10 +3441,8 @@ impl CheckpointInitialPrefill {
 #[cfg(feature = "semantic-policy")]
 fn encode_initial_prefill_record_prefix(
     record: &InitialPrefillRecord,
-    model_tensors: usize,
-    output_tensors: usize,
 ) -> Result<Vec<u8>, SemanticTransitionError> {
-    let extent = initial_prefill_content_extent(record, model_tensors, output_tensors)?;
+    let extent = initial_prefill_content_extent(record)?;
     let mut bytes = Vec::new();
     bytes
         .try_reserve_exact(extent)
@@ -3525,23 +3476,14 @@ fn encode_initial_prefill_record_prefix(
 fn initial_prefill_geometry_content_extent(
     tokens: &[u64],
     mapping: &[SemanticSourceMapping],
-    model_tensors: usize,
-    output_tensors: usize,
 ) -> Result<usize, SemanticTransitionError> {
-    let extent = (5usize * 32 + 6 * 8)
+    let extent = (5usize * 32 + 4 * 8)
         .checked_add(
             tokens
                 .len()
                 .checked_mul(8)
                 .ok_or(SemanticTransitionError::GenerationExhausted)?,
         )
-        .and_then(|size| {
-            size.checked_add(
-                model_tensors
-                    .checked_add(output_tensors)?
-                    .checked_mul(2 * 8)?,
-            )
-        })
         .ok_or(SemanticTransitionError::GenerationExhausted)?;
     mapping.iter().try_fold(extent, |size, row| {
         size.checked_add(3 * 8)
@@ -3578,15 +3520,8 @@ pub struct SemanticCheckpointInitialPrefillObservation {
 #[cfg(feature = "semantic-policy")]
 fn initial_prefill_content_extent(
     record: &InitialPrefillRecord,
-    model_tensors: usize,
-    output_tensors: usize,
 ) -> Result<usize, SemanticTransitionError> {
-    initial_prefill_geometry_content_extent(
-        &record.tokens,
-        &record.mapping,
-        model_tensors,
-        output_tensors,
-    )
+    initial_prefill_geometry_content_extent(&record.tokens, &record.mapping)
 }
 
 impl CheckpointInitialPrefill {
@@ -3596,7 +3531,7 @@ impl CheckpointInitialPrefill {
         let extent = Self::MAGIC.len() + 8 + 1;
         let extent = value.map_or(Ok(extent), |value| {
             extent
-                .checked_add(3 * 32 + 8 + 8)
+                .checked_add(2 * 32 + 8 + 8)
                 .and_then(|size| size.checked_add(value.content.len()))
                 .ok_or(SemanticTransitionError::GenerationExhausted)
         })?;
@@ -4036,7 +3971,7 @@ fn initial_source_ledger(
             ordinal: entry.offset,
             authority_generation: generation,
             origin_logical_digest: Identity256::from_bytes(Sha256::digest(&source.origin).into()),
-            authority_closure_digest: authority_digest,
+            authority_closure_origin: authority_digest,
             ..TokenProvenance::default()
         };
         // SAFETY: TokenProvenance is a padding-free repr(C) integral record.
@@ -4414,7 +4349,7 @@ struct TextBindingStorage {
     model_schema_digest: Identity256,
     model_identity: Identity256,
     _witness: SemanticTensorOwner,
-    _model_content_witness: Option<SemanticTensorOwner>,
+    _model_owner: Option<SemanticTensorOwner>,
     consumer_stream: u64,
     parent: TextBindingParent,
 }
@@ -4593,14 +4528,13 @@ fn enqueue_numerical_block_snapshot(
     })
 }
 
-/// Actual device-validated publication identity. This identifies content and
-/// lineage; it is not a use-authority token or an externally issuable lease.
+/// Native publication origin and current physical selection. This carries
+/// lineage, not a contents proof or an independently issuable use authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SemanticPublishedIdentity {
     pub instance: Identity256,
     pub word: u64,
     pub logical_digest: Identity256,
-    pub state_digest: Identity256,
 }
 
 /// Read-only identity projected from one fully validated original publication material.
@@ -4619,7 +4553,6 @@ pub struct SemanticPublicationInputProjection<B = Vec<u8>> {
     pub semantic_root: Identity256,
     pub model_generation: u64,
     pub model_geometry_digest: Identity256,
-    pub model_numerical_digest: Identity256,
     pub neural_generation: u64,
     pub cache_generation: u64,
     pub prefix_extent: u64,
@@ -4631,15 +4564,14 @@ pub struct SemanticPublicationInputProjection<B = Vec<u8>> {
     pub cache: Vec<SemanticPublicationTensorProjection<B>>,
 }
 
-/// Original cache geometry and logical bytes under the native tensor seal.
-/// Logical bytes exclude stride gaps and unused capacity, exactly as the seal does.
+/// Original cache geometry and logical bytes. Stride gaps and unused capacity
+/// are excluded without constructing a tensor-content identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SemanticPublicationTensorProjection<B = Vec<u8>> {
     pub layout: SemanticTensorLayout,
     pub capacity_bytes: u64,
     pub logical_begin: u64,
     pub logical_end: u64,
-    pub identity: Identity256,
     pub logical_bytes: B,
 }
 
@@ -4674,7 +4606,7 @@ pub struct SemanticTokenProvenance {
     pub action_receipt_digest: Identity256,
     pub authority_generation: u64,
     pub origin_logical_digest: Identity256,
-    pub authority_closure_digest: Identity256,
+    pub authority_closure_origin: Identity256,
     pub record_digest: Identity256,
     pub successor_logical_digest: Identity256,
 }
@@ -4683,10 +4615,8 @@ pub struct SemanticTokenProvenance {
 /// model. Content identities grant no authority independently of that reader.
 pub struct SemanticModelContext {
     pub parent: SemanticPublishedIdentity,
-    pub descriptor_digest: Identity256,
-    /// Original storage/view geometry and device-sealed numerical state. These
-    /// do not replace the opaque ModelContract or grant independent authority.
-    pub numerical_state: (Identity256, Identity256),
+    /// Original structural geometry; this does not grant independent authority.
+    pub model_geometry_digest: Identity256,
     pub semantic_root: (u64, u64, u64, Identity256, [u64; 3]),
     /// Original prefix identity U8[32] and committed extent U64[1] device views.
     pub prefix: (DlpackManagedTensor, DlpackManagedTensor),
@@ -4710,8 +4640,8 @@ pub struct SemanticResidentModelMemory {
     pub parent: SemanticPublishedIdentity,
     /// Model generation, neural bank and neural generation.
     pub generations: (u64, u64, u64),
-    /// Original storage/view geometry and sealed numerical contents.
-    pub numerical_state: (Identity256, Identity256),
+    /// Original structural geometry of the retained model owner.
+    pub model_geometry_digest: Identity256,
     pub allocations: Vec<(DeviceAllocationProvenance, DlpackManagedTensor)>,
     pub storages: Vec<SemanticModelStorage>,
     pub views: Vec<(SemanticModelView, SemanticTensorLayout)>,
@@ -5448,18 +5378,17 @@ struct PublicationRange {
     length_bytes: u64,
     logical_begin: u64,
     logical_end: u64,
-    digest: Identity256,
-    backing_digest: Identity256,
 }
 
-/// Descriptor integrity includes local handles; logical content identities do
-/// not. Every physical range resolves through the owner's fixed storage table.
+/// Physical ranges resolve through the owner's fixed storage table. The
+/// original instance and logical origin survive restoration independently.
 #[repr(C)]
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 struct PublicationHeader {
     abi: u64,
     instance: Identity256,
     recovered_instance: Identity256,
+    original_instance: Identity256,
     sealed_epoch: u64,
     base_word: u64,
     publication_word: u64,
@@ -5485,10 +5414,21 @@ struct PublicationHeader {
     training_rng: [u64; 4],
     range_count: u64,
     model_geometry_digest: Identity256,
-    model_numerical_digest: Identity256,
     logical_digest: Identity256,
-    state_digest: Identity256,
-    descriptor_digest: Identity256,
+}
+
+fn publication_range_origin(logical: Identity256, range: &PublicationRange) -> Identity256 {
+    let mut hash = Sha256::new();
+    hash.update(logical.as_bytes());
+    for coordinate in [
+        range.role,
+        range.index,
+        range.logical_begin,
+        range.logical_end,
+    ] {
+        hash.update(coordinate.to_le_bytes());
+    }
+    Identity256::from_bytes(hash.finalize().into())
 }
 
 impl PublicationHeader {
@@ -5866,11 +5806,10 @@ pub struct SemanticUpdateForwardReceiptMaterial {
     pub row_seals: u64,
     pub finite: u64,
     pub model_geometry_digest: Identity256,
-    pub model_numerical_digest: Identity256,
     pub logits_digest: Identity256,
     pub identity: Identity256,
     /// Exact private receipt words, including original pointer values as inert data.
-    /// Its SHA-256 seal is the final 32 bytes, over the preceding 200 bytes.
+    /// Its metadata receipt is the final 32 bytes, over the preceding 168 bytes.
     pub canonical_bytes: Vec<u8>,
 }
 
@@ -5897,7 +5836,6 @@ pub struct SemanticUpdateMeasurements {
     pub bank: u8,
     pub model_generation: u64,
     pub model_geometry_digest: Identity256,
-    pub model_numerical_digest: Identity256,
     pub transition_status: u64,
     pub selection: SemanticTrainingViewSelection,
     pub canaries: Vec<SemanticUpdateCanaryMeasurement>,
@@ -6280,11 +6218,11 @@ struct CompletionCoverage {
     prefix_identity: Identity256,
     prefix_begin: u64,
     prefix_end: u64,
-    source_digest: Identity256,
-    attention_digest: Identity256,
-    linear_digest: Identity256,
-    value_digest: Identity256,
-    edit_digest: Identity256,
+    source_origin: Identity256,
+    attention_origin: Identity256,
+    linear_origin: Identity256,
+    value_origin: Identity256,
+    edit_origin: Identity256,
     receipt_digest: Identity256,
 }
 
@@ -6373,7 +6311,7 @@ struct TokenProvenance {
     action_receipt_digest: Identity256,
     authority_generation: u64,
     origin_logical_digest: Identity256,
-    authority_closure_digest: Identity256,
+    authority_closure_origin: Identity256,
     record_digest: Identity256,
     successor_logical_digest: Identity256,
 }
@@ -6534,13 +6472,13 @@ unsafe impl DeviceRepr for TokenProvenance {}
 
 const _: () = assert!(size_of::<SourceSlot>() == 64);
 const _: () = assert!(size_of::<PublicationStorageEntry>() == 24);
-const _: () = assert!(size_of::<PublicationRange>() == 128);
-const _: () = assert!(size_of::<PublicationHeader>() == 488);
+const _: () = assert!(size_of::<PublicationRange>() == 64);
+const _: () = assert!(size_of::<PublicationHeader>() == 424);
 const _: () = assert!(size_of::<PublicationControl>() == 144);
-const _: () = assert!(size_of::<PublicationBank>() == 47192);
+const _: () = assert!(size_of::<PublicationBank>() == 47128);
 const _: () = assert!(size_of::<PublicationRoleCount>() == 16);
-const _: () = assert!(size_of::<SemanticModelContractLayout>() == 48);
-const _: () = assert!(size_of::<PublicationContract>() == 424);
+const _: () = assert!(size_of::<SemanticModelContractLayout>() == 40);
+const _: () = assert!(size_of::<PublicationContract>() == 416);
 const _: () = assert!(size_of::<SemanticTextRow>() == 16);
 const _: () = assert!(size_of::<TextBinding>() == 24);
 const _: () = assert!(size_of::<ModelUpdateBinding>() == 32);
@@ -7344,7 +7282,6 @@ impl SemanticReplayStateMaterialProof {
             instance: header.instance,
             word: header.publication_word,
             logical_digest: header.logical_digest,
-            state_digest: header.state_digest,
         }
     }
 
@@ -7358,12 +7295,7 @@ impl SemanticReplayStateMaterialProof {
 
     pub fn model_restore_context(
         &self,
-    ) -> (
-        SemanticPublishedIdentity,
-        u64,
-        (u64, u64, u64),
-        (Identity256, Identity256),
-    ) {
+    ) -> (SemanticPublishedIdentity, u64, (u64, u64, u64), Identity256) {
         let header = self.owner.header;
         (
             self.original_identity(),
@@ -7373,7 +7305,7 @@ impl SemanticReplayStateMaterialProof {
                 header.neural_bank,
                 header.neural_generation,
             ),
-            (header.model_geometry_digest, header.model_numerical_digest),
+            header.model_geometry_digest,
         )
     }
 
@@ -7994,7 +7926,6 @@ pub struct SemanticFeedbackRecordMaterial {
     pub capacity_bytes: u64,
     pub logical_begin: u64,
     pub logical_end: u64,
-    pub identity: Identity256,
     pub bytes: Vec<u8>,
 }
 
@@ -8244,7 +8175,6 @@ impl<B: PublicationByteStorage> PublicationMaterialRangeStorage<B> {
                     .is_multiple_of(size_of::<RawFeedbackRecord>())
                     || self.range.logical_end
                         > (self.bytes.len() / size_of::<RawFeedbackRecord>()) as u64))
-            || self.original_record_digest() != self.range.digest
         {
             return Err(SemanticTransitionError::ObservationMismatch);
         }
@@ -8255,16 +8185,8 @@ impl<B: PublicationByteStorage> PublicationMaterialRangeStorage<B> {
             capacity_bytes: self.capacity as u64,
             logical_begin: self.range.logical_begin,
             logical_end: self.range.logical_end,
-            identity: self.range.digest,
             bytes: self.bytes.to_vec(),
         })
-    }
-
-    // Exact opaque-record branch of publication_content_view. Runtime words
-    // must remain present here, including those normalized out of Hlogical.
-    fn original_record_digest(&self) -> Identity256 {
-        debug_assert!(!is_tensor_role(self.range.role));
-        self.record_digest(&self.bytes)
     }
 
     fn digest_prefix(&self) -> [u64; 16] {
@@ -8362,30 +8284,11 @@ impl<B: PublicationByteStorage> PublicationMaterialRangeStorage<B> {
                     .ok_or(SemanticTransitionError::ObservationMismatch)?,
             );
         }
-        let mut prefix = self.digest_prefix();
-        prefix[5..9].copy_from_slice(&[
-            layout.element_bytes,
-            layout.scalar_type,
-            layout.rank,
-            layout.logical_axis,
-        ]);
-        prefix[9..13].copy_from_slice(&dimensions);
-        let mut hash = Sha256::new();
-        for word in prefix {
-            hash.update(word.to_le_bytes());
-        }
-        hash.update(&logical_bytes);
-        if Identity256::from_bytes(hash.finalize().into()) != self.range.digest {
-            return Err(publication_input_error(
-                "cache bytes differ from their original native seal",
-            ));
-        }
         Ok(SemanticPublicationTensorProjection {
             layout,
             capacity_bytes: self.capacity as u64,
             logical_begin: self.range.logical_begin,
             logical_end: self.range.logical_end,
-            identity: self.range.digest,
             logical_bytes: finish(logical_bytes, prepared)?,
         })
     }
@@ -8600,7 +8503,6 @@ fn encode_publication_identity(bytes: &mut Vec<u8>, identity: SemanticPublishedI
     bytes.extend_from_slice(identity.instance.as_bytes());
     material_u64(bytes, identity.word);
     bytes.extend_from_slice(identity.logical_digest.as_bytes());
-    bytes.extend_from_slice(identity.state_digest.as_bytes());
 }
 
 #[cfg(feature = "semantic-policy")]
@@ -9127,18 +9029,10 @@ fn decode_publication_identity(
             .try_into()
             .unwrap(),
     );
-    let state_digest = Identity256::from_bytes(
-        reader
-            .take(32)
-            .map_err(SemanticTransitionError::Semantic)?
-            .try_into()
-            .unwrap(),
-    );
     Ok(SemanticPublishedIdentity {
         instance,
         word,
         logical_digest,
-        state_digest,
     })
 }
 
@@ -9153,7 +9047,7 @@ struct PublicationReplayProvenance {
 impl PublicationReplayProvenance {
     fn encode(&self) -> Result<Vec<u8>, SemanticTransitionError> {
         let mut bytes = REPLAY_PROVENANCE_MAGIC.to_vec();
-        material_u32(&mut bytes, 1);
+        material_u32(&mut bytes, 2);
         bytes.extend_from_slice(&publication_material_runtime());
         encode_publication_identity(&mut bytes, self.predecessor);
         self.authority.encode_into(&mut bytes)?;
@@ -9168,7 +9062,7 @@ impl PublicationReplayProvenance {
             .take(REPLAY_PROVENANCE_MAGIC.len())
             .map_err(SemanticTransitionError::Semantic)?
             != REPLAY_PROVENANCE_MAGIC
-            || reader.u32().map_err(SemanticTransitionError::Semantic)? != 1
+            || reader.u32().map_err(SemanticTransitionError::Semantic)? != 2
             || reader.take(32).map_err(SemanticTransitionError::Semantic)?
                 != publication_material_runtime()
         {
@@ -9227,7 +9121,6 @@ impl PublicationReplayProvenance {
             instance: header.instance,
             word: header.publication_word,
             logical_digest: header.logical_digest,
-            state_digest: header.state_digest,
         };
         self.validate_source(original, &predecessor.ranges)
     }
@@ -9255,7 +9148,6 @@ impl PublicationReplayProvenance {
                 || item.bytes.is_empty()
                 || item.bytes.len() > item.capacity
                 || item.range.logical_begin > item.range.logical_end
-                || item.original_record_digest() != item.range.digest
             {
                 return Err(publication_input_error(
                     "replay provenance changes an originally sealed authority record",
@@ -9288,22 +9180,9 @@ impl PublicationReplayEvidence {
             .ok_or_else(|| publication_input_error("replay evidence omits a publication record"))
     }
 
-    fn state_digest(&self) -> Result<Identity256, SemanticTransitionError> {
-        let mut digest = self.successor.logical_digest;
-        for item in &self.ranges {
-            digest = publication_fold_digest(
-                digest,
-                item.range.role,
-                item.range.index,
-                item.logical_record_digest()?,
-            );
-        }
-        Ok(digest)
-    }
-
     fn encode(&self) -> Result<Vec<u8>, SemanticTransitionError> {
         let mut bytes = REPLAY_EVIDENCE_MAGIC.to_vec();
-        material_u32(&mut bytes, 1);
+        material_u32(&mut bytes, 2);
         bytes.extend_from_slice(&publication_material_runtime());
         encode_publication_identity(&mut bytes, self.successor);
         material_u32(
@@ -9323,7 +9202,7 @@ impl PublicationReplayEvidence {
             .take(REPLAY_EVIDENCE_MAGIC.len())
             .map_err(SemanticTransitionError::Semantic)?
             != REPLAY_EVIDENCE_MAGIC
-            || reader.u32().map_err(SemanticTransitionError::Semantic)? != 1
+            || reader.u32().map_err(SemanticTransitionError::Semantic)? != 2
             || reader.take(32).map_err(SemanticTransitionError::Semantic)?
                 != publication_material_runtime()
         {
@@ -9378,7 +9257,6 @@ impl PublicationReplayEvidence {
                 || item.capacity == 0
                 || item.bytes.len() > item.capacity
                 || item.range.logical_begin > item.range.logical_end
-                || item.original_record_digest() != item.range.digest
             {
                 return Err(publication_input_error(
                     "replay evidence changes or omits an originally sealed publication record",
@@ -9402,7 +9280,6 @@ impl PublicationReplayEvidence {
             || attempt.replay_head_digest != self.range(27)?.logical_record_digest()?
             || attempt.intent_head_digest != self.range(30)?.logical_record_digest()?
             || attempt.acknowledgement_head_digest != self.range(32)?.logical_record_digest()?
-            || self.successor.state_digest != self.state_digest()?
         {
             return Err(publication_input_error(
                 "replay evidence differs from its whole native attempt and state links",
@@ -9446,7 +9323,6 @@ impl PublicationReplayEvidence {
             || header.base_word != base.publication_word
             || header.sealed_epoch != self.successor.word >> 1
             || header.logical_digest != self.successor.logical_digest
-            || header.state_digest != self.successor.state_digest
             || header.proposal != proposal
             || bank.state.proposal != base.proposal
             || bank.state.next_proposal != proposal
@@ -9461,11 +9337,7 @@ impl PublicationReplayEvidence {
             ));
         }
         let attempt = self.range(33)?.attempt()?;
-        if coverage.range.role != 14
-            || coverage.bytes.len() != size_of::<CompletionCoverage>()
-            || coverage.original_record_digest() != coverage.range.digest
-            || codebook.original_record_digest() != codebook.range.digest
-        {
+        if coverage.range.role != 14 || coverage.bytes.len() != size_of::<CompletionCoverage>() {
             return Err(publication_input_error(
                 "replay evidence sources differ from their actual native seals",
             ));
@@ -9819,8 +9691,7 @@ impl SemanticReplayMaterial {
                 && actual.word == 0
                 && original.instance != actual.instance
                 && header.recovered_instance == original.instance
-                && original.logical_digest == actual.logical_digest
-                && original.state_digest == actual.state_digest =>
+                && original.logical_digest == actual.logical_digest =>
             {
                 let length =
                     usize::try_from(payload.u64().map_err(SemanticTransitionError::Semantic)?)
@@ -10378,7 +10249,6 @@ impl SemanticReplayMaterial {
             instance: header.instance,
             word: header.publication_word,
             logical_digest: header.logical_digest,
-            state_digest: header.state_digest,
         }
     }
 
@@ -10400,7 +10270,6 @@ impl SemanticReplayMaterial {
             successor: self.successor_identity(),
             invocation: header.rng_binding()?,
             model_geometry_digest: header.model_geometry_digest,
-            model_numerical_digest: header.model_numerical_digest,
         })
     }
 
@@ -11020,7 +10889,6 @@ fn runtime_contract_bytes(
         model.schema_bytes,
         model.schema_digest_offset,
         model.generation_offset,
-        model.numerical_digest_offset,
         model.identity_offset,
     ] {
         material_u64(&mut bytes, field);
@@ -11085,7 +10953,6 @@ fn verified_runtime_model_mode<'a, B: PublicationByteStorage>(
     if (table.range.role, table.range.index, table.range.generation) != (55, 0, 1)
         || table.range.length_bytes != table.bytes.len() as u64
         || table.bytes.len() > table.capacity
-        || table.original_record_digest() != table.range.digest
     {
         return Err(SemanticTransitionError::ObservationMismatch);
     }
@@ -11339,7 +11206,7 @@ impl<B: PublicationByteStorage> PublicationMaterialStorage<B> {
         graph: &SemanticRootMaterial,
     ) -> Result<Vec<u8>, SemanticTransitionError> {
         let mut bytes = b"XLOG-PUBLICATION-MATERIAL\0".to_vec();
-        material_u32(&mut bytes, 3);
+        material_u32(&mut bytes, 4);
         bytes.extend_from_slice(&publication_material_runtime());
         material_bytes(
             &mut bytes,
@@ -11462,10 +11329,7 @@ impl<B: PublicationByteStorage> PublicationMaterialStorage<B> {
         let views = reader
             .count(32)
             .map_err(SemanticTransitionError::Semantic)?;
-        add(
-            allocations,
-            2 * size_of::<u64>() + size_of::<B>() + size_of::<Identity256>(),
-        )?;
+        add(allocations, 2 * size_of::<u64>() + size_of::<B>())?;
         add(storages, 2 * size_of::<SemanticModelStorage>())?;
         add(views, 2 * size_of::<SemanticModelView>())?;
         add(allocations, Self::tree_node_bound(size_of::<u64>(), 0)?)?;
@@ -11602,7 +11466,7 @@ impl<B: PublicationByteStorage> PublicationMaterialStorage<B> {
         let mut reader = SemanticMaterialReader::new(bytes);
         if reader.take(26).map_err(SemanticTransitionError::Semantic)?
             != b"XLOG-PUBLICATION-MATERIAL\0"
-            || reader.u32().map_err(SemanticTransitionError::Semantic)? != 3
+            || reader.u32().map_err(SemanticTransitionError::Semantic)? != 4
             || reader.take(32).map_err(SemanticTransitionError::Semantic)?
                 != publication_material_runtime()
         {
@@ -11733,22 +11597,7 @@ impl<B: PublicationByteStorage> PublicationMaterialStorage<B> {
             learning_phases,
         };
         material.validate_mode(mode)?;
-        if matches!(mode, PublicationMaterialMode::Published) {
-            for range in &material.ranges {
-                if !is_tensor_role(range.range.role)
-                    && range.original_record_digest() != range.range.digest
-                {
-                    return Err(publication_input_error(
-                        "publication material changes an originally sealed native record",
-                    ));
-                }
-            }
-            if material.original_descriptor_digest() != material.bank.header.descriptor_digest {
-                return Err(publication_input_error(
-                    "publication material differs from its original descriptor seal",
-                ));
-            }
-        }
+
         Ok(material)
     }
 
@@ -11803,7 +11652,6 @@ impl<B: PublicationByteStorage> PublicationMaterialStorage<B> {
             instance: header.instance,
             word: header.publication_word,
             logical_digest: header.logical_digest,
-            state_digest: header.state_digest,
         };
         let ranges = REPLAY_EVIDENCE_ROLES
             .iter()
@@ -11842,32 +11690,12 @@ impl<B: PublicationByteStorage> PublicationMaterialStorage<B> {
             || attempt.acknowledgement_head_digest != evidence.range(32)?.logical_record_digest()?
             || attempt.previous_attempt_digest == Identity256::default()
             || attempt.receipt_digest != evidence.range(33)?.logical_record_digest()?
-            || evidence.state_digest()? != header.state_digest
         {
             return Err(publication_input_error(
                 "selected publication has no sealed successful recompute completion",
             ));
         }
         Ok(())
-    }
-
-    // Match publication_descriptor_digest before any owner/slot relocation.
-    // This unkeyed consistency seal is not proof of historical execution. The
-    // native restore still hashes actual payloads, and the trusted importer
-    // separately verifies the complete execution evidence and current rights.
-    fn original_descriptor_digest(&self) -> Identity256 {
-        let mut bank = self.bank;
-        bank.header.abi = 1;
-        bank.header.descriptor_digest = Identity256::default();
-        let mut digest =
-            Identity256::from_bytes(Sha256::digest(publication_abi_bytes(&[bank])).into());
-        for material in &self.ranges {
-            let range = material.range;
-            let content =
-                Identity256::from_bytes(Sha256::digest(publication_abi_bytes(&[range])).into());
-            digest = publication_fold_digest(digest, range.role, range.index, content);
-        }
-        digest
     }
 
     fn validate(&self) -> Result<(), SemanticTransitionError> {
@@ -11948,14 +11776,7 @@ impl<B: PublicationByteStorage> PublicationMaterialStorage<B> {
         learning_phase::validate_history(self)?;
         let mut model_slots = BTreeMap::new();
         let mut slot_allocations = BTreeMap::new();
-        let backing_digests = if dormant.is_none() {
-            self.model_allocations
-                .iter()
-                .map(|bytes| Identity256::from_bytes(Sha256::digest(bytes).into()))
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
+
         for item in self
             .ranges
             .iter()
@@ -11971,10 +11792,7 @@ impl<B: PublicationByteStorage> PublicationMaterialStorage<B> {
             if item.range.offset_bytes != offset as u64
                 || item.capacity != bytes.len() - offset
                 || (dormant.is_none() && bytes.get(offset..end) != Some(item.bytes.as_ref()))
-                || (dormant.is_none() && item.range.backing_digest != backing_digests[allocation])
-                || (dormant.is_some()
-                    && (item.bytes.as_ptr() != bytes.as_ptr().wrapping_add(offset)
-                        || item.range.backing_digest != Identity256::default()))
+                || (dormant.is_some() && item.bytes.as_ptr() != bytes.as_ptr().wrapping_add(offset))
                 || model_slots
                     .insert(allocation, item.range.storage_slot)
                     .is_some_and(|slot| slot != item.range.storage_slot)
@@ -11989,8 +11807,7 @@ impl<B: PublicationByteStorage> PublicationMaterialStorage<B> {
         }
         if self.ranges.iter().any(|item| {
             !matches!(item.range.role, 18..=25)
-                && (slot_allocations.contains_key(&item.range.storage_slot)
-                    || item.range.backing_digest != Identity256::default())
+                && slot_allocations.contains_key(&item.range.storage_slot)
         }) {
             return Err(publication_input_error(
                 "model backing aliases native control or cache storage",
@@ -12004,14 +11821,7 @@ impl<B: PublicationByteStorage> PublicationMaterialStorage<B> {
                 && (header.publication_word != 0
                     || header.base_word != 0
                     || header.sealed_epoch != 0
-                    || header.descriptor_digest != Identity256::default()
-                    || header.logical_digest != Identity256::default()
-                    || header.state_digest != Identity256::default()
-                    || header.model_numerical_digest != Identity256::default()
-                    || self
-                        .ranges
-                        .iter()
-                        .any(|item| item.range.digest != Identity256::default())))
+                    || header.logical_digest != Identity256::default()))
             || contract.abi != 1
             || header.sealed_epoch != header.publication_word >> 1
             || contract.terminal_tokens != 0
@@ -12292,8 +12102,6 @@ fn publication_storage_geometry<P: PublicationAllocationGeometrySource>(
                     .map_err(|_| SemanticTransitionError::GenerationExhausted)?,
                 logical_begin: plan.logical_begin,
                 logical_end: plan.logical_end,
-                digest: Identity256::default(),
-                backing_digest: Identity256::default(),
             });
         }
     }
@@ -13016,10 +12824,9 @@ pub(crate) struct OriginalNativeCommand {
     submitted: bool,
     completed: bool,
     completion_failure: Option<sys::CUresult>,
+    submission_failure: Option<sys::CUresult>,
     #[cfg(feature = "semantic-policy")]
     dma_recorded: bool,
-    #[cfg(feature = "semantic-policy")]
-    allowance_claim: Option<std::sync::Weak<Mutex<ColdNativeAllowance>>>,
 }
 
 impl OriginalNativeCommand {
@@ -13034,16 +12841,17 @@ impl OriginalNativeCommand {
             completion: crate::device::ExecutionCompletion::new(
                 domain.execution_stream().context(),
             )
-            .map_err(|error| runtime_error("original content completion allocation", error))?,
+            .map_err(|error| {
+                native_runtime_error("original content completion allocation", error)
+            })?,
             completion_entered: false,
             entered: false,
             submitted: false,
             completed: false,
             completion_failure: None,
+            submission_failure: None,
             #[cfg(feature = "semantic-policy")]
             dma_recorded: false,
-            #[cfg(feature = "semantic-policy")]
-            allowance_claim: None,
         })
     }
 
@@ -13061,7 +12869,7 @@ impl OriginalNativeCommand {
             return Ok(());
         }
         if let Some(error) = self.completion_failure {
-            return Err(runtime_error(
+            return Err(native_runtime_error(
                 "original content completion",
                 cudarc::driver::DriverError(error),
             ));
@@ -13073,12 +12881,12 @@ impl OriginalNativeCommand {
                     .map_err(|error| {
                         *poisoned = true;
                         self.retain_completion_failure(&error);
-                        runtime_error("original content prelaunch completion", error)
+                        native_runtime_error("original content prelaunch completion", error)
                     })?;
                 self.completion =
                     crate::device::ExecutionCompletion::new(domain.execution_stream().context())
                         .map_err(|error| {
-                            runtime_error("original content completion allocation", error)
+                            native_runtime_error("original content completion allocation", error)
                         })?;
                 self.completion_entered = false;
             }
@@ -13123,7 +12931,7 @@ impl OriginalNativeCommand {
             }
             completion.map_err(|error| {
                 *poisoned |= self.entered;
-                runtime_error("original content completion fence", error)
+                native_runtime_error("original content completion fence", error)
             })?;
         }
         self.join_original(poisoned)
@@ -13135,14 +12943,19 @@ impl OriginalNativeCommand {
             .map_err(|error| {
                 *poisoned = true;
                 self.retain_completion_failure(&error);
-                runtime_error("original content completion", error)
+                native_runtime_error("original content completion", error)
             })?;
         if !self.submitted {
             *poisoned |= self.entered;
-            return Err(runtime_error(
-                "original content completion",
-                "original driver command has no successful submission",
-            ));
+            return Err(match self.submission_failure {
+                Some(status) => native_runtime_error(
+                    "original content submission",
+                    cudarc::driver::DriverError(status),
+                ),
+                None => {
+                    publication_input_error("original driver command has no successful submission")
+                }
+            });
         }
         self.completed = true;
         Ok(())
@@ -13173,7 +12986,7 @@ impl OriginalNativeCommand {
                     .map_err(|error| {
                         *poisoned = true;
                         self.retain_completion_failure(&error);
-                        runtime_error("original content prelaunch completion", error)
+                        native_runtime_error("original content prelaunch completion", error)
                     })?;
             }
             return Ok(false);
@@ -13305,13 +13118,11 @@ impl OriginalStepConsumers {
             }
             self.cursor += 1;
         }
-        wait_on_stream(
-            stream,
-            &mut self.poisoned,
-            waits,
-            "published reader consumer completion",
-            CudaStream::synchronize,
-        )?;
+        *waits += 1;
+        stream.synchronize().map_err(|error| {
+            self.poisoned = true;
+            native_runtime_error("published reader consumer completion", error)
+        })?;
         self.completed = true;
         Ok(())
     }
@@ -14527,7 +14338,7 @@ pub struct SemanticCompletedExecutionObservation {
     outcome: SemanticPreparedStepOutcome,
     predecessor: Option<SemanticPublishedIdentity>,
     successor: Option<SemanticPublishedIdentity>,
-    model_binding: Option<(u64, Identity256, Identity256)>,
+    model_binding: Option<(u64, Identity256)>,
     quantities: [u64; 4],
     transfers: Arc<SemanticPreparedSegmentTransfers>,
 }
@@ -14572,7 +14383,7 @@ impl SemanticCompletedExecutionObservation {
         self.requested_transition
     }
 
-    pub fn model_binding(&self) -> Option<(u64, Identity256, Identity256)> {
+    pub fn model_binding(&self) -> Option<(u64, Identity256)> {
         self.model_binding
     }
 }
@@ -16332,7 +16143,6 @@ impl SemanticPublishedLease {
             || header.publication_word != self.identity.word
             || header.sealed_epoch != self.identity.word >> 1
             || header.logical_digest != self.identity.logical_digest
-            || header.state_digest != self.identity.state_digest
         {
             return Err(SemanticTransitionError::ObservationMismatch);
         }
@@ -18910,8 +18720,6 @@ impl PolicyRetirementParent {
                         && original.length_bytes == current.length_bytes
                         && original.logical_begin == current.logical_begin
                         && original.logical_end == current.logical_end
-                        && original.digest == current.digest
-                        && original.backing_digest == current.backing_digest
                 })
     }
 }
@@ -18938,7 +18746,7 @@ impl OriginalConsumerEdge {
             event: stream
                 .context()
                 .new_event(None)
-                .map_err(|error| runtime_error("original consumer event", error))?,
+                .map_err(|error| native_runtime_error("original consumer event", error))?,
             context: Arc::clone(stream.context()),
             source: source as u64,
             destination: destination as u64,
@@ -18960,7 +18768,7 @@ impl OriginalConsumerEdge {
         }
         self.context
             .bind_to_thread()
-            .map_err(|error| runtime_error("original consumer context", error))?;
+            .map_err(|error| native_runtime_error("original consumer context", error))?;
         if !self.recorded {
             if self.record_entered {
                 self.resolve_entered()?;
@@ -18975,7 +18783,7 @@ impl OriginalConsumerEdge {
                     self.source as sys::CUstream,
                 )
             }
-            .map_err(|error| runtime_error("original consumer event record", error))?;
+            .map_err(|error| native_runtime_error("original consumer event record", error))?;
             self.recorded = true;
         }
         if !self.waited {
@@ -18983,9 +18791,9 @@ impl OriginalConsumerEdge {
                 // A failed stream wait may have entered. Joining its original
                 // successfully recorded event proves that same producer is
                 // complete without recording an event on future writes.
-                self.event
-                    .synchronize()
-                    .map_err(|error| runtime_error("original consumer event completion", error))?;
+                self.event.synchronize().map_err(|error| {
+                    native_runtime_error("original consumer event completion", error)
+                })?;
                 self.source_completed = true;
             } else {
                 self.wait_entered = true;
@@ -18999,7 +18807,7 @@ impl OriginalConsumerEdge {
                     )
                 }
                 .result()
-                .map_err(|error| runtime_error("original consumer stream join", error))?;
+                .map_err(|error| native_runtime_error("original consumer stream join", error))?;
             }
             self.waited = true;
         }
@@ -19015,11 +18823,11 @@ impl OriginalConsumerEdge {
         }
         self.context
             .bind_to_thread()
-            .map_err(|error| runtime_error("original consumer context", error))?;
+            .map_err(|error| native_runtime_error("original consumer context", error))?;
         if self.recorded {
-            self.event
-                .synchronize()
-                .map_err(|error| runtime_error("original consumer event completion", error))?;
+            self.event.synchronize().map_err(|error| {
+                native_runtime_error("original consumer event completion", error)
+            })?;
         } else {
             // SAFETY: this is the immutable original source stream under its
             // retained owning context and original capture exclusion. Positive
@@ -19027,7 +18835,9 @@ impl OriginalConsumerEdge {
             // record was submitted or recording a fence on future writes.
             unsafe { sys::cuStreamSynchronize(self.source as sys::CUstream) }
                 .result()
-                .map_err(|error| runtime_error("original consumer source completion", error))?;
+                .map_err(|error| {
+                    native_runtime_error("original consumer source completion", error)
+                })?;
         }
         self.source_completed = true;
         self.waited = true;
@@ -19778,6 +19588,13 @@ pub enum SemanticTransitionError {
         operation: &'static str,
         detail: String,
     },
+    NativeExecutionFailure {
+        operation: &'static str,
+        status: sys::CUresult,
+    },
+    NativeCompletionPending {
+        operation: &'static str,
+    },
 }
 
 impl fmt::Display for SemanticTransitionError {
@@ -19791,6 +19608,16 @@ fn runtime_error(operation: &'static str, error: impl fmt::Display) -> SemanticT
     SemanticTransitionError::Runtime {
         operation,
         detail: error.to_string(),
+    }
+}
+
+fn native_runtime_error(
+    operation: &'static str,
+    error: cudarc::driver::DriverError,
+) -> SemanticTransitionError {
+    SemanticTransitionError::NativeExecutionFailure {
+        operation,
+        status: error.0,
     }
 }
 
@@ -20067,9 +19894,8 @@ pub struct SemanticTransitionSession {
     completed_delivery_acknowledgement_dma: OriginalDeliveryAcknowledgementDma,
     replay_authentication: Option<ReplayAuthentication>,
     pending_training_materialization: Option<PendingTrainingMaterialization>,
-    replay_verification:
-        Option<Arc<Mutex<replay_verification::OriginalReplayPublicationVerification>>>,
-    replay_verification_pending: Arc<AtomicBool>,
+    replay_join: Option<Arc<Mutex<replay_join::OriginalReplayPublicationJoin>>>,
+    replay_join_pending: Arc<AtomicBool>,
     resident_model_activation: Option<Arc<Mutex<resident_model_memory::ResidentModelActivation>>>,
     pub(super) task_observations_authenticated: bool,
     next_reader: u64,
@@ -22317,8 +22143,7 @@ struct UnreleasedPublicationOwners {
     _pending_delivery_acknowledgement: Option<Arc<OriginalDeliveryAcknowledgement>>,
     _replay_authentication: Option<ReplayAuthentication>,
     _pending_training_materialization: Option<PendingTrainingMaterialization>,
-    _replay_verification:
-        Option<Arc<Mutex<replay_verification::OriginalReplayPublicationVerification>>>,
+    _replay_join: Option<Arc<Mutex<replay_join::OriginalReplayPublicationJoin>>>,
     _resident_model_activation: Option<Arc<Mutex<resident_model_memory::ResidentModelActivation>>>,
     _prepared_segment: Option<PreparedSegmentState>,
     _retired_preparation: Option<RetiredPreparedInitialization>,
@@ -22552,7 +22377,7 @@ impl Drop for SemanticTransitionSession {
                     _pending_delivery_acknowledgement: self.pending_delivery_acknowledgement.take(),
                     _replay_authentication: self.replay_authentication.take(),
                     _pending_training_materialization: self.pending_training_materialization.take(),
-                    _replay_verification: self.replay_verification.take(),
+                    _replay_join: self.replay_join.take(),
                     _resident_model_activation: self.resident_model_activation.take(),
                     _prepared_segment: self.prepared_segment.take(),
                     _retired_preparation: self.retired_preparation.take(),
@@ -22679,9 +22504,11 @@ impl SemanticTransitionSession {
 
     fn require_completed_graph_retirements(&self) -> Result<(), SemanticTransitionError> {
         for retirement in &self.graph_retirements {
-            retirement
-                .require_completed()
-                .map_err(|error| runtime_error("original executable retirement", error))?;
+            retirement.require_completed().map_err(|_| {
+                SemanticTransitionError::NativeCompletionPending {
+                    operation: "original executable retirement",
+                }
+            })?;
         }
         Ok(())
     }
@@ -22723,15 +22550,14 @@ impl SemanticTransitionSession {
         SemanticReplayStateMaterialAdmission::from_complete(material, &budget, source_digest)
     }
 
-    /// Fixed compact checkpoint v2 extent, also reserved by the cold exporter.
+    /// Fixed compact checkpoint v3 extent, also reserved by the cold exporter.
     pub const CHECKPOINT_REFERENT_BYTES: usize = b"XLOG-CHECKPOINT-REFERENT\0".len()
         + 4
         + 32
         + 8
-        + 104
+        + 72
         + 32
         + 8
-        + 32
         + 32
         + 8
         + 3 * 32
@@ -22762,7 +22588,6 @@ impl SemanticTransitionSession {
                 instance: header.instance,
                 word: header.publication_word,
                 logical_digest: header.logical_digest,
-                state_digest: header.state_digest,
             },
             semantic_root: header.semantic_digest,
             model_generation: header.model_generation,
@@ -22942,7 +22767,7 @@ impl SemanticTransitionSession {
                 || record.logical_position != slot.logical_position
                 || record.token != slot.token
                 || record.origin_logical_digest == Identity256::default()
-                || record.authority_closure_digest == Identity256::default()
+                || record.authority_closure_origin == Identity256::default()
                 || record.record_digest == Identity256::default()
                 || (slot.provenance == 1)
                     != (record.action_receipt_digest == Identity256::default())
@@ -22993,7 +22818,7 @@ impl SemanticTransitionSession {
                 action_receipt_digest: record.action_receipt_digest,
                 authority_generation: record.authority_generation,
                 origin_logical_digest: record.origin_logical_digest,
-                authority_closure_digest: record.authority_closure_digest,
+                authority_closure_origin: record.authority_closure_origin,
                 record_digest: record.record_digest,
                 successor_logical_digest: record.successor_logical_digest,
             })
@@ -23003,12 +22828,10 @@ impl SemanticTransitionSession {
                 instance: header.instance,
                 word: header.publication_word,
                 logical_digest: header.logical_digest,
-                state_digest: header.state_digest,
             },
             semantic_root: header.semantic_digest,
             model_generation: header.model_generation,
             model_geometry_digest: header.model_geometry_digest,
-            model_numerical_digest: header.model_numerical_digest,
             neural_generation: header.neural_generation,
             cache_generation: header.cache_generation,
             prefix_extent: header.prefix_extent,
@@ -23140,7 +22963,7 @@ impl SemanticTransitionSession {
             ));
         }
         if self.has_independent_session_native_effect()
-            || self.replay_verification_pending.load(Ordering::Acquire)
+            || self.replay_join_pending.load(Ordering::Acquire)
             || self.has_pending_prepared_metadata_freeze()
             || self.resident_model_activation.is_some()
             || !self.original_session_completion_is_uncontended()
@@ -26119,7 +25942,6 @@ impl SemanticTransitionSession {
             Option<SemanticPublishedIdentity>,
             u64,
             Identity256,
-            Identity256,
         ),
         SemanticTransitionError,
     > {
@@ -26194,14 +26016,12 @@ impl SemanticTransitionSession {
             instance: header.instance,
             word: header.publication_word,
             logical_digest: header.logical_digest,
-            state_digest: header.state_digest,
         };
         Ok((
             identity(parent),
             (result.advanced == 1).then(|| identity(result.header)),
             parent.model_generation,
             parent.model_geometry_digest,
-            parent.model_numerical_digest,
         ))
     }
 
@@ -26400,7 +26220,6 @@ impl SemanticTransitionSession {
                 instance: header.instance,
                 word: header.publication_word,
                 logical_digest: header.logical_digest,
-                state_digest: header.state_digest,
             };
             Ok(SemanticCompletedExecutionObservation {
                 original: step.clone(),
@@ -26408,11 +26227,7 @@ impl SemanticTransitionSession {
                 outcome: original_outcome,
                 predecessor: Some(identity(parent)),
                 successor: (result.advanced == 1).then(|| identity(result.header)),
-                model_binding: Some((
-                    parent.model_generation,
-                    parent.model_geometry_digest,
-                    parent.model_numerical_digest,
-                )),
+                model_binding: Some((parent.model_generation, parent.model_geometry_digest)),
                 quantities: [work.raw, work.model_once, work.native_attempt, calls],
                 transfers,
             })
@@ -26694,7 +26509,7 @@ impl SemanticTransitionSession {
                 let material = if receipt.availability == 2 {
                     let (state, row_seals, (rows, capacity, vocabulary, scalar, block_positions)) =
                         forward_streams[role];
-                    let digest: [u8; 32] = Sha256::digest(&bytes[..200]).into();
+                    let digest: [u8; 32] = Sha256::digest(&bytes[..168]).into();
                     if receipt.abi != 2
                         || receipt.role != role as u64
                         || receipt.work_sequence == 0
@@ -26710,15 +26525,6 @@ impl SemanticTransitionSession {
                         || (result.advanced == 1 && receipt.finite != 1)
                         || receipt.model_geometry_digest != binding.3
                         || receipt.identity != Identity256::from_bytes(digest)
-                        || receipt.model_numerical_digest == Identity256::default()
-                        || (role == 0
-                            && (receipt.generation != binding.2
-                                || receipt.model_numerical_digest != binding.4))
-                        || (role == 1
-                            && result.advanced == 1
-                            && (receipt.generation != result.header.model_generation
-                                || receipt.model_numerical_digest
-                                    != result.header.model_numerical_digest))
                     {
                         return Err(SemanticTransitionError::ObservationMismatch);
                     }
@@ -26737,7 +26543,6 @@ impl SemanticTransitionSession {
                         row_seals: receipt.row_seals,
                         finite: receipt.finite,
                         model_geometry_digest: receipt.model_geometry_digest,
-                        model_numerical_digest: receipt.model_numerical_digest,
                         logits_digest: receipt.logits_digest,
                         identity: receipt.identity,
                         canonical_bytes: bytes,
@@ -26771,7 +26576,6 @@ impl SemanticTransitionSession {
                 bank: bank as u8,
                 model_generation: binding.2,
                 model_geometry_digest: binding.3,
-                model_numerical_digest: binding.4,
                 transition_status: state.status,
                 selection,
                 canaries: observations,
@@ -26847,7 +26651,7 @@ impl SemanticTransitionSession {
 
     /// Cold readback of each original raw feedback, statement and provenance
     /// record, after known completion and before this prepared step retires.
-    /// The original input guard brackets readback; neither a current-bank
+    /// The original retained inputs own readback; neither a current-bank
     /// reader nor a fresh encoder/semantic query is constructed. These bytes
     /// are inputs to the canonical carrier, not an execution or replay grant.
     pub fn prepared_feedback_records(
@@ -26989,7 +26793,6 @@ impl SemanticTransitionSession {
         material_u64(&mut bytes, result.refusal);
         material_u64(&mut bytes, result.advanced);
         bytes.extend_from_slice(binding.3.as_bytes());
-        bytes.extend_from_slice(binding.4.as_bytes());
         material_u64(&mut bytes, events.len() as u64);
         for (index, event) in events.iter().enumerate() {
             material_u64(&mut bytes, event.kind);
@@ -27165,18 +26968,7 @@ impl SemanticTransitionSession {
             self.poisoned = true;
             return Err(SemanticTransitionError::ObservationMismatch);
         }
-        let mut bytes = encode_initial_prefill_record_prefix(
-            &record,
-            retained.model.tensors.len(),
-            retained.output.tensors.len(),
-        )?;
-        for group in [&retained.model, &retained.output] {
-            material_u64(&mut bytes, group.tensors.len() as u64);
-            for tensor in &group.tensors {
-                material_u64(&mut bytes, tensor.layout.role);
-                material_u64(&mut bytes, tensor.layout.index);
-            }
-        }
+        let bytes = encode_initial_prefill_record_prefix(&record)?;
         let _ = reservation;
         Ok(Some(OriginalInitialPrefillContent {
             predecessor,
@@ -27216,7 +27008,6 @@ impl SemanticTransitionSession {
                         || predecessor.word != 0
                         || recovered_instance != saved.original.instance
                         || predecessor.logical_digest != saved.original.logical_digest
-                        || predecessor.state_digest != saved.original.state_digest
                         || live_content.is_some()
                     {
                         self.poisoned = true;
@@ -27321,7 +27112,7 @@ impl SemanticTransitionSession {
             .ok_or(SemanticTransitionError::ObservationMismatch)?
             .0;
         let mut capacity = SemanticCompletedMaterialCapacity::default();
-        let publication_identity_bytes = 3 * 32 + size_of::<u64>();
+        let publication_identity_bytes = 2 * 32 + size_of::<u64>();
         // These are the serialized fields, not the narrower private device ABI.
         let component_receipt_bytes = COMPLETED_COMPONENT_RECEIPT_BYTES;
         let semantic_receipt_bytes = 42 * size_of::<u64>();
@@ -27356,8 +27147,6 @@ impl SemanticTransitionSession {
                 2 * 8,
                 repeated_material_extent(record.tokens.len(), 8)?,
                 2 * 8,
-                repeated_material_extent(retained.model.tensors.len(), 2 * 8)?,
-                repeated_material_extent(retained.output.tensors.len(), 2 * 8)?,
             ])?;
             for row in &record.mapping {
                 content = completed_material_extent(&[content, 3 * 8, row.source.len()])?;
@@ -27515,10 +27304,10 @@ impl SemanticTransitionSession {
                     4 * 8,
                     publication_identity_bytes,
                     8,
-                    3 * 32,
+                    2 * 32,
                     2 * 64,
                     2 * 32,
-                    6 * 8,
+                    5 * 8,
                     3 * 8,
                     original_records,
                     repeated_material_extent(roster.len(), 7 * 8)?,
@@ -27540,7 +27329,7 @@ impl SemanticTransitionSession {
             b"XLOG-COMPLETED-STEP-WITNESSES\0".len(),
             15 * 8,
             2 * publication_identity_bytes,
-            2 * 32,
+            32,
             repeated_material_extent(work.recording.events().len(), (4 + 8 + 3) * 8)?,
         ])?;
         let numerical = completed_material_extent(&[
@@ -27673,7 +27462,6 @@ impl SemanticTransitionSession {
             instance: parent_header.instance,
             word: parent_header.publication_word,
             logical_digest: parent_header.logical_digest,
-            state_digest: parent_header.state_digest,
         }) != binding.0
         {
             self.poisoned = true;
@@ -28577,7 +28365,7 @@ impl SemanticTransitionSession {
         // mutable producer tensor in place of this retained pre-draw snapshot.
         let profile = self.publication_read(profile)?;
         let mut bytes = b"XLOG-ESTIMATOR-BOUND\0".to_vec();
-        material_u64(&mut bytes, 1);
+        material_u64(&mut bytes, 2);
         material_u64(&mut bytes, 1); // Native preflight law version.
         material_u64(&mut bytes, 100);
         material_u64(&mut bytes, bank as u64);
@@ -28587,12 +28375,10 @@ impl SemanticTransitionSession {
                 instance: parent.instance,
                 word: parent.publication_word,
                 logical_digest: parent.logical_digest,
-                state_digest: parent.state_digest,
             },
         );
         material_u64(&mut bytes, parent.model_generation);
         bytes.extend_from_slice(parent.model_geometry_digest.as_bytes());
-        bytes.extend_from_slice(parent.model_numerical_digest.as_bytes());
         bytes.extend_from_slice(domain.as_bytes());
         bind_completed_material(&mut bytes, scoring_law);
         bind_completed_material(&mut bytes, batch_receipt);
@@ -28604,7 +28390,6 @@ impl SemanticTransitionSession {
             layout.schema_bytes,
             layout.schema_digest_offset,
             layout.generation_offset,
-            layout.numerical_digest_offset,
             layout.identity_offset,
         ] {
             material_u64(&mut bytes, offset);
@@ -29588,7 +29373,7 @@ impl SemanticTransitionSession {
         bank: usize,
         mut continuation: SemanticContinuationInput<D>,
         witness: &SemanticTensorOwner,
-        model_content_witness: Option<&SemanticTensorOwner>,
+        model_owner: Option<&SemanticTensorOwner>,
         consumer_stream: u64,
     ) -> Result<(), SemanticTransitionError> {
         // The new managed producers must already have completion custody if
@@ -29639,7 +29424,7 @@ impl SemanticTransitionSession {
         let kind = self.prepared_transition_kind(step)?;
         let (physical_blocks, model_schema_digest, model_identity) =
             storage.continuation_block_contract(kind, &continuation, true)?;
-        let model_contract = match (physical_blocks, model_content_witness) {
+        let model_contract = match (physical_blocks, model_owner) {
             (None, None) => None,
             (Some(_), Some(model_witness)) => {
                 self.checked_prepared_tensor_owner(step, model_witness)?;
@@ -29904,7 +29689,7 @@ impl SemanticTransitionSession {
             model_schema_digest,
             model_identity,
             _witness: witness.clone(),
-            _model_content_witness: model_content_witness.cloned(),
+            _model_owner: model_owner.cloned(),
             consumer_stream,
             parent: TextBindingParent::Prepared(Arc::clone(
                 owner.inputs.as_ref().expect("fixed inputs"),
@@ -32028,6 +31813,7 @@ impl SemanticTransitionSession {
         let extents = self.base_snapshot.extents();
         let header = PublicationHeader {
             instance,
+            original_instance: instance,
             ring_head: parent.ring_head,
             prefix_extent: parent.prefix.len() as u64,
             semantic_owner: self.graph.transition_arena()[1],
@@ -32304,7 +32090,6 @@ impl SemanticTransitionSession {
             || header.recovered_instance != expected.instance
             || header.publication_word != 0
             || header.logical_digest != expected.logical_digest
-            || header.state_digest != expected.state_digest
         {
             return Err(publication_input_error(
                 "checkpoint restore no longer owns the exact fresh recovered publication",
@@ -32392,11 +32177,7 @@ impl SemanticTransitionSession {
             .map(|saved| saved.content.len());
         #[cfg(feature = "semantic-policy")]
         if let Some(retained) = &self.retained_initial_prefill {
-            let actual = initial_prefill_content_extent(
-                &retained.record,
-                retained.model.tensors.len(),
-                retained.output.tensors.len(),
-            )?;
+            let actual = initial_prefill_content_extent(&retained.record)?;
             if content.is_some_and(|saved| saved != actual) {
                 return Err(SemanticTransitionError::ObservationMismatch);
             }
@@ -32405,7 +32186,7 @@ impl SemanticTransitionSession {
         let extent = CheckpointInitialPrefill::MAGIC.len() + 8 + 1;
         content.map_or(Ok(extent), |content| {
             extent
-                .checked_add(3 * 32 + 8 + 8)
+                .checked_add(2 * 32 + 8 + 8)
                 .and_then(|extent| extent.checked_add(content))
                 .ok_or(SemanticTransitionError::GenerationExhausted)
         })
@@ -32422,7 +32203,7 @@ impl SemanticTransitionSession {
                 )
             })
             .and_then(|size| {
-                size.checked_add(CheckpointInitialPrefill::MAGIC.len() + 8 + 1 + 3 * 32 + 2 * 8)
+                size.checked_add(CheckpointInitialPrefill::MAGIC.len() + 8 + 1 + 2 * 32 + 2 * 8)
             })
             .ok_or(SemanticTransitionError::GenerationExhausted)?;
         if let Some(saved) = &self.checkpoint_initial_prefill {
@@ -32433,11 +32214,7 @@ impl SemanticTransitionSession {
         #[cfg(feature = "semantic-policy")]
         if let Some(retained) = &self.retained_initial_prefill {
             let record = &retained.record;
-            let content_extent = initial_prefill_content_extent(
-                record,
-                retained.model.tensors.len(),
-                retained.output.tensors.len(),
-            )?;
+            let content_extent = initial_prefill_content_extent(record)?;
             extent = extent
                 .checked_add(
                     content_extent
@@ -32618,7 +32395,6 @@ impl SemanticTransitionSession {
             instance: header.instance,
             word: header.publication_word,
             logical_digest: header.logical_digest,
-            state_digest: header.state_digest,
         };
         if contract.task_identity != task_identity
             || prefill.original.word != 0
@@ -32697,7 +32473,6 @@ impl SemanticTransitionSession {
             instance: original_header.instance,
             word: original_header.publication_word,
             logical_digest: original_header.logical_digest,
-            state_digest: original_header.state_digest,
         };
         let mut prefill = CheckpointInitialPrefill::decode_section(section)?.ok_or_else(|| {
             publication_input_error("pre-action checkpoint has no original initial prefill")
@@ -32755,7 +32530,8 @@ impl SemanticTransitionSession {
             || control.word != 0
             || header.model_geometry_digest != bank.header.model_geometry_digest
             || (operation == 4
-                && header.model_numerical_digest != bank.header.model_numerical_digest)
+                && (header.original_instance != bank.header.original_instance
+                    || header.logical_digest != bank.header.logical_digest))
         {
             return Err(SemanticTransitionError::ObservationMismatch);
         }
@@ -32766,7 +32542,6 @@ impl SemanticTransitionSession {
             instance: header.instance,
             word: header.publication_word,
             logical_digest: header.logical_digest,
-            state_digest: header.state_digest,
         })
     }
 
@@ -32829,6 +32604,7 @@ impl SemanticTransitionSession {
         } else {
             None
         };
+        let mut launch_status = None;
         let launch = |stream: &CudaEnqueue<'_>, entered: &mut bool, submitted: &mut bool| {
             let mut params = [(&mut descriptor as *mut Descriptor).cast()];
             // SAFETY: retained strict owners cover the unchanged descriptor ABI.
@@ -32854,14 +32630,33 @@ impl SemanticTransitionSession {
                     reader.retirement_submitted |= *submitted;
                 }
             }
-            result.map_err(|error| XlogError::Kernel(error.to_string()))
+            result.map_err(|error| {
+                launch_status = Some(error.0);
+                XlogError::Kernel(error.to_string())
+            })
         };
         if let Some(original) = original {
-            return original.run(&self.domain, poisoned, recorder, launch);
+            let result = original.run(&self.domain, poisoned, recorder, launch);
+            if let Some(status) = launch_status {
+                original.submission_failure = Some(status);
+                return Err(native_runtime_error(
+                    "original publication command submission",
+                    cudarc::driver::DriverError(status),
+                ));
+            }
+            return result;
         }
-        enqueue_recorded(&self.domain, poisoned, recorder, |stream| {
+        let mut launch = launch;
+        let result = enqueue_recorded(&self.domain, poisoned, recorder, |stream| {
             launch(stream, &mut false, &mut false)
-        })?;
+        });
+        if let Some(status) = launch_status {
+            return Err(native_runtime_error(
+                "publication command submission",
+                cudarc::driver::DriverError(status),
+            ));
+        }
+        result?;
         wait_on_stream(
             &self.stream,
             poisoned,
@@ -32936,7 +32731,7 @@ impl SemanticTransitionSession {
                 .map(|owner| Arc::clone(owner) as Arc<dyn Send + Sync>)
         });
         let read = crate::device::RetainedDeviceRead::new_with_owner(&self.stream, source, owner)
-            .map_err(|error| runtime_error("publication metadata staging", error))?;
+            .map_err(|error| native_runtime_error("publication metadata staging", error))?;
         Ok(PublicationRead {
             issuer: Arc::clone(&self.publication_issuer),
             read,
@@ -32992,7 +32787,7 @@ impl SemanticTransitionSession {
         }
         let result = original.read.resolve_on(&self.stream).map_err(|error| {
             *poisoned = true;
-            runtime_error("publication metadata read completion", error)
+            native_runtime_error("publication metadata read completion", error)
         })?;
         if !completed {
             self.provider
@@ -33042,12 +32837,22 @@ impl SemanticTransitionSession {
         }
         let mut recorder = self.domain.new_strict_recorder();
         recorder.read(original.read.source());
+        let mut copy_status = None;
         let result = enqueue_recorded(&self.domain, poisoned, recorder, |stream| {
-            original.read.enqueue(stream.stream())
+            original.read.enqueue(stream.stream()).map_err(|error| {
+                copy_status = Some(error.0);
+                error
+            })
         });
         #[cfg(feature = "semantic-policy")]
         self.record_publication_read_submitted_dma(original)?;
-        result
+        match copy_status {
+            Some(status) => Err(native_runtime_error(
+                "publication metadata copy submission",
+                cudarc::driver::DriverError(status),
+            )),
+            None => result,
+        }
     }
 
     fn require_delivery_acknowledgement_read_dma_bound(
@@ -33678,7 +33483,6 @@ impl SemanticTransitionSession {
             instance: lease.instance,
             word: lease.word,
             logical_digest: header.logical_digest,
-            state_digest: header.state_digest,
         };
         let model_owners = storage
             .model_slots_for_directory(&directory)?
@@ -34408,8 +34212,7 @@ impl SemanticTransitionSession {
         let source = self.published_source(lease, consumer_stream)?;
         Ok(SemanticModelContext {
             parent: lease.identity,
-            descriptor_digest: header.descriptor_digest,
-            numerical_state: (header.model_geometry_digest, header.model_numerical_digest),
+            model_geometry_digest: header.model_geometry_digest,
             semantic_root: (
                 header.semantic_owner,
                 header.semantic_slot,
@@ -34607,9 +34410,6 @@ impl SemanticTransitionSession {
             capacity,
             bytes,
         };
-        if material.original_record_digest() != range.digest {
-            return Err(SemanticTransitionError::ObservationMismatch);
-        }
         Ok(material)
     }
 
@@ -35312,7 +35112,6 @@ impl SemanticTransitionSession {
                 || header.neural_bank != original.parent_header.neural_bank
                 || header.neural_generation != original.parent_header.neural_generation
                 || header.model_geometry_digest != original.parent_header.model_geometry_digest
-                || header.model_numerical_digest != original.parent_header.model_numerical_digest
                 || header.proposal != original.parent_header.proposal
                 || header.family_id != original.parent_header.family_id
                 || header.stream_serial != original.parent_header.stream_serial
@@ -35329,7 +35128,6 @@ impl SemanticTransitionSession {
                 instance: header.instance,
                 word: header.publication_word,
                 logical_digest: header.logical_digest,
-                state_digest: header.state_digest,
             };
             state.result = Some(Ok(identity));
             state.poisoned = false;
@@ -35483,9 +35281,6 @@ impl SemanticTransitionSession {
             capacity: original.capacity,
             bytes,
         };
-        if material.original_record_digest() != original.range.digest {
-            return Err(SemanticTransitionError::ObservationMismatch);
-        }
         Ok(material)
     }
 
@@ -35831,9 +35626,6 @@ impl SemanticTransitionSession {
         self.complete_step_consumers(lease, &streams)?;
         self.ensure_quiescent()?;
         let record = self.read_published_material_range(lease, 43, 0)?;
-        if record.original_record_digest() != record.range.digest {
-            return Err(SemanticTransitionError::ObservationMismatch);
-        }
         let table =
             self.read_published_material_range(lease, SemanticStateRole::TensorLayout as u64, 0)?;
         let storage = Arc::clone(
@@ -36906,16 +36698,6 @@ impl SemanticTransitionSession {
     /// cached seals alone cannot detect writes through shared tensor aliases.
     /// The method owns consumer stream one for both readers. Their later release
     /// rosters must include one as well as every application consumer stream.
-    pub fn verify_replay_publication(
-        &mut self,
-        material: &SemanticReplayMaterial,
-        predecessor: &SemanticPublishedLease,
-        successor: &SemanticPublishedLease,
-    ) -> Result<(), SemanticTransitionError> {
-        let mut original =
-            self.begin_replay_publication_verification(material, predecessor, successor)?;
-        self.resolve_replay_publication_verification(&mut original, predecessor, successor)
-    }
 
     // Fence all registered writer/consumer prefixes before hashing either bank.
     // This does not retire the original graph's aliases or witnesses and cannot
@@ -37019,7 +36801,7 @@ impl SemanticTransitionSession {
         lease: &SemanticPublishedLease,
         role: u64,
         index: u64,
-    ) -> Result<replay_verification::RetainedMaterialRange, SemanticTransitionError> {
+    ) -> Result<replay_join::RetainedMaterialRange, SemanticTransitionError> {
         self.checked_original_consumer_step(lease)?;
         if !lease.active {
             return Err(publication_input_error(
@@ -37058,7 +36840,7 @@ impl SemanticTransitionSession {
         } else {
             Some(self.stage_publication_read(owner.slice()?.view().slice(begin..end))?)
         };
-        Ok(replay_verification::RetainedMaterialRange {
+        Ok(replay_join::RetainedMaterialRange {
             range: *range,
             capacity: owner.len() - begin,
             read,
@@ -38497,7 +38279,7 @@ impl SemanticTransitionSession {
             model_schema_digest,
             model_identity,
             _witness: witness.clone(),
-            _model_content_witness: None,
+            _model_owner: None,
             consumer_stream,
             parent: TextBindingParent::Published {
                 bank: (lease.identity.word & 1) as usize,
@@ -38813,8 +38595,8 @@ impl SemanticTransitionSession {
             completed_delivery_acknowledgement_dma: OriginalDeliveryAcknowledgementDma::default(),
             replay_authentication: None,
             pending_training_materialization: None,
-            replay_verification: None,
-            replay_verification_pending: Arc::new(AtomicBool::new(false)),
+            replay_join: None,
+            replay_join_pending: Arc::new(AtomicBool::new(false)),
             resident_model_activation: None,
             replay_material_budget: None,
             #[cfg(feature = "semantic-policy")]
@@ -38914,21 +38696,23 @@ impl SemanticTransitionSession {
         &self,
         exclusion: OriginalSessionEffectExclusion<'_>,
     ) -> bool {
-        self.replay_verification_pending.load(Ordering::Acquire)
+        self.replay_join_pending.load(Ordering::Acquire)
             || self.resident_model_activation.is_some()
-            || self.has_unresolved_session_native_effect_except_replay_verification_with_effect_exclusion(exclusion)
+            || self.has_unresolved_session_native_effect_except_replay_join_with_effect_exclusion(
+                exclusion,
+            )
     }
 
     // Only the exact retained comparison capability may consume this base.
     // Its caller must separately authenticate the owner, both original readers
     // and the original graph export before excluding that one pending flag.
-    fn has_unresolved_session_native_effect_except_replay_verification(&self) -> bool {
-        self.has_unresolved_session_native_effect_except_replay_verification_with_effect_exclusion(
+    fn has_unresolved_session_native_effect_except_replay_join(&self) -> bool {
+        self.has_unresolved_session_native_effect_except_replay_join_with_effect_exclusion(
             OriginalSessionEffectExclusion::default(),
         )
     }
 
-    fn has_unresolved_session_native_effect_except_replay_verification_with_effect_exclusion(
+    fn has_unresolved_session_native_effect_except_replay_join_with_effect_exclusion(
         &self,
         exclusion: OriginalSessionEffectExclusion<'_>,
     ) -> bool {
@@ -39129,7 +38913,7 @@ impl SemanticTransitionSession {
             return false;
         }
         !self.has_independent_session_native_effect()
-            && !self.replay_verification_pending.load(Ordering::Acquire)
+            && !self.replay_join_pending.load(Ordering::Acquire)
             && (initialization.is_some() || !self.has_pending_prepared_segment_preparation())
             && (metadata.is_some() || !self.has_pending_prepared_metadata_freeze())
             && self.original_prepared_non_owner_effects_are_clear()
@@ -39179,7 +38963,7 @@ impl SemanticTransitionSession {
     fn retired_prepared_initialization_may_release(&self) -> bool {
         self.has_retired_prepared_initialization()
             && !self.has_independent_session_native_effect_except_retired_preparation()
-            && !self.replay_verification_pending.load(Ordering::Acquire)
+            && !self.replay_join_pending.load(Ordering::Acquire)
             && !self.has_pending_prepared_segment_preparation()
             && !self.has_pending_prepared_metadata_freeze()
             && self.original_prepared_non_owner_effects_are_clear()
@@ -40619,7 +40403,6 @@ impl SemanticTransitionSession {
             instance: header.instance,
             word: header.publication_word,
             logical_digest: header.logical_digest,
-            state_digest: header.state_digest,
         };
         self.poisoned = false;
         pending.completion = Some(identity);
@@ -41797,20 +41580,11 @@ impl SemanticTransitionSession {
                 "prepared transition requires recorded branch model content, its unused original continuation, a policy only for proposals, and a bound model output for updates",
             ));
         }
-        let policy_witness = if kind == SemanticTransitionKind::Proposal {
-            Some(branch.policy_witness.clone().ok_or_else(|| {
-                publication_input_error("prepared transition has no original policy content")
-            })?)
-        } else {
-            None
-        };
-        let continuation_witness = branch
-            .continuation
-            .as_ref()
-            .expect("checked continuation")
-            .text_binding
-            ._witness
-            .clone();
+        if kind == SemanticTransitionKind::Proposal && branch.policy_witness.is_none() {
+            return Err(publication_input_error(
+                "prepared transition has no original policy owner",
+            ));
+        }
         let continuation_work = self.prepared_policy_work_counter(
             step,
             bank,
@@ -41818,24 +41592,7 @@ impl SemanticTransitionSession {
             &self.publication_issuer,
             step.token,
         )?;
-        if let Some(witness) = &policy_witness {
-            self.record_prepared_tensor_content_with_work(
-                step,
-                witness,
-                true,
-                Some(&continuation_work),
-                #[cfg(feature = "semantic-policy")]
-                None,
-            )?;
-        }
-        self.record_prepared_tensor_content_with_work(
-            step,
-            &continuation_witness,
-            true,
-            Some(&continuation_work),
-            #[cfg(feature = "semantic-policy")]
-            None,
-        )?;
+
         let result = (|| {
             let canary_work = if kind == SemanticTransitionKind::Update {
                 Some(self.prepared_policy_work_counter(
@@ -44515,9 +44272,6 @@ impl SemanticTransitionSession {
                     capacity: allocation.len() - begin,
                     bytes: original,
                 };
-                if material.original_record_digest() != range.digest {
-                    return Err(SemanticTransitionError::ObservationMismatch);
-                }
                 initial
                     .checked_add(u64::from_le_bytes(
                         material.bytes[48..56]
@@ -47607,7 +47361,6 @@ mod text_parent_tests {
                     schema_bytes: bytes.len() as u64,
                     schema_digest_offset: 0,
                     generation_offset: 32,
-                    numerical_digest_offset: 40,
                     identity_offset: 72,
                 };
                 let mut record = vec![0; 104];
@@ -48060,7 +47813,6 @@ mod text_parent_tests {
         let identity = restored.restore_state_material(&bytes).unwrap();
         assert_ne!(identity.instance, original.bank.header.instance);
         assert_eq!(identity.logical_digest, original.bank.header.logical_digest);
-        assert_eq!(identity.state_digest, original.bank.header.state_digest);
         let mut lease = restored.acquire().unwrap();
         assert_eq!(
             restored.published_model_numerical_mode(&lease).unwrap(),
@@ -48159,134 +47911,6 @@ mod text_parent_tests {
         session.release(&mut lease, &[1]).unwrap();
         drop(session);
         provider.memory().reap_pending_deallocations().unwrap();
-    }
-
-    #[test]
-    #[ignore = "requires an explicitly authorized remote CUDA run; fatal cases use fresh processes"]
-    fn replay_boundaries_reject_mutated_shared_predecessor_weights() {
-        const CHILD_KIND: &str = "XLOG_REPLAY_CONTENT_TEST_CHILD";
-        const COMPLETED: &str =
-            "shared replay content mutation produced a fatal CUDA completion error";
-        let Some(kind) = std::env::var_os(CHILD_KIND) else {
-            let qualified = concat!(
-                module_path!(),
-                "::replay_boundaries_reject_mutated_shared_predecessor_weights"
-            );
-            let test_name = qualified.split_once("::").unwrap().1;
-            for kind in ["verify", "evidence", "provenance"] {
-                let output = std::process::Command::new(std::env::current_exe().unwrap())
-                    .args([
-                        "--exact",
-                        test_name,
-                        "--ignored",
-                        "--nocapture",
-                        "--test-threads=1",
-                    ])
-                    .env(CHILD_KIND, kind)
-                    .output()
-                    .unwrap();
-                assert!(
-                    output.status.success(),
-                    "{kind} child did not verify a CUDA trap:\n{}\n{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                assert!(
-                    String::from_utf8_lossy(&output.stdout).contains(COMPLETED),
-                    "{kind} child did not reach the typed CUDA completion check"
-                );
-            }
-            return;
-        };
-        assert!(kind == "verify" || kind == "evidence" || kind == "provenance");
-        let (provider, domain) = publication_test_provider();
-        let mut original = publication_test_session(Arc::clone(&provider), &domain);
-        original
-            .bind_parent(publication_test_parent(&provider))
-            .unwrap();
-        let mut old = original.acquire().unwrap();
-        let predecessor_bytes = original.published_state_material(&old).unwrap();
-        publication_test_recompute(&mut original, &old, &provider);
-        let mut current = original.acquire().unwrap();
-        let evidence = original.published_replay_evidence(&old, &current).unwrap();
-        assert!(
-            original.release_events.is_empty(),
-            "completed export events must not wait for reader release"
-        );
-        let material = SemanticReplayMaterial::decode(
-            &predecessor_bytes,
-            &evidence,
-            old.identity.logical_digest,
-            current.identity.logical_digest,
-        )
-        .unwrap();
-        original.release(&mut old, &[1]).unwrap();
-        original.release(&mut current, &[1]).unwrap();
-        drop(original);
-
-        let mut replay = publication_test_session(Arc::clone(&provider), &domain);
-        replay.restore_replay_material(&material).unwrap();
-        let predecessor = replay.acquire().unwrap();
-        publication_test_recompute(&mut replay, &predecessor, &provider);
-        let successor = replay.acquire().unwrap();
-        let alias = replay
-            .published_tensor(&predecessor, SemanticStateRole::SlowWeights, 0, 1)
-            .unwrap();
-        let successor_alias = replay
-            .published_tensor(&successor, SemanticStateRole::SlowWeights, 0, 1)
-            .unwrap();
-        // SAFETY: each managed export retains its own actual acquired reader and
-        // valid DLPack descriptor; the pointers prove these banks share weights.
-        let tensor = unsafe { &(*alias.as_ptr()).dl_tensor };
-        let successor_tensor = unsafe { &(*successor_alias.as_ptr()).dl_tensor };
-        assert_eq!(tensor.byte_offset, 0);
-        assert_eq!(tensor.data, successor_tensor.data);
-        let pointer = tensor.data as usize as u64;
-        drop(successor_alias);
-        replay
-            .verify_replay_publication(&material, &predecessor, &successor)
-            .unwrap();
-        replay
-            .published_replay_evidence(&predecessor, &successor)
-            .unwrap();
-        replay
-            .published_replay_provenance(&predecessor, &successor)
-            .unwrap();
-        // SAFETY: the fixture's live alias retains four FP32 bytes, and the
-        // external write uses the actual registered legacy consumer stream.
-        assert_eq!(
-            unsafe { sys::cuMemsetD8Async(pointer, 0, 4, std::ptr::null_mut()) },
-            sys::cudaError_enum::CUDA_SUCCESS
-        );
-        if kind == "verify" {
-            drop(alias);
-            replay.quiesce_published_reader(&predecessor, &[1]).unwrap();
-            assert!(replay
-                .verify_replay_publication(&material, &predecessor, &successor)
-                .is_err());
-        } else if kind == "evidence" {
-            assert!(replay
-                .published_replay_evidence(&predecessor, &successor)
-                .is_err());
-        } else {
-            assert!(replay
-                .published_replay_provenance(&predecessor, &successor)
-                .is_err());
-        }
-        // SAFETY: only this disposable child's context has been poisoned. A
-        // typed fatal CUDA error, not a Rust panic, establishes guard refusal.
-        let completion = unsafe { sys::cuStreamSynchronize(std::ptr::null_mut()) };
-        assert!(
-            matches!(
-                completion,
-                sys::cudaError_enum::CUDA_ERROR_ILLEGAL_INSTRUCTION
-                    | sys::cudaError_enum::CUDA_ERROR_LAUNCH_FAILED
-            ),
-            "unexpected CUDA completion: {completion:?}"
-        );
-        println!("{COMPLETED}");
-        std::io::Write::flush(&mut std::io::stdout()).unwrap();
-        std::process::exit(0);
     }
 
     fn publication_test_alias(
@@ -48783,7 +48407,6 @@ mod text_parent_tests {
             sealed_epoch: 8,
             publication_word: 16,
             range_count: ranges.len() as u64,
-            state_digest: Identity256::from_bytes([29; 32]),
             ..PublicationHeader::default()
         };
         let mut model_memory = ModelMemoryGeometry::default();
@@ -48795,7 +48418,6 @@ mod text_parent_tests {
             let ordinal = model_allocations.len() as u64;
             let mut bytes = vec![0; range.capacity];
             bytes[..range.bytes.len()].copy_from_slice(&range.bytes);
-            range.range.backing_digest = Identity256::from_bytes(Sha256::digest(&bytes).into());
             model_memory.allocation_bytes.push(bytes.len() as u64);
             model_memory.storages.push(SemanticModelStorage {
                 allocation: ordinal,
@@ -48830,7 +48452,6 @@ mod text_parent_tests {
                     schema_bytes: 4,
                     schema_digest_offset: 0,
                     generation_offset: 32,
-                    numerical_digest_offset: 40,
                     identity_offset: 72,
                 },
                 ..PublicationContract::default()
@@ -48858,11 +48479,8 @@ mod text_parent_tests {
         };
         publication_material_sample_runtime(&mut material);
         for range in &mut material.ranges {
-            if !is_tensor_role(range.range.role) {
-                range.range.digest = range.original_record_digest();
-            }
+            if !is_tensor_role(range.range.role) {}
         }
-        material.bank.header.descriptor_digest = material.original_descriptor_digest();
         material
     }
 
@@ -48894,7 +48512,6 @@ mod text_parent_tests {
         record.capacity = runtime.capacity_bytes;
         record.bytes = runtime.bytes;
         record.range.length_bytes = record.bytes.len() as u64;
-        record.range.digest = record.original_record_digest();
     }
 
     #[test]
@@ -49083,7 +48700,6 @@ mod text_parent_tests {
         let (_, mut layouts, active) = decode_tensor_table(&table.bytes).unwrap();
         layouts[0].scalar_type = 2;
         table.bytes = tensor_table_bytes(&layouts, active.computed, &active.rows).unwrap();
-        table.range.digest = table.original_record_digest();
         assert!(changed.model_numerical_mode().is_err());
     }
 
@@ -49098,7 +48714,6 @@ mod text_parent_tests {
             .unwrap();
         let (_, layouts, _) = decode_tensor_table(&table.bytes).unwrap();
         table.bytes = tensor_table_bytes(&layouts, true, &[]).unwrap();
-        table.range.digest = table.original_record_digest();
         assert_eq!(changed.model_numerical_mode().unwrap(), mode);
     }
 
@@ -49111,8 +48726,6 @@ mod text_parent_tests {
             .find(|range| range.range.role == 43)
             .unwrap();
         runtime.bytes.fill(0);
-        runtime.range.digest = runtime.original_record_digest();
-        changed.bank.header.descriptor_digest = changed.original_descriptor_digest();
         assert!(
             changed.encode().is_err(),
             "opaque caller bytes are not the native runtime contract"
@@ -49388,50 +49001,6 @@ mod text_parent_tests {
     }
 
     #[test]
-    fn publication_material_decode_checks_original_record_bytes() {
-        // These records contain origin coordinates omitted by normalized state
-        // hashing. A saved descriptor is insufficient without their raw seals.
-        for role in [2, 14, 15, 30, 33, 48] {
-            let mut changed = publication_material_sample();
-            let record = changed
-                .ranges
-                .iter_mut()
-                .find(|item| item.range.role == role)
-                .unwrap();
-            record.bytes[0] ^= 1;
-            assert!(
-                PublicationMaterial::decode(&changed.encode().unwrap()).is_err(),
-                "cold decoding accepted altered original record {role}"
-            );
-        }
-        for word in [1, 5, 6, 39] {
-            let mut changed = publication_material_sample();
-            let record = changed
-                .ranges
-                .iter_mut()
-                .find(|item| item.range.role == 33)
-                .unwrap();
-            record.bytes = publication_abi_bytes(&[AttemptReceipt::default()]);
-            record.range.length_bytes = record.bytes.len() as u64;
-            record.capacity = record.bytes.len();
-            record.range.digest = record.original_record_digest();
-            publication_material_sample_runtime(&mut changed);
-            changed.bank.header.descriptor_digest = changed.original_descriptor_digest();
-            assert!(PublicationMaterial::decode(&changed.encode().unwrap()).is_ok());
-            changed
-                .ranges
-                .iter_mut()
-                .find(|item| item.range.role == 33)
-                .unwrap()
-                .bytes[word * 8] ^= 1;
-            assert!(
-                PublicationMaterial::decode(&changed.encode().unwrap()).is_err(),
-                "cold decoding accepted altered normalized-out attempt word {word}"
-            );
-        }
-    }
-
-    #[test]
     fn checkpoint_projection_uses_validated_original_publication() {
         let material = publication_material_sample();
         let header = material.bank.header;
@@ -49441,7 +49010,6 @@ mod text_parent_tests {
         assert_eq!(projection.publication.instance, header.instance);
         assert_eq!(projection.publication.word, header.publication_word);
         assert_eq!(projection.publication.logical_digest, header.logical_digest);
-        assert_eq!(projection.publication.state_digest, header.state_digest);
         assert_eq!(projection.semantic_root, header.semantic_digest);
         assert_eq!(projection.model_generation, header.model_generation);
     }
@@ -49476,17 +49044,13 @@ mod text_parent_tests {
         // exactly as in initial publication. Imported evidence is never resealed.
         publication_material_sample_runtime(&mut predecessor);
         for item in &mut predecessor.ranges {
-            if !is_tensor_role(item.range.role) {
-                item.range.digest = item.original_record_digest();
-            }
+            if !is_tensor_role(item.range.role) {}
         }
-        predecessor.bank.header.descriptor_digest = predecessor.original_descriptor_digest();
         let mut evidence = PublicationReplayEvidence {
             successor: SemanticPublishedIdentity {
                 instance: predecessor.bank.header.instance,
                 word: 19,
                 logical_digest: Identity256::from_bytes([13; 32]),
-                state_digest: Identity256::default(),
             },
             ranges: predecessor
                 .ranges
@@ -49531,10 +49095,7 @@ mod text_parent_tests {
         let mut attempt = item.attempt().unwrap();
         attempt.receipt_digest = item.logical_record_digest().unwrap();
         item.bytes = publication_abi_bytes(&[attempt]);
-        for item in &mut evidence.ranges {
-            item.range.digest = item.original_record_digest();
-        }
-        evidence.successor.state_digest = evidence.state_digest().unwrap();
+        for item in &mut evidence.ranges {}
     }
 
     #[test]
@@ -49553,7 +49114,6 @@ mod text_parent_tests {
         coverage_range.bytes = publication_abi_bytes(&[current_coverage]);
         coverage_range.capacity = coverage_range.bytes.len();
         coverage_range.range.length_bytes = coverage_range.bytes.len() as u64;
-        coverage_range.range.digest = coverage_range.original_record_digest();
         let coverage = coverage_range.logical_record_digest().unwrap();
         let attempt_range = evidence.ranges.last_mut().unwrap();
         let mut attempt = attempt_range.attempt().unwrap();
@@ -49564,7 +49124,6 @@ mod text_parent_tests {
         selected.bank.header.base_word = previous_word;
         selected.bank.header.publication_word = evidence.successor.word;
         selected.bank.header.logical_digest = evidence.successor.logical_digest;
-        selected.bank.header.state_digest = evidence.successor.state_digest;
         selected.bank.header.terminal = 0;
         for replacement in &evidence.ranges {
             let original = selected
@@ -49630,7 +49189,7 @@ mod text_parent_tests {
             match change {
                 0 => changed.successor.instance = Identity256::from_bytes([90; 32]),
                 1 => changed.successor.word += 4,
-                2 => changed.successor.state_digest = Identity256::default(),
+                2 => changed.successor.logical_digest = Identity256::default(),
                 3 => {
                     changed.ranges.remove(0);
                 }
@@ -49677,7 +49236,6 @@ mod text_parent_tests {
             .unwrap()
             .clone();
         decision.bytes[0] ^= 1;
-        decision.range.digest = decision.original_record_digest();
         let mut provenance = PublicationReplayProvenance {
             predecessor: replay.predecessor_identity(),
             authority,
@@ -49701,7 +49259,6 @@ mod text_parent_tests {
             .is_err());
         provenance.predecessor = replay.predecessor_identity();
         provenance.authority.bytes[0] ^= 1;
-        provenance.authority.range.digest = provenance.authority.original_record_digest();
         assert!(replay
             .verify_provenance(&provenance.encode().unwrap())
             .is_err());
@@ -49737,10 +49294,6 @@ mod text_parent_tests {
             attempt.bytes[word * 8] ^= 1;
         }
         assert_eq!(attempt.logical_record_digest().unwrap(), original);
-        assert_ne!(
-            attempt.original_record_digest(),
-            evidence.range(33).unwrap().original_record_digest()
-        );
         attempt.bytes[7 * 8] ^= 1;
         assert_ne!(attempt.logical_record_digest().unwrap(), original);
         for role in [27, 28, 31, 32] {
@@ -49770,7 +49323,6 @@ mod text_parent_tests {
             capacity: bytes.len(),
             bytes,
         };
-        item.range.digest = item.original_record_digest();
         item
     }
 
@@ -49931,7 +49483,6 @@ mod text_parent_tests {
         };
         completion.receipt_digest = coverage.logical_record_digest().unwrap();
         coverage.bytes = publication_abi_bytes(&[completion]);
-        coverage.range.digest = coverage.original_record_digest();
         let item = evidence.ranges.last_mut().unwrap();
         let mut attempt = item.attempt().unwrap();
         attempt.transition_kind = 1;
@@ -49940,7 +49491,6 @@ mod text_parent_tests {
         attempt.coverage_digest = coverage.logical_record_digest().unwrap();
         item.bytes = publication_abi_bytes(&[attempt]);
         seal_replay_sample(&mut evidence);
-        bank.header.state_digest = evidence.successor.state_digest;
         assert_eq!(
             evidence.validate(&predecessor).unwrap(),
             SemanticTransitionKind::Proposal
@@ -49976,13 +49526,11 @@ mod text_parent_tests {
             .is_err());
         let mut changed_coverage = coverage.clone();
         changed_coverage.bytes[6 * 8] ^= 1;
-        changed_coverage.range.digest = changed_coverage.original_record_digest();
         assert!(evidence
             .validate_observed(&predecessor, &bank, &changed_coverage, &codebook)
             .is_err());
         let mut changed_codebook = codebook.clone();
         changed_codebook.bytes[25 * 8] ^= 1;
-        changed_codebook.range.digest = changed_codebook.original_record_digest();
         assert!(evidence
             .validate_observed(&predecessor, &bank, &coverage, &changed_codebook)
             .is_err());
@@ -49991,7 +49539,6 @@ mod text_parent_tests {
         attempt.semantic_receipts_digest = Identity256::from_bytes([92; 32]);
         item.bytes = publication_abi_bytes(&[attempt]);
         seal_replay_sample(&mut evidence);
-        bank.header.state_digest = evidence.successor.state_digest;
         evidence.validate(&predecessor).unwrap();
         assert!(evidence
             .validate_observed(&predecessor, &bank, &coverage, &codebook)
@@ -50172,42 +49719,6 @@ mod text_parent_tests {
             .unwrap()
             .storage_slot = slot;
         assert!(plan_step_inputs(&shared_raw, &layouts, 64, &sizes).is_err());
-    }
-
-    #[test]
-    fn feedback_record_material_preserves_original_seal_and_rejects_changed_content() {
-        let mut original = PublicationMaterialRange {
-            range: PublicationRange {
-                role: 15,
-                generation: 1,
-                length_bytes: 768,
-                logical_end: 1,
-                ..PublicationRange::default()
-            },
-            capacity: 768,
-            bytes: vec![0; 768],
-        };
-        original.range.digest = original.original_record_digest();
-        let material = original.clone().into_feedback_record().unwrap();
-        assert_eq!(material.identity, original.range.digest);
-        assert_eq!(
-            (
-                material.logical_begin,
-                material.logical_end,
-                material.capacity_bytes
-            ),
-            (0, 1, 768)
-        );
-        assert_eq!(material.bytes, original.bytes);
-        let mut changed = original.clone();
-        changed.bytes[0] ^= 1;
-        assert!(changed.into_feedback_record().is_err());
-        let mut changed = original.clone();
-        changed.range.logical_end = 2;
-        assert!(changed.into_feedback_record().is_err());
-        let mut changed = original;
-        changed.range.role = 18;
-        assert!(changed.into_feedback_record().is_err());
     }
 
     #[test]
@@ -50435,7 +49946,6 @@ mod text_parent_tests {
                 instance: identity(1),
                 word: 12,
                 logical_digest: identity(2),
-                state_digest: identity(3),
             },
             header: PublicationHeader {
                 abi: 1,
@@ -50443,8 +49953,6 @@ mod text_parent_tests {
                 publication_word: 12,
                 sealed_epoch: 6,
                 logical_digest: identity(2),
-                state_digest: identity(3),
-                descriptor_digest: identity(4),
                 semantic_owner: 5,
                 semantic_slot: 6,
                 semantic_generation: 7,
@@ -50463,7 +49971,6 @@ mod text_parent_tests {
             directory: Vec::new(),
         };
         let context = lease.model_context_header().unwrap();
-        assert_eq!(context.descriptor_digest, identity(4));
         assert_eq!(
             (
                 context.semantic_owner,
@@ -50486,7 +49993,7 @@ mod text_parent_tests {
             ),
             (12, 1, 13, 14, 15)
         );
-        lease.header.state_digest = identity(19);
+        lease.header.logical_digest = identity(19);
         assert!(lease.model_context_header().is_err());
     }
 
@@ -50784,7 +50291,6 @@ mod text_parent_tests {
             schema_bytes: schema.len() as u64,
             schema_digest_offset: 0,
             generation_offset: 32,
-            numerical_digest_offset: 40,
             identity_offset: 72,
         };
         assert_eq!(
@@ -50931,10 +50437,8 @@ mod text_parent_tests {
                 _ => continue,
             }
             range.range.length_bytes = range.bytes.len() as u64;
-            range.range.digest = range.original_record_digest();
         }
         publication_material_sample_runtime(&mut material);
-        material.bank.header.descriptor_digest = material.original_descriptor_digest();
         let encoded = material.encode().unwrap();
         let projected = output_intents_from_publication_material(&encoded).unwrap();
         assert_eq!(projected.len(), 1);
@@ -50949,8 +50453,6 @@ mod text_parent_tests {
             .unwrap();
         let last = entry_range.bytes.last_mut().unwrap();
         *last ^= 1;
-        entry_range.range.digest = entry_range.original_record_digest();
-        material.bank.header.descriptor_digest = material.original_descriptor_digest();
         assert!(output_intents_from_publication_material(&material.encode().unwrap()).is_err());
     }
 
@@ -51105,9 +50607,7 @@ mod text_parent_tests {
             &[],
         )
         .unwrap();
-        table.range.digest = table.original_record_digest();
         publication_material_sample_runtime(&mut material);
-        material.bank.header.descriptor_digest = material.original_descriptor_digest();
         let encoded = material.encode().unwrap();
         let restored = PublicationMaterial::decode(&encoded).unwrap();
         assert_eq!(restored.layouts[&(18, 0)], scalar);
@@ -51199,7 +50699,6 @@ mod text_parent_tests {
                 .find(|storage| storage.allocation == allocation as u64)
                 .unwrap()
                 .span_bytes = 0;
-            buffer.range.backing_digest = Identity256::from_bytes(Sha256::digest(b"").into());
             let table = material
                 .ranges
                 .iter_mut()
@@ -51211,9 +50710,7 @@ mod text_parent_tests {
                 &[],
             )
             .unwrap();
-            table.range.digest = table.original_record_digest();
             publication_material_sample_runtime(&mut material);
-            material.bank.header.descriptor_digest = material.original_descriptor_digest();
             let encoded = material.encode().unwrap();
             let restored = PublicationMaterial::decode(&encoded).unwrap();
             assert_eq!(restored.layouts[&(role, 0)], empty);
@@ -51237,7 +50734,6 @@ mod text_parent_tests {
                 buffer.range.logical_begin = begin;
                 buffer.range.logical_end = end;
                 publication_material_sample_runtime(&mut material);
-                material.bank.header.descriptor_digest = material.original_descriptor_digest();
                 assert!(
                     material.encode().is_err(),
                     "empty buffer accepted a fictitious capacity or interval"
@@ -51252,7 +50748,6 @@ mod text_parent_tests {
             buffer.range.logical_begin = 0;
             buffer.range.logical_end = 0;
             publication_material_sample_runtime(&mut material);
-            material.bank.header.descriptor_digest = material.original_descriptor_digest();
             material.layouts.get_mut(&(role, 0)).unwrap().dimensions[1] = 1;
             assert!(
                 material.encode().is_err(),
@@ -51441,7 +50936,7 @@ mod text_parent_tests {
         );
         assert_eq!(record.action_receipt_digest, Identity256::default());
         assert_ne!(record.origin_logical_digest, Identity256::default());
-        assert_ne!(record.authority_closure_digest, Identity256::default());
+        assert_ne!(record.authority_closure_origin, Identity256::default());
         assert_ne!(record.record_digest, Identity256::default());
         for field in 0..7 {
             let mut changed = ring;

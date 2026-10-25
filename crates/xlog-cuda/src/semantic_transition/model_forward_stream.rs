@@ -211,7 +211,7 @@ fn full_forward_native_work_ceiling(
         ])?,
         1,
     )?;
-    let mut guard = native_work_bound::model_contract_guard_native_work_ceiling(
+    let mut guard = native_work_bound::selected_model_origin_native_work_ceiling(
         storage,
         &storage.bank_templates[0],
     )?;
@@ -269,7 +269,8 @@ pub(super) fn evaluation_forward_native_work_ceiling(
 /// Authenticate the same completed forward and the three original output seals.
 /// These bounds follow the fixed identity/merge loops in the shared GPU owner;
 /// hashing uses the canonical padding and tariff helpers above.
-pub(super) fn evaluation_forward_binding_native_work_ceiling() -> Result<[u64; 9], SemanticTransitionError> {
+pub(super) fn evaluation_forward_binding_native_work_ceiling(
+) -> Result<[u64; 9], SemanticTransitionError> {
     Ok([1, 0, 0, 0, 0, 0, 0, 0, 9])
 }
 
@@ -1427,11 +1428,16 @@ impl SemanticTransitionSession {
     ) -> Result<SemanticModelForwardWitness, SemanticTransitionError> {
         self.require_model_forward_stream(step, stream, consumer_stream)?;
         if (stream.role == 0) != allocation_owner.is_none() {
-            return Err(publication_input_error("only the candidate full forward requires its retained original output owner"));
+            return Err(publication_input_error(
+                "only the candidate full forward requires its retained original output owner",
+            ));
         }
         if let Some(witness) = allocation_owner {
             self.checked_prepared_tensor_owner(step, witness)?;
-            if self.steps[&step.token].content[witness.index].model_bank.is_some() {
+            if self.steps[&step.token].content[witness.index]
+                .model_bank
+                .is_some()
+            {
                 return Err(publication_input_error(
                     "candidate full forward requires its original output storage owner",
                 ));

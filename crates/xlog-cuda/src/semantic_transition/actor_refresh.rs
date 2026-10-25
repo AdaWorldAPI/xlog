@@ -387,7 +387,6 @@ pub(super) struct PreparedActorRefreshDevice {
     original_origin: SemanticTrainingViewOriginRecord,
     pub(super) acquired_generation: u64,
     pub(super) model_geometry_digest: Identity256,
-    pub(super) model_numerical_digest: Identity256,
     pub(super) role: u64,
     pub(super) demonstrated_lane: u64,
     pub(super) demonstrated_choices: [u64; COMPONENT_COUNT],
@@ -787,8 +786,7 @@ pub(super) fn actor_initialize_native_work_ceiling(
         visits,
         actor_work_add(n, actor_work_add(actor_work_mul(n, n)?, pairs)?)?,
     )?;
-    // Range/table/layout searches at sealing; same-slot model prefixes; the
-    // logical and descriptor folds; source, feedback and model lookups.
+    // Bound original directory, shape, source, feedback and model lookups.
     visits = actor_work_add(
         visits,
         actor_work_add(
@@ -868,91 +866,38 @@ pub(super) fn actor_initialize_native_work_ceiling(
                         size_of::<DeviceState>() as u64,
                         actor_work_add(
                             actor_work_mul(2, 6 * 8 + 4 + 3 * 8)?,
-                            actor_work_add(
-                                size_of::<PublicationHeader>() as u64 + (1 + 8 + 19) * 8 + 64 + 16,
-                                actor_work_mul(intents, 25 * 8 + 80)?,
-                            )?,
+                            actor_work_add(64 + 16, actor_work_mul(intents, 25 * 8 + 80)?)?,
                         )?,
                     )?,
                 )?,
             )?,
         ],
     )?;
-    // Each current typed range is sealed once; directory entries and logical
-    // folds are separate hashes. Full model backing hashes include padding and
-    // sibling views; summing per view conservatively covers shared backings.
-    for item in directory {
-        let mut typed = native_work_bound::content_digest_ceiling(item.length_bytes, 21, false)?;
-        typed[0] = 0;
-        native_work_bound::add_native_work_ceiling(&mut ceiling, typed)?;
-        actor_work_hash(&mut ceiling, size_of::<PublicationRange>() as u64)?;
-        for _ in 0..2 {
-            actor_work_hash(&mut ceiling, 80)?;
-        }
-        native_work_bound::add_native_work_ceiling(
-            &mut ceiling,
-            [0, 0, 0, 0, 0, 0, 0, 0, 2 * 80 + 32],
-        )?;
-        if matches!(item.role, 18..=25) {
-            let allocation = storage
-                .allocations
-                .get(item.storage_slot as usize)
-                .ok_or(SemanticTransitionError::ObservationMismatch)?;
-            actor_work_hash(&mut ceiling, allocation.len() as u64)?;
-            for _ in 0..3 {
-                actor_work_hash(&mut ceiling, 80)?;
-            }
-            native_work_bound::add_native_work_ceiling(
-                &mut ceiling,
-                [0, 0, 0, 0, 0, 0, 0, 0, 3 * 80 + 32],
-            )?;
-        }
-        if matches!(item.role, 2 | 14 | 15) {
-            let mut logical =
-                native_work_bound::content_digest_ceiling(item.length_bytes, 21, false)?;
-            logical[0] = 0;
-            native_work_bound::add_native_work_ceiling(&mut ceiling, logical)?;
-        }
+    // Fresh completion groups name actual input origins, never tensor contents.
+    native_work_bound::add_native_work_ceiling(&mut ceiling, [0, 3 * n, 0, 0, 0, 0, 0, 0, 528])?;
+    for _ in directory
+        .iter()
+        .filter(|range| matches!(range.role, 1 | 4..=13))
+    {
+        actor_work_hash(&mut ceiling, 64)?;
+        actor_work_hash(&mut ceiling, 80)?;
+        native_work_bound::add_native_work_ceiling(&mut ceiling, [0, 0, 0, 0, 0, 0, 0, 0, 144])?;
     }
-    actor_work_hash(&mut ceiling, size_of::<PublicationBank>() as u64)?;
-    actor_work_hash(&mut ceiling, size_of::<PublicationHeader>() as u64)?;
-    actor_work_hash(&mut ceiling, (32 * size_of::<SourceSlot>()) as u64)?;
-    actor_work_hash(
+    native_work_bound::add_native_work_ceiling(
         &mut ceiling,
-        (COMPONENT_COUNT * size_of::<SemanticTransitionReceipt>()) as u64,
+        native_work_bound::publication_record_identity_native_work_ceiling(size_of::<
+            CompletionCoverage,
+        >() as u64)?,
     )?;
-    // The numerical and logical domains include their terminal NUL, as in the
-    // actual native producer. The codebook can be hashed by action fallback and
-    // logical publication; retain both original occurrences.
-    actor_work_hash(
-        &mut ceiling,
-        b"xlog.semantic.model-numerics.v1\0".len() as u64,
-    )?;
-    actor_work_hash(&mut ceiling, 80)?;
-    for _ in 0..2 {
-        let prefix = b"xlog.semantic.logical-codebooks.v1\0".len() as u64 + 32 + 8;
-        actor_work_hash(
-            &mut ceiling,
-            actor_work_add(prefix, range(48)?.length_bytes)?,
-        )?;
-        native_work_bound::add_native_work_ceiling(&mut ceiling, [0, 0, 0, 0, 0, 0, 0, 0, prefix])?;
-    }
+    // The original initializer derives a branch origin from compact coordinates.
+    actor_work_hash(&mut ceiling, 212)?;
+    native_work_bound::add_native_work_ceiling(&mut ceiling, [0, 0, 0, 0, 0, 0, 0, 0, 388])?;
     actor_work_hash(&mut ceiling, contract.model_contract_layout.schema_bytes)?;
-    let model_identity_bytes = b"xlog.semantic.model-identity.v1\0".len() as u64 + 32 + 8 + 32;
+    let model_identity_bytes = b"xlog.semantic.model-identity.v2\0".len() as u64 + 32 + 8 + 32;
     actor_work_hash(&mut ceiling, model_identity_bytes)?;
     native_work_bound::add_native_work_ceiling(
         &mut ceiling,
-        [
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            model_identity_bytes + 8 + 32 + 8 + 32 + 32 + 80,
-        ],
+        [0, 0, 0, 0, 0, 0, 0, 0, model_identity_bytes + 8 + 72],
     )?;
     // Partitioned payload SHA padding adds at most one extra block per intent
     // above a single full-payload hash. Identity and chain hashes are distinct.
@@ -2024,7 +1969,6 @@ impl SemanticTransitionSession {
                 original_origin: proof.inner.member.origin,
                 acquired_generation: 0,
                 model_geometry_digest: Identity256::default(),
-                model_numerical_digest: Identity256::default(),
                 role: u64::from(proof.is_demonstration()),
                 demonstrated_lane: proof
                     .inner

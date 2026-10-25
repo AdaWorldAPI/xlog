@@ -5,8 +5,8 @@ use super::*;
 impl SemanticTransitionSession {
     /// Return the complete structural contract of this actual acquired parent.
     ///
-    /// Only the finalizer's four fields are projected from the acquired header.
-    /// The original directory seal must authenticate every returned byte. This
+    /// The finalizer projects structural schema, generation and origin identity
+    /// from the acquired header. This
     /// performs no device read and grants neither numerical nor import access.
     pub fn published_model_contract_metadata(
         &self,
@@ -58,18 +58,14 @@ impl SemanticTransitionSession {
         let schema_digest: [u8; 32] = Sha256::digest(&bytes[schema_begin..schema_end]).into();
         let generation = header.model_generation.to_le_bytes();
         let mut identity = Sha256::new();
-        identity.update(b"xlog.semantic.model-identity.v1\0");
+        identity.update(b"xlog.semantic.model-identity.v2\0");
         identity.update(schema_digest);
         identity.update(generation);
-        identity.update(header.model_numerical_digest.as_bytes());
+        identity.update(header.original_instance.as_bytes());
         let identity: [u8; 32] = identity.finalize().into();
         for (offset, value) in [
             (layout.schema_digest_offset, schema_digest.as_slice()),
             (layout.generation_offset, generation.as_slice()),
-            (
-                layout.numerical_digest_offset,
-                header.model_numerical_digest.as_bytes().as_slice(),
-            ),
             (layout.identity_offset, identity.as_slice()),
         ] {
             let begin = offset as usize;
@@ -80,9 +76,6 @@ impl SemanticTransitionSession {
             capacity: allocation.len(),
             bytes,
         };
-        if record.original_record_digest() != range.digest {
-            return Err(SemanticTransitionError::ObservationMismatch);
-        }
         Ok((record.bytes, layout))
     }
 }

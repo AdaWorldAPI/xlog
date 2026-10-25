@@ -94,7 +94,6 @@ impl SemanticTransitionSession {
                 instance: header.instance,
                 word: header.publication_word,
                 logical_digest: header.logical_digest,
-                state_digest: header.state_digest,
             },
             digest,
         )
@@ -111,7 +110,6 @@ impl SemanticTransitionSession {
             instance: header.instance,
             word: header.publication_word,
             logical_digest: header.logical_digest,
-            state_digest: header.state_digest,
         };
         let digest = Identity256::from_bytes(Sha256::digest(bytes).into());
         self.require_checkpoint_source_digest(parent, source, digest)
@@ -187,7 +185,6 @@ impl SemanticTransitionSession {
                     instance: original.material.bank.header.instance,
                     word: original.material.bank.header.publication_word,
                     logical_digest: original.material.bank.header.logical_digest,
-                    state_digest: original.material.bank.header.state_digest,
                 })
         {
             return Err(SemanticTransitionError::ObservationMismatch);
@@ -1640,7 +1637,8 @@ impl SemanticTransitionSession {
                         || control.word != 0
                         || header.model_geometry_digest != bank.header.model_geometry_digest
                         || (operation == 4
-                            && header.model_numerical_digest != bank.header.model_numerical_digest)
+                            && (header.original_instance != bank.header.original_instance
+                                || header.logical_digest != bank.header.logical_digest))
                     {
                         return Err(SemanticTransitionError::ObservationMismatch);
                     }
@@ -1651,12 +1649,10 @@ impl SemanticTransitionSession {
                         instance: header.instance,
                         word: header.publication_word,
                         logical_digest: header.logical_digest,
-                        state_digest: header.state_digest,
                     });
                     if !original.transitioned
                         && original.result.is_some_and(|restored| {
                             restored.logical_digest != original.header.logical_digest
-                                || restored.state_digest != original.header.state_digest
                         })
                     {
                         return Err(SemanticTransitionError::ObservationMismatch);
@@ -1733,8 +1729,7 @@ impl SemanticTransitionSession {
                         .result
                         .ok_or(SemanticTransitionError::ObservationMismatch)?;
                     if !original.transitioned
-                        && (restored.logical_digest != original.header.logical_digest
-                            || restored.state_digest != original.header.state_digest)
+                        && (restored.logical_digest != original.header.logical_digest)
                     {
                         return Err(SemanticTransitionError::ObservationMismatch);
                     }

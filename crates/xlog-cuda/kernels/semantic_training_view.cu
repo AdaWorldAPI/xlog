@@ -16,17 +16,14 @@ struct SemanticTrainingViewOriginRecord {
     uint64_t predecessor_instance[4];
     uint64_t predecessor_word;
     uint64_t predecessor_logical[4];
-    uint64_t predecessor_state[4];
     uint64_t successor_instance[4];
     uint64_t successor_word;
     uint64_t successor_logical[4];
-    uint64_t successor_state[4];
     uint64_t model_generation;
     uint64_t stream_serial;
     uint64_t family_id;
     uint64_t proposal;
     uint64_t model_geometry_digest[4];
-    uint64_t model_numerical_digest[4];
 };
 
 struct TrainingViewRowDescriptor {
@@ -106,7 +103,6 @@ struct SemanticTrainingReplayAppendEntry {
 
 struct TrainingPublicationRange {
     uint64_t role,index,storage_slot,generation,offset_bytes,length_bytes,logical_begin,logical_end;
-    uint64_t digest[4],backing_digest[4];
 };
 
 struct TrainingPublicationStorageEntry { uint64_t pointer,bytes,generation; };
@@ -292,11 +288,8 @@ __device__ bool semantic_training_origin_matches(const SemanticTrainingViewOrigi
     }
     for (uint32_t i = 0; i < 4; ++i) {
         if (historical.predecessor_logical[i] != fresh.predecessor_logical[i] ||
-            historical.predecessor_state[i] != fresh.predecessor_state[i] ||
             historical.successor_logical[i] != fresh.successor_logical[i] ||
-            historical.successor_state[i] != fresh.successor_state[i] ||
-            historical.model_geometry_digest[i] != fresh.model_geometry_digest[i] ||
-            historical.model_numerical_digest[i] != fresh.model_numerical_digest[i]) {
+            historical.model_geometry_digest[i] != fresh.model_geometry_digest[i]) {
             return false;
         }
     }

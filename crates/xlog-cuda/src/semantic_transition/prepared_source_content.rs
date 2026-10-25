@@ -2992,7 +2992,7 @@ impl SemanticTransitionSession {
             || !Arc::ptr_eq(identity.allowance(), &original.allowance)
             || self.has_pending_state_restoration_except(None, None)
             || self.resident_model_activation.is_some()
-            || self.replay_verification_pending.load(Ordering::Acquire)
+            || self.replay_join_pending.load(Ordering::Acquire)
             || self.has_pending_cold_model_work_completion(None)
             || self
                 .readers
@@ -3592,8 +3592,7 @@ impl SemanticTransitionSession {
         let result = SemanticPreparedSourceContentPorts {
             model_context: SemanticModelContext {
                 parent: lease.identity,
-                descriptor_digest: header.descriptor_digest,
-                numerical_state: (header.model_geometry_digest, header.model_numerical_digest),
+                model_geometry_digest: header.model_geometry_digest,
                 semantic_root: (
                     header.semantic_owner,
                     header.semantic_slot,

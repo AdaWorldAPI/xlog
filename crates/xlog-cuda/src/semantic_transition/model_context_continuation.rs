@@ -44,7 +44,6 @@ pub(super) struct PreparedModelContextContinuationDevice {
     source_instance: Identity256,
     target_instance: Identity256,
     model_geometry_digest: Identity256,
-    model_numerical_digest: Identity256,
     acquired_generation: u64,
     source_word: u64,
     target_word: u64,
@@ -80,8 +79,6 @@ struct OriginalModelContextContinuation {
     activation_rng: Option<SemanticRngBinding>,
     native_work: Option<DeviceMemoryView<u64>>,
     native_claimed: bool,
-    prefix_guard: Option<OriginalNativeCommand>,
-    prefix_guard_stream: Option<u64>,
     source_work_attached: bool,
     checkpoint_restore: Option<Arc<Mutex<restoration::OriginalDormantContextRestore>>>,
     source_alias: Option<OriginalModelContextSourceAlias>,
@@ -544,7 +541,6 @@ impl ModelContextContinuationOwner {
             source_instance: self.source_publication.instance,
             target_instance: storage.instance,
             model_geometry_digest: self.source_header.model_geometry_digest,
-            model_numerical_digest: self.source_header.model_numerical_digest,
             ..PreparedModelContextContinuationDevice::default()
         };
         let proof = allocate_publication(&target.provider, 1)?;
@@ -645,10 +641,6 @@ impl SemanticTransitionSession {
             .map_err(|_| SemanticTransitionError::Poisoned)?;
         let pending = original.command.completion_pending()
             || original
-                .prefix_guard
-                .as_ref()
-                .is_some_and(OriginalNativeCommand::completion_pending)
-            || original
                 .source_alias
                 .as_ref()
                 .is_some_and(|alias| alias.command.completion_pending())
@@ -685,10 +677,6 @@ impl SemanticTransitionSession {
                 .token_write
                 .as_ref()
                 .is_some_and(state_restoration::OriginalDeviceWrite::completion_pending)
-                || stage
-                    .input_guard
-                    .as_ref()
-                    .is_some_and(OriginalNativeCommand::completion_pending)
             {
                 return Ok(true);
             }
@@ -911,7 +899,6 @@ impl SemanticTransitionSession {
         if header.model_generation != source.model_generation
             || header.neural_generation != source.neural_generation
             || header.model_geometry_digest != source.model_geometry_digest
-            || header.model_numerical_digest != source.model_numerical_digest
         {
             return Err(SemanticTransitionError::ObservationMismatch);
         }
@@ -1141,82 +1128,27 @@ impl SemanticTransitionSession {
         Ok([(vec![32], vec![1], (1, 8)), (shape, strides, (1, 64))])
     }
 
-    /// Guard the selected original prefix once, then export only its two
-    /// actual native views. The original report remains open for their reads.
+    /// Export the selected original prefix and its extent from the retained
+    /// native publication. The original report remains open for their reads.
     pub fn model_context_activation_prefix_views(
         &mut self,
         continuation: &SemanticModelContextContinuation,
         parent: &SemanticPublishedLease,
         consumer_stream: u64,
-    ) -> Result<(DlpackManagedTensor, DlpackManagedTensor, Identity256), SemanticTransitionError>
-    {
+    ) -> Result<(DlpackManagedTensor, DlpackManagedTensor), SemanticTransitionError> {
         self.require_activated_model_context_parent(continuation, parent)?;
         self.model_context_activation_prefix_geometry(continuation)?;
         dlpack_consumer_stream(consumer_stream)?;
         let owner = &continuation.inner;
-        let mut original = owner
+        let original = owner
             .original
             .lock()
             .map_err(|_| SemanticTransitionError::Poisoned)?;
-        if original
-            .prefix_guard_stream
-            .is_some_and(|stream| stream != consumer_stream)
-        {
-            return Err(publication_input_error(
-                "activation prefix cannot replace its original guarded consumer stream",
-            ));
-        }
         let work = original
             .activation_work
             .as_ref()
             .ok_or(SemanticTransitionError::NotBound)?;
         self.model_context_activation_native_work(continuation, work)?;
-        if original.prefix_guard.is_none() {
-            original.prefix_guard = Some(OriginalNativeCommand::new(&self.domain)?);
-            original.prefix_guard_stream = Some(consumer_stream);
-        }
-        let storage = self
-            .publication
-            .as_ref()
-            .ok_or(SemanticTransitionError::NotBound)?;
-        let execute = self
-            .provider
-            .device()
-            .inner()
-            .get_func(
-                "xlog_semantic_transition",
-                "semantic_publication_content_guard",
-            )
-            .ok_or_else(|| {
-                runtime_error("kernel lookup", "publication prefix guard unavailable")
-            })?;
-        let reader = self
-            .readers
-            .get(&parent.token)
-            .ok_or(SemanticTransitionError::NotBound)?
-            .device
-            .view();
-        let native_work = original
-            .native_work
-            .as_ref()
-            .ok_or(SemanticTransitionError::NotBound)?
-            .clone();
-        let OriginalModelContextContinuation {
-            prefix_guard,
-            poisoned,
-            ..
-        } = &mut *original;
-        storage.enqueue_content_guard(
-            &self.domain,
-            poisoned,
-            reader,
-            &execute,
-            SemanticStateRole::PrefixIdentity as u64,
-            0,
-            SemanticTensorLayout::default(),
-            Some(&native_work),
-            prefix_guard.as_mut(),
-        )?;
         drop(original);
         let prefix = self.published_record(
             parent,
@@ -1229,7 +1161,7 @@ impl SemanticTransitionSession {
             PublicationBankField::PrefixExtent,
             consumer_stream,
         )?;
-        Ok((prefix, extent, parent.header.descriptor_digest))
+        Ok((prefix, extent))
     }
 
     pub fn finish_model_context_activation_callback(
@@ -1540,7 +1472,6 @@ impl SemanticTransitionSession {
             instance: header.instance,
             word: header.publication_word,
             logical_digest: header.logical_digest,
-            state_digest: header.state_digest,
         };
         let mut original = owner
             .original
@@ -2266,8 +2197,6 @@ impl SemanticTransitionSession {
                 activation_rng: None,
                 native_work: None,
                 native_claimed: false,
-                prefix_guard: None,
-                prefix_guard_stream: None,
                 source_work_attached: false,
                 checkpoint_restore: None,
                 source_alias: None,

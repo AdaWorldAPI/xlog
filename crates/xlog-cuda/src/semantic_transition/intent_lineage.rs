@@ -204,8 +204,7 @@ pub(super) fn contributor_indices<B: PublicationByteStorage>(
         let index = proposals
             .iter()
             .position(|(replay, _, _)| {
-                replay.predecessor_identity().word == record.base_word
-                    && replay.predecessor_identity().logical_digest == record.origin_logical_digest
+                replay.predecessor_identity().logical_digest == record.origin_logical_digest
                     && replay.successor_identity().logical_digest == record.successor_logical_digest
             })
             .ok_or_else(|| {
@@ -231,7 +230,11 @@ pub(super) fn contributor_indices<B: PublicationByteStorage>(
             || record.ordinal != (state.task_evaluation.winner - 1) * 68 + record.source_slot
             || receipt.choice as u64 != slot.token
             || record.authority_generation != replay.predecessor.bank.header.authority_generation
-            || record.authority_closure_digest != closure.range.digest
+            || record.authority_closure_origin
+                != publication_range_origin(
+                    replay.predecessor.bank.header.logical_digest,
+                    &closure.range,
+                )
             || record.record_digest == Identity256::default()
             || record.action_receipt_digest
                 != Identity256::from_bytes(

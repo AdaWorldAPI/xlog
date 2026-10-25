@@ -1137,7 +1137,7 @@ fn assignment_material(
     assignments: &[&MainActorAssignment],
 ) -> Vec<u8> {
     let mut bytes = b"XLOG-ACTOR-REFRESH-ASSIGNMENTS\0".to_vec();
-    material_u64(&mut bytes, 5);
+    material_u64(&mut bytes, 6);
     bytes.extend_from_slice(program.as_bytes());
     bytes.extend_from_slice(initial_index.as_bytes());
     material_u64(&mut bytes, u64::from(rng.is_some()));
@@ -1165,7 +1165,6 @@ fn assignment_material(
         }
         bytes.extend_from_slice(claim.parent.instance.as_bytes());
         bytes.extend_from_slice(claim.parent.logical_digest.as_bytes());
-        bytes.extend_from_slice(claim.parent.state_digest.as_bytes());
         bytes.extend_from_slice(claim.instruction_identity.as_bytes());
         material_u64(&mut bytes, claim.instruction.len() as u64);
         bytes.extend_from_slice(&claim.instruction);
@@ -1220,7 +1219,7 @@ fn assignment_material_allocation_bound(
         add(3 * 8)?;
     }
     for claim in &program.admissions {
-        add(7 * 8 + 4 * 32 + 8 + 32 + 8 + 8 + 8)?;
+        add(7 * 8 + 3 * 32 + 8 + 32 + 8 + 8 + 8)?;
         add(u64::try_from(claim.instruction.len())
             .map_err(|_| SemanticTransitionError::GenerationExhausted)?)?;
         if claim.checkpoint_source.is_some() {
@@ -1323,7 +1322,7 @@ fn decode_assignment_material(
     let magic = b"XLOG-ACTOR-REFRESH-ASSIGNMENTS\0";
     let semantic = SemanticTransitionError::Semantic;
     if reader.take(magic.len()).map_err(semantic)? != magic
-        || reader.u64().map_err(semantic)? != 5
+        || reader.u64().map_err(semantic)? != 6
         || reader.take(32).map_err(semantic)? != program.identity.as_bytes()
         || reader.take(32).map_err(semantic)? != initial_index.as_bytes()
     {
@@ -1387,13 +1386,6 @@ fn decode_assignment_material(
                 .map_err(|_| invalid_program())?,
         );
         let logical_digest = Identity256::from_bytes(
-            reader
-                .take(32)
-                .map_err(semantic)?
-                .try_into()
-                .map_err(|_| invalid_program())?,
-        );
-        let state_digest = Identity256::from_bytes(
             reader
                 .take(32)
                 .map_err(semantic)?
@@ -1495,7 +1487,6 @@ fn decode_assignment_material(
                 instance,
                 word,
                 logical_digest,
-                state_digest,
             },
             parent_token,
             state,
@@ -1759,7 +1750,6 @@ impl SemanticTransitionSession {
             instance: header.instance,
             word: header.publication_word,
             logical_digest: header.logical_digest,
-            state_digest: header.state_digest,
         };
         let program = self
             .actor_refresh_program

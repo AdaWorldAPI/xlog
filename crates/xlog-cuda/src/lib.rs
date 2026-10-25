@@ -105,7 +105,7 @@ pub use semantic_transition::{
     SemanticReplayAppendRows, SemanticReplayDecisionBytes, SemanticReplayLoadedMaterial,
     SemanticReplayMaterial, SemanticReplayMaterialBudget, SemanticReplayMaterialOutput,
     SemanticReplayMaterialReservation, SemanticReplayMaterialScratch, SemanticReplayModelBackings,
-    SemanticReplayPublicationVerification, SemanticReplayStateMaterialAdmission,
+    SemanticReplayPublicationJoin, SemanticReplayStateMaterialAdmission,
     SemanticReplayStateMaterialProof, SemanticReplayTrainingViewRow, SemanticResidentModelMemory,
     SemanticResolvedReplayMaterial, SemanticRngBinding, SemanticSegmentColdCapacity,
     SemanticSegmentTerminalWait, SemanticSourceMapping, SemanticStateRecord, SemanticStateRole,
@@ -115,8 +115,8 @@ pub use semantic_transition::{
     SemanticTaskObjectiveLaw, SemanticTaskObservation, SemanticTaskObservationRoots,
     SemanticTaskObservationRootsOwner, SemanticTaskPriorityGoal, SemanticTaskPriorityLevel,
     SemanticTaskProgram, SemanticTaskReceiptFamily, SemanticTaskRefusal, SemanticTaskRelease,
-    SemanticTaskScoring, SemanticTaskVerificationBinding, SemanticTensorOwner,
-    SemanticTensorInput, SemanticTensorLayout, SemanticTextRow, SemanticTextSlot,
+    SemanticTaskScoring, SemanticTaskVerificationBinding, SemanticTensorInput,
+    SemanticTensorLayout, SemanticTensorOwner, SemanticTextRow, SemanticTextSlot,
     SemanticTokenProvenance, SemanticTransitionError, SemanticTransitionHostIoStats,
     SemanticTransitionKind, SemanticTransitionLane, SemanticTransitionObservation,
     SemanticTransitionOutcome, SemanticTransitionReceipt, SemanticTransitionRefusal,
@@ -145,8 +145,8 @@ pub use semantic_transition::{
 #[cfg(feature = "semantic-policy")]
 pub use semantic_transition::{
     SemanticCancelledEvaluationCapture, SemanticCancelledModelEvaluation,
-    SemanticCompletedModelEvaluation, SemanticEvaluationCohort,
-    SemanticModelEvaluation, SemanticModelEvaluationResult,
+    SemanticCompletedModelEvaluation, SemanticEvaluationCohort, SemanticModelEvaluation,
+    SemanticModelEvaluationResult,
 };
 #[cfg(feature = "semantic-policy")]
 pub use semantic_transition::{
