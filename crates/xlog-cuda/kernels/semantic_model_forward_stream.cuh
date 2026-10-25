@@ -51,7 +51,7 @@ struct ModelCanaryStreamInputs {
     uint64_t baseline_leaf_scratch,candidate_leaf_scratch,leaf_capacity,position_scratch;
 };
 static_assert(sizeof(ModelForwardStreamState)==296,"model forward stream state ABI");
-static_assert(sizeof(ModelForwardStreamInputs)==176,"model forward stream inputs ABI");
+static_assert(sizeof(ModelForwardStreamInputs)==160,"model forward stream inputs ABI");
 static_assert(sizeof(ModelStreamLeaf)==128,"model stream leaf ABI");
 static_assert(sizeof(ModelCanaryStreamRow)==192,"model canary stream row ABI");
 static_assert(sizeof(ModelCanaryStreamState)==1160,"model canary stream state ABI");
