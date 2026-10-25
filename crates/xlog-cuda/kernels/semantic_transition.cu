@@ -6118,13 +6118,14 @@ __device__ uint64_t publication_acknowledge(const Descriptor& descriptor,Publica
     return status;
 }
 __device__ uint64_t publication_materialize_training(PublicationControl& control,
-        const TrainingOriginalMaterializationInput& input) {
+        const TrainingOriginalMaterializationInput& input,semantic_graph::NativeWorkTally* work) {
     if(!input.lease || !control.contract || !publication_compare_exchange(control.reader_gate,0,1))return 2;
+    semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::CanonicalByte,8);
     uint64_t status=1;
     do {
         const auto& lease=*reinterpret_cast<const PublicationLease*>(input.lease);
         const uint64_t word=publication_load(control.word);
-        const auto* base=publication_acquired_bank(control,lease);
+        const auto* base=publication_acquired_bank(control,lease,work);
         const auto& contract=*reinterpret_cast<const PublicationContract*>(control.contract);
         if(!base || word!=lease.word || base->header.terminal!=0 ||
            control.reader_counts[word&1]!=1 || control.reader_counts[(word&1)^1] ||
@@ -6132,11 +6133,11 @@ __device__ uint64_t publication_materialize_training(PublicationControl& control
            contract.replay_original_slot_boundary>contract.replay_row_capacity ||
            !input.original_count || input.original_count>contract.replay_original_slot_boundary ||
            !(input.original_prefix_identity[0]|input.original_prefix_identity[1]|input.original_prefix_identity[2]|input.original_prefix_identity[3]) ||
-           publication_validate_selected_model(control,*base))break;
+           publication_validate_selected_model(control,*base,work))break;
         const auto* old=reinterpret_cast<const PublicationRange*>(control.directories[word&1]);
         auto* next_ranges=reinterpret_cast<PublicationRange*>(control.directories[(word&1)^1]);
-        const auto* old_entries=publication_find_range(old,base->header.range_count,56);
-        const auto* target=publication_find_range(next_ranges,base->header.range_count,56);
+        const auto* old_entries=publication_find_range(old,base->header.range_count,56,0,work);
+        const auto* target=publication_find_range(next_ranges,base->header.range_count,56,0,work);
         if(!old_entries || !target || old_entries->length_bytes!=sizeof(SemanticTrainingReplayAppendHeader) ||
            target->storage_slot==old_entries->storage_slot || target->storage_slot>=control.storage_count)break;
         const auto* bytes=publication_range_bytes(control,*old_entries);
@@ -6149,6 +6150,7 @@ __device__ uint64_t publication_materialize_training(PublicationControl& control
            (original.chain_head[0]|original.chain_head[1]|original.chain_head[2]|original.chain_head[3]))break;
         uint64_t total=0;bool valid=true;
         for(uint32_t i=0;i<7;++i) {
+            semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::TableSlot,1);
             if(input.lengths[i]>UINT64_MAX-total ||
                (input.lengths[i] && !publication_pointer_span(input.destinations[i],input.lengths[i],8))) {valid=false;break;}
             total+=input.lengths[i];
@@ -6165,38 +6167,48 @@ __device__ uint64_t publication_materialize_training(PublicationControl& control
         if(objective.row_count!=input.original_count || objective.group_count!=8 || objective.canary_count!=5 ||
            !objective.capacity || objective.capacity>UINT64_MAX/8 ||
            (input.lengths[6] && input.lengths[6]!=objective.capacity*8) ||
-           !publication_identity_equal(objective.task_identity,contract.task_identity))break;
+           !publication_identity_equal(objective.task_identity,contract.task_identity,work))break;
         const PublicationRange target_template=*target;
+        semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::CanonicalByte,sizeof(PublicationRange));
         valid=true;
         for(uint64_t i=0;i<base->header.range_count;++i) {
+            semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::TableSlot,1);
             const uint64_t role=old[i].role;
             if(!publication_mutable_role(role) || role==56 || role==1 || role==2 || role==31 || (role>=18 && role<=25)) {
                 next_ranges[i]=old[i];
-            } else if(publication_preserve_range(control,old,base->header.range_count,old[i],next_ranges[i])) {
+                semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::CanonicalByte,sizeof(PublicationRange));
+            } else if(publication_preserve_range(control,old,base->header.range_count,old[i],next_ranges[i],work)) {
                 valid=false;break;
             }
         }
         if(!valid)break;
-        auto* next_entries=const_cast<PublicationRange*>(publication_find_range(next_ranges,base->header.range_count,56));
+        auto* next_entries=const_cast<PublicationRange*>(publication_find_range(next_ranges,base->header.range_count,56,0,work));
         next_entries->storage_slot=target_template.storage_slot;
         next_entries->generation=target_template.generation;
+        semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::CanonicalByte,2*sizeof(uint64_t));
         auto* next_bytes=publication_range_bytes(control,*next_entries);
         if(!next_bytes)break;
         uint64_t offset=0;
         for(uint32_t i=0;i<7;++i) {
-            if(input.lengths[i])publication_copy_bytes(reinterpret_cast<uint8_t*>(input.destinations[i]),source+offset,input.lengths[i]);
+            semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::TableSlot,1);
+            if(input.lengths[i])publication_copy_bytes(reinterpret_cast<uint8_t*>(input.destinations[i]),source+offset,input.lengths[i],work);
             offset+=input.lengths[i];
         }
         auto sealed=original;
         sealed.original_stage=1;sealed.original_count=input.original_count;
-        semantic_graph::copy_identity(sealed.original_prefix_identity,input.original_prefix_identity);
+        semantic_graph::copy_identity(sealed.original_prefix_identity,input.original_prefix_identity,work);
+        semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::CanonicalByte,
+            2*sizeof(SemanticTrainingReplayAppendHeader)+2*sizeof(uint64_t));
         *reinterpret_cast<SemanticTrainingReplayAppendHeader*>(next_bytes)=sealed;
         auto& next=*publication_bank(control,word^1);next=*base;
+        semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::CanonicalByte,sizeof(PublicationBank)+3*sizeof(uint64_t));
         next.header.sealed_epoch=(word>>1)+1;next.header.base_word=word;
         next.header.publication_word=(next.header.sealed_epoch<<1)|((word&1)^1);
-        publication_derive_origin(next,base->header,PublicationOriginKind::TrainingMaterialization);
+        publication_derive_origin(next,base->header,PublicationOriginKind::TrainingMaterialization,work);
+        semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::CanonicalByte,8);
         status=publication_compare_exchange(control.word,word,next.header.publication_word) ? 0 : 3;
     } while(false);
+    semantic_graph::charge_native(work,semantic_graph::NativeWorkEvent::CanonicalByte,8);
     publication_store(control.reader_gate,0);
     return status;
 }
@@ -6650,7 +6662,7 @@ __device__ void publication_command(const Descriptor& descriptor) {
         status=publication_acknowledge(descriptor,control,input.delivery,&input);
     } else if(descriptor.publication.operation==9 && descriptor.publication.lease) {
         status=publication_materialize_training(control,
-            *reinterpret_cast<const TrainingOriginalMaterializationInput*>(descriptor.publication.lease));
+            *reinterpret_cast<const TrainingOriginalMaterializationInput*>(descriptor.publication.lease),work);
     } else if(descriptor.publication.lease) {
         auto& lease=*reinterpret_cast<PublicationLease*>(descriptor.publication.lease);
         if(descriptor.publication.operation==2)status=publication_acquire(control,lease,0,UINT64_MAX,work);

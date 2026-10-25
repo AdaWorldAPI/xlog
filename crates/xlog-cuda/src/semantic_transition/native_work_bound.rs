@@ -1,3 +1,9 @@
+pub(super) use super::native_work_report::{
+    add_native_work_ceiling, ceiling_product, ceiling_sum, native_work_ceiling_overflow,
+    native_work_ceiling_units, publication_hash_ceiling,
+    selected_model_origin_geometry_native_work_ceiling, selected_model_origin_native_work_ceiling,
+};
+
 use super::*;
 
 impl OriginalNativeCommand {
@@ -1403,38 +1409,12 @@ impl ColdNativeAllowance {
         bytes: usize,
         recorded: &mut bool,
     ) -> Result<(), SemanticTransitionError> {
-        if *recorded {
-            return Ok(());
-        }
-        let mut reached = self.submitted_dma;
-        add_native_work_ceiling(
-            &mut reached,
-            [
-                1,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                u64::try_from(bytes).map_err(|_| native_work_ceiling_overflow())?,
-            ],
-        )?;
-        // A finite-entitlement failure cannot erase a command already submitted
-        // to the driver. Retain its reached evidence before refusing completion.
-        self.submitted_dma = reached;
-        *recorded = true;
-        if reached
-            .iter()
-            .zip(self.submitted_dma_ceiling)
-            .any(|(actual, upper)| *actual > upper)
-        {
-            return Err(publication_input_error(
-                "submitted native DMA exceeded its original finite entitlement",
-            ));
-        }
-        Ok(())
+        native_work_report::record_submitted_native_dma(
+            &mut self.submitted_dma,
+            self.submitted_dma_ceiling,
+            bytes,
+            recorded,
+        )
     }
 
     /// Merge only after the original operation's joins. DMA occurrences have
@@ -1655,89 +1635,6 @@ pub(super) struct OriginalStepInputPreparation {
     pub(super) command: OriginalNativeCommand,
     pub(super) allowance: Option<std::sync::Weak<Mutex<ColdNativeAllowance>>>,
     pub(super) native_work: Option<DeviceMemoryView<u64>>,
-}
-
-/// The actual publication ModelContract guard authenticates its original bank,
-/// every directory seal, the schema/identity, and the selected model seal fold.
-/// Its outer guard hashes the raw contract a second time; private retained
-/// contract verifications are separate content occurrences.
-pub(super) fn selected_model_origin_native_work_ceiling(
-    storage: &PublicationStorage,
-    directory: &[PublicationRange],
-) -> Result<[u64; 9], SemanticTransitionError> {
-    selected_model_origin_geometry_native_work_ceiling(&storage.contract_value, directory)
-}
-
-pub(super) fn selected_model_origin_geometry_native_work_ceiling(
-    contract: &PublicationContract,
-    directory: &[PublicationRange],
-) -> Result<[u64; 9], SemanticTransitionError> {
-    if !directory
-        .iter()
-        .any(|range| range.role == 44 && range.index == 0)
-    {
-        return Err(SemanticTransitionError::ObservationMismatch);
-    }
-    let mut result = [
-        0,
-        ceiling_sum([directory.len() as u64, 4 + 72])?,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        112,
-    ];
-    add_native_work_ceiling(
-        &mut result,
-        publication_hash_ceiling(contract.model_contract_layout.schema_bytes)?,
-    )?;
-    add_native_work_ceiling(
-        &mut result,
-        publication_hash_ceiling(b"xlog.semantic.model-identity.v2\0".len() as u64 + 32 + 8 + 32)?,
-    )?;
-    native_work_ceiling_units(result)?;
-    Ok(result)
-}
-
-/// Add producer ceilings in the native tally's fixed event order.
-pub(super) fn add_native_work_ceiling(
-    destination: &mut [u64; 9],
-    addition: [u64; 9],
-) -> Result<(), SemanticTransitionError> {
-    let mut combined = *destination;
-    for (total, value) in combined.iter_mut().zip(addition) {
-        *total = total
-            .checked_add(value)
-            .ok_or_else(native_work_ceiling_overflow)?;
-    }
-    *destination = combined;
-    Ok(())
-}
-
-/// Native events have unit tariffs, as checked by `ExecutionWork::validate_model`.
-pub(super) fn native_work_ceiling_units(ceiling: [u64; 9]) -> Result<u64, SemanticTransitionError> {
-    ceiling.into_iter().try_fold(0u64, |total, value| {
-        total
-            .checked_add(value)
-            .ok_or_else(native_work_ceiling_overflow)
-    })
-}
-
-fn native_work_ceiling_overflow() -> SemanticTransitionError {
-    publication_input_error("native producer work ceiling overflowed")
-}
-
-fn ceiling_sum(values: impl IntoIterator<Item = u64>) -> Result<u64, SemanticTransitionError> {
-    values.into_iter().try_fold(0u64, |sum, value| {
-        sum.checked_add(value)
-            .ok_or_else(native_work_ceiling_overflow)
-    })
-}
-
-fn ceiling_product(a: u64, b: u64) -> Result<u64, SemanticTransitionError> {
-    a.checked_mul(b).ok_or_else(native_work_ceiling_overflow)
 }
 
 /// Finite producer geometry of the original native model-context seal. The
@@ -2180,14 +2077,6 @@ pub(super) fn group_critic_native_work_ceiling(
     let ceiling = [0, ceiling_sum([members, 8])?, 0, 0, 0, 0, 0, 0, 0];
     native_work_ceiling_units(ceiling)?;
     Ok(ceiling)
-}
-
-pub(super) fn publication_hash_ceiling(bytes: u64) -> Result<[u64; 9], SemanticTransitionError> {
-    if bytes > u64::MAX / 8 {
-        return Err(native_work_ceiling_overflow());
-    }
-    let blocks = ceiling_sum([bytes, 9 + 63])? / 64;
-    Ok([0, 0, 0, 0, 0, 0, 0, blocks, 32])
 }
 
 fn text_binding_validation_native_work_ceiling() -> Result<[u64; 9], SemanticTransitionError> {

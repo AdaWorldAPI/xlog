@@ -1803,15 +1803,26 @@ impl<T: DeviceRepr + Send + Sync> OriginalTypedWrite for TypedOriginalWrite<T> {
         let mut recorder = domain.new_strict_recorder();
         recorder.write(&self.destination);
         let _ = stream;
-        enqueue_recorded(domain, poisoned, recorder, |enqueue| {
-            self.write.enqueue_admitted(enqueue)
-        })
+        let mut failure = None;
+        let result = enqueue_recorded(domain, poisoned, recorder, |enqueue| {
+            self.write.enqueue_admitted(enqueue).map_err(|error| {
+                failure = Some(error.0);
+                error
+            })
+        });
+        match failure {
+            Some(status) => Err(native_runtime_error(
+                "original device write submission",
+                cudarc::driver::DriverError(status),
+            )),
+            None => result,
+        }
     }
 
     fn resolve(&mut self, stream: &Arc<CudaStream>) -> Result<(), SemanticTransitionError> {
         self.write
             .resolve_on(stream)
-            .map_err(|error| runtime_error("original device write completion", error))
+            .map_err(|error| native_runtime_error("original device write completion", error))
     }
 
     fn retire_without_result(
@@ -1842,6 +1853,10 @@ pub(crate) struct OriginalDeviceWrite {
 }
 
 impl OriginalDeviceWrite {
+    pub(super) fn submitted(&self) -> bool {
+        self.transfer.submitted()
+    }
+
     pub(super) fn dma_bytes(&self) -> usize {
         self.bytes
     }

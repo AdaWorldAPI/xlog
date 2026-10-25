@@ -1473,6 +1473,10 @@ impl SemanticTrainingViewArena {
         add(7, size_of::<DeviceMemoryView<u8>>())?;
         add(
             1,
+            crate::semantic_transition::original_training_materialization_metadata_bytes()?,
+        )?;
+        add(
+            1,
             crate::semantic_transition::state_restoration::OriginalDeviceWrite::metadata_allocation_bytes::<TrainingViewRowDescriptor>()
                 + crate::semantic_transition::state_restoration::OriginalDeviceWrite::metadata_allocation_bytes::<u8>()
                 + crate::semantic_transition::state_restoration::OriginalDeviceWrite::metadata_allocation_bytes::<SemanticTrainingObjectiveRecord>()

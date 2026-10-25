@@ -152,7 +152,7 @@ pub use semantic_transition::{
 pub use semantic_transition::{
     SemanticColdModelWork, SemanticColdModelWorkAdmission, SemanticColdModelWorkDisposition,
     SemanticColdModelWorkOperation, SemanticColdModelWorkPurpose, SemanticColdModelWorkRegion,
-    SemanticColdModelWorkReportCursor, SemanticColdModelWorkResult, SemanticColdNativeWork,
+    SemanticColdModelWorkReportCursor, SemanticColdNativeWork,
     SemanticColdNativeWorkActivationIdentity, SemanticColdNativeWorkActivationPermit,
     SemanticColdResidentRestorationPrelude,
 };
@@ -173,3 +173,5 @@ pub use wcoj_metadata::{
     WcojCycle4HgWorkPlanU64, WcojRelationMetadata, WcojTriangleHgWorkPlanU32,
     WcojTriangleHgWorkPlanU64,
 };
+
+pub use semantic_transition::SemanticColdModelWorkResult;
