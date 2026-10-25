@@ -1,6 +1,6 @@
 ---
 title: "Environment variables"
-description: "Every environment variable the XLOG runtime, build, and probabilistic engines read — tuning knobs, parity kill switches, and build-time controls — plus the bench, test, and example-script variables listed separately at the end."
+description: "Environment controls for XLOG runtime routing, builds, probability engines, and manual diagnostics, with benchmark, test, and example variables listed separately."
 ---
 
 XLOG reads environment variables for tuning, debugging, and parity checking. The
@@ -20,9 +20,13 @@ every row.
 
 Runtime boolean knobs use one strict spelling set:
 `1`/`true`/`yes`/`on` to enable and
-`0`/`false`/`no`/`off` to disable, case-insensitively. An empty or unknown
-value is a typed configuration error. Per-variable parsing is noted where a
-build tool or measurement hook intentionally has a narrower contract.
+`0`/`false`/`no`/`off` to disable, case-insensitively after trimming whitespace. An empty or unknown
+value, including non-Unicode text, is a typed configuration error when read.
+An explicit typed runtime setting overrides its corresponding environment value
+without parsing that value. Numeric selectors and measurement hooks have their
+own rules below. CUDA build flags use the same boolean parser but report malformed
+values as build-script panics; the allocation debug probes also panic on malformed
+configuration.
 
 ## Kernel artifacts and build
 
@@ -33,13 +37,16 @@ you build from source. They are read by the `xlog-cuda` build script
 
 | Variable | Effect | Values / Default |
 |---|---|---|
-| `XLOG_CUBIN_DIR` | Runtime: directory of staged kernel artifacts (`*.sm_NN.cubin`, `*.portable.ptx`), searched before the binary-adjacent `kernels/` directory and the embedded PTX fallback. The `pyxlog` package sets it automatically to its bundled kernels when unset. | path; unset by default |
-| `NVCC_PATH` | Build: explicit path to `nvcc`; falls back to `PATH` lookup. | path |
-| `XLOG_PTXAS_PATH` | Build: override the `ptxas` binary used for cubin assembly; the build panics if the path does not exist. | path; unset by default |
-| `XLOG_NO_CUBIN` | Build: skip cubin generation, produce portable PTX only. | `1` to enable; default off |
-| `XLOG_CUBIN_ARCHS` | Build: comma-separated cubin target architectures. | e.g. `sm_89,sm_120`; default `sm_120` |
-| `XLOG_PTX_MAX_VERSION` | Build: rewrite the `.version` directive of the generated portable PTX down to the named ISA, so wheels run on drivers older than the build toolkit (for example `8.4` for pre-CUDA-13 drivers). No-op when unset. | version string; unset by default |
-| `XLOG_RUSTDOC_NO_CUDA` | Build: skip kernel compilation entirely and emit empty embedded kernel data — docs-only builds without a CUDA toolkit. `DOCS_RS=1` has the same effect. | `1` to enable; default off |
+| `XLOG_CUBIN_DIR` | Runtime: directory of staged kernel artifacts (`*.sm_NN.cubin`, `*.portable.ptx`), searched before binary-adjacent `kernels/` and embedded PTX. Staged artifacts with a known mismatching build hash are skipped. Python selects bundled kernels when this value is missing or empty and the bundled directory exists. | path; unset by default |
+| `NVCC_PATH` | Build: existing path to `nvcc`; a missing path falls through to `nvcc` on `PATH`. Build fails if neither can be used. | path |
+| `XLOG_PTXAS_PATH` | Build: override the `ptxas` binary used for cubin assembly; a non-empty missing path panics. Empty/unreadable text selects no override. | path; unset by default |
+| `XLOG_NO_CUBIN` | Build: skip cubin generation, produce portable PTX only. | strict boolean; default off |
+| `XLOG_CUBIN_ARCHS` | Build: comma-separated cubin targets, trimmed with empty entries removed. An empty value requests no cubin targets. | e.g. `sm_89,sm_120`; default `sm_120` when unset/unreadable |
+| `XLOG_PTX_MAX_VERSION` | Build: replace the portable PTX `.version` directive with the supplied trimmed text. This changes a directive, not the instructions, and does not establish driver compatibility. The helper does not validate a version or compare it to the existing version. | non-empty text; missing/empty/unreadable = no rewrite |
+| `XLOG_RUSTDOC_NO_CUDA` | Build: skip kernel compilation and emit empty embedded kernel data for documentation builds. `DOCS_RS` is an alternative boolean gate. | strict boolean; default off |
+| `XLOG_SEMANTIC_POLICY_HEADER` | Build with `semantic-policy`: read the supplied numerical policy header, verify its digest, and stage those verified bytes for the kernel build. | path; required with that feature |
+| `XLOG_SEMANTIC_POLICY_SHA256` | Expected digest of that header; a missing, malformed, or mismatching digest stops the build. | exactly 64 hexadecimal digits; required with `semantic-policy` |
+| `XLOG_SEMANTIC_POLICY_NAMESPACE` | Select the C++ namespace in the verified policy header. Missing text or a namespace with invalid identifier segments stops the build. | `::`-separated C++ identifier segments; required with `semantic-policy` |
 
 ## Runtime and memory
 
@@ -52,21 +59,23 @@ behind exact probabilistic inference) and exists only in debug builds.
 Eligible ordinary query plans automatically select the resident conditional
 graph, which keeps recursive scan and filter dispatch inside one GPU-side
 control-flow graph. Two diagnostic controls override that default. They are
-mutually exclusive: enabling both stops evaluation with a configuration error.
+mutually exclusive: enabling both produces an `Execution` error; malformed
+boolean text produces `Configuration` instead.
 
 | Variable | Effect | Values / Default |
 |---|---|---|
-| `XLOG_WCOJ_POOL_MB_PER_STREAM` | Device memory pool budget per CUDA stream, in MiB. | positive integer; default `256` |
-| `XLOG_UNION_CHUNK_BYTES` | Byte budget per chunk of the multiway-union fold that merges same-head rule outputs. Bounds peak device memory for many-rule heads to the chunk budget plus the deduplicated accumulator. | positive integer bytes; default `1073741824` (1 GiB) |
+| `XLOG_WCOJ_POOL_MB_PER_STREAM` | Planned device pool budget per CUDA stream, in MiB. Zero, malformed, or unreadable values use the default. Conversion to bytes saturates at `u64::MAX`. | positive `u64`, whitespace trimmed; default `256` |
+| `XLOG_UNION_CHUNK_BYTES` | Target byte budget used to group inputs in a multiway-union fold. It is not a total peak-memory cap: live inputs, accumulator, output, and concat/sort workspaces also consume memory. Zero, malformed, or unreadable values use the default. | positive `usize` bytes; default `1073741824` (1 GiB) |
 | `XLOG_REQUIRE_RESIDENT_RECURSION` | Require the complete ordinary plan to use the resident conditional graph; an unsupported plan or failed preparation is an error instead of a route change. | strict boolean; default off |
 | `XLOG_DISABLE_RESIDENT_RECURSION` | Force the existing ordinary GPU route. Use this as the baseline for answer and timing comparisons with the automatic resident path. | strict boolean; default off |
-| `XLOG_WARMUP_PROFILE` | Diagnostic: collect per-module PTX load timing and compile-warmup profiling stats. | `1` to enable; default off |
-| `XLOG_DEBUG_POISON_ALLOC` | Debug probe: fill fresh allocations with `0xDD` so reads of unwritten memory surface deterministically. Read once per process. | `1` to enable; default off |
-| `XLOG_DEBUG_POISON_FREE` | Debug probe: poison allocations with `0xDD` at drop so live aliases of freed memory become visually distinct. Read once per process. | `1` to enable; default off |
-| `XLOG_DEBUG_ALLOC_GUARD` | Debug probe: track live allocation ranges and panic if the allocator hands out a region overlapping a live one (double-hand-out / use-after-free detector). | `1` to enable; default off |
-| `XLOG_DEBUG_VERIFY_CLONES` | Debug probe: byte-compare every on-device buffer clone against its source immediately after the copy, to discriminate transport faults from source corruption. | `1` to enable; default off |
-| `XLOG_CDCL_TRACE` | Debug-build-only trace of the GPU CDCL solver (compiled in only with debug assertions; release binaries ignore it). | set to any value; default off |
-| `XLOG_FORCE_HOST_ROUNDTRIP` | Measurement hook read by `pyxlog`. Normally a neural network's output tensor is handed to the GPU-resident reasoner without leaving the device. Set this and every such tensor is copied GPU → host → GPU first. The copy is an identity, so answers do not change; only the data path does. Timing the same job with and without it therefore measures the per-iteration transfer cost a CPU-reasoning hybrid would pay. Available since 0.11.0. | exactly `1` to enable — `true`/`on` are **not** accepted; default off |
+| `XLOG_WARMUP_PROFILE` | Diagnostic: collect per-module PTX load timing and compile-warmup profiling stats. | strict boolean; default off |
+| `XLOG_RESIDENT_LATENCY_DIAGNOSTICS` | Emit timing diagnostics around resident preparation and evaluation. These diagnostics do not establish device residency or numerical acceptance. | strict boolean; default off |
+| `XLOG_DEBUG_POISON_ALLOC` | Debug probe: fill fresh legacy allocations with `0xDD`. Read once per process; malformed boolean text panics. | strict boolean; default off |
+| `XLOG_DEBUG_POISON_FREE` | Debug probe: poison legacy allocations with `0xDD` at drop. Read once per process; malformed boolean text panics. | strict boolean; default off |
+| `XLOG_DEBUG_ALLOC_GUARD` | Debug probe: track live legacy allocation ranges and panic on overlap. Read once per process; malformed boolean text panics. | strict boolean; default off |
+| `XLOG_DEBUG_VERIFY_CLONES` | Debug probe: byte-compare each on-device buffer clone against its source. Read once per process. | exactly `1` enables; every other value leaves it off |
+| `XLOG_CDCL_TRACE` | Debug-build-only trace of the GPU CDCL solver (compiled only with debug assertions; release binaries ignore it). | strict boolean; default off |
+| `XLOG_FORCE_HOST_ROUNDTRIP` | Measurement hook read by `pyxlog`: copy each neural-output tensor GPU → host → GPU before the symbolic handoff. This deliberately introduces transfers; it cannot serve as residency evidence. | strict boolean; default off |
 
 ## Join and optimizer knobs
 
@@ -86,12 +95,12 @@ The 4-cycle controls in this table have been available since 0.7.0.
 | `XLOG_ADAPTIVE_REOPT_MIN_RATIO` | Mis-plan threshold ratio for adaptive re-optimization; values below `1.0` or non-finite fall back to the default. | float `>= 1.0`; default `1.2` |
 | `XLOG_PERSISTENT_HASH_INDEXES` | Reuse of persistent build-side hash indexes across joins. On by default; set `0`/`false`/`off`/`no` to disable. | default on |
 | `XLOG_PERSISTENT_HASH_INDEX_BACKGROUND_BUILD` | Background-build telemetry for persistent hash indexes. | `1`/`true`/`on`/`yes`; default off |
-| `XLOG_WCOJ_COST_MODEL` | Select the WCOJ cost model: `cardinality` or `skew` (alias `skewclassifier`; any other non-empty value also resolves to the skew classifier). | default `cardinality` |
+| `XLOG_WCOJ_COST_MODEL` | Select `cardinality` or `skew` (alias `skewclassifier`), case-insensitively after trimming. Any other present Unicode value, including empty text, selects the skew classifier. Explicit runtime config wins. The current skew classifier declines adaptive triangle and 4-cycle dispatch; it is a conservative opt-out, not an active histogram classifier. | unset/non-Unicode = `cardinality` |
 | `XLOG_USE_WCOJ_TRIANGLE_U32` | Force the WCOJ triangle dispatch on unless the triangle kill switch is enabled. When unset, the adaptive cost model decides per rule (adaptive is on by default). | strict boolean; default off (adaptive) |
 | `XLOG_USE_WCOJ_4CYCLE` | Force the WCOJ 4-cycle dispatch on (width-neutral: u32, u64, Symbol). | strict boolean; default off |
 | `XLOG_USE_WCOJ_4CYCLE_ADAPTIVE` | Opt in to adaptive cost-model dispatch for 4-cycles. Unlike triangle, 4-cycle adaptive dispatch is off by default. | strict boolean; default off |
 | `XLOG_WCOJ_CHAIN_ENABLE` | Chain-shaped rule dispatcher. On by default; set `0`/`false` for A/B measurements against the binary-join path. | default on |
-| `XLOG_WCOJ_BLOCK_WORK_UNIT` | WCOJ block work-unit size. Out-of-range or unparsable values log a warning and use the default. | `1..=8192`; default `1024` |
+| `XLOG_WCOJ_BLOCK_WORK_UNIT` | WCOJ block work-unit size. Empty, malformed, negative, and out-of-range Unicode values warn and use the default; unset/non-Unicode uses the default without that warning. | trimmed `u32` in `1..=8192`; default `1024` |
 | `XLOG_BURIED_SKEW_THRESHOLD` | Skew threshold used by the hypergraph variable-order heuristic; non-finite or non-positive values are ignored. | float `> 0`; default `3.0` |
 
 ## Factorized and WCOJ kill switches
@@ -113,12 +122,12 @@ since 0.7.0.
 
 | Variable | Effect | Values / Default |
 |---|---|---|
-| `XLOG_DISABLE_FREE_JOIN` | Force every general multiway body through the existing binary-join route instead of the generalized Free Join dispatch. | strict boolean; default off |
-| `XLOG_DISABLE_FACTORIZED_DELTA` | Force every recursive delta step through the ordinary hash-join and diff route instead of the factorized recursive-delta dispatch. | strict boolean; default off |
-| `XLOG_FACTORIZED_DELTA_MAX_DOMAIN` | Raise the dense-domain dispatch cap for the factorized delta, up to the provider hard bound of `2^16`. | integer; default `2^14` |
-| `XLOG_FACTORIZED_DELTA_MAX_TABLE_BYTES` | Byte ceiling for the sparse route's conservative hash table; above it the sparse entry declines and the ordinary route remains selected. | integer bytes; default half the device budget |
-| `XLOG_FACTORIZED_DELTA_WORK_DIVISOR` | Per-iteration work floor: dispatch only when estimated candidate work is at least the bitmap word count divided by this value, protecting sparse long-chain fixpoints from the popcount-and-scan floor. | integer `>= 1`; default `8` |
-| `XLOG_DISABLE_WCOJ_GROUPBY_FUSION` | Force every group-by over a WCOJ triangle through the materialize-then-groupby path instead of the aggregate-fused dispatch. | strict boolean; default off |
+| `XLOG_DISABLE_FREE_JOIN` | Disable generalized Free Join dispatch. Other eligible specialized routes are selected independently. | strict boolean; default off |
+| `XLOG_DISABLE_FACTORIZED_DELTA` | Disable factorized recursive updates, leaving the ordinary join/difference path available. Other join specializations retain their own gates. | strict boolean; default off |
+| `XLOG_FACTORIZED_DELTA_MAX_DOMAIN` | Dense-domain dispatch cap, clamped at the provider hard bound `65536`. Zero is accepted; malformed/unreadable values use the default. | `u32`; default `16384` |
+| `XLOG_FACTORIZED_DELTA_MAX_TABLE_BYTES` | Byte ceiling for the sparse route's conservative hash table. Zero is accepted; malformed/unreadable values use the default. | `u64` bytes; default half the device budget |
+| `XLOG_FACTORIZED_DELTA_WORK_DIVISOR` | Per-iteration work floor: dispatch when estimated work is at least bitmap word count divided by this value. Zero, malformed, or unreadable values use the default. | `u64 >= 1`; default `8` |
+| `XLOG_DISABLE_WCOJ_GROUPBY_FUSION` | Disable aggregate-fused WCOJ dispatch, leaving ordinary materialization and grouping available. | strict boolean; default off |
 | `XLOG_DISABLE_WCOJ_TRIANGLE` | Kill switch for triangle WCOJ dispatch. It has higher precedence than the force flag and adaptive classifier. | strict boolean; default off |
 | `XLOG_DISABLE_WCOJ_4CYCLE` | Kill switch for the 4-cycle dispatch, overriding both force and adaptive gates. | strict boolean; default off |
 | `XLOG_WCOJ_STRICT` | Diagnostic: propagate WCOJ pipeline errors instead of recording the decline and using the binary-join route. | strict boolean; default off |
@@ -128,6 +137,14 @@ A WCOJ layout or kernel error never corrupts the relation store: by default it i
 counted, logged to stderr, and the existing binary-join route runs.
 `XLOG_WCOJ_STRICT=1` turns that decline into a hard error for diagnosis.
 </Note>
+
+For triangle and 4-cycle routing, resolve each typed config field before its
+matching environment variable. The effective disable gate is checked first,
+then force, then adaptive. An explicit force field of `Some(false)` stops the
+route; a false force environment value still permits adaptive routing. Triangle
+adaptive defaults on and has no environment gate; 4-cycle adaptive defaults off.
+An explicit disable field of `Some(false)` overrides a true disable environment
+value. `XLOG_WCOJ_STRICT` propagates pipeline errors; it is not a residency mode.
 
 ## Probabilistic
 
@@ -143,14 +160,18 @@ The D4 compile and verification budget controls have been available since
 
 | Variable | Effect | Values / Default |
 |---|---|---|
-| `XLOG_MC_RESIDENT_MEMORY_BUDGET_BYTES` | Memory budget for the GPU-resident Monte Carlo engine's launch planning. An unparsable value is a typed error, not a silent default. | integer bytes; unset = provider budget |
-| `XLOG_MC_RESIDENT_BLOCKS_PER_WORLD` | Blocks launched per sampled world in the resident MC engine. Zero or unparsable values are typed errors. | integer `>= 1`; default `1` |
-| `XLOG_D4_VERIFY_MAX_CONFLICTS` | Per-verify conflict budget for the GPU CDCL equivalence verifier. When the budget runs out, the verify declines with the typed `VerifyBudgetExceeded` error rather than trusting an unfinished search. Read once per process. | integer; default `0` = unlimited |
-| `XLOG_D4_VERIFY_MAX_VARS` | Size bound on CNF variable capacity before the D4 compile and verify launch; an over-bound program declines with the typed `CompileCapacityExceeded` error instead of risking a context-poisoning CUDA launch failure. | integer; default unbounded |
-| `XLOG_D4_VERIFY_MAX_CLAUSES` | Same size bound, on CNF clause capacity. | integer; default unbounded |
-| `XLOG_DEBUG_VERIFY_SIZE` | Diagnostic: log the CNF variable/clause capacities the size bound sees, so safe values for the two bounds above can be read off a real workload. | `1` to enable; default off |
+| `XLOG_MC_RESIDENT_MEMORY_BUDGET_BYTES` | Additional launch-planning byte ceiling. Malformed or non-Unicode text is an `Execution` error. Provider allocation budgets apply separately. | `u64` bytes, including zero; unset = no additional planning ceiling |
+| `XLOG_MC_RESIDENT_BLOCKS_PER_WORLD` | Blocks per sampled world; values above one use a cooperative engine launch. Zero, malformed, or non-Unicode text is an `Execution` error. | `u32 >= 1`; default `1` |
+| `XLOG_D4_VERIFY_MAX_CONFLICTS` | Per-verify GPU CDCL conflict budget; exhaustion produces `VerifyBudgetExceeded`. Read once per process. Malformed/unreadable values use the default. | trimmed `u32`; default `0` = unlimited |
+| `XLOG_D4_VERIFY_MAX_VARS` | CNF variable-capacity bound; an over-bound program produces `CompileCapacityExceeded`. Read once per process. Malformed/unreadable values use `u32::MAX`. | trimmed `u32`; default `u32::MAX` |
+| `XLOG_D4_VERIFY_MAX_CLAUSES` | The same bound and parsing rule for CNF clause capacity. | trimmed `u32`; default `u32::MAX` |
+| `XLOG_DEBUG_VERIFY_SIZE` | Diagnostic: log the CNF variable/clause capacities observed by the size check. | strict boolean; default off |
 | `XLOG_CIRCUIT_CACHE_DIR` | Directory for the compiled-circuit disk cache. | path; default `$XDG_CACHE_HOME/xlog/circuits`, else `$HOME/.cache/xlog/circuits` |
-| `XLOG_CIRCUIT_CACHE_MAX_MB` | Disk-cache size limit; oldest entries are evicted beyond it. | integer MiB; default `512` |
+| `XLOG_CIRCUIT_CACHE_MAX_MB` | Disk-cache size limit; oldest entries are evicted beyond it. Malformed/unreadable values use the default; zero is accepted. | `u64` MiB; default `512` |
+
+The cache limit's MiB-to-byte multiplication is currently unchecked. Keep
+`XLOG_CIRCUIT_CACHE_MAX_MB` at or below `u64::MAX / 1048576`; larger parsed values
+can overflow rather than produce a configuration diagnostic.
 
 ## Rule induction
 
@@ -162,7 +183,7 @@ for validation.
 | Variable | Effect | Values / Default |
 |---|---|---|
 | `XLOG_ILP_EXACT_CHAIN_SMEM` | Shared-memory tiling for the chain topology in the exact-induction scoring kernel. On by default; set `0`/`false`/`off`/`no` to disable. | default on |
-| `XLOG_ILP_EXACT_CHAIN_SMEM_MIN_ROWS` | Minimum row count before the shared-memory chain path engages. | integer; default `256` |
+| `XLOG_ILP_EXACT_CHAIN_SMEM_MIN_ROWS` | Minimum row count before the shared-memory chain path engages. Zero is accepted; malformed/unreadable values use the default. | trimmed `u32`; default `256` |
 | `XLOG_ALLOW_PYTHON_ILP_REFERENCE` | Permit `induce_exact(backend="python")`, the host-orchestrated reference scorer. Without it the Python backend raises a config error — it exists only for explicit parity or compatibility validation, never as a production path. | `1` to allow; default rejected |
 
 ## Recorded operator dispatch
@@ -170,8 +191,10 @@ for validation.
 Every `CudaKernelProvider` already owns the complete device-runtime resource
 graph. The flags below do not select another allocator or provider. They select
 recorded launch implementations for supported operators inside that same
-provider-owned runtime. Each uses the strict boolean contract above and is also
-implied by the umbrella `XLOG_USE_RECORDED_OPS`.
+provider-owned runtime. The operator flags use strict booleans and are ORed with
+the umbrella `XLOG_USE_RECORDED_OPS`; both values are parsed, so an invalid value
+still fails even when the other is true. CSM graph selection has separate graph
+gates and is not implied by the umbrella alone.
 
 | Variable | Effect | Values / Default |
 |---|---|---|
@@ -184,7 +207,7 @@ implied by the umbrella `XLOG_USE_RECORDED_OPS`.
 | `XLOG_USE_RECORDED_CSM` | Recorded count-scan-materialize hash-join sub-strategy (inner and left-outer joins only; consulted only after the recorded hash-join path is selected). | same; default off |
 | `XLOG_USE_CSM_CUDA_GRAPH` | CUDA Graph capture and replay for the bounded CSM path; requires the recorded CSM path to be selected first. | same; default off |
 | `XLOG_USE_CUDA_GRAPHS` | Broader graph opt-in that also enables the CSM graph path. | same; default off |
-| `XLOG_CSM_CUDA_GRAPH_AUTO_OUTPUT_CAP` | Worst-case output-row cap below which the CSM graph path auto-selects a capacity class. | integer; default `1000000` |
+| `XLOG_CSM_CUDA_GRAPH_AUTO_OUTPUT_CAP` | Worst-case output-row cap for automatic CSM graph capacity selection. Zero is accepted; malformed/unreadable values use the default. | `u64`; default `1000000` |
 
 ## Bench, test, and developer-tool variables
 
@@ -198,8 +221,8 @@ CUDA-initialization failures in the certification suite panic instead of skippin
 satisfy the release gate). The same script requires
 `XLOG_PINNED_CORPUS_ROOT` for its resident preparation, production, and scaling
 tests.
-`XLOG_DETERMINISTIC`, `XLOG_CNF_OUTPUT_PATH`, and
-`XLOG_GPU_HASH_OUTPUT_PATH` drive cross-process determinism tests. The
+`XLOG_CNF_OUTPUT_PATH` and `XLOG_GPU_HASH_OUTPUT_PATH` select output files in
+cross-process determinism tests. The
 cross-stream lifetime stress test uses `XLOG_CROSS_STREAM_STRESS_BASE_SEED`,
 `XLOG_CROSS_STREAM_STRESS_CHILD`, `XLOG_CROSS_STREAM_STRESS_REFERENCE`, and
 `XLOG_PARALLEL_STRESS_FIXTURE_MODE`; its child/reference variables are internal
@@ -207,9 +230,9 @@ to the test harness.
 
 | Variable | Read by | Effect | Values / Default |
 |---|---|---|---|
-| `XLOG_REQUIRE_CUDA` | CUDA test harnesses and `scripts/validate_release_gpu.sh` | Turn missing or unusable CUDA into a hard failure instead of a skipped test. | exactly `1` to require CUDA; unset by default |
+| `XLOG_REQUIRE_CUDA` | CUDA test harnesses and `scripts/validate_release_gpu.sh` | Turn missing or unusable CUDA into a hard failure instead of a skipped test. Certification's parser panics on malformed values. | strict boolean; default off |
 | `XLOG_PINNED_CORPUS_ROOT` | the resident prepare-only, production, and scaling acceptance tests | Path to a clean checkout of the pinned acceptance corpus. The tests require the exact recorded commit, a clean index and worktree, and initialized clean submodules. | path; required by the complete GPU release script |
-| `WCOJ_BENCH_FULL` | the WCOJ triangle Criterion benchmark | Run the full input-size sweep instead of the reduced default. | `1` or `true` (case-insensitive); default off |
+| `WCOJ_BENCH_FULL` | the WCOJ triangle Criterion benchmark | Run the full input-size sweep instead of the reduced default. Malformed values panic in the benchmark. | strict boolean; default off |
 | `XLOG_SKEWED_MULTIWAY_ONLY_CELL` | the skewed-multiway Criterion benchmark | Run only the named benchmark cases instead of the whole sweep. | comma-separated cell names; unset runs every cell |
 | `CAVIAR_CONTINUOUS_DIR` | `python/tests/test_caviar_alignment_evidence.py` and `python/tests/test_caviar_xml_corpus.py` | Directory holding local `caviar-train.json` / `caviar-test.json`, neither of which is shipped in this repo. `test_caviar_alignment_evidence.py` skips its whole module unless both files are found there. `test_caviar_xml_corpus.py` uses it only to gate its dump cross-check test, and checks that the path names an existing directory rather than checking for the two files. | path. `test_caviar_alignment_evidence.py` falls back to `../caviar_data` resolved against the **current working directory** pytest is invoked from — not the repository root and not the test file's own directory. `test_caviar_xml_corpus.py` has no default: unset means skip |
 | `CAVIAR_XML_DIR` | `python/tests/test_caviar_xml_corpus.py` | Directory holding the 30 CAVIAR ground-truth XML files. The module's real-data tests skip unless it names an existing directory; the dump cross-check additionally needs `CAVIAR_CONTINUOUS_DIR`. The shipped example script reads the same variable — see [Example scripts](#example-scripts). | path; unset by default |

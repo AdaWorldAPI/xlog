@@ -896,8 +896,13 @@ fn plan_prepared_epistemic_gpu_execution_core(
 /// - no rule reduction exists to host the constraint's modal evaluation;
 /// - a constraint body mixes relational/comparison/binding literals with the
 ///   epistemic literals (only pure-modal constraint bodies are in fragment);
-/// - a constraint epistemic atom carries a non-ground tuple key (headless
-///   constraints have no reduced output column to bind variables against).
+/// - a flattened key still contains a shared/repeated variable or an unsupported
+///   scalar term. Positive single-occurrence variables become existential wildcard
+///   columns; a named variable under modal negation is rejected as unsafe.
+///
+/// High-level execution normalizes supported shared-variable constraints to
+/// ordinary helper relations before this planner is called. Direct planner callers
+/// must supply the already-normalized pure-modal constraint shape.
 fn lower_epistemic_constraints(
     eir: &EirProgram,
     epistemic_literals: &mut Vec<EirEpistemicLiteral>,

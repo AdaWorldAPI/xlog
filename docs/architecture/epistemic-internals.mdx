@@ -31,6 +31,11 @@ Every accepted epistemic program first passes through the same semantic boundary
 3. classify ordinary and modal dependencies, validate relation identity and tuple
    shape, and select an execution route.
 
+These are implemented finite execution classes, rather than an unrestricted
+solver for arbitrary epistemic specifications. Candidate and model capacities,
+tuple schemas, clause-union rules, and the selected recursion route still bound
+which programs can execute.
+
 The route then depends on the classified program:
 
 - An acyclic modal program builds a single-pass GPU plan and runs
@@ -266,15 +271,32 @@ at compile time with a typed `UnsupportedEpistemicConstruct`:
 
 | Construct | Trigger | Source |
 | --- | --- | --- |
-| `epistemic rule-union materialization` | A predicate has more than one defining clause, at least one clause is epistemic, and the modal filters are not provably redundant across clauses. Single-pass materialization keeps no per-clause modal provenance, so it cannot safely filter the clause union. | `epistemic.rs:3258` |
-| `epistemic derived predicate schema` | The same derived epistemic predicate name is defined at two arities. A derived epistemic relation gets one runtime identity per name, so it needs one source signature. | `epistemic.rs:3136` |
-| `epistemic augmented predicate schema` | Clauses for one head signature lower to different internal arities, because a modal-local (body-only) variable adds hidden output columns in some clauses but not others. | `epistemic.rs:3200` |
-| `epistemic augmented head query` | A query against an augmented epistemic head whose arguments are not all distinct named variables — a constant, `_`, a repeated variable, or a compound term. | `epistemic.rs:3228` |
-| `epistemic modal tuple key` | A modal literal's tuple key flattens to a binding arity that does not match the target's declared arity. Use one scalar key term per target column. | `epistemic.rs:2310` |
+| `epistemic rule-union materialization` | A predicate has more than one defining clause, at least one clause is epistemic, and the modal filters are not provably redundant across clauses. Single-pass materialization keeps no per-clause modal provenance, so it cannot safely filter the clause union. | `xlog-logic/src/epistemic.rs` |
+| `epistemic derived predicate schema` | The same derived epistemic predicate name is defined at two arities. A derived epistemic relation gets one runtime identity per name, so it needs one source signature. | `xlog-logic/src/epistemic.rs` |
+| `epistemic augmented predicate schema` | Clauses for one head signature lower to different internal arities, because a modal-local (body-only) variable adds hidden output columns in some clauses but not others. | `xlog-logic/src/epistemic.rs` |
+| `epistemic augmented head query` | A query against an augmented epistemic head whose arguments are not all distinct named variables — a constant, `_`, a repeated variable, or a compound term. | `xlog-logic/src/epistemic.rs` |
+| `epistemic modal tuple key` | A modal literal's tuple key flattens to a binding arity that does not match the target's declared arity. Use one scalar key term per target column. | `xlog-logic/src/epistemic.rs` |
 
 The first is the one a program author is most likely to hit: writing two rule
 clauses for one epistemic head is ordinary Datalog style, and it is now rejected
 rather than silently mis-filtered.
+
+## Constraint normalization
+
+`xlog-gpu` normalizes supported shared-variable constraints before EIR planning.
+`desugar_shared_variable_epistemic_constraints_core` constructs an ordinary helper
+for diagonals, joins, and range-restricted negated differences when no modal target
+is directly defined by an epistemic rule. It replaces the authored body with a
+positive `know` over the helper while retaining the authored constraint identity.
+The lower-level planner then sees a pure-modal constraint with independent key
+variables. Direct planner callers do not get this high-level normalization merely
+by calling the EIR planner.
+
+`lower_epistemic_constraints` accepts ground integer/symbol keys, anonymous keys,
+and positive single-occurrence variables after finite outer structures flatten.
+It rejects a residual mixed body or repeated/shared variable, and rejects an
+unbound named variable under modal negation with a safety diagnostic. A recursive
+epistemic program with modal constraints still has no accepted route.
 
 ## Invariants and diagnostics
 

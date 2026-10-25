@@ -21,13 +21,17 @@ against the geometry it was never shown.
 theories — what makes a situation start (`initiatedAt`), what makes it stop
 (`terminatedAt`) — and reconstructs a per-frame answer from them by inertia. Each search
 is gated by a **permutation-null fit threshold** derived per fold from 1000 label
-shufflings, so a candidate must beat chance before it is reported. On the deduplicated,
-leakage-free corpus it does not, and the harness returns **no rule**. That abstention is
-the designed behaviour and it is the point, not a bug.
+shufflings, so a candidate must clear the training-side null threshold before it is
+reported. On the deduplicated corpus, meeting initiation is selected on 1 of 10
+scene-family folds and the direct meeting clause on 9 of 10. Both return zero
+held-out true positives; the selected clauses fail to transfer.
 
 > **Read the honest scope before quoting any number.** The 0.7782 meeting F1 is measured
-> on a corpus with a documented duplication defect. On the clean protocol the result is
-> 0.0 — an abstention at 11 meeting / 5 moving initiations. **No ranking against OLED,
+> on a corpus with a documented duplication defect; its vocabulary was chosen after
+> the first run's errors were known. The pre-registered dump result is 0.7329. On
+> the clean protocol meeting F1 is 0.0 despite clauses being selected on some folds;
+> moving has no initiation clause. There are only 11 meeting / 5 moving initiations.
+> **No ranking against OLED,
 > WOLED-ASP, or hand-crafted rules is claimed or supported.** The neural detector under
 > 10-fold EC cross-validation on the dump corpus is a **negative result** (F1 0.0011).
 > All three are documented in full in the evidence package linked below.

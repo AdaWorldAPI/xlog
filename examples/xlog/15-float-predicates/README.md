@@ -24,8 +24,9 @@ This ordering:
 - Distinguishes NaN sign, signaling state, and payload
 - Matches Rust's `f64::total_cmp` behavior
 
-Arithmetic-generated NaNs use one canonical positive quiet-NaN bit pattern.
-They therefore compare equal to themselves. Do not use `V != V` to detect NaN.
+Division and `pow` normalize NaN results to one positive quiet-NaN bit pattern;
+addition, subtraction, and multiplication do not canonicalize NaNs. Every NaN
+bit pattern compares equal to itself. Do not use `V != V` to detect NaN.
 
 ## Examples
 
@@ -50,7 +51,7 @@ xlog run examples/xlog/15-float-predicates/01_nan_handling.xlog --device 0
 ### Preventing invalid arithmetic
 ```xlog
 // Validate the producing operation instead of relying on NaN self-inequality.
-valid(Id, V) :- input(Id, Num, Denom), Denom != 0.0, V is Num / Denom.
+valid(Id, V) :- input(Id, Num, Denom), Denom != 0.0, Denom != -0.0, V is Num / Denom.
 ```
 
 ### Filtering Out Infinity
@@ -63,4 +64,5 @@ finite(Id, V) :- data(Id, V), V > -1000000.0, V < 1000000.0.
 ```xlog
 // Preserve provenance when the invalid operation itself matters.
 invalid_divisor(Id) :- input(Id, _, Denom), Denom = 0.0.
+invalid_divisor(Id) :- input(Id, _, Denom), Denom = -0.0.
 ```

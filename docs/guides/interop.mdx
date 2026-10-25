@@ -69,9 +69,11 @@ for q in result.queries:
     print(q.relation_name, q.num_rows, cols)
 ```
 
-**Confirm it stayed on the GPU.** Check each wrapped tensor's device: `cols[0].device`
-reports `cuda` (the same device XLOG computed on). A host round-trip would surface as
-`cpu` instead.
+**Confirm the result's location.** `cols[0].device` reports `cuda`, the device on
+which the returned column lives. This does not prove its transfer history: a
+download followed by an upload would also end on CUDA. Use the named route's
+transfer telemetry, and independent profiling when required, to establish that
+stronger claim.
 
 Input relations travel the same path in reverse. `evaluate(dlpack_inputs=...)` takes a
 mapping from relation name to a sequence of 1-D DLPack columns — one tensor per column,
@@ -292,9 +294,11 @@ Two exceptions belong to this surface, both `RuntimeError` subclasses:
   out-of-range abstain label, and a joint-solve kernel that would not load on this device.
 - `pyxlog.SolverResourceExhausted` — the fuel budget you passed to the constructor ran
   out, reported as `solver fuel exhausted: spent {spent} of {limit} node expansions`. The
-  meter lives in the carrier session and saturates, so a retry repeats the identical
-  refusal instead of slipping more work past the budget. Read the running total from the
-  `fuel_spent` property.
+  meter lives in the carrier session. A charge that would exceed the limit is
+  refused without changing its accepted `fuel_spent`; this is not a sticky terminal
+  refusal, and a smaller later charge can still fit. The counter uses saturating
+  `u64` addition, so `u64::MAX` does not provide overflow-detecting accounting.
+  Read the accepted running total from `fuel_spent`.
 
 ## Arrow C Device interface — zero-copy Arrow
 

@@ -12,8 +12,9 @@ user guide: [Worst-case-optimal join tuning](/guides/wcoj-tuning).
 Some queries join three or more relations at once — counting triangles or cycles
 in a large graph, for example. Run as an ordinary chain of two-way joins, they
 build a huge intermediate table before returning a tiny answer. A **worst-case
-optimal join (WCOJ)** computes the whole pattern directly, so peak memory stays
-flat instead of blowing up on that intermediate.
+optimal join (WCOJ)** computes the whole pattern directly, avoiding those binary
+intermediates. Materialized output and workspace can still grow with the query;
+this is not a constant-memory guarantee.
 
 This page is about how XLOG implements those joins. XLOG has a family of WCOJ
 *routes*: specialized code paths that recognize a particular join shape and run a
@@ -110,9 +111,11 @@ triangle or 4-cycle kernel. It has been available since 0.10.0.
 Instead of a shape-specific kernel, it uses a frontier-based GPU algorithm that
 handles a broader set of multiway bodies.
 
-The planner can reorder inputs when the prefix-key constraints and statistics point
-to a better route. It can also decline in two cases: when a candidate ordering would
-lose the factorized benefit, or when the required statistics are missing.
+The planner can reorder inputs when prefix-key constraints and cardinality
+estimates point to a better route. On a large join it can decline when no
+competitive prefix-key-compatible order exists. Missing optional statistics alone
+do not force a decline: planning also uses the actual input row counts and can
+keep the existing order.
 
 Free Join does not replace the specialized kernels. The dedicated WCOJ shapes stay
 dedicated; Free Join is the fallback general route for everything else.

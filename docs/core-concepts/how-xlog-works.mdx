@@ -192,12 +192,12 @@ usable inside a training loop rather than alongside it.
 
 ## Device result handoff
 
-Query-output and gradient buffers remain on the GPU when handed to tensor code. XLOG
-exposes them through DLPack capsules and Arrow — two standard formats for sharing
-tensors and tables between GPU libraries without copying the data plane through host
-memory.
+Device-output APIs expose query and gradient buffers through DLPack capsules and
+the Arrow C Device interface for direct handoff. Host-shaped results and host Arrow exports are separate paths;
+an Arrow table or a generic `evaluate()` call is not automatically a zero-copy
+CUDA interface. See the [Python API](/reference/python) for each result contract.
 
-Because of that, a downstream tensor computation in PyTorch, JAX, or cuDF reads those
+With a compatible DLPack consumer, downstream tensor computation reads the shared
 device buffers directly. Host-orchestrated routes may still observe bounded status or
 metadata, so a final tensor's device location is not by itself evidence that the
 entire preceding execution had zero transfers.

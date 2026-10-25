@@ -84,12 +84,14 @@ The script does the following:
   public-API, and callback suites with CUDA required;
 - runs the host-readable probabilistic CLI suite and the accepted epistemic GPU
   evidence adapter suite in release mode;
-- enables the resident-graph test feature and requires exactly 20 passing
+- enables the resident-graph test feature and requires exactly 22 passing
   runtime-module tests with no failures, ignored tests, measured tests, or
   CUDA-skip messages;
 - runs the exact prepare-only, production-launch, disconnected-rule scaling,
   and semantic-matrix acceptance tests, requiring exactly one passing test from
   each filter;
+- requires the resident Monte Carlo nonconvergence and sparse-overflow checks,
+  with one passing test from each exact filter;
 - runs `xlog-cuda-tests` certification in release mode;
 - runs a basic `xlog run` smoke command;
 - verifies that packaged artifacts include the expected kernel files.

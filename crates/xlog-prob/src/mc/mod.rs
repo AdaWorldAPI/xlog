@@ -3,9 +3,15 @@
 //! This engine samples probabilistic facts / annotated disjunction decisions on the GPU and
 //! evaluates the deterministic core in each sampled world.
 //!
-//! For programs with non-monotone recursion (cycles through `not` and/or aggregates),
-//! Monte Carlo evaluation requires the user to opt into the approximate probabilistic
-//! engine. The deterministic evaluation uses a bounded, cycle-aware semantics:
+//! Production GPU evaluation uses the bounded positive resident subset; it rejects
+//! negation and aggregate heads. With `host-io`, callers can explicitly select the
+//! labeled CPU oracle through `McProgram::evaluate_cpu` or enable
+//! `McEvalConfig::allow_cpu_oracle_fallback` for `McProgram::evaluate`. The oracle
+//! downloads GPU-generated samples and evaluates each sampled world on the host;
+//! its results are not GPU-native or zero-host evidence.
+//!
+//! For non-monotone recursion (cycles through `not` and/or aggregates), that host
+//! oracle uses bounded, cycle-aware semantics:
 //!
 //! - If an SCC reaches a fixpoint under synchronous iteration, that fixpoint is used.
 //! - If the SCC enters a cycle, the interpretation is the intersection of all states in the cycle

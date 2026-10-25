@@ -10,14 +10,16 @@
 
 **Documentation: [xlog.md](https://xlog.md)** · [Whitepaper (PDF)](paper/main.pdf) · [Language reference](https://xlog.md/reference/language) · [Examples](examples/)
 
-Neural-symbolic systems today keep symbolic reasoning on the CPU while neural computation runs
-on the GPU, and every training iteration pays a PCIe round-trip that dominates wall-clock time
-at scale. XLOG closes that gap with a shared compiler and provider-owned CUDA runtime
+When symbolic reasoning runs on the CPU and neural computation runs on the GPU,
+training can pay for host–device transfers between the two. XLOG addresses that
+boundary with a shared compiler and provider-owned CUDA runtime
 services supporting four reasoning paradigms — deterministic Datalog, exact and approximate
 probabilistic inference, epistemic reasoning, and differentiable neural-symbolic training —
 with SAT/MaxSAT verification available as a shared solver service. Transfer-free claims are
 route-specific: the certified resident recursive core and resident Monte Carlo sampled core
-record zero tracked host–device transfers and return one bounded terminal receipt.
+record zero tracked host–device transfers within their measured regions. The recursive
+graph then reads one pinned terminal receipt; Monte Carlo reads a three-word postflight
+record, with query results read separately when requested.
 
 Implemented in Rust with custom CUDA kernels, XLOG caches compiled circuits across training
 iterations and exposes GPU-resident results as zero-copy DLPack and Arrow C Device
@@ -25,8 +27,9 @@ views to PyTorch, JAX, and cuDF; persistent Python relation replacements instead
 device-to-device snapshots (Arrow IPC covers host-side interchange). On the MNIST-addition
 neural-symbolic benchmark, circuit caching
 yields a measured **2.74× end-to-end training speedup** (95% CI `[2.29, 3.18]`) in a
-cached-vs-uncached ablation of XLOG's own pipeline, and steady epochs run **2.80× faster than
-Scallop** at matched accuracy under an identical protocol.
+cached-vs-uncached ablation of XLOG's own pipeline. A separate MNIST-addition comparison
+with Scallop supports accuracy parity, not an epoch-time speedup: host and CPU-quota
+confounding prevented a controlled timing claim.
 
 ---
 
@@ -184,7 +187,7 @@ python scripts/xlog_doctor.py
 # "Host output is disabled".
 cargo build --release -p xlog-cli --features host-io
 
-# Full workspace build (libraries, tests, benches; CLI without host-io):
+# Full workspace build (libraries and binaries; CLI without host-io):
 cargo build --release
 ```
 

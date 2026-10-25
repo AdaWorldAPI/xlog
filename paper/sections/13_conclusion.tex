@@ -11,17 +11,19 @@ are checked on the GPU, and the host observes bounded status and error scalars.
 
 Residency claims are likewise route-specific. Ordinary relational and exact
 execution are host-orchestrated over device data planes. Eligible recursion and
-resident Monte Carlo use certified cores that record zero tracked transfers and
-then return one authoritative terminal receipt. Byte exhaustion, fixed-capacity
-exhaustion, and nonconvergence remain separate typed outcomes.
+resident Monte Carlo record zero tracked transfers within their measured cores.
+The recursive graph then returns one pinned terminal receipt; Monte Carlo reads
+three postflight metadata words and leaves result reads separate. Resource,
+capacity, and convergence failures must be interpreted through each route's
+actual diagnostic rather than treated as a completed result.
 
 The measurements describe a system that pays off where the symbolic workload
 is large and repeated: reusing a verified circuit across training iterations,
 and avoiding the intermediate blowup of binary-join plans on skewed cyclic
-queries. Against external engines the picture is mixed: clear
-gains in bounded-memory join evaluation and in per-epoch neurosymbolic
-training, and a clear loss to a mature CPU compiler on small exact-inference
-programs.
+queries. Against external engines the picture is mixed: bounded-memory join
+evaluation improves with input size on the measured skewed graphs, MNIST-addition
+accuracy is comparable to Scallop's without a per-epoch timing claim, and small
+exact-inference programs run substantially slower than in ProbLog2.
 
 What they do not give is a general ranking of xlog against other systems. Each
 comparison covers one engine per reasoning mode on one class of program, the

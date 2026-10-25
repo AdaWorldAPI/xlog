@@ -302,9 +302,9 @@ impl FuelMeter {
         self.spent = self.spent.saturating_sub(expansions);
     }
 
-    /// Charge `expansions` node expansions. Refuses typed the
-    /// moment the budget would be exceeded; the overflowing charge
-    /// is not applied.
+    /// Charge `expansions` using saturating addition. A saturating sum above the
+    /// limit is refused without changing `spent`. With a `u64::MAX` limit,
+    /// arithmetic overflow saturates to that limit and is accepted.
     pub fn charge(&mut self, expansions: u64) -> Result<(), SolverError> {
         let new_spent = self.spent.saturating_add(expansions);
         if new_spent > self.limit {

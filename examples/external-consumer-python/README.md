@@ -1,13 +1,21 @@
 # External Consumer Example Suite
 
-Focused post-close hardening examples for the external consumer ML/Python
-productization surface. Each directory contains a small `.xlog` program and a
+These examples exercise the public Python APIs for graph queries, relation updates,
+neural training and rule induction. Each directory contains a small `.xlog` program and a
 self-checking `run.py` that emits one JSON result.
 
-Run the full suite with the external-consumer compatibility validator and write
-its summary to the JSON path chosen for the current validation run.
+From the repository root, run the full suite on an authorized CUDA execution host:
 
-The examples require CUDA and an installed or editable in-tree `pyxlog` build.
+```bash
+python scripts/validate_external_consumer_examples.py --python /usr/local/bin/python \
+  --output /tmp/xlog-external-consumer-summary.json
+```
+
+Each example must report `status="PASS"`; the validator combines those reports in
+the selected JSON file. The examples require CUDA and an installed `pyxlog` wheel
+with packaged kernels in the selected interpreter. For a source build, use
+`scripts/install_pyxlog_for_python.py --python /usr/local/bin/python` under the
+manual LOCAL build policy before transferring the artifacts to the execution host.
 
 | Example | Purpose | Surfaces |
 |---|---|---|
@@ -17,5 +25,7 @@ The examples require CUDA and an installed or editable in-tree `pyxlog` build.
 | `04_native_exact_induction` | external consumer-shaped exact ILP topology selection | learnable `.xlog`, `IlpProgramFactory`, `induce_exact(..., backend="native")`, Python/native parity |
 | `05_probabilistic_async_diagnostics` | Probabilistic API diagnostics | probabilistic `.xlog`, `Program.evaluate_async`, exact and MC mode, memory/progress/graph/host-transfer stats |
 
-This suite is a post-close hardening addendum. It does not rewrite the original
-closure gate and does not authorize push, merge, tag, or release-board changes.
+CUDA tensor checks establish output location. The validator's
+`zero_copy_diagnostics` field contains those location checks; it does not measure
+allocation sharing or establish ZERO TRANSFER. Review the separate transfer
+diagnostics for the operations actually measured.

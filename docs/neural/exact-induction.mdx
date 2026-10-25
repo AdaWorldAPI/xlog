@@ -115,8 +115,9 @@ Datalog clause it stands for.
 
 Two edge cases are handled for you. When you pass no negatives, the engine
 synthesizes an empty negative buffer so the kernel signature stays uniform. When
-there are no candidates or no positives, it returns an all-zero result rather than
-launching.
+there are no candidates, it returns an all-zero result without scoring. With no
+positives, the candidate list and `total_scored` are empty/zero while the candidate
+and negative input counts remain available.
 
 ## Confirm it worked
 
@@ -155,9 +156,15 @@ exactly one coverage slot. Because every block owns a distinct output slot, the
 scoring path never has two threads updating the same location (no cross-block
 atomics). That is what makes the result bit-for-bit identical on every run.
 
-After scoring, the engine selects the top-`K` per topology on the device. The host
-then applies a fixed dictionary-order (lexicographic) sort to break ties, so equal
-scores always resolve the same way.
+After scoring, a second kernel selects the top-`K` per topology on the device.
+It orders candidates by positive coverage descending, negative coverage ascending,
+then left and right candidate positions in the supplied list. Candidates covering
+zero positives are omitted. Equal scores are therefore repeatable for a fixed
+candidate order; reordering that list can change which tied rule comes first.
+
+The Python binding drops unknown candidate names and declared relations without
+loaded buffers. Check `result.candidate_count` against your intended pool and
+upload every relation you want scored. An unknown head returns an empty result.
 
 ### Column types
 
@@ -178,8 +185,8 @@ per candidate boundary, and device-to-device concatenation scales with the
 candidate rows. These operations prepare device buffers; they are not
 device-to-host (GPU-to-CPU) transfers.
 
-The production `induce_exact` call copies results back from the GPU exactly
-**once**: a single compact export of the selected top-`K` rows, no matter how many
+For a nontrivial request, the production `induce_exact` call copies results back
+from the GPU exactly **once**: a compact export of the selected top-`K` rows, no matter how many
 candidates, queries, or topologies are involved. You can verify this with
 `prog.d2h_transfer_count()`, which counts those GPU-to-CPU transfers.
 
@@ -188,6 +195,9 @@ The count is higher if you run with `backend="python"`, the gated reference scor
 compared against the native one. It is not a production path, and it refuses to run
 unless you also set
 [`XLOG_ALLOW_PYTHON_ILP_REFERENCE=1`](/reference/environment-variables).
+For a semantic comparison with native topology isolation, also pass
+`strict_per_topology=True`; the reference default preserves older cross-topology
+mask behavior and is not the matching oracle.
 
 ## Availability
 

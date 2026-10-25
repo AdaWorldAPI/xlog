@@ -369,3 +369,22 @@ with the published dense-grid figure is made (different temporal grid).
 The B-column artifacts were regenerated after a review correction aligned
 `sustained_240` point membership with the converter's half-open intervals;
 the correction and current md5 pins are recorded in `PREREG_SOFT.md`.
+
+The duration relation is an offline input: membership at a timestamp uses the
+end of the complete interval component. It cannot be supplied causally at that
+timestamp, so the streaming weight experiment excludes it.
+
+## Single-pass weight results
+
+[`PREREG_ONLINE.md`](PREREG_ONLINE.md) records the completed forward and reverse
+chronological passes over the base vocabulary. Both score micro F1 0.7398,
+with the same thresholded predictions as the batch weighted run: tp/fp/fn
+2,300/339/1,279. Their learned weights differ. One body remains above the
+decision threshold in every fold and regime; a competing score reaches 0.493,
+only 0.007 below the 0.5 threshold. This is a result for this pool and threshold,
+not evidence of general robustness to training order.
+
+The pool and permutation-null gate are computed from each complete training
+fold before the pass. Only the weights learn online; structure does not. These
+CPU rule-reconstruction runs establish neither GPU training performance nor a
+ranking against published maritime systems on a different temporal grid.
