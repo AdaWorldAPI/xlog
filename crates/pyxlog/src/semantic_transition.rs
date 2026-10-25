@@ -938,11 +938,13 @@ impl PySemanticTransitionSession {
                         pending.set_cause(py, Some(original));
                         return Err(pending);
                     }
-                    // A known admission rejection did not begin terminal release.
-                    let rejected = retained.take();
-                    drop(guard);
-                    drop(retained);
-                    drop(rejected);
+                    if !live.task_release_started() {
+                        // A known admission rejection did not begin terminal release.
+                        let rejected = retained.take();
+                        drop(guard);
+                        drop(retained);
+                        drop(rejected);
+                    }
                     return Err(original);
                 }
                 // Invalidate task aliases before detached producer finalizers can reenter.
