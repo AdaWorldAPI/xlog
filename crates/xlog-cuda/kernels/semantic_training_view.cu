@@ -153,8 +153,8 @@ struct TrainingViewLaunch {
     uint64_t append_payload_bytes[2];
 };
 
-static_assert(sizeof(TrainingPublicationRange)==128 && sizeof(TrainingPublicationStorageEntry)==24 &&
-    sizeof(SemanticTrainingReplayAppendHeader)==128 && sizeof(SemanticTrainingReplayAppendEntry)==480,
+static_assert(sizeof(TrainingPublicationRange)==64 && sizeof(TrainingPublicationStorageEntry)==24 &&
+    sizeof(SemanticTrainingReplayAppendHeader)==128 && sizeof(SemanticTrainingReplayAppendEntry)==384,
     "training replay publication ABI");
 
 __device__ bool semantic_training_identity_equal(const uint64_t* left, const uint64_t* right) {
