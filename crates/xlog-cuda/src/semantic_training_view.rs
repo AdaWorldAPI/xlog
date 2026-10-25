@@ -563,7 +563,7 @@ unsafe impl DeviceRepr for SemanticTrainingReplayAppendHeader {}
 unsafe impl DeviceRepr for SemanticTrainingReplayAppendEntry {}
 
 const _: () = assert!(size_of::<SemanticTrainingReplayAppendHeader>() == 128);
-const _: () = assert!(size_of::<SemanticTrainingReplayAppendEntry>() == 480);
+const _: () = assert!(size_of::<SemanticTrainingReplayAppendEntry>() == 384);
 
 struct TrainingPublicationBinding {
     word: DeviceMemoryView<u64>,
