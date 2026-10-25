@@ -175,9 +175,10 @@ struct ReplayModelBackingState {
 /// Lookup uses original allocation coordinates, not content equality. Cold
 /// completed-step export registers the genuine immutable source owner, which
 /// historical readers lease even on their first import. If no original owner
-/// survives, complete cold restoration owns and initializes one backing. Weak entries grant neither write
-/// authority nor lifetime: original Sessions, readers and captured consumers
-/// retain the strong owners through known final use or unknown completion.
+/// survives, complete cold restoration owns and initializes one backing. Weak
+/// entries grant neither write authority nor lifetime: original Sessions,
+/// readers and captured consumers retain the strong owners through known final
+/// use or unknown completion.
 #[derive(Default)]
 pub struct SemanticReplayModelBackings {
     state: Mutex<ReplayModelBackingState>,
@@ -221,7 +222,9 @@ impl SemanticReplayModelBackings {
                 });
                 if let Some(entry) = entry {
                     if entry.geometry != geometry {
-                        return Err(publication_input_error("historical replay changed the original live numerical geometry"));
+                        return Err(publication_input_error(
+                            "historical replay changed the original live numerical geometry",
+                        ));
                     }
                     entry.allocation.upgrade()
                 } else {
