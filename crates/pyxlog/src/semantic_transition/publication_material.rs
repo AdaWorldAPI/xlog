@@ -36,14 +36,13 @@ const ORIGIN_KEYS: [&str; 12] = [
     "record_digest",
 ];
 
-const CACHE_KEYS: [&str; 8] = [
+const CACHE_KEYS: [&str; 7] = [
     "role",
     "index",
     "capacity_bytes",
     "logical_begin",
     "logical_end",
     "layout",
-    "identity",
     "logical_bytes",
 ];
 
@@ -168,7 +167,6 @@ fn projection_metadata_extent(
         add_extent(&mut cache, python_metadata_tuple_extent(py, count)?)?;
     }
     add_extent(&mut cache, repeated_extent(integer, 19)?)?;
-    add_extent(&mut cache, identity)?;
     add_extent(&mut cache, std::mem::size_of::<Bound<'_, PyDict>>())?;
     add_extent(&mut extent, repeated_extent(cache, count)?)?;
     Ok(extent)
@@ -253,7 +251,6 @@ pub(super) fn inspect(
                 PyTuple::new(py, layout.strides_bytes)?,
             ),
         )?;
-        cache.set_item("identity", PyBytes::new(py, item.identity.as_bytes()))?;
         let payload = item
             .logical_bytes
             .slice_payload(0..item.logical_bytes.as_bytes().len())

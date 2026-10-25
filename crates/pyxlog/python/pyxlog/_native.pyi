@@ -55,7 +55,7 @@ def resource_observer_device_certificate(device_ordinal: int) -> _ResourceDevice
 
 _Path = Union[str, PathLike[str]]
 
-_PublishedIdentity = tuple[bytes, int, bytes, bytes]
+_PublishedIdentity = tuple[bytes, int, bytes]
 _NativeIdentityWords = tuple[int, int, int, int]
 _MeasurementAvailability = Literal["not_executed", "incomplete", "obtained"]
 
@@ -89,7 +89,6 @@ class _UpdateForwardReceiptMaterial(TypedDict):
     dimensions: tuple[int, int, int]
     strides_bytes: tuple[int, int, int]
     model_geometry_digest: bytes
-    model_numerical_digest: bytes
     logits_digest: bytes
     identity: bytes
     canonical_bytes: bytes
@@ -106,7 +105,6 @@ class _UpdateMeasurements(TypedDict):
     bank: int
     model_generation: int
     model_geometry_digest: bytes
-    model_numerical_digest: bytes
     transition_status: int
     selection: dict[str, Any]
     canaries: tuple[_UpdateCanaryMeasurement, ...]
@@ -199,6 +197,8 @@ class SemanticPreparedStep:
         ],
     ) -> SemanticPreparedActorRefresh: ...
 
+    def record_saved_tensor_work(self, tensor_owner: SemanticTensorOwner) -> None: ...
+
     def model_work_buffer_port(self, *, consumer_stream: int) -> SemanticModelWorkBufferPort:
         """Original step counter shared by both banks; export only after finalization."""
         ...
@@ -253,7 +253,14 @@ class SemanticPreparedStep:
 
     def completed_model_binding(
         self, *, consumer_streams: Sequence[int]
-    ) -> tuple[_PublishedIdentity, Optional[_PublishedIdentity], int, bytes, bytes, Any]: ...
+    ) -> tuple[_PublishedIdentity, Optional[_PublishedIdentity], int, bytes, Any]: ...
+
+    def completed_feedback_records(
+        self, *, consumer_streams: Sequence[int],
+    ) -> tuple[
+        _PublishedIdentity, Optional[_PublishedIdentity],
+        tuple[tuple[int, int, int, int, int, int, bytes], ...],
+    ]: ...
 
     def save_checkpoint(
         self, *, consumer_streams: Sequence[int],
@@ -297,7 +304,7 @@ class SemanticRetainedReplayMember:
     def finish_without_published_update(self, update_step: SemanticPreparedStep) -> None: ...
     def finish_cancelled_private_segment(self) -> None: ...
 
-_SourceModelContractMetadata = tuple[bytes, tuple[int, int, int, int, int, int]]
+_SourceModelContractMetadata = tuple[bytes, tuple[int, int, int, int, int]]
 _SourceModelMemoryGeometry = tuple[
     tuple[int, ...], tuple[tuple[int, int, int], ...],
     tuple[tuple[
@@ -388,7 +395,7 @@ class SemanticPreparedSourceContentGeometry:
         ...
     def model_contract_material(self) -> SemanticMaterialBytes: ...
     def model_restore_context(self) -> tuple[
-        _PublishedIdentity, int, tuple[int, int, int], tuple[bytes, bytes]
+        _PublishedIdentity, int, tuple[int, int, int], bytes
     ]:
         """Independent original historical context; unavailable for CURRENT."""
         ...
@@ -421,41 +428,6 @@ class SemanticPreparedSourceContentGeometry:
         ...
     def continuation_capacity(self) -> int: ...
     def continuation_blocks(self) -> Optional[int]: ...
-    def content_family(
-        self, phase: Literal["model", "pack-policy", "finalize-continuation"],
-        kind: Literal["bind-model", "capture", "verify"],
-        *, prepared_kind: Optional[Literal["recompute", "proposal"]] = None,
-        prepared_bank: Optional[Literal[0, 1]] = None,
-    ) -> SemanticSourceContentFamily: ...
-    def freeze_content_occurrences(
-        self, *, events: tuple[_SourceContentEvent, ...],
-    ) -> tuple[SemanticSourceContentOccurrence, ...]:
-        """Freeze the complete original roster once before factory effects."""
-        ...
-
-class SemanticSourceContentFamily:
-    """Native-issued original command family; no public construction."""
-    def kind(self) -> str: ...
-    def phase(self) -> str: ...
-    def prepared_kind(self) -> Optional[Literal["recompute", "proposal"]]: ...
-    def prepared_bank(self) -> Optional[Literal[0, 1]]: ...
-
-class SemanticSourceContentOccurrence:
-    """One original frozen event, not a caller-provided native price."""
-    def kind(self) -> str: ...
-    def phase(self) -> str: ...
-    def prepared_kind(self) -> Optional[Literal["recompute", "proposal"]]: ...
-    def prepared_bank(self) -> Optional[Literal[0, 1]]: ...
-    def receiver_slot(self) -> int: ...
-    def output_slot(self) -> Optional[int]: ...
-    def tensor_layouts(self) -> tuple[_SourceContentTensorDescriptor, ...]: ...
-    def allocation_layouts(self) -> tuple[_SourceContentAllocationLayout, ...]: ...
-
-_SourceContentEvent = tuple[
-    SemanticSourceContentFamily, int, Optional[int],
-    tuple[_SourceContentTensorDescriptor, ...],
-    tuple[_SourceContentAllocationDescriptor, ...],
-]
 
 class SemanticPreparedSourceContent:
     """Original SOURCE structural ports, not numerical content authority.
@@ -479,25 +451,6 @@ class SemanticPreparedSourceContent:
     def activate(self, *, consumer_stream: int) -> None:
         """Prepare original SOURCE contents under the same admitted recorder."""
         ...
-    def content_family(
-        self, phase: Literal["model", "pack-policy", "finalize-continuation"],
-        kind: Literal["bind-model", "capture", "verify"],
-    ) -> SemanticSourceContentFamily: ...
-    def freeze_content_occurrences(
-        self, *, events: tuple[_SourceContentEvent, ...],
-    ) -> tuple[SemanticSourceContentOccurrence, ...]:
-        """Return the same already-frozen early original expression roster.
-
-        Tensor fields are layout, logical begin/end, storage slot, version slot,
-        allocation slot and byte offset. Allocation fields are slot, full byte
-        extent and original native provenance when already physically present.
-        A missing version slot makes no counter claim; it does not assert a new
-        or independent counter. Known partitions require authentic producer tokens.
-        No count, work ceiling or native tariff is accepted.
-        """
-        ...
-    def pack_policy_occurrences(self) -> tuple[SemanticSourceContentOccurrence, ...]: ...
-    def finalize_continuation_occurrences(self) -> tuple[SemanticSourceContentOccurrence, ...]: ...
 
 class SemanticPreparedTaskImport:
     """Original SOURCE import before its sole numerical invocation.
@@ -615,9 +568,6 @@ class SemanticColdModelWork:
         operations: tuple[tuple[int, tuple[int, ...]], ...],
         *,
         region_ends: tuple[int, ...] = (),
-        evaluation_content: Optional[tuple[
-            tuple[_SemanticTensorInput, ...], tuple[_SemanticTensorInput, ...]
-        ]] = None,
         source_content: tuple[
             Union[SemanticPreparedSourceContent, SemanticPreparedSourceContentGeometry], ...
         ] = (),
@@ -625,10 +575,8 @@ class SemanticColdModelWork:
     ) -> tuple[int, int, int]:
         """Admit once before any original buffer/view export or numerical producer.
 
-        Evaluation content is the actual output-three and objective-eight roster,
-        using the existing five-field tensor inputs, not caller native prices.
-        Source recipes contribute their complete frozen original occurrences
-        to this same admission, not a second caller-provided cost or allowance.
+        Genuine source allocation/copy work and evaluation preparation remain
+        part of the original native model-work ceiling.
         Historical geometry resolves its existing live recipe in original order;
         missing, expired and CURRENT bindings are rejected without another freeze.
         """
@@ -716,7 +664,7 @@ class SemanticModelEvaluation:
     def model_work_buffer(self, *, consumer_stream: int) -> Any: ...
     def capture(
         self, enqueue: Callable[[], Any], *, memory_scope: Any,
-        output_witness: Any, consumer_streams: Sequence[int],
+        output_owner: SemanticTensorOwner, consumer_streams: Sequence[int],
     ) -> tuple[int, int, int]:
         """Retain the original capture and its work/event/call bounds without launching."""
         ...
@@ -725,7 +673,7 @@ class SemanticModelEvaluation:
     def record_model_invocation(self) -> None: ...
     def record_model_work(self, kind: int, dimensions: tuple[int, ...]) -> None: ...
     def record_model_device_work(self, kind: int, upper_dimensions: tuple[int, ...]) -> int: ...
-    def finish(self, output_witness: Any, *, consumer_streams: Sequence[int]) -> SemanticCompletedModelEvaluation:
+    def finish(self, output_owner: SemanticTensorOwner, *, consumer_streams: Sequence[int]) -> SemanticCompletedModelEvaluation:
         """Incomplete expenditure raises without a result and retains the original owner/fence."""
         ...
     def resolve_completion(self) -> SemanticCompletedModelEvaluation:
@@ -918,6 +866,11 @@ class SemanticTransitionTaskUse:
         """
         ...
 
+class SemanticTaskReleasePending(RuntimeError):
+    """Retain the original close handles and repeat only its unfinished native join."""
+
+    operation: Literal["close_imported_task", "close_aborted_task", "close_aborted_publications", "close"]
+
 class SemanticCompletedSegmentPending(RuntimeError):
     """Native execute/pending resolver handoff; not a cold getter retry signal.
 
@@ -1106,7 +1059,7 @@ class SemanticPublishedParent:
     def source_model_contract_metadata(self) -> _SourceModelContractMetadata:
         """Complete seal-authenticated host contract of this acquired parent.
 
-        Returns record bytes and six layout byte offsets without a device read.
+        Returns record bytes and five layout coordinates without a device read.
         Planning metadata does not grant numerical or SOURCE import access.
         """
         ...
@@ -1158,12 +1111,25 @@ class SemanticTransitionSession:
         learning_phase_checkpoint_issuer: Any = None,
     ) -> Any: ...
 
-class SemanticTensorContentWitness:
-    def verify(
+class SemanticInitialPrefillReceipt:
+    """One original output handoff, consumed by that task's bind_parent."""
+
+class SemanticInitialPrefillStage:
+    def source_layout(self) -> tuple[Any, ...]: ...
+    def bind_model_content(
+        self, *, tensors: Any, model_allocations: Any, consumer_stream: int,
+    ) -> None: ...
+    def record_input(self, *, token_tensor: Any, consumer_stream: int) -> None: ...
+    def record_outputs(
         self, *, tensors: Any, consumer_stream: int,
-        occurrence: Optional[SemanticSourceContentOccurrence] = None,
-    ) -> None:
-        """Use the same original frozen handle for every SOURCE verification."""
+    ) -> SemanticInitialPrefillReceipt: ...
+
+class SemanticTensorOwner:
+    """Actual original tensor storage and Python/autograd producer custody."""
+
+    @property
+    def learning_feedback_intervention(self) -> Optional[tuple[bytes, bool]]:
+        """Genuine model-owner phase read, not cold planning metadata."""
         ...
 
 _LearningPhase = Literal["alignment", "fast", "consolidation"]
@@ -1262,16 +1228,14 @@ class SemanticTransitionController:
         The serializer receives that exact object, never a replacement writer.
         """
         ...
-    def bind_model_content(
+    def retain_model_tensor_owners(
         self, task_use: SemanticTransitionTaskUse, *, parent: Any,
         tensors: Any, consumer_stream: int, bank: Optional[int] = None,
-        occurrence: Optional[SemanticSourceContentOccurrence] = None,
-    ) -> SemanticTensorContentWitness: ...
-    def capture_tensor_content(
+    ) -> SemanticTensorOwner: ...
+    def retain_tensor_owners(
         self, task_use: SemanticTransitionTaskUse, *, parent: Any,
         tensors: Any, consumer_stream: int,
-        occurrence: Optional[SemanticSourceContentOccurrence] = None,
-    ) -> SemanticTensorContentWitness: ...
+    ) -> SemanticTensorOwner: ...
     def task_observation_roots(
         self, *, task_scope: Sequence[str], live_authorities: Any,
         statement_records: Sequence[int], allowed_support_records: Sequence[int],
@@ -1384,9 +1348,9 @@ class SemanticTransitionController:
 
     def finalize_segment_layout(
         self, task_use: SemanticTransitionTaskUse, *,
-        layouts: tuple[tuple[SemanticPreparedStep, int, int], ...],
+        layouts: tuple[tuple[SemanticPreparedStep, int], ...],
     ) -> None:
-        """Seal every original ordered step's (capture rows, bank event count).
+        """Freeze every original step's actual model-work capacity.
 
         Derived layout is finalized once before original initialization/capture.
         A refused allocation preserves this child and never permits a new plan.
@@ -1406,6 +1370,14 @@ class SemanticTransitionController:
         The original allocation pool spans all stages through instantiation.
         Recording requires genuine completion of every original future import.
         """
+        ...
+
+    def close_imported_task(self, task_use: SemanticTransitionTaskUse) -> None: ...
+    def close_aborted_task(self, task_use: SemanticTransitionTaskUse) -> None: ...
+    def close_aborted_publications(
+        self, releases: tuple[tuple[SemanticPublishedParent, Sequence[int]], ...],
+    ) -> None:
+        """Join only this complete original parent/consumer roster after abort."""
         ...
 
     def close(self, parent: SemanticPublishedParent) -> None:

@@ -18043,9 +18043,9 @@ impl PySemanticPreparedStep {
     /// Cold original records, not encoded features or current-bank substitutes.
     /// Returns (predecessor_identity, successor_identity_or_None, records), with
     /// records ordered by (role, index). Each record is (role, index, generation,
-    /// capacity_bytes, logical_begin, logical_end, native_identity, raw_bytes).
-    /// Native identity is the original range seal; a carrier hashes raw_bytes
-    /// separately for bytes_sha256. No new model or publication identity issues.
+    /// capacity_bytes, logical_begin, logical_end, raw_bytes).
+    /// These actual records retain their original owning publication, not a
+    /// separate numerical content identity.
     #[pyo3(signature = (*, consumer_streams))]
     fn completed_feedback_records(
         &self,
@@ -18075,7 +18075,6 @@ impl PySemanticPreparedStep {
                     record.capacity_bytes,
                     record.logical_begin,
                     record.logical_end,
-                    PyBytes::new(py, record.identity.as_bytes()),
                     PyBytes::new(py, &record.bytes),
                 )
             }),
@@ -18431,8 +18430,8 @@ struct ReplayImportFinalization {
     reader_quiesced: bool,
     acquisition: Option<xlog_cuda::SemanticPublishedAcquisition>,
     successor: Option<SemanticPublishedLease>,
-    comparison: Option<xlog_cuda::SemanticReplayPublicationVerification>,
-    comparison_finished: bool,
+    publication_join: Option<xlog_cuda::SemanticReplayPublicationJoin>,
+    publication_join_finished: bool,
     successor_released: bool,
     predecessor_released: bool,
     state_finished: bool,
@@ -25323,7 +25322,7 @@ impl PySemanticTransitionController {
     /// acknowledgement_payload_capacity_bytes, model_generation, policy_generation,
     /// model_numerical_mode (complete, restorable producer-owned cold metadata),
     /// model_contract_layout (S_begin, S_bytes, S_digest_offset, generation_offset,
-    /// N_offset, identity_offset), six u64 byte coordinates in record 44,
+    /// identity_offset), five u64 coordinates in record 44,
     /// neural_generation, cache_generation, training_cursor, training_rng
     /// (four u64 words), fuel, rng (model u32, stream u64, family u8, proposal u32),
     /// topology_identity and table_identity (bytes32), role_counts (55 u64s),
@@ -28136,15 +28135,13 @@ impl PySemanticTransitionController {
                     // custody until native final use succeeds. Import replay
                     // verifies history; it neither runs a backward nor opens
                     // the public policy final-use API during Importing.
-                    let comparison = invocation
+                    let published = invocation
                         .outcome
                         .as_published()
-                        .map_err(xlog_err)
-                        .and_then(|_| {
-                            self.verify_import_successor(py, &issued, &acquired, &material, import)
-                        });
+                        .map(|_| ())
+                        .map_err(xlog_err);
                     if let Some(prepared) = prepared {
-                        comparison?;
+                        published?;
                         let invocation = Py::new(py, invocation)?;
                         return Py::new(
                             py,
@@ -28191,16 +28188,15 @@ impl PySemanticTransitionController {
                         drop(retained.into_native());
                     }
                     // Finalization is attempted once even for a refusal or a
-                    // failed comparison. Uncertain completion retains invocation,
+                    // failed final use. Uncertain completion retains invocation,
                     // tape and reader; reader release will not retry that use.
-                    finish_with_cleanup(py, comparison, completion)?;
+                    finish_with_cleanup(py, published, completion)?;
                 }
                 #[cfg(not(feature = "semantic-policy"))]
                 return Err(invalid("proposal replay requires a semantic-policy build"));
             } else {
                 bind_continuation(budget)?;
                 self.execute_continuation_in_execution(py, &issued, &acquired, Some(import))?;
-                self.verify_import_successor(py, &issued, &acquired, &material, import)?;
             }
             Ok(None)
         })();
@@ -28244,8 +28240,11 @@ impl PySemanticTransitionController {
         progress: Option<&mut ReplayImportFinalization>,
     ) -> PyResult<()> {
         // Cleanup runs exactly once even if restore, packing, execution or the
-        // first comparison failed. Its sole permission is retiring the original
+        // replay execution failed. Its sole permission is retiring the original
         // Runtime's temporary owners; an aborted native owner still rejects reads.
+        // Ordinary import failure is terminal, with native Session custody of
+        // the full original join retained for quarantine. Retained source members
+        // supply their reachable progress to resolve that same join instead.
         let mut local = ReplayImportFinalization::default();
         let progress = progress.unwrap_or(&mut local);
         let cleanup_result = Self::finish_original_import_invocation(
@@ -28331,14 +28330,14 @@ impl PySemanticTransitionController {
                         }
                         prepared.require_completed()?;
                         // Original native FinalUse and Runtime cleanup are
-                        // already known. Quiescence itself rejects retained
-                        // tensor owners, before the final P/S comparison.
+                        // already known. Retire the actual source producers
+                        // before quiescence and the final origin/reader join.
                         prepared.retire_source_owner(py)?;
                     }
                 }
                 let mut owner = import.session.owner()?;
                 // Join all callback writes to P/S shared storage and retire
-                // aliases, but retain P's reader for final full comparison.
+                // aliases, but retain P's reader for final origin/reader join.
                 let lease = acquired.lease()?;
                 let result = owner.quiesce_published_reader(&lease, &streams);
                 let pending = result.as_ref().is_err_and(|error| {
@@ -28390,30 +28389,26 @@ impl PySemanticTransitionController {
                     &mut progress.native_pending,
                 )?);
             }
-            if !progress.comparison_finished {
+            if !progress.publication_join_finished {
                 let mut owner = import.session.owner()?;
                 let predecessor = acquired.lease()?;
                 let successor = progress
                     .successor
                     .as_ref()
                     .expect("original successor reader");
-                if progress.comparison.is_none() {
-                    progress.comparison = Some(
+                if progress.publication_join.is_none() {
+                    progress.publication_join = Some(
                         owner
-                            .begin_replay_publication_verification(
-                                material,
-                                &predecessor,
-                                successor,
-                            )
+                            .begin_replay_publication_join(material, &predecessor, successor)
                             .map_err(xlog_err)?,
                     );
                 }
-                let comparison = progress
-                    .comparison
+                let publication_join = progress
+                    .publication_join
                     .as_mut()
-                    .expect("original complete-state comparison");
-                let result = owner.resolve_replay_publication_verification(
-                    comparison,
+                    .expect("original publication origin join");
+                let result = owner.resolve_replay_publication_join(
+                    publication_join,
                     &predecessor,
                     successor,
                 );
@@ -28426,7 +28421,7 @@ impl PySemanticTransitionController {
                             )
                     )
                 }) && owner
-                    .replay_publication_verification_pending(comparison, &predecessor, successor)
+                    .replay_publication_join_pending(publication_join, &predecessor, successor)
                     .map_err(xlog_err)?;
                 drop(predecessor);
                 drop(owner);
@@ -28437,7 +28432,7 @@ impl PySemanticTransitionController {
                     pending,
                     &mut progress.native_pending,
                 )?;
-                progress.comparison_finished = true;
+                progress.publication_join_finished = true;
             }
             if !progress.successor_released {
                 let mut owner = import.session.owner()?;
@@ -28623,33 +28618,6 @@ impl PySemanticTransitionController {
             .published_identity(&*parent.lease()?)
             .map_err(xlog_err)?;
         Ok(())
-    }
-
-    fn verify_import_successor(
-        &self,
-        py: Python<'_>,
-        task_use: &PySemanticTransitionTaskUse,
-        predecessor: &PySemanticPublishedParent,
-        material: &xlog_cuda::SemanticReplayMaterial,
-        import: &ColdImportGuard<'_>,
-    ) -> PyResult<()> {
-        let mut owner = import.session.owner()?;
-        let _state = self.execution_state(py, task_use, predecessor, &owner, Some(import))?;
-        let mut successor = owner.acquire().map_err(xlog_err)?;
-        let comparison = predecessor.lease().and_then(|lease| {
-            owner
-                .verify_replay_publication(material, &lease, &successor)
-                .map_err(xlog_err)
-        });
-        // This private successor was never exported to Python; native full
-        // content verification registered the controller's legacy stream 1.
-        // Retire its actual native reader even on comparison failure; preserve
-        // both errors if cleanup also fails and let import abort own it.
-        let release = owner.release(&mut successor, &[1]).map_err(xlog_err);
-        // Normalizing an exception may execute Python; release native locks first.
-        drop(_state);
-        drop(owner);
-        finish_with_cleanup(py, comparison, release)
     }
 
     #[expect(
