@@ -4,12 +4,11 @@ use super::material_bytes::PySemanticMaterialBytes;
 use super::*;
 use pyo3::exceptions::PyKeyError;
 
-const FIELD_NAMES: [&str; 15] = [
+const FIELD_NAMES: [&str; 14] = [
     "schema",
     "publication",
     "semantic_root",
     "model_geometry_digest",
-    "model_numerical_digest",
     "prefix_identity",
     "model_generation",
     "neural_generation",
@@ -54,7 +53,7 @@ const CACHE_KEYS: [&str; 8] = [
     frozen
 )]
 pub(crate) struct PySemanticPublicationMaterialProjection {
-    fields: [Py<PyAny>; 15],
+    fields: [Py<PyAny>; 14],
     _original: xlog_cuda::SemanticLoadedPublicationInputProjection,
     _metadata: Arc<xlog_cuda::SemanticReplayMaterialReservation>,
 }
@@ -145,7 +144,7 @@ fn projection_metadata_extent(
         .checked_add(33)
         .ok_or_else(|| invalid("publication identity extent overflow"))?;
     add_extent(&mut extent, repeated_extent(integer, 7)?)?;
-    add_extent(&mut extent, repeated_extent(identity, 7)?)?;
+    add_extent(&mut extent, repeated_extent(identity, 6)?)?;
     add_extent(&mut extent, python_metadata_tuple_extent(py, 4)?)?;
     for count in [original.prefix.len(), original.source.len()] {
         add_extent(&mut extent, python_metadata_tuple_extent(py, count)?)?;
@@ -279,9 +278,6 @@ pub(super) fn inspect(
             .into_any()
             .unbind(),
         PyBytes::new(py, projection.model_geometry_digest.as_bytes())
-            .into_any()
-            .unbind(),
-        PyBytes::new(py, projection.model_numerical_digest.as_bytes())
             .into_any()
             .unbind(),
         PyBytes::new(py, projection.prefix_identity.as_bytes())

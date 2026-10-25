@@ -358,7 +358,6 @@ impl PySemanticPublishedParent {
                 layout.schema_bytes,
                 layout.schema_digest_offset,
                 layout.generation_offset,
-                layout.numerical_digest_offset,
                 layout.identity_offset,
             ),
         )
@@ -447,10 +446,7 @@ pub(super) fn resident_memory_tuple(
             PyBytes::new(py, parent.state_digest.as_bytes()),
         ),
         memory.generations,
-        (
-            PyBytes::new(py, memory.numerical_state.0.as_bytes()),
-            PyBytes::new(py, memory.numerical_state.1.as_bytes()),
-        ),
+        PyBytes::new(py, memory.model_geometry_digest.as_bytes()),
         PyTuple::new(py, allocations)?,
         storages,
         views,

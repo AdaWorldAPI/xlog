@@ -112,7 +112,7 @@ impl OriginalSourceTensorExport {
 struct OriginalSourceModelContext {
     parent: SemanticPublishedIdentity,
     descriptor_digest: Identity256,
-    numerical_state: (Identity256, Identity256),
+    model_geometry_digest: Identity256,
     semantic_root: (u64, u64, u64, Identity256, [u64; 3]),
     tensors: [OriginalSourceTensorExport; 4],
     generations: (u64, u64, u64, u64, u64),
@@ -286,7 +286,7 @@ impl OriginalSourcePortProjection {
             context: OriginalSourceModelContext {
                 parent: context.parent,
                 descriptor_digest: context.descriptor_digest,
-                numerical_state: context.numerical_state,
+                model_geometry_digest: context.model_geometry_digest,
                 semantic_root: context.semantic_root,
                 tensors: [
                     context.prefix.0,
@@ -354,10 +354,7 @@ impl OriginalSourcePortProjection {
                 PyBytes::new(py, context.table_identity.as_bytes()),
             ),
             context.capacities,
-            (
-                PyBytes::new(py, context.numerical_state.0.as_bytes()),
-                PyBytes::new(py, context.numerical_state.1.as_bytes()),
-            ),
+            PyBytes::new(py, context.model_geometry_digest.as_bytes()),
         )
             .into_pyobject(py)?
             .unbind();
@@ -1733,7 +1730,6 @@ impl PySemanticPreparedTaskImport {
                 layout.schema_bytes,
                 layout.schema_digest_offset,
                 layout.generation_offset,
-                layout.numerical_digest_offset,
                 layout.identity_offset,
             ),
         )
@@ -1929,7 +1925,6 @@ impl PySemanticPublishedParent {
                 layout.schema_bytes,
                 layout.schema_digest_offset,
                 layout.generation_offset,
-                layout.numerical_digest_offset,
                 layout.identity_offset,
             ),
         )

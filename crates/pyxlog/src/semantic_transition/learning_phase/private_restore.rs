@@ -21,7 +21,7 @@ pub(super) struct PrivateTrajectoryStart {
     callback_work: Option<Py<PySemanticColdModelWork>>,
     child_joined: bool,
     report: Option<SemanticColdModelWorkResult>,
-    model_binding: Option<(u64, Identity256, Identity256)>,
+    model_binding: Option<(u64, Identity256)>,
     observer_finish_entered: bool,
     backing_peak: Option<u64>,
     record_entered: bool,
@@ -571,11 +571,7 @@ impl PySemanticLearningPhaseTransition {
                 self.trajectory_start()?
                     .as_mut()
                     .expect("retained original trajectory")
-                    .model_binding = Some((
-                    model.model_generation,
-                    model.model_geometry_digest,
-                    model.model_numerical_digest,
-                ));
+                    .model_binding = Some((model.model_generation, model.model_geometry_digest));
             }
             restored
                 .session
@@ -681,11 +677,7 @@ impl PySemanticLearningPhaseTransition {
             arguments.set_item("restored_parent", parent.identity(py)?)?;
             arguments.set_item(
                 "model_binding",
-                (
-                    model.0,
-                    PyBytes::new(py, model.1.as_bytes()),
-                    PyBytes::new(py, model.2.as_bytes()),
-                ),
+                (model.0, PyBytes::new(py, model.1.as_bytes())),
             )?;
             arguments.set_item(
                 "source_checkpoint",

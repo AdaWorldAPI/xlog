@@ -2814,7 +2814,6 @@ impl PySemanticLearningPhaseTransition {
             (
                 native.model_generation,
                 PyBytes::new(py, native.model_geometry_digest.as_bytes()),
-                PyBytes::new(py, native.model_numerical_digest.as_bytes()),
             ),
         )?;
         arguments.set_item(

@@ -4582,10 +4582,6 @@ fn update_measurements_report(
         "model_geometry_digest",
         PyBytes::new(py, observation.model_geometry_digest.as_bytes()),
     )?;
-    report.set_item(
-        "model_numerical_digest",
-        PyBytes::new(py, observation.model_numerical_digest.as_bytes()),
-    )?;
     report.set_item("transition_status", observation.transition_status)?;
     report.set_item(
         "capacity_refusal",
@@ -4645,7 +4641,6 @@ fn update_measurements_report(
         ("successor_logical", origin.successor_logical),
         ("successor_state", origin.successor_state),
         ("model_geometry_digest", origin.model_geometry_digest),
-        ("model_numerical_digest", origin.model_numerical_digest),
     ] {
         source.set_item(name, PyTuple::new(py, value)?)?;
     }
@@ -4724,10 +4719,6 @@ fn update_measurements_report(
                 payload.set_item(
                     "model_geometry_digest",
                     PyBytes::new(py, receipt.model_geometry_digest.as_bytes()),
-                )?;
-                payload.set_item(
-                    "model_numerical_digest",
-                    PyBytes::new(py, receipt.model_numerical_digest.as_bytes()),
                 )?;
                 payload.set_item(
                     "logits_digest",
@@ -7434,8 +7425,8 @@ fn parse_parent(
     // the complete canonical contribution, and requires lossless cold restore
     // before admitting it; a payload hash is not reconstructible metadata.
     ColdValue::from_canonical_bytes(&model_numerical_mode)?;
-    let [schema_begin, schema_bytes, schema_digest_offset, generation_offset, numerical_digest_offset, identity_offset] =
-        unsigned_array::<6>(&metadata_value(
+    let [schema_begin, schema_bytes, schema_digest_offset, generation_offset, identity_offset] =
+        unsigned_array::<5>(&metadata_value(
             metadata,
             "model_contract_layout",
             &mut budget,
@@ -7445,7 +7436,6 @@ fn parse_parent(
         schema_bytes,
         schema_digest_offset,
         generation_offset,
-        numerical_digest_offset,
         identity_offset,
     };
     let nonterminal_intent = metadata
@@ -17787,7 +17777,7 @@ impl PySemanticPreparedStep {
 
     /// Cold authenticated binding of this completed step's original model.
     /// Returns (predecessor_identity, successor_identity_or_None, model_generation,
-    /// model_geometry_digest, model_numerical_digest, carrier_or_None). The
+    /// model_geometry_digest, carrier_or_None). The
     /// immutable successful-Proposal carrier exposes numerical_realization, logits and random_state as
     /// (native_owner_identity, canonical_bytes). Identities have the same four
     /// fields as PublishedParent.identity(); they are not live readers.
@@ -17829,7 +17819,7 @@ impl PySemanticPreparedStep {
                     "completed model binding changed while serializing its carrier",
                 ));
             }
-            let (predecessor, successor, generation, geometry, numerical) = binding;
+            let (predecessor, successor, generation, geometry) = binding;
             let identity = |value: xlog_cuda::SemanticPublishedIdentity| {
                 (
                     PyBytes::new(py, value.instance.as_bytes()),
@@ -17843,7 +17833,6 @@ impl PySemanticPreparedStep {
                 successor.map(identity),
                 generation,
                 PyBytes::new(py, geometry.as_bytes()),
-                PyBytes::new(py, numerical.as_bytes()),
                 carrier
                     .map(|inner| Py::new(py, PySemanticCompletedModelCarrier { inner }))
                     .transpose()?,
@@ -20086,7 +20075,7 @@ impl PySemanticPublishedParent {
 
     /// Project model metadata from this exact acquired parent. Returns:
     /// (parent_identity, descriptor_digest, semantic_root, prefix, ring,
-    /// generations, contracts, capacities, numerical_state).
+    /// generations, contracts, capacities, model_geometry_digest).
     ///
     /// ``semantic_root`` is (owner, slot, generation, digest, extents), with
     /// statement/support/version extents. It identifies the acquired XLOG root;
@@ -20097,11 +20086,9 @@ impl PySemanticPublishedParent {
     /// ``generations`` is (model, neural_bank, neural, cache, authority).
     /// ``contracts`` is (topology_identity, position_table_identity).
     /// ``capacities`` is (prefix, feedback, exclusive_position_bound).
-    /// ``numerical_state`` is (model_geometry_digest, model_numerical_digest),
-    /// both 32-byte identities from this same acquired header. The first binds
-    /// full allocation/storage/view geometry and model layouts; the second
-    /// folds that identity with actual typed and full-backing seals for roles
-    /// 18..25. Neither substitutes for the full ModelContract or parent identity.
+    /// ``model_geometry_digest`` is the 32-byte identity of the complete
+    /// allocation/storage/view geometry and model layouts in this acquired header.
+    /// The original ModelContract and parent retain their ownership authority.
     /// Other digests are 32-byte bytes. The descriptor digest binds the publication
     /// instance/word; it is not the action catalogue's descriptor identity.
     ///
@@ -20155,17 +20142,14 @@ impl PySemanticPublishedParent {
                 PyBytes::new(py, context.table_identity.as_bytes()),
             ),
             context.capacities,
-            (
-                PyBytes::new(py, context.numerical_state.0.as_bytes()),
-                PyBytes::new(py, context.numerical_state.1.as_bytes()),
-            ),
+            PyBytes::new(py, context.model_geometry_digest.as_bytes()),
         )
             .into_pyobject(py)?
             .unbind())
     }
 
     /// Export the exact selected resident neural bank without a device copy.
-    /// Returns (parent_identity, generations, numerical_state, allocations,
+    /// Returns (parent_identity, generations, model_geometry_digest, allocations,
     /// storages, views). Each allocation row is (native_provenance, U8 DLPack)
     /// and occurs exactly once. Storage rows are (allocation, byte_offset,
     /// span_bytes). View rows are (role, index, storage, byte_offset, layout),
