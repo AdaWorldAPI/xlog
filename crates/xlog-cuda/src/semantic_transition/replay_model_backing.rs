@@ -12,7 +12,6 @@ struct ReplayBackingOrigin {
 
 pub(super) struct ReplayModelBacking {
     origin: ReplayBackingOrigin,
-    seal: Identity256,
     geometry: Vec<u8>,
     allocation: Arc<TrackedCudaSlice<u8>>,
     sealed: AtomicBool,
@@ -21,7 +20,6 @@ pub(super) struct ReplayModelBacking {
 struct LiveModelGeneration {
     provider: Weak<CudaKernelProvider>,
     origin: ReplayBackingOrigin,
-    seal: Identity256,
     geometry: Vec<u8>,
     allocation: Weak<TrackedCudaSlice<u8>>,
 }
@@ -37,10 +35,9 @@ fn live_model_generations() -> &'static Mutex<Vec<LiveModelGeneration>> {
 fn backing_descriptor<B: PublicationByteStorage>(
     material: &PublicationMaterialStorage<B>,
     allocation: usize,
-) -> Result<(ReplayBackingOrigin, Identity256, Vec<u8>), SemanticTransitionError> {
+) -> Result<(ReplayBackingOrigin, Vec<u8>), SemanticTransitionError> {
     let bytes = material.model_memory.allocation_bytes[allocation];
     let mut origin = None;
-    let mut seal = None;
     let mut geometry = Vec::new();
     material_u64(&mut geometry, bytes);
     material_u64(
@@ -84,9 +81,6 @@ fn backing_descriptor<B: PublicationByteStorage>(
         if origin
             .replace(coordinate)
             .is_some_and(|old| old != coordinate)
-            || seal
-                .replace(range.backing_digest)
-                .is_some_and(|old| old != range.backing_digest)
         {
             return Err(publication_input_error(
                 "historical model aliases disagree on their original backing generation",
@@ -103,7 +97,6 @@ fn backing_descriptor<B: PublicationByteStorage>(
         ] {
             material_u64(&mut geometry, value);
         }
-        geometry.extend_from_slice(range.digest.as_bytes());
         geometry.extend_from_slice(&publication_abi_bytes(&[
             material.layouts[&(view.role, view.index)]
         ]));
@@ -111,17 +104,16 @@ fn backing_descriptor<B: PublicationByteStorage>(
     let (storage_slot, generation) = origin.ok_or(SemanticTransitionError::ObservationMismatch)?;
     Ok((
         ReplayBackingOrigin {
-            instance: material.bank.header.instance,
+            instance: material.bank.header.original_instance,
             storage_slot,
             generation,
         },
-        seal.ok_or(SemanticTransitionError::ObservationMismatch)?,
         geometry,
     ))
 }
 
-/// Register only after the complete original cold observation authenticated
-/// the actual acquired directory, every typed seal and the full backing bytes.
+/// Register the actual acquired directory and original immutable backing owners
+/// after their complete cold observation.
 #[cfg(feature = "semantic-policy")]
 pub(super) fn register_original_model_generations<B: PublicationByteStorage>(
     provider: &Arc<CudaKernelProvider>,
@@ -136,7 +128,7 @@ pub(super) fn register_original_model_generations<B: PublicationByteStorage>(
     })?;
     live.retain(|entry| entry.provider.strong_count() != 0 && entry.allocation.strong_count() != 0);
     for (index, (slot, allocation)) in originals.iter().enumerate() {
-        let (origin, seal, geometry) = backing_descriptor(material, index)?;
+        let (origin, geometry) = backing_descriptor(material, index)?;
         if *slot != origin.storage_slot
             || allocation.len() as u64 != material.model_memory.allocation_bytes[index]
         {
@@ -150,22 +142,20 @@ pub(super) fn register_original_model_generations<B: PublicationByteStorage>(
                     .is_some_and(|owner| Arc::ptr_eq(&owner, provider))
         });
         if let Some(existing) = existing {
-            if existing.seal != seal
-                || existing.geometry != geometry
+            if existing.geometry != geometry
                 || existing
                     .allocation
                     .upgrade()
                     .is_none_or(|owner| !Arc::ptr_eq(&owner, allocation))
             {
                 return Err(publication_input_error(
-                    "original numerical generation changed its allocation owner or seals",
+                    "original numerical generation changed its allocation owner or geometry",
                 ));
             }
         } else {
             live.push(LiveModelGeneration {
                 provider: Arc::downgrade(provider),
                 origin,
-                seal,
                 geometry,
                 allocation: Arc::downgrade(allocation),
             });
@@ -185,7 +175,7 @@ struct ReplayModelBackingState {
 /// Lookup uses original allocation coordinates, not content equality. Cold
 /// completed-step export registers the genuine immutable source owner, which
 /// historical readers lease even on their first import. If no original owner
-/// survives, complete cold restoration owns and seals one backing. Weak entries grant neither write
+/// survives, complete cold restoration owns and initializes one backing. Weak entries grant neither write
 /// authority nor lifetime: original Sessions, readers and captured consumers
 /// retain the strong owners through known final use or unknown completion.
 #[derive(Default)]
@@ -214,7 +204,7 @@ impl SemanticReplayModelBackings {
         state.allocations.retain(|owner| owner.strong_count() != 0);
         let mut leases = Vec::with_capacity(material.model_memory.allocation_bytes.len());
         for (allocation, &bytes) in material.model_memory.allocation_bytes.iter().enumerate() {
-            let (origin, seal, geometry) = backing_descriptor(material, allocation)?;
+            let (origin, geometry) = backing_descriptor(material, allocation)?;
             let original = {
                 let mut live = live_model_generations().lock().map_err(|_| {
                     publication_input_error("original numerical generation custody is poisoned")
@@ -230,8 +220,8 @@ impl SemanticReplayModelBackings {
                             .is_some_and(|owner| Arc::ptr_eq(&owner, provider))
                 });
                 if let Some(entry) = entry {
-                    if entry.seal != seal || entry.geometry != geometry {
-                        return Err(publication_input_error("historical replay changed the original live numerical geometry or seals"));
+                    if entry.geometry != geometry {
+                        return Err(publication_input_error("historical replay changed the original live numerical geometry"));
                     }
                     entry.allocation.upgrade()
                 } else {
@@ -244,15 +234,14 @@ impl SemanticReplayModelBackings {
                 .filter_map(Weak::upgrade)
                 .find(|owner| owner.origin == origin);
             let owner = if let Some(owner) = existing {
-                if owner.seal != seal
-                    || owner.geometry != geometry
+                if owner.geometry != geometry
                     || owner.allocation.len() as u64 != bytes
                     || original
                         .as_ref()
                         .is_some_and(|original| !Arc::ptr_eq(original, &owner.allocation))
                 {
                     return Err(publication_input_error(
-                        "replay model lease changed the original seal or allocation alias geometry",
+                        "replay model lease changed the original allocation owner or alias geometry",
                     ));
                 }
                 if !owner.sealed.load(Ordering::Acquire) {
@@ -270,7 +259,7 @@ impl SemanticReplayModelBackings {
                 } else {
                     // A durable restart may have no live original allocation.
                     // The unchanged complete cold restoration then owns and
-                    // seals one allocation, never a byte-equality alias.
+                    // initializes one allocation, never a byte-equality alias.
                     (
                         Arc::new(allocate_publication(provider, bytes as usize)?),
                         false,
@@ -278,7 +267,6 @@ impl SemanticReplayModelBackings {
                 };
                 let owner = Arc::new(ReplayModelBacking {
                     origin,
-                    seal,
                     geometry,
                     allocation,
                     sealed: AtomicBool::new(sealed),
