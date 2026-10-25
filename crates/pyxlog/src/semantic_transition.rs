@@ -111,9 +111,9 @@ pyo3::create_exception!(
 
 pyo3::create_exception!(
     pyxlog._native,
-    SemanticImportedTaskReleasePending,
+    SemanticTaskReleasePending,
     PyRuntimeError,
-    "The original model-free import retains an unfinished terminal join; resolve that same release."
+    "The original task retains an unfinished terminal join; resolve that same release."
 );
 
 fn fallible_python_u64(py: Python<'_>, value: u64) -> PyResult<Bound<'_, PyAny>> {
@@ -444,7 +444,8 @@ pub(crate) struct PySemanticTransitionSession {
     learning_preparing: AtomicBool,
     learning_transition: Mutex<Option<Py<learning_phase::PySemanticLearningPhaseTransition>>>,
     checkpoint_custody: Mutex<Option<learning_phase::cold_restore::CheckpointCustody>>,
-    imported_task_release: Mutex<Option<ImportedTaskRelease>>,
+    task_release: Mutex<Option<TaskRelease>>,
+    prefill_operation: Arc<AtomicBool>,
     #[cfg(feature = "semantic-policy")]
     pending_content_binding: Mutex<Option<PendingPythonContentBinding>>,
     #[cfg(feature = "semantic-policy")]
@@ -472,10 +473,75 @@ pub(crate) struct PySemanticTransitionSession {
     memory_bytes: u64,
 }
 
-struct ImportedTaskRelease {
-    owner: xlog_cuda::SemanticImportedTaskRelease,
-    task_use: Py<PySemanticTransitionTaskUse>,
-    controller: Py<PySemanticTransitionController>,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TaskReleaseKind {
+    Imported,
+    Aborted,
+}
+
+enum TaskReleaseCustody {
+    TaskUse {
+        task_use: Py<PySemanticTransitionTaskUse>,
+        controller: Py<PySemanticTransitionController>,
+        kind: TaskReleaseKind,
+    },
+    ObservedCold {
+        cold_task: Py<cold_task::PySemanticTransitionColdTask>,
+    },
+}
+
+impl TaskReleaseCustody {
+    fn same_as(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::TaskUse {
+                    task_use,
+                    controller,
+                    kind,
+                },
+                Self::TaskUse {
+                    task_use: original_task,
+                    controller: original_controller,
+                    kind: original_kind,
+                },
+            ) => {
+                kind == original_kind
+                    && task_use.as_ptr() == original_task.as_ptr()
+                    && controller.as_ptr() == original_controller.as_ptr()
+            }
+            (
+                Self::ObservedCold { cold_task },
+                Self::ObservedCold {
+                    cold_task: original,
+                },
+            ) => cold_task.as_ptr() == original.as_ptr(),
+            _ => false,
+        }
+    }
+}
+
+struct TaskRelease {
+    owner: Option<xlog_cuda::SemanticTaskRelease>,
+    custody: TaskReleaseCustody,
+}
+
+// Producer callbacks must return before terminal cleanup may detach their Session.
+struct InitialPrefillOperation(Arc<AtomicBool>);
+
+impl InitialPrefillOperation {
+    fn begin(session: &PySemanticTransitionSession) -> PyResult<Self> {
+        session
+            .prefill_operation
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| invalid("initial prefill is already in an original operation"))?;
+        Ok(Self(Arc::clone(&session.prefill_operation)))
+    }
+}
+
+impl Drop for InitialPrefillOperation {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 struct SemanticSessionGuard<'a>(MutexGuard<'a, Option<SemanticTransitionSession>>);
@@ -680,109 +746,224 @@ impl PySemanticTransitionSession {
         Ok(SemanticSessionGuard(owner))
     }
 
-    fn release_observed_cold(&self) -> PyResult<()> {
+    fn require_task_release_idle(&self) -> PyResult<()> {
         self.require_creator()?;
-        #[cfg(feature = "semantic-policy")]
-        if self.private_replay_custody()?.is_some() {
-            return Err(invalid(
-                "private replay Session release belongs to its original native phase",
-            ));
+        {
+            let owner = self.inner.try_lock().map_err(|_| {
+                invalid("terminal task release cannot interrupt an original native operation")
+            })?;
+            if owner.is_none() {
+                return Err(invalid("native Session was already released"));
+            }
         }
         if self.importing.load(Ordering::Acquire)
             || self.recording.load(Ordering::Acquire)
+            || self.prefill_operation.load(Ordering::Acquire)
             || self.retiring.load(Ordering::Acquire)
-            || self.issuance.load(Ordering::Acquire) != 0
-        {
-            return Err(invalid("fresh cold release requires an unused Session"));
-        }
-        let owner = {
-            let mut guard = self
-                .inner
+            || self.learning_preparing.load(Ordering::Acquire)
+            || self
+                .learning_transition
                 .lock()
-                .map_err(|_| invalid("native semantic session owner mutex is poisoned"))?;
-            let live = guard
-                .as_mut()
-                .ok_or_else(|| invalid("fresh cold Session was already released"))?;
-            live.join_observed_cold_release().map_err(xlog_err)?;
-            guard.take().expect("checked live fresh cold Session")
-        };
-        owner.finish_observed_cold_release().map_err(xlog_err)?;
-        self.training_canary_owner
-            .lock()
-            .map_err(|_| invalid("symbolic canary owner mutex is poisoned"))?
-            .take();
-        #[cfg(feature = "semantic-policy")]
+                .map_err(|_| invalid("learning-phase retention mutex is poisoned"))?
+                .is_some()
+            || self
+                .prepared_segment
+                .lock()
+                .map_err(|_| invalid("prepared segment mutex is poisoned"))?
+                .is_some()
+            || self
+                .checkpoint_custody
+                .lock()
+                .map_err(|_| invalid("checkpoint custody mutex is poisoned"))?
+                .as_ref()
+                .is_some_and(|custody| {
+                    custody.closure.is_some()
+                        || custody.origin.is_some()
+                        || custody.pending_export.is_some()
+                })
         {
-            let instruction = self
+            return Err(invalid(
+                "terminal task release requires its original idle owner outside execution and callbacks",
+            ));
+        }
+        #[cfg(feature = "semantic-policy")]
+        if self.private_replay_custody()?.is_some()
+            || self
+                .actor_refresh_child
+                .lock()
+                .map_err(|_| invalid("actor construction custody mutex is poisoned"))?
+                .is_some()
+            || self
                 .segment_instruction
                 .lock()
                 .map_err(|_| invalid("original instruction owner mutex is poisoned"))?
-                .take();
-            drop(instruction);
+                .is_some()
+            || self
+                .prepared_task_import
+                .lock()
+                .map_err(|_| invalid("prepared import custody mutex is poisoned"))?
+                .is_some()
+            || self
+                .pending_content_binding
+                .lock()
+                .map_err(|_| invalid("pending content custody mutex is poisoned"))?
+                .is_some()
+            || self
+                .pending_evaluation_preparation
+                .lock()
+                .map_err(|_| invalid("pending evaluation custody mutex is poisoned"))?
+                .is_some()
+            || self
+                .active_cold_model_work
+                .lock()
+                .map_err(|_| invalid("active cold callback custody mutex is poisoned"))?
+                .is_some()
+        {
+            return Err(invalid(
+                "terminal task release cannot interrupt original private or prepared custody",
+            ));
         }
-        drain_export_owners();
         Ok(())
     }
 
-    fn release_imported_task(
+    fn release_observed_cold(
         &self,
         py: Python<'_>,
-        task_use: &Bound<'_, PySemanticTransitionTaskUse>,
-        controller: &Bound<'_, PySemanticTransitionController>,
+        cold_task: &Bound<'_, cold_task::PySemanticTransitionColdTask>,
     ) -> PyResult<()> {
+        self.require_creator()?;
+        let custody = TaskReleaseCustody::ObservedCold {
+            cold_task: cold_task.clone().unbind(),
+        };
+        if self
+            .task_release
+            .try_lock()
+            .map_err(|_| {
+                invalid("terminal task release is already active or its custody is poisoned")
+            })?
+            .is_some()
+        {
+            return self.release_task(py, custody);
+        }
+        self.require_task_release_idle()?;
+        if self.issuance.load(Ordering::Acquire) != 0 {
+            return Err(invalid(
+                "fresh cold release requires its original unused Session",
+            ));
+        }
+        self.release_task(py, custody)
+    }
+
+    fn release_task(&self, py: Python<'_>, custody: TaskReleaseCustody) -> PyResult<()> {
         // Allocate Python custody before entering the terminal native wait.
-        let pending = SemanticImportedTaskReleasePending::new_err(
-            "retain controller and task_use, then repeat controller.close_imported_task(task_use); do not abort, import or replace that owner",
-        );
-        pending.value(py).setattr("controller", controller)?;
-        pending.value(py).setattr("task_use", task_use)?;
-        let mut retained = self
-            .imported_task_release
-            .lock()
-            .map_err(|_| invalid("original import release custody mutex is poisoned"))?;
+        let (operation, message) = match &custody {
+            TaskReleaseCustody::TaskUse { kind: TaskReleaseKind::Imported, .. } => (
+                "close_imported_task",
+                "retain controller and task_use, then repeat controller.close_imported_task(task_use); do not abort, import or replace that owner",
+            ),
+            TaskReleaseCustody::TaskUse { kind: TaskReleaseKind::Aborted, .. } => (
+                "close_aborted_task",
+                "retain controller and task_use, then repeat controller.close_aborted_task(task_use); do not import or replace that owner",
+            ),
+            TaskReleaseCustody::ObservedCold { .. } => (
+                "close",
+                "retain cold_task, then repeat cold_task.close(); do not import or replace that owner",
+            ),
+        };
+        let pending = SemanticTaskReleasePending::new_err(message);
+        match &custody {
+            TaskReleaseCustody::TaskUse {
+                task_use,
+                controller,
+                ..
+            } => {
+                pending
+                    .value(py)
+                    .setattr("controller", controller.bind(py))?;
+                pending.value(py).setattr("task_use", task_use.bind(py))?;
+            }
+            TaskReleaseCustody::ObservedCold { cold_task } => {
+                pending.value(py).setattr("cold_task", cold_task.bind(py))?;
+            }
+        }
+        pending.value(py).setattr("operation", operation)?;
+        let mut retained = self.task_release.try_lock().map_err(|_| {
+            invalid("terminal task release is already active or its custody is poisoned")
+        })?;
         if let Some(original) = retained.as_ref() {
-            if !original.task_use.bind(py).is(task_use)
-                || !original.controller.bind(py).is(controller)
-            {
+            if !original.custody.same_as(&custody) {
                 return Err(invalid(
-                    "import release requires its retained original handles",
+                    "task release requires its retained original operation and handles",
                 ));
             }
-        } else {
+        }
+        if retained
+            .as_ref()
+            .is_none_or(|original| original.owner.is_none())
+        {
             let owner = {
-                let mut guard = self
-                    .inner
-                    .lock()
-                    .map_err(|_| invalid("native semantic session owner mutex is poisoned"))?;
+                let mut guard = self.inner.try_lock().map_err(|error| match error {
+                    std::sync::TryLockError::WouldBlock => invalid(
+                        "terminal task release cannot interrupt an original native operation",
+                    ),
+                    std::sync::TryLockError::Poisoned(_) => {
+                        invalid("native semantic session owner mutex is poisoned")
+                    }
+                })?;
                 let live = guard
                     .as_mut()
-                    .ok_or_else(|| invalid("imported native Session was already released"))?;
-                task_use.borrow().require_original_identity(live)?;
-                if let Err(original) = live.join_imported_task_release() {
+                    .ok_or_else(|| invalid("native Session was already released"))?;
+                if let TaskReleaseCustody::TaskUse { task_use, .. } = &custody {
+                    task_use.borrow(py).require_original_identity(live)?;
+                }
+                if retained.is_none() {
+                    *retained = Some(TaskRelease {
+                        owner: None,
+                        custody,
+                    });
+                }
+                let joined = match &retained
+                    .as_ref()
+                    .expect("retained original task custody")
+                    .custody
+                {
+                    TaskReleaseCustody::TaskUse { kind, .. } => match kind {
+                        TaskReleaseKind::Imported => live.join_imported_task_release(),
+                        TaskReleaseKind::Aborted => live.join_aborted_task_release(),
+                    },
+                    TaskReleaseCustody::ObservedCold { .. } => live.join_observed_cold_release(),
+                };
+                if let Err(original) = joined {
                     let original = xlog_err(original);
-                    if live.imported_task_release_pending() {
+                    if live.task_release_pending() {
                         pending.set_cause(py, Some(original));
                         return Err(pending);
                     }
+                    // A known admission rejection did not begin terminal release.
+                    let rejected = retained.take();
+                    drop(guard);
+                    drop(retained);
+                    drop(rejected);
                     return Err(original);
                 }
-                guard.take().expect("checked joined ordinary import")
+                // Invalidate task aliases before detached producer finalizers can reenter.
+                self.issuance.fetch_add(1, Ordering::AcqRel);
+                guard.take().expect("checked joined original task")
             };
-            let owner = owner.prepare_imported_task_release().map_err(xlog_err)?;
-            *retained = Some(ImportedTaskRelease {
-                owner,
-                task_use: task_use.clone().unbind(),
-                controller: controller.clone().unbind(),
-            });
-            self.issuance.fetch_add(1, Ordering::AcqRel);
+            let owner = owner.prepare_task_release().map_err(xlog_err)?;
+            retained
+                .as_mut()
+                .expect("retained original task custody")
+                .owner = Some(owner);
         }
-        // This owner is issued only after the original terminal join succeeded.
-        // A failed allocation retirement retains its custody, but does not grant
-        // another terminal-join continuation through the Python Pending protocol.
+        // A late deallocation error retains allocator custody. Its retry only
+        // resolves retirement and cannot reenter the completed terminal join.
         retained
             .as_mut()
             .expect("retained original allocation retirement")
             .owner
+            .as_mut()
+            .expect("joined original allocation retirement")
             .resolve()
             .map_err(xlog_err)?;
         self.training_canary_owner
@@ -1006,7 +1187,8 @@ impl PySemanticTransitionSession {
             checkpoint_custody: Mutex::new(Some(
                 learning_phase::cold_restore::CheckpointCustody::issue(),
             )),
-            imported_task_release: Mutex::new(None),
+            task_release: Mutex::new(None),
+            prefill_operation: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "semantic-policy")]
             pending_content_binding: Mutex::new(None),
             #[cfg(feature = "semantic-policy")]
@@ -13690,6 +13872,7 @@ impl PySemanticInitialPrefillContentWitness {
     ) -> PyResult<()> {
         let stage = self.stage.borrow(py);
         let session = stage.session.borrow(py);
+        let _operation = InitialPrefillOperation::begin(&session)?;
         #[cfg(feature = "semantic-policy")]
         if stage.restored_custody.is_some() {
             stage.require_active(py)?;
@@ -13786,6 +13969,7 @@ impl PySemanticInitialPrefillStage {
         let this = &*stage;
         this.require_wrapper_hook()?;
         this.require_active(py)?;
+        let _operation = InitialPrefillOperation::begin(&this.session.borrow(py))?;
         let mut budget = 16 * 1024 * 1024;
         let stream = parse_witness_consumer_stream(consumer_stream, &mut budget)?;
         let check = || this.require_active(py);
@@ -13834,6 +14018,7 @@ impl PySemanticInitialPrefillStage {
         let this = &*stage;
         this.require_wrapper_hook()?;
         this.require_active(py)?;
+        let _operation = InitialPrefillOperation::begin(&this.session.borrow(py))?;
         let mut budget = 16 * 1024 * 1024;
         let stream = parse_witness_consumer_stream(consumer_stream, &mut budget)?;
         let check = || this.require_active(py);
@@ -13874,6 +14059,7 @@ impl PySemanticInitialPrefillStage {
     ) -> PyResult<()> {
         self.require_wrapper_hook()?;
         self.require_active(py)?;
+        let _operation = InitialPrefillOperation::begin(&self.session.borrow(py))?;
         let mut budget = 16 * 1024 * 1024;
         let stream = parse_witness_consumer_stream(consumer_stream, &mut budget)?;
         let check = || self.require_active(py);
@@ -13934,6 +14120,7 @@ impl PySemanticInitialPrefillStage {
         let this = &*stage;
         this.require_wrapper_hook()?;
         this.require_active(py)?;
+        let _operation = InitialPrefillOperation::begin(&this.session.borrow(py))?;
         let mut budget = 16 * 1024 * 1024;
         let stream = parse_witness_consumer_stream(consumer_stream, &mut budget)?;
         let check = || this.require_active(py);
@@ -23100,100 +23287,20 @@ impl PySemanticTransitionController {
         py: Python<'_>,
         task_use: Bound<'_, PySemanticTransitionTaskUse>,
     ) -> PyResult<()> {
-        let controlled = slf.borrow();
-        let issued = task_use.borrow();
-        let session = controlled.session.borrow(py);
-        session.require_creator()?;
-        if issued.session.as_ptr() != controlled.session.as_ptr() {
-            return Err(invalid("import release requires its original Session"));
-        }
-        if session
-            .imported_task_release
-            .lock()
-            .map_err(|_| invalid("original import release custody mutex is poisoned"))?
-            .is_some()
-        {
-            return session.release_imported_task(py, &task_use, slf);
-        }
-        controlled.require_read_issued(&issued)?;
-        if !matches!(issued.state()?.phase, TaskUsePhase::Imported)
-            || issued
-                .delivery
-                .lock()
-                .map_err(|_| invalid("delivery binding mutex is poisoned"))?
-                .is_some()
-            || issued
-                .pending_delivery_receiver
-                .lock()
-                .map_err(|_| invalid("pending delivery receiver mutex is poisoned"))?
-                .is_some()
-            || session.importing.load(Ordering::Acquire)
-            || session.recording.load(Ordering::Acquire)
-            || session.retiring.load(Ordering::Acquire)
-            || session.learning_preparing.load(Ordering::Acquire)
-            || session
-                .learning_transition
-                .lock()
-                .map_err(|_| invalid("learning-phase retention mutex is poisoned"))?
-                .is_some()
-            || session
-                .prepared_segment
-                .lock()
-                .map_err(|_| invalid("prepared segment mutex is poisoned"))?
-                .is_some()
-            || session
-                .checkpoint_custody
-                .lock()
-                .map_err(|_| invalid("checkpoint custody mutex is poisoned"))?
-                .as_ref()
-                .is_some_and(|custody| {
-                    custody.closure.is_some()
-                        || custody.origin.is_some()
-                        || custody.pending_export.is_some()
-                })
-        {
-            return Err(invalid(
-                "import release requires its completed original TaskUse outside execution and callbacks",
-            ));
-        }
-        #[cfg(feature = "semantic-policy")]
-        if session.private_replay_custody()?.is_some()
-            || session
-                .actor_refresh_child
-                .lock()
-                .map_err(|_| invalid("actor construction custody mutex is poisoned"))?
-                .is_some()
-            || session
-                .segment_instruction
-                .lock()
-                .map_err(|_| invalid("original instruction owner mutex is poisoned"))?
-                .is_some()
-            || session
-                .prepared_task_import
-                .lock()
-                .map_err(|_| invalid("prepared import custody mutex is poisoned"))?
-                .is_some()
-            || session
-                .pending_content_binding
-                .lock()
-                .map_err(|_| invalid("pending content custody mutex is poisoned"))?
-                .is_some()
-            || session
-                .pending_evaluation_preparation
-                .lock()
-                .map_err(|_| invalid("pending evaluation custody mutex is poisoned"))?
-                .is_some()
-            || session
-                .active_cold_model_work
-                .lock()
-                .map_err(|_| invalid("active cold callback custody mutex is poisoned"))?
-                .is_some()
-        {
-            return Err(invalid(
-                "ordinary import release cannot interrupt original private or prepared custody",
-            ));
-        }
-        session.release_imported_task(py, &task_use, slf)
+        Self::close_task(slf, py, task_use, TaskReleaseKind::Imported)
+    }
+
+    /// Terminally join and release an aborted ordinary task before parent publication.
+    /// Initial prefill may retain its original model, input and output owners.
+    /// No import, model call, callback or publication is resumed by this operation.
+    /// An unknown join retains the same controller and TaskUse for the same call;
+    /// a fatal CUDA error still requires terminating the isolated task process.
+    fn close_aborted_task(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        task_use: Bound<'_, PySemanticTransitionTaskUse>,
+    ) -> PyResult<()> {
+        Self::close_task(slf, py, task_use, TaskReleaseKind::Aborted)
     }
 
     /// Terminally release a Session only after its original publication,
@@ -25960,6 +26067,7 @@ impl PySemanticTransitionController {
         >,
     ) -> PyResult<Option<xlog_cuda::SemanticPublishedIdentity>> {
         self.session.borrow(py).require_creator()?;
+        let _operation = InitialPrefillOperation::begin(&self.session.borrow(py))?;
         self.require_read_issued(task_use)?;
         {
             let session = self.session.borrow(py);
@@ -28325,6 +28433,67 @@ impl PySemanticTransitionController {
         task_use.state()?.require_public_use()
     }
 
+    fn close_task(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        task_use: Bound<'_, PySemanticTransitionTaskUse>,
+        kind: TaskReleaseKind,
+    ) -> PyResult<()> {
+        let controlled = slf.borrow();
+        let issued = task_use.borrow();
+        let session = controlled.session.borrow(py);
+        session.require_creator()?;
+        if issued.session.as_ptr() != controlled.session.as_ptr() {
+            return Err(invalid(
+                "terminal task release requires its original Session",
+            ));
+        }
+        let custody = TaskReleaseCustody::TaskUse {
+            task_use: task_use.clone().unbind(),
+            controller: slf.clone().unbind(),
+            kind,
+        };
+        if session
+            .task_release
+            .try_lock()
+            .map_err(|_| {
+                invalid("terminal task release is already active or its custody is poisoned")
+            })?
+            .is_some()
+        {
+            return session.release_task(py, custody);
+        }
+        controlled.require_read_issued(&issued)?;
+        let admitted = match kind {
+            TaskReleaseKind::Imported => matches!(issued.state()?.phase, TaskUsePhase::Imported),
+            TaskReleaseKind::Aborted => matches!(
+                issued.state()?.phase,
+                TaskUsePhase::Imported
+                    | TaskUsePhase::InitialPrefill { .. }
+                    | TaskUsePhase::InitialPrefillReady { .. }
+                    | TaskUsePhase::Refused
+            ),
+        };
+        if !admitted
+            || issued
+                .delivery
+                .lock()
+                .map_err(|_| invalid("delivery binding mutex is poisoned"))?
+                .is_some()
+            || issued
+                .pending_delivery_receiver
+                .lock()
+                .map_err(|_| invalid("pending delivery receiver mutex is poisoned"))?
+                .is_some()
+        {
+            return Err(invalid(
+                "terminal task release requires its original unpublished TaskUse",
+            ));
+        }
+        session.require_task_release_idle()?;
+        session.release_task(py, custody)
+    }
+
     fn require_read_issued(&self, task_use: &PySemanticTransitionTaskUse) -> PyResult<()> {
         task_use.issuance.require_current()?;
         if !Arc::ptr_eq(&self.identity, &task_use.controller) {
@@ -30178,7 +30347,8 @@ mod tests {
             checkpoint_custody: Mutex::new(Some(
                 learning_phase::cold_restore::CheckpointCustody::issue(),
             )),
-            imported_task_release: Mutex::new(None),
+            task_release: Mutex::new(None),
+            prefill_operation: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "semantic-policy")]
             active_cold_model_work: Mutex::new(None),
             #[cfg(feature = "semantic-policy")]
@@ -30198,7 +30368,7 @@ mod tests {
             memory_bytes: 0,
         };
         assert!(session.owner().is_err());
-        assert!(session.release_observed_cold().is_err());
+        assert!(session.require_task_release_idle().is_err());
     }
 
     #[test]

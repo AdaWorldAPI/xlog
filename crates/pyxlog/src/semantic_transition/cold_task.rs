@@ -1125,18 +1125,12 @@ impl PySemanticTransitionColdTask {
     /// Terminally release this observed-only fresh CUDA Session before a
     /// restored Session is allocated. Immutable task content and statement
     /// ordinals remain readable; saved Session/controller aliases cannot run.
-    fn close(&self, py: Python<'_>) -> PyResult<()> {
-        if self
-            .session
-            .borrow(py)
-            .owner()?
-            .training_canary_source_borrowed()
-        {
-            return Err(invalid(
-                "logical canary source remains owned by dependent training sessions",
-            ));
-        }
-        self.session.borrow(py).release_observed_cold()
+    /// An unfinished terminal join retains this same ColdTask for another close;
+    /// fatal CUDA failure requires terminating the isolated task process.
+    fn close(slf: &Bound<'_, Self>, py: Python<'_>) -> PyResult<()> {
+        let cold = slf.borrow();
+        let session = cold.session.borrow(py);
+        session.release_observed_cold(py, slf)
     }
 
     /// Return content observed by the native cold task before final import.
