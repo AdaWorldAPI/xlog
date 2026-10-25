@@ -115,7 +115,7 @@ pub use semantic_transition::{
     SemanticTaskObjectiveLaw, SemanticTaskObservation, SemanticTaskObservationRoots,
     SemanticTaskObservationRootsOwner, SemanticTaskPriorityGoal, SemanticTaskPriorityLevel,
     SemanticTaskProgram, SemanticTaskReceiptFamily, SemanticTaskRefusal, SemanticTaskRelease,
-    SemanticTaskScoring, SemanticTaskVerificationBinding, SemanticTensorContentWitness,
+    SemanticTaskScoring, SemanticTaskVerificationBinding, SemanticTensorOwner,
     SemanticTensorInput, SemanticTensorLayout, SemanticTextRow, SemanticTextSlot,
     SemanticTokenProvenance, SemanticTransitionError, SemanticTransitionHostIoStats,
     SemanticTransitionKind, SemanticTransitionLane, SemanticTransitionObservation,
@@ -145,7 +145,7 @@ pub use semantic_transition::{
 #[cfg(feature = "semantic-policy")]
 pub use semantic_transition::{
     SemanticCancelledEvaluationCapture, SemanticCancelledModelEvaluation,
-    SemanticColdEvaluationContent, SemanticCompletedModelEvaluation, SemanticEvaluationCohort,
+    SemanticCompletedModelEvaluation, SemanticEvaluationCohort,
     SemanticModelEvaluation, SemanticModelEvaluationResult,
 };
 #[cfg(feature = "semantic-policy")]
@@ -162,11 +162,8 @@ pub use semantic_work::ModelWorkKind;
 pub use semantic_transition::{
     SemanticModelInputGenerationPort, SemanticPreparedSourceCache, SemanticPreparedSourceContent,
     SemanticPreparedSourceContentGeometry, SemanticPreparedSourceContentPorts,
-    SemanticPreparedTensorContentBindings, SemanticPreparedTensorContentEvent,
-    SemanticPreparedTensorContentReceiver, SemanticSourceAllocationDescriptor,
-    SemanticSourceContentAllocation, SemanticSourceContentEvent, SemanticSourceContentFamily,
+    SemanticSourceAllocationDescriptor, SemanticSourceContentAllocation,
     SemanticSourceContentGeometryKind, SemanticSourceContentGeometrySeed,
-    SemanticSourceContentKind, SemanticSourceContentOccurrence, SemanticSourceContentPhase,
     SemanticSourceContentRetirement, SemanticSourceGeometryAllocation,
     SemanticSourceGeometryTensor, SemanticSourceTensorDescriptor,
 };
