@@ -443,7 +443,6 @@ pub(super) fn resident_memory_tuple(
             PyBytes::new(py, parent.instance.as_bytes()),
             parent.word,
             PyBytes::new(py, parent.logical_digest.as_bytes()),
-            PyBytes::new(py, parent.state_digest.as_bytes()),
         ),
         memory.generations,
         PyBytes::new(py, memory.model_geometry_digest.as_bytes()),

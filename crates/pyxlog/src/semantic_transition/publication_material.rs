@@ -144,8 +144,8 @@ fn projection_metadata_extent(
         .checked_add(33)
         .ok_or_else(|| invalid("publication identity extent overflow"))?;
     add_extent(&mut extent, repeated_extent(integer, 7)?)?;
-    add_extent(&mut extent, repeated_extent(identity, 6)?)?;
-    add_extent(&mut extent, python_metadata_tuple_extent(py, 4)?)?;
+    add_extent(&mut extent, repeated_extent(identity, 5)?)?;
+    add_extent(&mut extent, python_metadata_tuple_extent(py, 3)?)?;
     for count in [original.prefix.len(), original.source.len()] {
         add_extent(&mut extent, python_metadata_tuple_extent(py, count)?)?;
         let row = python_metadata_tuple_extent(py, 8)?

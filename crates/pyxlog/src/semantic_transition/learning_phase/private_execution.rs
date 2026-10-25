@@ -4424,7 +4424,6 @@ impl PySemanticLearningPhaseTransition {
                         ColdValue::Text(hex(value.instance)),
                         ColdValue::Integer(value.word.to_string()),
                         ColdValue::Text(hex(value.logical_digest)),
-                        ColdValue::Text(hex(value.state_digest)),
                     ])
                 };
                 let binding = binding.cast::<PyDict>()?;

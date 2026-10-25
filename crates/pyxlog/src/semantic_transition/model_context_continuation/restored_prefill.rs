@@ -195,7 +195,6 @@ impl PySemanticRestoredModelContextPrefill {
                 PyBytes::new(py, source_parent.instance.as_bytes()),
                 source_parent.word,
                 PyBytes::new(py, source_parent.logical_digest.as_bytes()),
-                PyBytes::new(py, source_parent.state_digest.as_bytes()),
             ),
             PyBytes::new(py, source_digest.as_bytes()),
             PyBytes::new(py, target_digest.as_bytes()),
@@ -210,7 +209,6 @@ impl PySemanticRestoredModelContextPrefill {
             PyBytes::new(py, current_source.instance.as_bytes()),
             current_source.word,
             PyBytes::new(py, current_source.logical_digest.as_bytes()),
-            PyBytes::new(py, current_source.state_digest.as_bytes()),
         )
             .into_pyobject(py)?
             .unbind();
@@ -703,11 +701,11 @@ fn projection_extent(
         )?,
     )?;
     extent = add(extent, python_metadata_tuple_extent(py, 6)?)?;
-    extent = add(extent, multiply(2, python_metadata_tuple_extent(py, 4)?)?)?;
+    extent = add(extent, multiply(2, python_metadata_tuple_extent(py, 3)?)?)?;
     extent = add(
         extent,
         multiply(
-            9,
+            7,
             add(material_bytes::python_instance_extent::<PyBytes>(py)?, 33)?,
         )?,
     )?;

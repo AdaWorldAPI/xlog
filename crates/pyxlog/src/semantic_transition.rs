@@ -261,7 +261,6 @@ fn replay_delivery_identity_result(
         PyBytes::new(py, identity.instance.as_bytes()),
         identity.word,
         PyBytes::new(py, identity.logical_digest.as_bytes()),
-        PyBytes::new(py, identity.state_digest.as_bytes()),
     )
         .into_pyobject(py)
     {
@@ -1495,7 +1494,7 @@ enum CheckpointReferentPhase {
 struct CheckpointReferent {
     checkpoint_digest: [u8; 32],
     checkpoint_bytes: u64,
-    publication: [u8; 104],
+    publication: [u8; 72],
     semantic_root: [u8; 32],
     model_generation: u64,
     model_digest: [u8; 32],
@@ -1508,7 +1507,7 @@ struct CheckpointReferent {
 
 impl CheckpointReferent {
     const MAGIC: &'static [u8] = b"XLOG-CHECKPOINT-REFERENT\0";
-    const VERSION: u32 = 2;
+    const VERSION: u32 = 3;
     const BYTES: usize = SemanticTransitionSession::CHECKPOINT_REFERENT_BYTES;
 
     fn encode(&self) -> Vec<u8> {
@@ -1569,7 +1568,7 @@ impl CheckpointReferent {
         if checkpoint_bytes == 0 {
             return Err(invalid("checkpoint referent has an empty source"));
         }
-        let publication = take(&mut cursor, 104)
+        let publication = take(&mut cursor, 72)
             .try_into()
             .expect("fixed referent extent");
         let semantic_root = digest(&mut cursor);
@@ -1806,12 +1805,11 @@ fn selected_checkpoint_referents(
     Ok(referents)
 }
 
-fn checkpoint_publication_bytes(identity: xlog_cuda::SemanticPublishedIdentity) -> [u8; 104] {
-    let mut bytes = [0u8; 104];
+fn checkpoint_publication_bytes(identity: xlog_cuda::SemanticPublishedIdentity) -> [u8; 72] {
+    let mut bytes = [0u8; 72];
     bytes[..32].copy_from_slice(identity.instance.as_bytes());
     bytes[32..40].copy_from_slice(&identity.word.to_le_bytes());
     bytes[40..72].copy_from_slice(identity.logical_digest.as_bytes());
-    bytes[72..].copy_from_slice(identity.state_digest.as_bytes());
     bytes
 }
 
@@ -4571,7 +4569,6 @@ fn update_measurements_report(
             PyBytes::new(py, value.instance.as_bytes()),
             value.word,
             PyBytes::new(py, value.logical_digest.as_bytes()),
-            PyBytes::new(py, value.state_digest.as_bytes()),
         )
     };
     let report = PyDict::new(py);
@@ -4638,10 +4635,8 @@ fn update_measurements_report(
         ("lineage_instance", origin.lineage_instance),
         ("predecessor_instance", origin.predecessor_instance),
         ("predecessor_logical", origin.predecessor_logical),
-        ("predecessor_state", origin.predecessor_state),
         ("successor_instance", origin.successor_instance),
         ("successor_logical", origin.successor_logical),
-        ("successor_state", origin.successor_state),
         ("model_geometry_digest", origin.model_geometry_digest),
     ] {
         source.set_item(name, PyTuple::new(py, value)?)?;
@@ -5505,7 +5500,6 @@ impl PySemanticSegmentInstructionAdmission {
             PyBytes::new(py, identity.instance.as_bytes()),
             identity.word,
             PyBytes::new(py, identity.logical_digest.as_bytes()),
-            PyBytes::new(py, identity.state_digest.as_bytes()),
         )
             .into_pyobject(py)?
             .unbind())
@@ -14617,7 +14611,6 @@ fn completed_publication_identity(
         PyBytes::new(py, value.instance.as_bytes()),
         value.word,
         PyBytes::new(py, value.logical_digest.as_bytes()),
-        PyBytes::new(py, value.state_digest.as_bytes()),
     )
         .into_pyobject(py)?
         .unbind())
@@ -17523,7 +17516,6 @@ impl PySemanticPreparedStep {
                             PyBytes::new(py, value.instance.as_bytes()),
                             value.word,
                             PyBytes::new(py, value.logical_digest.as_bytes()),
-                            PyBytes::new(py, value.state_digest.as_bytes()),
                         )
                     };
                     Ok((
@@ -17781,7 +17773,7 @@ impl PySemanticPreparedStep {
     /// Returns (predecessor_identity, successor_identity_or_None, model_generation,
     /// model_geometry_digest, carrier_or_None). The
     /// immutable successful-Proposal carrier exposes numerical_realization, logits and random_state as
-    /// (native_owner_identity, canonical_bytes). Identities have the same four
+    /// (native_owner_identity, canonical_bytes). Identities have the same three
     /// fields as PublishedParent.identity(); they are not live readers.
     /// Join every original consumer stream. Read record 44 and complete model
     /// allocations through this step's existing exports, then call again after
@@ -17827,7 +17819,6 @@ impl PySemanticPreparedStep {
                     PyBytes::new(py, value.instance.as_bytes()),
                     value.word,
                     PyBytes::new(py, value.logical_digest.as_bytes()),
-                    PyBytes::new(py, value.state_digest.as_bytes()),
                 )
             };
             Ok((
@@ -18020,7 +18011,6 @@ impl PySemanticPreparedStep {
                 PyBytes::new(py, value.instance.as_bytes()),
                 value.word,
                 PyBytes::new(py, value.logical_digest.as_bytes()),
-                PyBytes::new(py, value.state_digest.as_bytes()),
             )
         };
         let records = PyTuple::new(
@@ -20048,7 +20038,6 @@ impl PySemanticPublishedParent {
             PyBytes::new(py, identity.instance.as_bytes()),
             identity.word,
             PyBytes::new(py, identity.logical_digest.as_bytes()),
-            PyBytes::new(py, identity.state_digest.as_bytes()),
         )
             .into_pyobject(py)?
             .unbind())
@@ -20076,7 +20065,7 @@ impl PySemanticPublishedParent {
     }
 
     /// Project model metadata from this exact acquired parent. Returns:
-    /// (parent_identity, descriptor_digest, semantic_root, prefix, ring,
+    /// (parent_identity, semantic_root, prefix, ring,
     /// generations, contracts, capacities, model_geometry_digest).
     ///
     /// ``semantic_root`` is (owner, slot, generation, digest, extents), with
@@ -20091,8 +20080,7 @@ impl PySemanticPublishedParent {
     /// ``model_geometry_digest`` is the 32-byte identity of the complete
     /// allocation/storage/view geometry and model layouts in this acquired header.
     /// The original ModelContract and parent retain their ownership authority.
-    /// Other digests are 32-byte bytes. The descriptor digest binds the publication
-    /// instance/word; it is not the action catalogue's descriptor identity.
+    /// Geometry and source identities use their original 32-byte encoding.
     ///
     /// The retained parent remains the owner: matching these values does not
     /// authenticate unrelated model inputs or issue a new use permission. Device
@@ -20126,9 +20114,7 @@ impl PySemanticPublishedParent {
                 PyBytes::new(py, parent.instance.as_bytes()),
                 parent.word,
                 PyBytes::new(py, parent.logical_digest.as_bytes()),
-                PyBytes::new(py, parent.state_digest.as_bytes()),
             ),
-            PyBytes::new(py, context.descriptor_digest.as_bytes()),
             (
                 root.0,
                 root.1,
@@ -20271,7 +20257,6 @@ impl PySemanticPublishedParent {
             PyBytes::new(py, identity.instance.as_bytes()),
             identity.word,
             PyBytes::new(py, identity.logical_digest.as_bytes()),
-            PyBytes::new(py, identity.state_digest.as_bytes()),
         );
         Ok((
             parent_identity,
@@ -20383,7 +20368,7 @@ impl PySemanticPublishedParent {
     /// recomputed, provenance_record). Kind is FILLED=1; provenance preserves
     /// SOURCE=1 or GENERATED=2, and provenance_record is its retained native ledger
     /// index, not an authority bit. Flags remain u64 values, not a numeric cast.
-    /// The identity is exactly the four-component tuple returned by identity().
+    /// The identity is exactly the three-component tuple returned by identity().
     ///
     /// Only [0, prefix_extent) is committed; even an empty prefix retains its
     /// cold capacity shape. Unused rows must not enter model computation.
@@ -20406,7 +20391,6 @@ impl PySemanticPublishedParent {
             PyBytes::new(py, identity.instance.as_bytes()),
             identity.word,
             PyBytes::new(py, identity.logical_digest.as_bytes()),
-            PyBytes::new(py, identity.state_digest.as_bytes()),
         );
         let tensor = retain_export_owner(tensor, self.session.clone_ref(py), session.owner_thread)?;
         Ok((
@@ -20587,7 +20571,6 @@ impl PySemanticPublishedParent {
             PyBytes::new(py, identity.instance.as_bytes()),
             identity.word,
             PyBytes::new(py, identity.logical_digest.as_bytes()),
-            PyBytes::new(py, identity.state_digest.as_bytes()),
         );
         let schema = feedback_schema_object(py, &feedback.schema)?;
         let [features, device_validity, queries, originals, offsets, supports] =
@@ -25034,7 +25017,6 @@ impl PySemanticTransitionController {
                 PyBytes::new(py, value.instance.as_bytes()),
                 value.word,
                 PyBytes::new(py, value.logical_digest.as_bytes()),
-                PyBytes::new(py, value.state_digest.as_bytes()),
             )
         };
         Ok((
@@ -25794,7 +25776,7 @@ impl PySemanticTransitionController {
 
     /// Materialize the initial native parent before any model continuation.
     /// This cold operation does not consume ``before_segment`` and returns only
-    /// the device-validated ``(instance, word, logical_digest, state_digest)``;
+    /// the native-owned ``(instance, word, logical_key)``;
     /// a model must separately acquire the resulting parent lease.
     ///
     /// ``source`` contains exactly 32 original ring rows and ``prefix`` the
@@ -25894,7 +25876,6 @@ impl PySemanticTransitionController {
             PyBytes::new(py, identity.instance.as_bytes()),
             identity.word,
             PyBytes::new(py, identity.logical_digest.as_bytes()),
-            PyBytes::new(py, identity.state_digest.as_bytes()),
         )
             .into_pyobject(py)?
             .unbind())
@@ -26471,7 +26452,6 @@ impl PySemanticTransitionController {
                     project_bytes(identity.instance.as_bytes())?.into_any(),
                     word,
                     project_bytes(identity.logical_digest.as_bytes())?.into_any(),
-                    project_bytes(identity.state_digest.as_bytes())?.into_any(),
                 ],
             )?
             .unbind())
@@ -30410,7 +30390,7 @@ mod tests {
         let referent = super::CheckpointReferent {
             checkpoint_digest: [7; 32],
             checkpoint_bytes: 900,
-            publication: [8; 104],
+            publication: [8; 72],
             semantic_root: [9; 32],
             model_generation: 11,
             model_digest: [10; 32],

@@ -111,7 +111,6 @@ impl OriginalSourceTensorExport {
 #[cfg(feature = "semantic-policy")]
 struct OriginalSourceModelContext {
     parent: SemanticPublishedIdentity,
-    descriptor_digest: Identity256,
     model_geometry_digest: Identity256,
     semantic_root: (u64, u64, u64, Identity256, [u64; 3]),
     tensors: [OriginalSourceTensorExport; 4],
@@ -199,8 +198,8 @@ impl OriginalSourcePortProjection {
             )
             .ok_or_else(|| invalid("SOURCE capsule metadata extent overflow"))?;
         for len in [
-            9,
-            4,
+            8,
+            3,
             5,
             3,
             2,
@@ -209,10 +208,9 @@ impl OriginalSourcePortProjection {
             2,
             3,
             2,
-            2,
-            4,
+            3,
             5,
-            4,
+            3,
             7,
             6,
             xlog_cuda::SEMANTIC_FEEDBACK_SUPPORT_FIELDS.len(),
@@ -238,7 +236,7 @@ impl OriginalSourcePortProjection {
             .and_then(|value| value.checked_add(count.checked_mul(per_cache)?))
             .and_then(|value| {
                 value.checked_add(
-                    17 * (material_bytes::python_instance_extent::<PyBytes>(py).ok()? + 32),
+                    12 * (material_bytes::python_instance_extent::<PyBytes>(py).ok()? + 32),
                 )
             })
             .and_then(|value| {
@@ -285,7 +283,6 @@ impl OriginalSourcePortProjection {
         Self {
             context: OriginalSourceModelContext {
                 parent: context.parent,
-                descriptor_digest: context.descriptor_digest,
                 model_geometry_digest: context.model_geometry_digest,
                 semantic_root: context.semantic_root,
                 tensors: [
@@ -325,14 +322,12 @@ impl OriginalSourcePortProjection {
                 PyBytes::new(py, identity.instance.as_bytes()),
                 identity.word,
                 PyBytes::new(py, identity.logical_digest.as_bytes()),
-                PyBytes::new(py, identity.state_digest.as_bytes()),
             )
         };
         let context = &mut self.context;
         let root = context.semantic_root;
         let model_context = (
             identity(context.parent),
-            PyBytes::new(py, context.descriptor_digest.as_bytes()),
             (
                 root.0,
                 root.1,
