@@ -793,6 +793,13 @@ _PolicyOutputLayout = tuple[
 class SemanticTransitionTaskUse:
     """Native-issued task; no public constructor."""
 
+    @property
+    def training_arena_result(self) -> Optional[
+        tuple[tuple[int, int, int, int, int, tuple[int, ...]], int]
+    ]:
+        """Original completed native work report and measured backing peak."""
+        ...
+
     def learning_feedback_intervention(
         self, parent: Union[SemanticPublishedParent, SemanticPreparedStep],
     ) -> Optional[tuple[bytes, bool]]:
@@ -1288,7 +1295,8 @@ class SemanticTransitionController:
 
     def admit_training_arena(
         self, task_use: SemanticTransitionTaskUse, *, parent: SemanticPublishedParent,
-        consumer_streams: Sequence[int], snapshot: Any, replay_rows: Any,
+        consumer_streams: Sequence[int], resource_observer: Any,
+        snapshot: Any, replay_rows: Any,
         material_source: _ReplayMaterialSource, training_objective: Any,
         training_domain: Any, refresh_snapshot: Any,
         resolve_checkpoint: Any = None, max_checkpoint_bytes: Any = None,
@@ -1296,6 +1304,10 @@ class SemanticTransitionController:
     ) -> SemanticPublishedParent:
         """Retain the original source and inherit its fixed payload pool."""
         ...
+
+    def resolve_training_arena(
+        self, *, parent: SemanticPublishedParent,
+    ) -> SemanticPublishedParent: ...
 
     def acknowledge_replay_delivery(
         self, task_use: SemanticTransitionTaskUse, *, parent: SemanticPublishedParent,

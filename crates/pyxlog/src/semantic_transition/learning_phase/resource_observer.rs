@@ -486,7 +486,7 @@ struct Interval {
 /// Stored addresses grant no cross-thread execution rights: every operation
 /// checks the original creator before converting them back to native pointers.
 /// There is deliberately no Drop implementation that releases unknown work.
-pub(super) struct ResourceObserver {
+pub(in crate::semantic_transition) struct ResourceObserver {
     capsule: Py<PyCapsule>,
     table: usize,
     context: usize,
@@ -504,7 +504,7 @@ pub(super) struct ResourceObserver {
 }
 
 impl ResourceObserver {
-    pub(super) fn capture(
+    pub(in crate::semantic_transition) fn capture(
         capsule: &Bound<'_, PyCapsule>,
         (uuid, original_context): ([u8; 16], u64),
     ) -> PyResult<Self> {
@@ -549,7 +549,7 @@ impl ResourceObserver {
         })
     }
 
-    pub(super) fn require_original(&self, py: Python<'_>) -> PyResult<()> {
+    pub(in crate::semantic_transition) fn require_original(&self, py: Python<'_>) -> PyResult<()> {
         if thread::current().id() != self.creator
             || self
                 .capsule
@@ -603,7 +603,11 @@ impl ResourceObserver {
     }
 
     /// Called only after exact durable admission and before source native work.
-    pub(super) fn begin(&self, py: Python<'_>, ordinal: u64) -> PyResult<()> {
+    pub(in crate::semantic_transition) fn begin(
+        &self,
+        py: Python<'_>,
+        ordinal: u64,
+    ) -> PyResult<()> {
         self.require_original(py)?;
         let mut retained = self.interval()?;
         if retained
@@ -922,7 +926,7 @@ impl ResourceObserver {
     }
 
     /// Called once, after actual source native/model joins, never by readback.
-    pub(super) fn finish(&self, py: Python<'_>) -> PyResult<()> {
+    pub(in crate::semantic_transition) fn finish(&self, py: Python<'_>) -> PyResult<()> {
         self.require_original(py)?;
         let mut retained = self.interval()?;
         let interval = retained
@@ -949,7 +953,7 @@ impl ResourceObserver {
     }
 
     /// No flush, join, replay, finish or numerical substitution occurs here.
-    pub(super) fn backing_peak(&self, py: Python<'_>) -> PyResult<u64> {
+    pub(in crate::semantic_transition) fn backing_peak(&self, py: Python<'_>) -> PyResult<u64> {
         self.require_original(py)?;
         let mut retained = self.interval()?;
         let interval = retained
@@ -1118,7 +1122,7 @@ impl ResourceObserver {
 
     /// Final owner release is allowed only after this original backing result
     /// was consumed. A failed release is irreversible and retains the capsule.
-    pub(super) fn release(&self, py: Python<'_>) -> PyResult<()> {
+    pub(in crate::semantic_transition) fn release(&self, py: Python<'_>) -> PyResult<()> {
         self.require_original(py)?;
         let mut retained = self.interval()?;
         let interval = retained
