@@ -1194,15 +1194,14 @@ impl PySemanticPreparedSourceContentGeometry {
             return Ok(original.value.clone_ref(py));
         }
         // CURRENT has no numerical context before its genuine Actor exists.
-        let (parent, generation, resident, numerical) =
+        let (parent, generation, resident, geometry) =
             self.inner.model_restore_context().map_err(xlog_err)?;
-        let mut extent = multiply(2, python_metadata_tuple_extent(py, 4)?)?;
-        extent = add(extent, python_metadata_tuple_extent(py, 3)?)?;
-        extent = add(extent, python_metadata_tuple_extent(py, 2)?)?;
+        let mut extent = python_metadata_tuple_extent(py, 4)?;
+        extent = add(extent, multiply(2, python_metadata_tuple_extent(py, 3)?)?)?;
         extent = add(
             extent,
             multiply(
-                5,
+                3,
                 add(material_bytes::python_instance_extent::<PyBytes>(py)?, 33)?,
             )?,
         )?;
@@ -1212,10 +1211,7 @@ impl PySemanticPreparedSourceContentGeometry {
             completed_publication_identity(py, parent)?,
             generation,
             resident,
-            (
-                PyBytes::new(py, numerical.0.as_bytes()),
-                PyBytes::new(py, numerical.1.as_bytes()),
-            ),
+            PyBytes::new(py, geometry.as_bytes()),
         )
             .into_pyobject(py)?
             .unbind();
