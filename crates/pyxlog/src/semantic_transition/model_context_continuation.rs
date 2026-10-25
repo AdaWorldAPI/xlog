@@ -1211,7 +1211,7 @@ impl PySemanticModelContextContinuation {
         parent.borrow(py).require_task(py, &task)?;
         let session = task.session.borrow(py);
         let stream = parse_witness_consumer_stream(consumer_stream, &mut 128)?;
-        let (prefix, extent, descriptor) = session
+        let (prefix, extent) = session
             .owner()?
             .model_context_activation_prefix_views(
                 &self.inner,
@@ -1225,11 +1225,7 @@ impl PySemanticModelContextContinuation {
                 retain_export_owner(tensor, task.session.clone_ref(py), session.owner_thread)?,
             )
         };
-        Ok((
-            capsule(prefix)?,
-            capsule(extent)?,
-            PyBytes::new(py, descriptor.as_bytes()),
-        )
+        Ok((capsule(prefix)?, capsule(extent)?)
             .into_pyobject(py)?
             .unbind())
     }

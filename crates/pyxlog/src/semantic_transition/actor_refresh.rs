@@ -111,8 +111,7 @@ pub(super) fn record_prepared_steps(
                         return body.with_sequence(stream, |nested| {
                             nested.capture_segment_on_stream(stream, || -> PyResult<()> {
                                 let result = (|| {
-                                    session.owner()?.begin_prepared_step_bank_capture(&native, bank).map_err(xlog_err)?;
-                                    session.owner()?.record_prepared_bank_model_content(&native, bank).map_err(xlog_err)
+                                    session.owner()?.begin_prepared_step_bank_capture(&native, bank).map_err(xlog_err)
                                 })();
                                 if let Err(error) = &result { *requested_error.borrow_mut() = Some(error.clone_ref(py)); }
                                 result
@@ -142,10 +141,6 @@ pub(super) fn record_prepared_steps(
                             session
                                 .owner()?
                                 .begin_prepared_step_bank_capture(&native, bank)
-                                .map_err(xlog_err)?;
-                            session
-                                .owner()?
-                                .record_prepared_bank_model_content(&native, bank)
                                 .map_err(xlog_err)?;
                             let enqueue = recording_callback(check, || {
                                 prepared.getattr("enqueue_step")
@@ -1103,20 +1098,6 @@ impl ActorRefreshCustody {
                 drop(producer_steps);
                 for step in &steps {
                     step.borrow(py).release_recorded_producer_aliases(py)?;
-                }
-                drain_export_owners();
-                // Discharge all private receiver owners after the original
-                // child graph joins, before releasing any source step. Managed
-                // producer deleters must not run under the Session mutex.
-                for step in &native_steps {
-                    let receivers = {
-                        let source = session.borrow(py);
-                        let mut owner = source.owner()?;
-                        owner
-                            .take_prepared_tensor_content_receivers_for_retirement(step)
-                            .map_err(xlog_err)?
-                    };
-                    drop(receivers);
                 }
                 drain_export_owners();
                 for step in &native_steps {
