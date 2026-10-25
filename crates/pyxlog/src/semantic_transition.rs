@@ -1497,7 +1497,6 @@ struct CheckpointReferent {
     publication: [u8; 72],
     semantic_root: [u8; 32],
     model_generation: u64,
-    model_digest: [u8; 32],
     task: TaskCheckpointBinding,
     scope_digest: [u8; 32],
     authority_root: [u8; 32],
@@ -1519,7 +1518,6 @@ impl CheckpointReferent {
         bytes.extend_from_slice(&self.publication);
         bytes.extend_from_slice(&self.semantic_root);
         bytes.extend_from_slice(&self.model_generation.to_le_bytes());
-        bytes.extend_from_slice(&self.model_digest);
         bytes.extend_from_slice(&self.task.identity);
         bytes.extend_from_slice(&self.task.epoch.to_le_bytes());
         for digest in &self.task.content {
@@ -1577,7 +1575,6 @@ impl CheckpointReferent {
                 .try_into()
                 .expect("fixed referent extent"),
         );
-        let model_digest = digest(&mut cursor);
         let identity = digest(&mut cursor);
         let epoch = u64::from_le_bytes(
             take(&mut cursor, 8)
@@ -1602,7 +1599,6 @@ impl CheckpointReferent {
             publication,
             semantic_root,
             model_generation,
-            model_digest,
             task: TaskCheckpointBinding {
                 identity,
                 epoch,
@@ -1698,7 +1694,6 @@ impl CheckpointReferent {
             publication: checkpoint_publication_bytes(native.publication),
             semantic_root: *native.semantic_root.as_bytes(),
             model_generation: native.model_generation,
-            model_digest: Sha256::digest(&manifest.model).into(),
             task,
             scope_digest: checkpoint_scope_digest(&authority.scope),
             authority_root: *authority.authority_root().as_bytes(),
@@ -2735,7 +2730,6 @@ impl PySemanticTransitionSession {
         )?;
         fields.set_item("semantic_root", PyBytes::new(py, &record.semantic_root))?;
         fields.set_item("model_generation", record.model_generation)?;
-        fields.set_item("model_state_sha256", PyBytes::new(py, &record.model_digest))?;
         fields.set_item("task_identity", PyBytes::new(py, &record.task.identity))?;
         fields.set_item("task_epoch", record.task.epoch)?;
         fields.set_item(
@@ -30393,7 +30387,6 @@ mod tests {
             publication: [8; 72],
             semantic_root: [9; 32],
             model_generation: 11,
-            model_digest: [10; 32],
             task: binding,
             scope_digest: [11; 32],
             authority_root: [12; 32],
