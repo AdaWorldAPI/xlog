@@ -672,6 +672,7 @@ pub const KERNEL_MODULES: &[KernelModuleSpec] = &[
             "semantic_transition_execute",
             "semantic_feedback_encode",
             "semantic_feedback_project",
+            #[cfg(feature = "semantic-policy")]
             "semantic_group_critic_reduce",
             "semantic_model_work_reset",
             "semantic_model_invocation",
