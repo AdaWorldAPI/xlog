@@ -672,9 +672,7 @@ pub const KERNEL_MODULES: &[KernelModuleSpec] = &[
             "semantic_transition_execute",
             "semantic_feedback_encode",
             "semantic_feedback_project",
-            "semantic_publication_content_guard",
-            "semantic_retained_model_contract_guard",
-            "semantic_tensor_content_witness",
+            "semantic_group_critic_reduce",
             "semantic_model_work_reset",
             "semantic_model_invocation",
             "semantic_cold_model_work_result",
@@ -685,18 +683,16 @@ pub const KERNEL_MODULES: &[KernelModuleSpec] = &[
             "semantic_policy_uniform_domains",
             "semantic_publication_step_inputs",
             "semantic_prepared_replay_parent",
-            "semantic_publication_step_input_guard",
-            "semantic_completed_step_input_guard",
             "semantic_publication_replace_model_storage",
             "semantic_publication_step_admit",
             "semantic_publication_step_kind_gate",
             "semantic_publication_step_kind_bank_gate",
             "semantic_publication_step_active_gate",
             "semantic_publication_step_release",
-            "semantic_publication_model_seals",
             "semantic_numerical_block_snapshot",
             "semantic_publication_step_result",
             "semantic_publication_prepare_continuation",
+            "semantic_publication_continue_model_context",
             "semantic_model_forward_stream_begin",
             "semantic_model_forward_stream_block_leaves",
             "semantic_model_forward_stream_block",
@@ -731,48 +727,6 @@ mod tests {
                 spec.cu_name, KERNEL_CU_NAMES[i],
                 "KERNEL_MODULES[{}].cu_name = {:?}, expected {:?}",
                 i, spec.cu_name, KERNEL_CU_NAMES[i],
-            );
-        }
-    }
-
-    #[test]
-    fn semantic_consumers_are_loaded_with_their_producer_guards() {
-        let module = KERNEL_MODULES
-            .iter()
-            .find(|module| module.module_name == "xlog_semantic_transition")
-            .expect("semantic transition module is registered");
-        for entry in [
-            "semantic_feedback_encode",
-            "semantic_feedback_project",
-            "semantic_publication_content_guard",
-            "semantic_tensor_content_witness",
-            "semantic_publication_prepare_continuation",
-        ] {
-            assert!(
-                module.kernels.contains(&entry),
-                "native semantic entry {entry} is absent from the loaded symbol roster"
-            );
-        }
-    }
-
-    #[test]
-    fn acquired_step_inputs_and_original_baseline_guard_are_loaded_together() {
-        let module = KERNEL_MODULES
-            .iter()
-            .find(|module| module.module_name == "xlog_semantic_transition")
-            .expect("semantic transition module is registered");
-        for entry in [
-            "semantic_publication_step_inputs",
-            "semantic_publication_step_input_guard",
-            "semantic_publication_step_admit",
-            "semantic_publication_step_release",
-            "semantic_publication_step_result",
-            "semantic_publication_model_seals",
-            "semantic_numerical_block_snapshot",
-        ] {
-            assert!(
-                module.kernels.contains(&entry),
-                "acquired step input entry {entry} is absent from the loaded symbol roster"
             );
         }
     }

@@ -23,6 +23,8 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- *(cuda)* align semantic module loading with the real kernel exports and register
+  the group-critic reducer and model-context continuation entry points.
 - *(runtime)* encode each resident-route certificate node from its local fields once, avoiding repeated recursive plan formatting for deep unary plans while preserving exact expression constants and route identity.
 - *(runtime)* preserve nullary schemas when initializing mutually recursive predicates.
 - *(runtime)* serialize execution statistics through a JSON encoder so diagnostic text and operation names are escaped correctly.
