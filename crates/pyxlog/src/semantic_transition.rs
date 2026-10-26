@@ -22779,6 +22779,8 @@ impl PySemanticTransitionController {
 
     /// Terminally join and release an aborted ordinary task before parent publication.
     /// Initial prefill may retain its original model, input and output owners.
+    /// A completed receiver binding remains attached to the original TaskUse;
+    /// unfinished receiver authentication still excludes terminal release.
     /// No import, model call, callback or publication is resumed by this operation.
     /// An unknown join retains the same controller and TaskUse for the same call;
     /// a fatal CUDA error still requires terminating the isolated task process.
@@ -27762,11 +27764,12 @@ impl PySemanticTransitionController {
             ),
         };
         if !admitted
-            || issued
+            || (issued
                 .delivery
                 .lock()
                 .map_err(|_| invalid("delivery binding mutex is poisoned"))?
                 .is_some()
+                && matches!(kind, TaskReleaseKind::Imported))
             || issued
                 .pending_delivery_receiver
                 .lock()
