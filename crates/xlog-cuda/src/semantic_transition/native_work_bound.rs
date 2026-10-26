@@ -281,6 +281,7 @@ pub(crate) struct ColdNativeAllowance {
     )>,
     model_context_preparation: Option<FrozenModelContextPreparation>,
     model_context_source_budget: Option<[u64; 3]>,
+    initial_preparation_budget: Option<[u64; 3]>,
 }
 
 /// Ordered producer geometry frozen before the imported context's first model
@@ -694,6 +695,7 @@ impl ColdNativeAllowance {
             model_context_publication_dma: None,
             model_context_preparation: None,
             model_context_source_budget: None,
+            initial_preparation_budget: None,
         }
     }
 
@@ -764,7 +766,8 @@ impl ColdNativeAllowance {
     }
 
     pub(super) fn is_model_context_report(&self) -> bool {
-        self.model_context_ceiling.is_some()
+        self.initial_preparation_budget.is_some()
+            || self.model_context_ceiling.is_some()
             || self.model_context_prefill.is_some()
             || self.model_context_preparation.is_some()
             || self.model_context_activation_ceiling.is_some()
@@ -774,7 +777,10 @@ impl ColdNativeAllowance {
         &self,
         model: [u64; 3],
     ) -> Result<(), SemanticTransitionError> {
-        if let Some(budget) = self.model_context_source_budget {
+        if let Some(budget) = self
+            .model_context_source_budget
+            .or(self.initial_preparation_budget)
+        {
             let total = native_work_ceiling_units(self.native_ceiling()?)?
                 .checked_add(model[0])
                 .ok_or_else(native_work_ceiling_overflow)?;
@@ -784,6 +790,23 @@ impl ColdNativeAllowance {
                 ));
             }
         }
+        Ok(())
+    }
+
+    pub(super) fn freeze_initial_prefill_preparation(
+        &mut self,
+        budget: [u64; 3],
+    ) -> Result<(), SemanticTransitionError> {
+        if self.purpose != SemanticColdModelWorkPurpose::PrivateModelPreparation
+            || self.initial_preparation_budget.is_some()
+            || self.model_scratch_ceiling.is_some()
+            || self.native_initialization_claimed
+        {
+            return Err(publication_input_error(
+                "initial preparation requires its original unopened program allowance",
+            ));
+        }
+        self.initial_preparation_budget = Some(budget);
         Ok(())
     }
 

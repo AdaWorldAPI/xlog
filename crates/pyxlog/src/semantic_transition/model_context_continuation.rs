@@ -635,6 +635,10 @@ impl PySemanticModelContextContinuation {
             )
         };
         let issued = self.target_task.borrow(py);
+        let producers = issued
+            .session
+            .borrow(py)
+            .retain_initial_prefill_stage_producers(&issued, &scope, Vec::new())?;
         let stage = Py::new(
             py,
             PySemanticInitialPrefillStage {
@@ -644,9 +648,7 @@ impl PySemanticModelContextContinuation {
                 lease,
                 layout,
                 prefix_len,
-                model_producers: Mutex::new(Vec::new()),
-                input_producer: Mutex::new(None),
-                output_producers: Mutex::new(Vec::new()),
+                producers,
                 restored_custody: None,
             },
         )?;

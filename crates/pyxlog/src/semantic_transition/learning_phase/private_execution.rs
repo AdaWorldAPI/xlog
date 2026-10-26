@@ -1657,7 +1657,7 @@ impl PySemanticLearningPhaseTransition {
         }
         work.check(py)?;
         let work_custody = work.custody(py)?;
-        let reader = work_custody.reader.borrow(py);
+        let reader = work_custody.published_reader()?.borrow(py);
         let source = reader.session.borrow(py);
         for child in children {
             let custody = source

@@ -3268,7 +3268,8 @@ struct InitialPrefillStage {
 }
 
 /// Storage needed by the original forward after the one-use prefill stage has
-/// joined its parent. The Session owns it until its final stream-safe release.
+/// joined its parent. Tensor owners retire with the first known prepared segment;
+/// the original scope and record remain available for later material custody.
 struct RetainedInitialPrefillContent {
     scope: Arc<()>,
     task_identity: Identity256,
@@ -19848,6 +19849,8 @@ pub struct SemanticTransitionSession {
     cold_canary_source: Option<Arc<crate::SemanticTrainingCanarySource>>,
     training_canary_source: Option<Arc<crate::SemanticTrainingCanarySource>>,
     initial_prefill: Option<InitialPrefillStage>,
+    #[cfg(feature = "semantic-policy")]
+    initial_cold_model_work: Option<cold_model_work::InitialPrefillColdWork>,
     retained_initial_prefill: Option<RetainedInitialPrefillContent>,
     checkpoint_initial_prefill: Option<CheckpointInitialPrefill>,
     checkpoint_initial_prefill_reservation: Option<Arc<SemanticReplayMaterialReservation>>,
@@ -22152,6 +22155,8 @@ struct UnreleasedPublicationOwners {
     _readers: BTreeMap<u64, PublishedReader>,
     _steps: BTreeMap<u64, StepContentStorage>,
     _initial_prefill: Option<InitialPrefillStage>,
+    #[cfg(feature = "semantic-policy")]
+    _initial_cold_model_work: Option<cold_model_work::InitialPrefillColdWork>,
     _initial_prefill_content: Option<RetainedInitialPrefillContent>,
     _prepared_resources: Vec<Arc<dyn Send + Sync>>,
     _pending_replay_delivery: Option<PendingReplayDelivery>,
@@ -22346,10 +22351,19 @@ impl Drop for SemanticTransitionSession {
             });
         #[cfg(not(feature = "semantic-policy"))]
         let context_pending = false;
+        #[cfg(feature = "semantic-policy")]
+        let initial_preparation_unjoined = self
+            .initial_cold_model_work
+            .as_ref()
+            .is_some_and(|owner| owner.needs_terminal_join())
+            && !matches!(self.task_release, TaskReleaseState::Joined(_));
+        #[cfg(not(feature = "semantic-policy"))]
+        let initial_preparation_unjoined = false;
         if matches!(
             self.task_release,
             TaskReleaseState::Joining(_) | TaskReleaseState::Failed(_)
-        ) || self.pending_replay_delivery.is_some()
+        ) || initial_preparation_unjoined
+            || self.pending_replay_delivery.is_some()
             || self
                 .pending_delivery_acknowledgement
                 .as_ref()
@@ -22385,6 +22399,8 @@ impl Drop for SemanticTransitionSession {
                     _events: std::mem::take(&mut self.release_events),
                     _steps: std::mem::take(&mut self.steps),
                     _initial_prefill: self.initial_prefill.take(),
+                    #[cfg(feature = "semantic-policy")]
+                    _initial_cold_model_work: self.initial_cold_model_work.take(),
                     _initial_prefill_content: self.retained_initial_prefill.take(),
                     _text_binding: self.text_binding.take(),
                     _prepared_resources: std::mem::take(&mut self.prepared_resources),
@@ -30986,6 +31002,14 @@ impl SemanticTransitionSession {
         self.actor_refresh_work.clear();
         if retired_preparation.is_none() {
             self.reclaim_model_generations()?;
+            // The original graphs and step consumers have retired. Publication
+            // generations retain their own selected model owners; these are only
+            // the extra producer aliases from the one-use initial prefill.
+            if let Some(initial) = &mut self.retained_initial_prefill {
+                initial.model.tensors.clear();
+                #[cfg(feature = "semantic-policy")]
+                initial.output.tensors.clear();
+            }
         }
         let resources = std::mem::take(&mut self.prepared_resources);
         // An original catalogue retired without a result does not establish
@@ -31134,7 +31158,7 @@ impl SemanticTransitionSession {
         layout: SemanticInitialSourceLayout,
         model_generation: u64,
     ) -> Result<SemanticInitialPrefillLease, SemanticTransitionError> {
-        self.ensure_rebindable()?;
+        self.ensure_rebindable_with_prefill()?;
         if self.publication.is_some() || self.initial_prefill.is_some() {
             return Err(publication_input_error(
                 "initial prefill requires one unpublished imported task",
@@ -31174,6 +31198,10 @@ impl SemanticTransitionSession {
             output_content: None,
             consumer_stream: None,
         });
+        #[cfg(feature = "semantic-policy")]
+        if let Some(original) = &mut self.initial_cold_model_work {
+            original.bind_scope(&scope)?;
+        }
         Ok(SemanticInitialPrefillLease {
             issuer: Arc::clone(&self.publication_issuer),
             scope,
@@ -31451,6 +31479,8 @@ impl SemanticTransitionSession {
             )?;
         }
         self.join_initial_prefill_parent(&parent, &tensors, &allocations)?;
+        #[cfg(feature = "semantic-policy")]
+        self.require_completed_cold_model_work()?;
         self.ensure_rebindable_with_prefill()?;
         if self.publication.is_some() {
             return Err(publication_input_error(
@@ -38601,6 +38631,8 @@ impl SemanticTransitionSession {
             cold_canary_source: None,
             training_canary_source: None,
             initial_prefill: None,
+            #[cfg(feature = "semantic-policy")]
+            initial_cold_model_work: None,
             retained_initial_prefill: None,
             checkpoint_initial_prefill: None,
             checkpoint_initial_prefill_reservation: None,
@@ -38687,6 +38719,14 @@ impl SemanticTransitionSession {
     }
 
     pub fn is_poisoned(&self) -> bool {
+        #[cfg(feature = "semantic-policy")]
+        if self
+            .initial_cold_model_work
+            .as_ref()
+            .is_some_and(|owner| owner.completion_pending())
+        {
+            return self.is_poisoned_except_cold_report(Some(0));
+        }
         self.is_poisoned_except_cold_report(None)
     }
 
@@ -39047,6 +39087,10 @@ impl SemanticTransitionSession {
     }
 
     fn join_task_release(&mut self, kind: TaskReleaseKind) -> Result<(), SemanticTransitionError> {
+        #[cfg(feature = "semantic-policy")]
+        let initial_preparation = self.initial_cold_model_work.is_some();
+        #[cfg(not(feature = "semantic-policy"))]
+        let initial_preparation = false;
         match &self.task_release {
             TaskReleaseState::Joined(original) if original == &kind => return Ok(()),
             TaskReleaseState::Joining(original) if original == &kind => {}
@@ -39058,7 +39102,7 @@ impl SemanticTransitionSession {
                     self.ensure_quiescent()?;
                 } else {
                     self.ensure_quiescent_except_cold_report_with_effect_exclusion(
-                        None,
+                        initial_preparation.then_some(0),
                         OriginalSessionEffectExclusion {
                             allow_session_poison: true,
                             delivery_acknowledgement: None,
@@ -39083,6 +39127,7 @@ impl SemanticTransitionSession {
                     || self.checkpoint_initial_prefill.is_some()
                     || self.state_material_restore.is_some()
                     || self.publication_preparation.is_some()
+                    || (initial_preparation && kind != TaskReleaseKind::Aborted)
                     || self.resident_model_activation.is_some()
                     || self.continuation_base.is_some()
                     || (kind != TaskReleaseKind::Aborted
@@ -44919,6 +44964,12 @@ impl SemanticTransitionSession {
     }
 
     fn ensure_rebindable(&self) -> Result<(), SemanticTransitionError> {
+        #[cfg(feature = "semantic-policy")]
+        if self.publication.is_none() && self.initial_cold_model_work.is_some() {
+            return Err(publication_input_error(
+                "initial preparation retains its original imported task",
+            ));
+        }
         if self.initial_prefill.is_some() {
             return Err(publication_input_error(
                 "an imported task's initial prefill stage cannot be rebound",

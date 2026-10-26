@@ -95,7 +95,7 @@ impl PySemanticLearningPhaseTransition {
             || call.result.is_some()
             || call.error.is_some()
             || custody.parent()?.as_ptr() != expected.as_ptr()
-            || custody.reader.as_ptr() != current.reader.as_ptr()
+            || custody.published_reader()?.as_ptr() != current.reader.as_ptr()
         {
             return Err(invalid(
                 "delivery cold callback changed its actual original region or owners",
@@ -151,7 +151,7 @@ impl PySemanticLearningPhaseTransition {
             || tail.retired
             || !current.calls[8].entered
             || !std::ptr::eq(&*current.regions[8].borrow(py), work)
-            || current.reader.as_ptr() != work.custody(py)?.reader.as_ptr()
+            || current.reader.as_ptr() != work.custody(py)?.published_reader()?.as_ptr()
         {
             return Err(invalid(
                 "terminal private retirement changed its original admitted region",
@@ -1341,7 +1341,7 @@ impl PySemanticLearningPhaseTransition {
             }
         };
         let region_custody = region.borrow(py).custody(py)?;
-        let reader = region_custody.reader.clone_ref(py);
+        let reader = region_custody.published_reader()?.clone_ref(py);
         let original = region_custody
             .region
             .clone()

@@ -1312,6 +1312,12 @@ fn pyxlog(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.py()
             .get_type::<semantic_transition::SemanticTaskReleasePending>(),
     )?;
+    #[cfg(feature = "semantic-policy")]
+    m.add(
+        "SemanticInitialPrefillPending",
+        m.py()
+            .get_type::<semantic_transition::SemanticInitialPrefillPending>(),
+    )?;
     m.add_class::<semantic_transition::model_work_port::PySemanticModelWorkBufferPort>()?;
     #[cfg(feature = "semantic-policy")]
     {

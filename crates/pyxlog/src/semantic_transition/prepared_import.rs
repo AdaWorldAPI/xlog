@@ -460,7 +460,7 @@ impl PySemanticPreparedSourceContent {
                 "SOURCE activation changed its original callback parent",
             ));
         }
-        let reader = custody.reader.borrow(py);
+        let reader = custody.published_reader()?.borrow(py);
         let source = reader.session.borrow(py);
         source.require_creator()?;
         let mut owner = session.owner()?;

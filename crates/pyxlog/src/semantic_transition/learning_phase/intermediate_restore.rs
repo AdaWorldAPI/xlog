@@ -86,7 +86,7 @@ impl PySemanticLearningPhaseTransition {
                 .work
                 .as_ref()
                 .is_none_or(|original| !original.same_invocation(&custody.inner))
-            || custody.reader.as_ptr() != self.parent.as_ptr()
+            || custody.published_reader()?.as_ptr() != self.parent.as_ptr()
             || !current
                 .callbacks
                 .iter()
@@ -302,7 +302,7 @@ impl PySemanticLearningPhaseTransition {
             || current.closed
             || current.error.is_some()
             || !expected
-            || custody.reader.as_ptr() != self.parent.as_ptr()
+            || custody.published_reader()?.as_ptr() != self.parent.as_ptr()
         {
             return Err(invalid(
                 "intermediate cold callback changed its actual original region or owners",
