@@ -2774,9 +2774,36 @@ the 32-row active ring. The task's observed payload and source mapping, not a
 second caller token list, determine these rows. Missing tokens, invalid mapping,
 capacity and text geometry are rejected. Use `ring_head` in initial metadata.
 
-When `prefill_tokens` is nonempty, issue the one-use
-`task_use.begin_initial_prefill(...)` with the same geometry and actual
-`model_generation`; `stage.source_layout()` supplies the original layout.
+When `prefill_tokens` is nonempty, call
+`task_use.prepare_initial_prefill(prepare_callback, initialize_callback, ...)`
+with the same source geometry, actual `model_generation`,
+`memory_capacity_bytes` and `other_external_cuda_bytes`. Native compares the
+memory declarations with the original Program instruction and derives the
+existing `prepare` allowance from the retained original Program, without
+advancing its schedule or accepting another budget from Python.
+
+`prepare_callback(work)` receives the genuine active `SemanticColdModelWork`.
+Use `work.consumer_stream` and its original buffer ports to finalize the actual
+bounded arena before freezing and admitting its numerical plan. Return the
+prepared owner. Only then does native issue the actual stage and call
+`initialize_callback(stage, prepared_owner)` once with that exact owner.
+`stage.source_layout()` supplies the original layout. The returned pair is
+`(stage, initialize_result)`, preserving both original objects.
+
+`SemanticInitialPrefillPending` means only that the retained native completion
+or consumer join is unfinished. Retain the TaskUse, both callback objects and
+their owners, then repeat the same method with unchanged arguments. A retry
+does not call either callback, reset the arena, advance a schedule, or run
+another forward. Ordinary callback and fatal native errors propagate as their
+original failures; keep their owners until the original aborted-task join.
+An already completed restored prefill does not enter this numerical path.
+Keep the original cold-work handle through workspace retirement: it retains
+the actual report-stream owner even after terminal Session close. An integer
+stream handle alone does not preserve that lifetime. Native releases its saved
+callbacks, results and stage producer aliases after known original
+prepared-segment retirement or full task/publication release, never after a
+reader-only release.
+
 At the real wrapper boundary, call
 `stage.bind_model_content(tensors=..., model_allocations=..., consumer_stream=...)`.
 It returns `None` and retains the actual model/backing owners; it produces no

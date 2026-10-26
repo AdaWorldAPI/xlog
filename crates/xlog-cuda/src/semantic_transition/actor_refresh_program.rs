@@ -201,6 +201,49 @@ pub(super) struct ActorRefreshProgram {
     admissions: Vec<InstructionAdmission>,
 }
 
+pub(super) struct InitialPrefillProgramAuthority {
+    pub(super) owner: Arc<()>,
+    pub(super) identity: Identity256,
+    pub(super) instruction: Arc<[u8]>,
+    pub(super) budget: [u64; 3],
+    _reservation: SemanticReplayMaterialReservation,
+}
+
+fn original_source_has_model_context_successor(
+    program: &ActorRefreshProgram,
+    claim: &InstructionAdmission,
+) -> bool {
+    let Some(first) = program.steps.iter().find(|step| step.kind.is_some()) else {
+        return false;
+    };
+    let Some(source) = program.steps.get(claim.first as usize..claim.end as usize) else {
+        return false;
+    };
+    let Some(next) = program.steps.get(claim.end as usize) else {
+        return false;
+    };
+    let Some(target) = program
+        .steps
+        .get(claim.end as usize..next.segment_end as usize)
+    else {
+        return false;
+    };
+    claim.first == first.ordinal
+        && source.len() >= 2
+        && source
+            .last()
+            .is_some_and(|step| step.kind == Some(SemanticTransitionKind::Recompute))
+        && source[..source.len() - 1]
+            .iter()
+            .all(|step| step.kind == Some(SemanticTransitionKind::Proposal))
+        && source.iter().all(|step| step.branch.is_none())
+        && next.segment_begin == next.ordinal
+        && first.request.checked_add(1) == Some(next.request)
+        && target.len() == 1
+        && next.kind == Some(SemanticTransitionKind::Recompute)
+        && next.branch.is_none()
+}
+
 impl ActorRefreshProgram {
     pub(super) fn checkpoint_owner_binding(&self) -> (Arc<()>, Identity256) {
         (Arc::clone(&self.owner), self.identity)
@@ -1887,15 +1930,6 @@ impl SemanticTransitionSession {
             .as_ref()
             .ok_or_else(invalid_program)?
             .index;
-        let first = program
-            .steps
-            .iter()
-            .find(|step| step.kind.is_some())
-            .ok_or_else(invalid_program)?;
-        let source_steps = program
-            .steps
-            .get(claim.first as usize..claim.end as usize)
-            .ok_or_else(invalid_program)?;
         let next = program
             .steps
             .get(claim.end as usize)
@@ -1934,20 +1968,7 @@ impl SemanticTransitionSession {
         };
         if Arc::ptr_eq(&self.publication_issuer, &target.publication_issuer)
             || !source_owned
-            || claim.first != first.ordinal
-            || source_steps.len() < 2
-            || source_steps
-                .last()
-                .is_none_or(|step| step.kind != Some(SemanticTransitionKind::Recompute))
-            || source_steps[..source_steps.len() - 1]
-                .iter()
-                .any(|step| step.kind != Some(SemanticTransitionKind::Proposal))
-            || source_steps.iter().any(|step| step.branch.is_some())
-            || next.segment_begin != next.ordinal
-            || next.request != first.request.checked_add(1).ok_or_else(invalid_program)?
-            || target_steps.len() != 1
-            || next.kind != Some(SemanticTransitionKind::Recompute)
-            || next.branch.is_some()
+            || !original_source_has_model_context_successor(program, claim)
             || program.bytes != target_program.bytes
             || program.identity != target_program.identity
             || !target_program.admissions.is_empty()
@@ -2408,6 +2429,91 @@ impl SemanticTransitionSession {
         let quantities = [program.proposals, program.updates];
         self.actor_refresh_program = Some(program);
         Ok(quantities)
+    }
+
+    pub(super) fn initial_prefill_program_authority(
+        &self,
+        memory_capacity_bytes: u64,
+        other_external_cuda_bytes: u64,
+    ) -> Result<InitialPrefillProgramAuthority, SemanticTransitionError> {
+        let program = self
+            .actor_refresh_program
+            .as_ref()
+            .ok_or_else(invalid_program)?;
+        let first = program
+            .steps
+            .iter()
+            .find(|step| step.kind.is_some())
+            .ok_or_else(invalid_program)?;
+        if !program.admissions.is_empty()
+            || program.original_rng.is_some()
+            || !program.main_origins.is_empty()
+            || first.segment_begin != first.ordinal
+            || first.branch.is_some()
+        {
+            return Err(publication_input_error(
+                "initial prefill requires its original program before instruction execution",
+            ));
+        }
+        let budget = self
+            .replay_material_budget
+            .as_ref()
+            .ok_or(SemanticTransitionError::NotBound)?;
+        let _parse = budget.reserve_json_parse(&program.bytes)?;
+        let value = json_value(&program.bytes)?;
+        let preparation = resource_budget(&value["budgets"]["prepare"])?;
+        let instruction = json_value(&first.instruction)?;
+        let capacity = SemanticSegmentColdCapacity {
+            segment_capacity_bytes: integer(&instruction["capacity_bytes"])?,
+            other_external_cuda_bytes: integer(&instruction["other_external_cuda_bytes"])?,
+        };
+        if capacity.segment_capacity_bytes != memory_capacity_bytes
+            || capacity.other_external_cuda_bytes != other_external_cuda_bytes
+        {
+            return Err(publication_input_error(
+                "initial prefill capacity differs from its original source instruction",
+            ));
+        }
+        let retained = size_of::<InitialPrefillProgramAuthority>()
+            .checked_add(first.instruction.len())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or(SemanticTransitionError::GenerationExhausted)?;
+        let reservation = budget.reserve_auxiliary(retained)?;
+        Ok(InitialPrefillProgramAuthority {
+            owner: Arc::clone(&program.owner),
+            identity: program.identity,
+            instruction: Arc::from(first.instruction.as_slice()),
+            budget: preparation,
+            _reservation: reservation,
+        })
+    }
+
+    pub(super) fn instruction_prepares_original_model_context(
+        &self,
+        admission: &SemanticSegmentInstructionAdmission,
+    ) -> Result<bool, SemanticTransitionError> {
+        let original = self.instruction_admission(admission)?;
+        let program = self
+            .actor_refresh_program
+            .as_ref()
+            .ok_or_else(invalid_program)?;
+        Ok(original_source_has_model_context_successor(
+            program, original,
+        ))
+    }
+
+    pub(super) fn require_initial_prefill_program_authority(
+        &self,
+        original: &InitialPrefillProgramAuthority,
+    ) -> Result<(), SemanticTransitionError> {
+        let program = self
+            .actor_refresh_program
+            .as_ref()
+            .ok_or_else(invalid_program)?;
+        if !Arc::ptr_eq(&program.owner, &original.owner) || program.identity != original.identity {
+            return Err(SemanticTransitionError::ObservationMismatch);
+        }
+        Ok(())
     }
 
     /// Authenticate the original live reader and instruction before any cold

@@ -222,6 +222,14 @@ impl PySemanticRestoredModelContextPrefill {
             model_allocations,
             _metadata: metadata,
         });
+        let producers = session.retain_initial_prefill_stage_producers(
+            &task,
+            &scope,
+            vec![
+                custody.model_tensors.clone_ref(py),
+                custody.model_allocations.clone_ref(py),
+            ],
+        )?;
         let stage = Py::new(
             py,
             PySemanticInitialPrefillStage {
@@ -231,12 +239,7 @@ impl PySemanticRestoredModelContextPrefill {
                 lease: lease.clone(),
                 layout: source_layout.clone_ref(py),
                 prefix_len,
-                model_producers: Mutex::new(vec![
-                    custody.model_tensors.clone_ref(py),
-                    custody.model_allocations.clone_ref(py),
-                ]),
-                input_producer: Mutex::new(None),
-                output_producers: Mutex::new(Vec::new()),
+                producers,
                 restored_custody: Some(Arc::clone(&custody)),
             },
         )?;

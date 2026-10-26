@@ -7,6 +7,8 @@
 //! up to `max_streams`. Streams are never returned to a free-list —
 //! they stay alive for the runtime's lifetime so [`StreamId`] handles
 //! remain valid for correlated allocate/launch/deallocate sequences.
+//! Internal execution-domain leases reuse only retired leased streams after all
+//! domain and stream aliases release custody and completion is known.
 //!
 //! # Failure semantics
 //!
@@ -19,7 +21,7 @@
 //! the caller.
 
 use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Mutex, Weak};
 
 use cudarc::driver::CudaStream;
 
@@ -51,7 +53,7 @@ pub fn planned_pool_budget_bytes(arms: u64, streams: u64) -> u64 {
         .saturating_mul(configured_pool_bytes_per_stream())
 }
 
-/// Errors returned by [`StreamPool::acquire`]. Both variants are hard
+/// Errors returned by stream admission and retired-lease completion. These are hard
 /// failures; callers must not silently substitute [`StreamId::DEFAULT`].
 #[derive(Debug)]
 pub enum StreamPoolError {
@@ -62,6 +64,8 @@ pub enum StreamPoolError {
     /// `CudaStream::fork` returned an error. Carries the wrapped
     /// driver message.
     ForkFailed(String),
+    /// A retired leased stream could not prove completion before reuse.
+    JoinFailed(String),
 }
 
 impl std::fmt::Display for StreamPoolError {
@@ -72,6 +76,9 @@ impl std::fmt::Display for StreamPoolError {
             }
             Self::ForkFailed(msg) => {
                 write!(f, "stream fork failed: {}", msg)
+            }
+            Self::JoinFailed(msg) => {
+                write!(f, "retired stream join failed: {}", msg)
             }
         }
     }
@@ -89,6 +96,7 @@ pub struct StreamPool {
     /// the device's default stream so synchronous codepaths keep
     /// working unchanged during the migration window.
     streams: Mutex<Vec<Arc<CudaStream>>>,
+    leased: Mutex<Vec<(StreamId, Weak<()>)>>,
 }
 
 impl StreamPool {
@@ -99,6 +107,7 @@ impl StreamPool {
             max_streams: max_streams.max(1),
             pool_bytes_per_stream: configured_pool_bytes_per_stream(),
             streams: Mutex::new(Vec::new()),
+            leased: Mutex::new(Vec::new()),
         }
     }
 
@@ -139,6 +148,44 @@ impl StreamPool {
             }
             Err(e) => Err(StreamPoolError::ForkFailed(e.to_string())),
         }
+    }
+
+    /// Lease one bounded physical stream until its complete domain and external
+    /// stream custody retire. Permanent `acquire` ids are never lease candidates.
+    pub(crate) fn acquire_lease(
+        &self,
+    ) -> Result<(StreamId, Arc<CudaStream>, Arc<()>), StreamPoolError> {
+        let mut streams = self.streams.lock().expect("stream pool poisoned");
+        let mut leased = self.leased.lock().expect("stream leases poisoned");
+        for (id, original) in leased.iter_mut() {
+            let stream = &streams[id.0 as usize - 1];
+            if original.strong_count() == 0 && Arc::strong_count(stream) == 1 {
+                stream
+                    .context()
+                    .bind_to_thread()
+                    .and_then(|_| stream.synchronize())
+                    .map_err(|error| StreamPoolError::JoinFailed(error.to_string()))?;
+                let lease = Arc::new(());
+                *original = Arc::downgrade(&lease);
+                return Ok((*id, Arc::clone(stream), lease));
+            }
+        }
+        if streams.len() >= self.max_streams {
+            return Err(StreamPoolError::Capacity {
+                max: self.max_streams,
+            });
+        }
+        let stream = self
+            .device
+            .inner()
+            .stream()
+            .fork()
+            .map_err(|error| StreamPoolError::ForkFailed(error.to_string()))?;
+        streams.push(Arc::clone(&stream));
+        let id = StreamId(streams.len() as u32);
+        let lease = Arc::new(());
+        leased.push((id, Arc::downgrade(&lease)));
+        Ok((id, stream, lease))
     }
 
     /// Borrow the live `CudaStream` for `id`. Returns `None` if `id`

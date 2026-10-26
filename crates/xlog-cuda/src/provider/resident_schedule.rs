@@ -972,6 +972,7 @@ pub struct ResidentExecutionDomain {
     stream: Arc<CudaStream>,
     context: Arc<cudarc::driver::CudaContext>,
     marker: Arc<()>,
+    _stream_lease: Option<Arc<()>>,
 }
 
 /// Enqueued resident operation that must be completed or cancelled exactly once.
@@ -2401,7 +2402,22 @@ impl CudaKernelProvider {
             stream,
             context: Arc::clone(provider_context),
             marker: Arc::new(()),
+            _stream_lease: None,
         })
+    }
+
+    /// Bind a report-owned domain to the runtime's finite physical stream pool.
+    pub(crate) fn bind_leased_resident_execution_domain(
+        &self,
+        runtime: Arc<XlogDeviceRuntime>,
+    ) -> Result<ResidentExecutionDomain> {
+        let (stream_id, stream, lease) = runtime
+            .stream_pool()
+            .acquire_lease()
+            .map_err(|error| XlogError::Kernel(error.to_string()))?;
+        let mut domain = self.bind_resident_execution_domain(runtime, stream_id, stream)?;
+        domain._stream_lease = Some(lease);
+        Ok(domain)
     }
 
     fn upload_resident_schedule_metadata<T>(&self, values: &[T]) -> Result<TrackedCudaSlice<T>>

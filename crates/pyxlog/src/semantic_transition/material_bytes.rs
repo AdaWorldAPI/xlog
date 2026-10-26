@@ -247,7 +247,7 @@ impl OriginalColdCheckpointWriter {
                 "checkpoint writer entered another original report region",
             ));
         }
-        let reader = custody.reader.borrow(py);
+        let reader = custody.published_reader()?.borrow(py);
         let session = reader.session.borrow(py);
         session.require_creator()?;
         let owner = session.owner()?;
@@ -496,7 +496,7 @@ impl CheckpointWriterOrigin {
                             "checkpoint writer changed its original callback parent",
                         ));
                     }
-                    let reader = custody.reader.borrow(py);
+                    let reader = custody.published_reader()?.borrow(py);
                     let source = reader.session.borrow(py);
                     source.require_creator()?;
                     if reader.session.as_ptr() == parent_owner.session.as_ptr() {

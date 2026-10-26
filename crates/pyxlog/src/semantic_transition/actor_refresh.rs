@@ -704,7 +704,7 @@ impl ActorRefreshCustody {
         let work = work.borrow(py);
         let work_custody = work.custody(py)?;
         let result = work_custody
-            .reader
+            .published_reader()?
             .borrow(py)
             .session
             .borrow(py)
@@ -1530,7 +1530,7 @@ impl ActorRefreshCustody {
             ));
         }
         let cold_work = work_custody
-            .reader
+            .published_reader()?
             .borrow(py)
             .session
             .borrow(py)

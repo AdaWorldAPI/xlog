@@ -1146,7 +1146,7 @@ impl PySemanticLearningPhaseTransition {
                         // Keep uncertain work/storage owners, not an entered
                         // Python context. Visibility is still active here.
                         work.custody(py)?
-                            .reader
+                            .published_reader()?
                             .borrow(py)
                             .session
                             .borrow(py)
@@ -2332,7 +2332,7 @@ impl PySemanticLearningPhaseTransition {
             } else {
                 current.owners()?.parent.as_ptr() != work.custody(py)?.parent()?.as_ptr()
             }
-            || self.parent.as_ptr() != work.custody(py)?.reader.as_ptr()
+            || self.parent.as_ptr() != work.custody(py)?.published_reader()?.as_ptr()
         {
             return Err(invalid(
                 "evaluation cold callback changed its actual region, TaskUse or parent",

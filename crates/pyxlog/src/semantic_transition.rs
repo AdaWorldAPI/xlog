@@ -54,6 +54,8 @@ pub(crate) mod actor_refresh;
 pub(crate) mod cancelled_checkpoint;
 pub(crate) mod cold_task;
 mod feedback_projection;
+#[cfg(feature = "semantic-policy")]
+mod initial_prefill;
 pub(crate) mod learning_phase;
 pub(crate) mod material_bytes;
 pub(crate) mod material_owner;
@@ -110,6 +112,14 @@ pyo3::create_exception!(
     SemanticTaskReleasePending,
     PyRuntimeError,
     "The original task retains an unfinished terminal join; resolve that same release."
+);
+
+#[cfg(feature = "semantic-policy")]
+pyo3::create_exception!(
+    pyxlog._native,
+    SemanticInitialPrefillPending,
+    PyRuntimeError,
+    "The original initial prefill retains an unfinished native join; repeat the same preparation without repeating either callback."
 );
 
 fn fallible_python_u64(py: Python<'_>, value: u64) -> PyResult<Bound<'_, PyAny>> {
@@ -529,6 +539,7 @@ pub(crate) struct PySemanticTransitionSession {
     learning_transition: Mutex<Option<Py<learning_phase::PySemanticLearningPhaseTransition>>>,
     checkpoint_custody: Mutex<Option<learning_phase::cold_restore::CheckpointCustody>>,
     task_release: Mutex<Option<TaskRelease>>,
+    initial_prefill_stage_producers: Mutex<Option<Arc<InitialPrefillProducers>>>,
     producer_operation: Arc<AtomicBool>,
     #[cfg(feature = "semantic-policy")]
     pending_evaluation_preparation: Mutex<Option<model_evaluation::PendingEvaluationPreparation>>,
@@ -537,6 +548,9 @@ pub(crate) struct PySemanticTransitionSession {
     #[cfg(feature = "semantic-policy")]
     active_cold_model_work:
         Mutex<Option<Py<learning_phase::cold_model_work::PySemanticColdModelWork>>>,
+    #[cfg(feature = "semantic-policy")]
+    initial_prefill_preparation:
+        Mutex<Option<Arc<Mutex<initial_prefill::InitialPrefillPreparation>>>>,
     #[cfg(feature = "semantic-policy")]
     private_replay_child: Mutex<Option<Arc<learning_phase::PrivateReplayChildCustody>>>,
     #[cfg(feature = "semantic-policy")]
@@ -859,6 +873,8 @@ impl PySemanticTransitionSession {
 
     fn require_task_release_idle(&self) -> PyResult<()> {
         self.require_creator()?;
+        #[cfg(feature = "semantic-policy")]
+        self.require_initial_prefill_idle()?;
         {
             let owner = self.inner.try_lock().map_err(|_| {
                 invalid("terminal task release cannot interrupt an original native operation")
@@ -1146,6 +1162,15 @@ impl PySemanticTransitionSession {
                 })?;
             }
         }
+        {
+            // The native join is known. Detached producer finalizers must run
+            // outside custody locks before resolving their actual allocations.
+            drop(retained);
+            self.release_initial_prefill_producers(py, None);
+            retained = self.task_release.try_lock().map_err(|_| {
+                invalid("terminal task release lost its original retirement custody")
+            })?;
+        }
         // A late deallocation error retains allocator custody. Its retry only
         // resolves retirement and cannot reenter the completed terminal join.
         retained
@@ -1378,6 +1403,7 @@ impl PySemanticTransitionSession {
                 learning_phase::cold_restore::CheckpointCustody::issue(),
             )),
             task_release: Mutex::new(None),
+            initial_prefill_stage_producers: Mutex::new(None),
             producer_operation: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "semantic-policy")]
             pending_evaluation_preparation: Mutex::new(None),
@@ -1385,6 +1411,8 @@ impl PySemanticTransitionSession {
             prepared_task_import: Mutex::new(None),
             #[cfg(feature = "semantic-policy")]
             active_cold_model_work: Mutex::new(None),
+            #[cfg(feature = "semantic-policy")]
+            initial_prefill_preparation: Mutex::new(None),
             #[cfg(feature = "semantic-policy")]
             private_replay_child: Mutex::new(None),
             #[cfg(feature = "semantic-policy")]
@@ -5623,7 +5651,7 @@ impl PySemanticSegmentInstructionAdmission {
         if private.is_some() {
             let work_ref = work.borrow(py);
             let custody = work_ref.custody(py)?;
-            let reader = custody.reader.borrow(py);
+            let reader = custody.published_reader()?.borrow(py);
             let source = reader.session.borrow(py);
             if std::ptr::eq(&*source, &*session) {
                 return Err(invalid(
@@ -11981,6 +12009,10 @@ enum TaskUsePhase {
         reads: bool,
     },
     Imported,
+    #[cfg(feature = "semantic-policy")]
+    InitialPrefillPreparing {
+        scope: Arc<()>,
+    },
     InitialPrefill {
         scope: Arc<()>,
     },
@@ -14052,16 +14084,111 @@ pub(crate) struct PySemanticInitialPrefillStage {
     lease: SemanticInitialPrefillLease,
     layout: Py<PyTuple>,
     prefix_len: usize,
-    model_producers: Mutex<Vec<Py<PyAny>>>,
-    input_producer: Mutex<Option<Py<PyAny>>>,
-    output_producers: Mutex<Vec<Py<PyAny>>>,
+    producers: Arc<InitialPrefillProducers>,
     #[cfg(feature = "semantic-policy")]
     restored_custody:
         Option<Arc<model_context_continuation::restored_prefill::RestoredPrefillPythonCustody>>,
 }
 
+struct InitialPrefillProducers {
+    issuance: TaskIssuance,
+    scope: Arc<()>,
+    model: Mutex<Vec<Py<PyAny>>>,
+    input: Mutex<Option<Py<PyAny>>>,
+    outputs: Mutex<Vec<Py<PyAny>>>,
+}
+
+impl InitialPrefillProducers {
+    fn release(&self) {
+        let model = std::mem::take(
+            &mut *self
+                .model
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let input = self
+            .input
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let outputs = std::mem::take(
+            &mut *self
+                .outputs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        drop((model, input, outputs));
+    }
+}
+
+impl PySemanticTransitionSession {
+    fn retain_initial_prefill_stage_producers(
+        &self,
+        task_use: &PySemanticTransitionTaskUse,
+        scope: &Arc<()>,
+        model: Vec<Py<PyAny>>,
+    ) -> PyResult<Arc<InitialPrefillProducers>> {
+        let mut model = Some(model);
+        let original = {
+            let mut retained = self
+                .initial_prefill_stage_producers
+                .lock()
+                .map_err(|_| invalid("initial prefill producer custody is poisoned"))?;
+            if let Some(original) = retained.as_ref() {
+                if !original.issuance.same_as(&task_use.issuance)
+                    || !Arc::ptr_eq(&original.scope, scope)
+                {
+                    return Err(invalid(
+                        "initial prefill producers belong to another original task scope",
+                    ));
+                }
+                Arc::clone(original)
+            } else {
+                let original = Arc::new(InitialPrefillProducers {
+                    issuance: task_use.issuance.clone(),
+                    scope: Arc::clone(scope),
+                    model: Mutex::new(model.take().expect("original model producers")),
+                    input: Mutex::new(None),
+                    outputs: Mutex::new(Vec::new()),
+                });
+                *retained = Some(Arc::clone(&original));
+                original
+            }
+        };
+        drop(model);
+        Ok(original)
+    }
+
+    fn release_initial_prefill_producers(&self, py: Python<'_>, issuance: Option<&TaskIssuance>) {
+        // Known original graph retirement or full terminal release only. Take
+        // every roster before Python finalizers may reenter the controller.
+        let original = {
+            let mut retained = self
+                .initial_prefill_stage_producers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if retained.as_ref().is_some_and(|original| {
+                issuance.is_none_or(|issuance| original.issuance.same_as(issuance))
+            }) {
+                retained.take()
+            } else {
+                None
+            }
+        };
+        #[cfg(feature = "semantic-policy")]
+        let preparation = self.take_initial_prefill_preparation(py, issuance);
+        #[cfg(not(feature = "semantic-policy"))]
+        let _ = py;
+        if let Some(original) = original {
+            original.release();
+        }
+        #[cfg(feature = "semantic-policy")]
+        drop(preparation);
+    }
+}
+
 /// A completed, one-use handoff from the original model wrapper hooks to the
-/// parent publisher. Retaining this object also retains the original producers.
+/// parent publisher. Its original producers survive until known retirement.
 #[pyclass(
     name = "SemanticInitialPrefillReceipt",
     module = "pyxlog._native",
@@ -14133,7 +14260,7 @@ impl PySemanticInitialPrefillStage {
         let mut inputs = model.handoff.into_native();
         inputs.extend(allocations.handoff.into_native());
         {
-            let mut retained = self.model_producers.lock().map_err(|_| {
+            let mut retained = self.producers.model.lock().map_err(|_| {
                 PyRuntimeError::new_err("initial prefill model custody is poisoned")
             })?;
             retained.extend(model.producers);
@@ -14194,7 +14321,8 @@ impl PySemanticInitialPrefillStage {
             native_allocation: None,
         };
         *self
-            .input_producer
+            .producers
+            .input
             .lock()
             .map_err(|_| PyRuntimeError::new_err("initial prefill input custody is poisoned"))? =
             Some(token_tensor.clone().unbind());
@@ -14226,7 +14354,7 @@ impl PySemanticInitialPrefillStage {
         let device = this.session.borrow(py).device_ordinal;
         let parsed = parse_tensor_inputs_guarded(tensors, &mut budget, device, stream, &check)?;
         {
-            let mut retained = this.output_producers.lock().map_err(|_| {
+            let mut retained = this.producers.outputs.lock().map_err(|_| {
                 PyRuntimeError::new_err("initial prefill output custody is poisoned")
             })?;
             retained.extend(parsed.producers);
@@ -16978,7 +17106,7 @@ impl PySemanticPreparedStep {
                 private
                     .borrow(py)
                     .require_private_actor_cold_callback(py, &session, &step, &work_ref)?;
-                let reader = custody.reader.borrow(py);
+                let reader = custody.published_reader()?.borrow(py);
                 let source = reader.session.borrow(py);
                 let owner = session.owner()?;
                 if std::ptr::eq(&*source, &*session) {
@@ -19681,6 +19809,12 @@ impl PySemanticPublishedParent {
     // their Python finalizers may call the controller again.
     fn release_continuation_producers(&self) {
         release_python_producers(&self.continuation_producers);
+        Python::attach(|py| {
+            let issuance = self.task_use.borrow(py).issuance.clone();
+            self.session
+                .borrow(py)
+                .release_initial_prefill_producers(py, Some(&issuance));
+        });
     }
 
     fn require_task(&self, py: Python<'_>, task_use: &PySemanticTransitionTaskUse) -> PyResult<()> {
@@ -20398,6 +20532,48 @@ impl PySemanticPublishedParent {
     }
 }
 
+fn issue_initial_prefill_stage(
+    py: Python<'_>,
+    task_use: Py<PySemanticTransitionTaskUse>,
+    scope: Arc<()>,
+    layout: SemanticInitialSourceLayout,
+    layout_parts: Py<PyTuple>,
+    model_generation: u64,
+) -> PyResult<Py<PySemanticInitialPrefillStage>> {
+    let prefix_len = layout.prefill_tokens.len();
+    let session = task_use.borrow(py).session.clone_ref(py);
+    let lease = {
+        let session_ref = session.borrow(py);
+        let mut owner = session_ref.owner()?;
+        match owner.begin_initial_prefill(layout, model_generation) {
+            Ok(lease) => lease,
+            Err(error) => {
+                owner.abort();
+                return Err(xlog_err(error));
+            }
+        }
+    };
+    let producers = session.borrow(py).retain_initial_prefill_stage_producers(
+        &task_use.borrow(py),
+        &scope,
+        Vec::new(),
+    )?;
+    Py::new(
+        py,
+        PySemanticInitialPrefillStage {
+            session,
+            task_use,
+            scope,
+            lease,
+            layout: layout_parts,
+            prefix_len,
+            producers,
+            #[cfg(feature = "semantic-policy")]
+            restored_custody: None,
+        },
+    )
+}
+
 #[pymethods]
 impl PySemanticTransitionTaskUse {
     /// Read the retained Session binding without exposing the controller.
@@ -20470,37 +20646,9 @@ impl PySemanticTransitionTaskUse {
             provenance_capacity_records,
         )?;
         let parts = initial_source_parts(py, layout.clone())?;
-        let prefix_len = layout.prefill_tokens.len();
         let scope = issued.state()?.begin_initial_prefill()?;
-        let session = issued.session.clone_ref(py);
-        let lease = {
-            let session_ref = session.borrow(py);
-            let mut owner = session_ref.owner()?;
-            match owner.begin_initial_prefill(layout, model_generation) {
-                Ok(lease) => lease,
-                Err(error) => {
-                    owner.abort();
-                    return Err(xlog_err(error));
-                }
-            }
-        };
         drop(issued);
-        Py::new(
-            py,
-            PySemanticInitialPrefillStage {
-                session,
-                task_use: slf,
-                scope,
-                lease,
-                layout: parts,
-                prefix_len,
-                model_producers: Mutex::new(Vec::new()),
-                input_producer: Mutex::new(None),
-                output_producers: Mutex::new(Vec::new()),
-                #[cfg(feature = "semantic-policy")]
-                restored_custody: None,
-            },
-        )
+        issue_initial_prefill_stage(py, slf, scope, layout, parts, model_generation)
     }
 
     /// Return one immutable native projection of the exact ordered query,
@@ -22718,6 +22866,8 @@ impl PySemanticTransitionController {
         }
         .map_err(xlog_err)?;
         drop(native_resources);
+        let issuance = task_use.borrow(py).issuance.clone();
+        session.release_initial_prefill_producers(py, Some(&issuance));
         let retired_instruction = session
             .prepared_segment
             .lock()
@@ -25607,6 +25757,10 @@ impl PySemanticTransitionController {
         self.session.borrow(py).require_creator()?;
         let _operation = TensorProducerOperation::begin(&self.session.borrow(py))?;
         self.require_read_issued(task_use)?;
+        #[cfg(feature = "semantic-policy")]
+        self.session
+            .borrow(py)
+            .require_initial_prefill_joined(py, task_use)?;
         {
             let session = self.session.borrow(py);
             task_use.require_current(&*session.owner()?)?;
@@ -27763,6 +27917,13 @@ impl PySemanticTransitionController {
                     | TaskUsePhase::Refused
             ),
         };
+        #[cfg(feature = "semantic-policy")]
+        let admitted = admitted
+            || (matches!(kind, TaskReleaseKind::Aborted)
+                && matches!(
+                    issued.state()?.phase,
+                    TaskUsePhase::InitialPrefillPreparing { .. }
+                ));
         if !admitted
             || (issued
                 .delivery
@@ -27842,7 +28003,7 @@ impl PySemanticTransitionController {
                     .ok_or_else(|| invalid("shared preparation lost its original source work"))?;
                 let work = work.borrow(py);
                 let work_custody = work.custody(py)?;
-                let reader = work_custody.reader.borrow(py);
+                let reader = work_custody.published_reader()?.borrow(py);
                 let source = reader.session.borrow(py);
                 let source = source.owner()?;
                 let report = session
@@ -29605,9 +29766,12 @@ mod tests {
                 learning_phase::cold_restore::CheckpointCustody::issue(),
             )),
             task_release: Mutex::new(None),
+            initial_prefill_stage_producers: Mutex::new(None),
             producer_operation: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "semantic-policy")]
             active_cold_model_work: Mutex::new(None),
+            #[cfg(feature = "semantic-policy")]
+            initial_prefill_preparation: Mutex::new(None),
             #[cfg(feature = "semantic-policy")]
             private_replay_child: Mutex::new(None),
             #[cfg(feature = "semantic-policy")]

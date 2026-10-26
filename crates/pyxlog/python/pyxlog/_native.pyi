@@ -793,6 +793,23 @@ _PolicyOutputLayout = tuple[
 class SemanticTransitionTaskUse:
     """Native-issued task; no public constructor."""
 
+    def prepare_initial_prefill(
+        self, prepare_callback: Callable[[SemanticColdModelWork], Any],
+        initialize_callback: Callable[[SemanticInitialPrefillStage, Any], Any], *,
+        prefix_capacity: int, feedback_capacity: int, max_position: int,
+        pad_token: int, provenance_capacity_records: int, model_generation: int,
+        memory_capacity_bytes: int, other_external_cuda_bytes: int,
+    ) -> tuple[SemanticInitialPrefillStage, Any]:
+        """Prepare the original arena, then execute one pre-parent invocation.
+
+        The first callback receives the genuine active cold-work owner and
+        returns its prepared owner. The second receives the actual stage and
+        that exact owner. Native returns the same stage and second result.
+        Repeat only after SemanticInitialPrefillPending with identical callback
+        objects and arguments; neither callback is entered again.
+        """
+        ...
+
     @property
     def training_arena_result(self) -> Optional[
         tuple[tuple[int, int, int, int, int, tuple[int, ...]], int]
@@ -872,6 +889,13 @@ class SemanticTransitionTaskUse:
         or proof that an admitted operation completed.
         """
         ...
+
+class SemanticInitialPrefillPending(RuntimeError):
+    """Retain original preparation; retry only its unfinished native join."""
+
+    task_use: SemanticTransitionTaskUse
+    prepare_callback: Callable[[SemanticColdModelWork], Any]
+    initialize_callback: Callable[[SemanticInitialPrefillStage, Any], Any]
 
 class SemanticTaskReleasePending(RuntimeError):
     """Retain the original close handles and repeat only its unfinished native join."""
