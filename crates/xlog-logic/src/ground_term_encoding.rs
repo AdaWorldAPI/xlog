@@ -170,6 +170,123 @@ pub fn append_ground_term_bytes(
     Ok(())
 }
 
+/// A ground-term encoding failure at a specific fact row and column.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FactColumnError {
+    /// Zero-based index of the fact row in the input.
+    pub row: usize,
+    /// Zero-based column index within the row.
+    pub column: usize,
+    /// The underlying encoding failure.
+    pub error: GroundTermEncodingError,
+}
+
+/// Encode fact rows into one little-endian byte column per scalar column.
+///
+/// Every row must have `column_types.len()` terms. When `dedup_rows` is set, a
+/// row whose encoded bytes equal an earlier row's in every column is dropped,
+/// and the first occurrence keeps its position; otherwise every row is kept.
+/// Returns the columns and the number of rows written.
+///
+/// Rows are compared in place: the deduplication table holds row positions
+/// into the columns being built, so a row's bytes are never copied a second
+/// time to serve as a key.
+pub fn encode_fact_columns(
+    rows: &[&[Term]],
+    column_types: &[ScalarType],
+    dedup_rows: bool,
+) -> Result<(Vec<Vec<u8>>, usize), FactColumnError> {
+    let widths: Vec<usize> = column_types.iter().map(ScalarType::size_bytes).collect();
+    let mut columns: Vec<Vec<u8>> = widths
+        .iter()
+        .map(|width| Vec::with_capacity(width * rows.len()))
+        .collect();
+    let mut table = if dedup_rows {
+        RowPositionTable::with_rows(rows.len())
+    } else {
+        RowPositionTable::empty()
+    };
+    let mut written = 0usize;
+    for (row_index, row) in rows.iter().enumerate() {
+        for (column, (term, scalar_type)) in row.iter().zip(column_types).enumerate() {
+            append_ground_term_bytes(&mut columns[column], term, *scalar_type).map_err(
+                |error| FactColumnError {
+                    row: row_index,
+                    column,
+                    error,
+                },
+            )?;
+        }
+        if dedup_rows && !table.insert_unique(&columns, &widths, written) {
+            for (column, width) in columns.iter_mut().zip(&widths) {
+                column.truncate(written * width);
+            }
+        } else {
+            written += 1;
+        }
+    }
+    Ok((columns, written))
+}
+
+/// Open-addressed set of row positions, keyed by the row's bytes as they lie
+/// in the columns.
+struct RowPositionTable {
+    slots: Vec<u32>,
+}
+
+impl RowPositionTable {
+    const EMPTY: u32 = u32::MAX;
+
+    fn empty() -> Self {
+        Self { slots: Vec::new() }
+    }
+
+    fn with_rows(rows: usize) -> Self {
+        let capacity = (rows.max(1) * 2).next_power_of_two();
+        Self {
+            slots: vec![Self::EMPTY; capacity],
+        }
+    }
+
+    fn row_bytes<'a>(
+        columns: &'a [Vec<u8>],
+        widths: &'a [usize],
+        row: usize,
+    ) -> impl Iterator<Item = &'a [u8]> + 'a {
+        columns
+            .iter()
+            .zip(widths)
+            .map(move |(column, width)| &column[row * width..(row + 1) * width])
+    }
+
+    /// Record `row` unless an earlier row has the same bytes. Returns whether
+    /// `row` was new.
+    fn insert_unique(&mut self, columns: &[Vec<u8>], widths: &[usize], row: usize) -> bool {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for part in Self::row_bytes(columns, widths, row) {
+            for &byte in part {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        let mask = self.slots.len() - 1;
+        let mut slot = (hash as usize) & mask;
+        loop {
+            let held = self.slots[slot];
+            if held == Self::EMPTY {
+                self.slots[slot] = u32::try_from(row).expect("fact row count fits in u32");
+                return true;
+            }
+            if Self::row_bytes(columns, widths, held as usize)
+                .eq(Self::row_bytes(columns, widths, row))
+            {
+                return false;
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{append_ground_term_bytes, GroundTermEncodingError};

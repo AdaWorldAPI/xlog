@@ -344,12 +344,12 @@ fn main() -> Result<()> {
     }
 
     // Load EDB facts (one GPU buffer per predicate).
-    let mut rows_by_pred: HashMap<String, Vec<Vec<Term>>> = HashMap::new();
+    let mut rows_by_pred: HashMap<String, Vec<&[Term]>> = HashMap::new();
     for fact in program.facts() {
         rows_by_pred
             .entry(fact.head.predicate.clone())
             .or_default()
-            .push(fact.head.terms.clone());
+            .push(fact.head.terms.as_slice());
     }
 
     for (pred, rows) in rows_by_pred {
