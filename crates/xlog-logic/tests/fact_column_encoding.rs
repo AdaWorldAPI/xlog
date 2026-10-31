@@ -128,8 +128,9 @@ fn allocations_do_not_grow_with_the_number_of_rows() {
     let (_, large_allocs) =
         allocations_during(|| encode_fact_columns(&large, &TYPES, true).unwrap());
     assert_eq!(small_allocs, large_allocs);
-    // One vector per column, the column list, and the position table.
-    assert!(large_allocs <= TYPES.len() + 2, "{large_allocs} allocations");
+    // One vector per column, the column list, the column widths and the
+    // position table.
+    assert_eq!(large_allocs, TYPES.len() + 3, "{large_allocs} allocations");
 
     // The previous algorithm allocates per row, so this measurement can fail.
     let (_, previous_allocs) = allocations_during(|| previous_encoding(&large, &TYPES, true));
