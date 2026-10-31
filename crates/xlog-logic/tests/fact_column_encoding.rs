@@ -134,5 +134,8 @@ fn allocations_do_not_grow_with_the_number_of_rows() {
 
     // The previous algorithm allocates per row, so this measurement can fail.
     let (_, previous_allocs) = allocations_during(|| previous_encoding(&large, &TYPES, true));
-    assert!(previous_allocs > large.len() / 2, "{previous_allocs} allocations");
+    assert!(
+        previous_allocs > large.len() / 2,
+        "{previous_allocs} allocations"
+    );
 }

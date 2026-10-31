@@ -209,13 +209,13 @@ pub fn encode_fact_columns(
     let mut written = 0usize;
     for (row_index, row) in rows.iter().enumerate() {
         for (column, (term, scalar_type)) in row.iter().zip(column_types).enumerate() {
-            append_ground_term_bytes(&mut columns[column], term, *scalar_type).map_err(|error| {
-                FactColumnError {
+            append_ground_term_bytes(&mut columns[column], term, *scalar_type).map_err(
+                |error| FactColumnError {
                     row: row_index,
                     column,
                     error,
-                }
-            })?;
+                },
+            )?;
         }
         if dedup_rows && !table.insert_unique(&columns, &widths, written) {
             for (column, width) in columns.iter_mut().zip(&widths) {
