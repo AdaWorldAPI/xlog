@@ -1,7 +1,7 @@
 //! GPU-accelerated evaluation of compiled Datalog programs.
 
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -20,7 +20,7 @@ use xlog_logic::epistemic::{
     try_reduce_case_a_recursive_epistemic_program, try_reduce_prepared_recursive_epistemic_program,
     EpistemicSplitExecutablePlan, G91CompatibilityReduction,
 };
-use xlog_logic::ground_term_encoding::append_ground_term_bytes;
+use xlog_logic::ground_term_encoding::encode_fact_columns;
 use xlog_logic::{
     format_constraint_body, Atom, BodyLiteral, Compiler, Constraint, EpistemicLiteral, EpistemicOp,
     Program, Query, Rule, Term,
@@ -5158,36 +5158,24 @@ impl LogicProgram {
                 )));
             }
 
-            let mut seen_rows = Self::host_fact_row_equality_matches_union(schema)
-                .then(|| HashSet::with_capacity(rows.len()));
-            let mut fact_rows = 0;
-            let mut columns: Vec<Vec<u8>> = vec![Vec::new(); schema.arity()];
-            let mut column_starts = Vec::with_capacity(schema.arity());
-            for row in rows {
-                column_starts.clear();
-                let mut row_key = Vec::with_capacity(schema.row_size_bytes());
-                for (col_idx, term) in row.iter().enumerate() {
-                    let typ = schema.column_type(col_idx).ok_or_else(|| {
+            let column_types = (0..schema.arity())
+                .map(|col_idx| {
+                    schema.column_type(col_idx).ok_or_else(|| {
                         XlogError::Execution(format!("Missing type for column {}", col_idx))
-                    })?;
-                    column_starts.push(columns[col_idx].len());
-                    append_ground_term_bytes(&mut columns[col_idx], term, typ).map_err(|error| {
-                        XlogError::Execution(format!(
-                            "Failed to encode fact for predicate {pred} at column {col_idx}: {error}"
-                        ))
-                    })?;
-                    if seen_rows.is_some() {
-                        row_key.extend_from_slice(&columns[col_idx][column_starts[col_idx]..]);
-                    }
-                }
-                if seen_rows.as_mut().is_some_and(|seen| !seen.insert(row_key)) {
-                    for (column, start) in columns.iter_mut().zip(&column_starts) {
-                        column.truncate(*start);
-                    }
-                } else {
-                    fact_rows += 1;
-                }
-            }
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let (mut columns, fact_rows) = encode_fact_columns(
+                &rows,
+                &column_types,
+                Self::host_fact_row_equality_matches_union(schema),
+            )
+            .map_err(|failure| {
+                XlogError::Execution(format!(
+                    "Failed to encode fact for predicate {pred} at column {}: {}",
+                    failure.column, failure.error
+                ))
+            })?;
             if directly_loaded_fact_names.contains(&pred) && fact_rows > 1 {
                 let mut order = (0..fact_rows).collect::<Vec<_>>();
                 order.sort_unstable_by(|&left, &right| {
