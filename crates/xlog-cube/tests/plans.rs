@@ -439,11 +439,21 @@ fn a_repeated_variable_selects_the_diagonal() {
     );
 }
 
-/// The diagonal of a recursive relation: on the cycle-with-exit fixture,
-/// `reach` has exactly 12 pairs and the ids on a cycle are 0, 1 and 2.
+/// The diagonal of a recursive relation. On the cycle-with-exit fixture
+/// `reach` has exactly 12 pairs and the ids on a cycle are 0, 1 and 2. Id 4
+/// reaches the cycle without lying on it, so "reaches something" and "on a
+/// cycle" differ.
 #[test]
 fn the_diagonal_of_a_closure_is_the_ids_on_a_cycle() {
-    let r: Rel = vec![(0, 1), (1, 2), (2, 0), (2, 3)];
+    let cycle: Rel = vec![(0, 1), (1, 2), (2, 0), (2, 3)];
+    let (ex, _) = run(
+        "reach(X,Y) :- r(X,Y). reach(X,Z) :- reach(X,Y), r(Y,Z).",
+        &cycle,
+        &vec![],
+    );
+    assert_eq!(rows(&ex, "reach").len(), 12);
+    let mut r = cycle.clone();
+    r.push((4, 0));
     let (ex, report) = run(
         "reach(X,Y) :- r(X,Y). reach(X,Z) :- reach(X,Y), r(Y,Z). cyc(X) :- reach(X,X).",
         &r,
@@ -451,8 +461,8 @@ fn the_diagonal_of_a_closure_is_the_ids_on_a_cycle() {
     );
     assert!(report.refused.is_empty(), "{report:?}");
     let reach = rows(&ex, "reach");
-    assert_eq!(reach.len(), 12);
-    assert!(!reach.contains(&vec![3, 3]));
+    assert_eq!(reach.len(), 16, "12, plus 4 reaching 0..=3");
+    assert!(!reach.contains(&vec![3, 3]) && !reach.contains(&vec![4, 4]));
     assert_eq!(
         rows(&ex, "cyc"),
         [0, 1, 2].iter().map(|&x| vec![x]).collect()
@@ -466,5 +476,20 @@ fn a_diagonal_join_side_is_refused() {
     let r: Rel = vec![(1, 1), (2, 3)];
     let s: Rel = vec![(1, 5)];
     let (_, report) = run("t(X,Z) :- r(X,X), s(X,Z).", &r, &s);
+    assert_eq!(report.refused.len(), 1, "{report:?}");
+}
+
+/// A repeated variable in a non-binary atom (`t(X,Y,X)`, `col0 == col2`)
+/// names a column a binary relation does not have: refused, never read.
+#[test]
+fn a_diagonal_outside_two_columns_is_refused() {
+    let mut c = Compiler::new();
+    let plan = c.compile("d(X) :- t(X,Y,X).").expect("compile");
+    let mut ex = CubeExecutor::new();
+    for (name, id) in c.rel_ids() {
+        ex.register_relation(*id, name);
+    }
+    ex.put_relation("t", &[(1, 1)]);
+    let report = ex.execute_plan(&plan).expect("plan");
     assert_eq!(report.refused.len(), 1, "{report:?}");
 }
