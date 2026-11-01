@@ -13,12 +13,17 @@
 //! index; names come back out only through `Codebook::label` (`relation`,
 //! the [`Report`]).
 //!
-//! Every relation is data. XLOG resolves its term built-ins (`functor/3`,
-//! `arg/3`, `=../2`) at compile time: `normalize_meta_builtins` rewrites
-//! them into atoms over helper relations and emits those relations' rows as
-//! facts. A registered relation nobody supplied rows for is empty, as in
-//! Datalog. Symbol values are already ids from XLOG's own symbol table, so
-//! no string reaches execution.
+//! Behaviour is not data. XLOG's term built-ins (`functor/3`, `arg/3`,
+//! `=../2`) are XLOG-exclusive behaviour, addressed in lance-graph's
+//! `0xFFFF :: 0xF100` lens (`lance_graph_xlog::lens`). XLOG's compiler
+//! rewrites each into an atom over a helper relation; a registered name the
+//! lens lists resolves to that word's address, is never interned, and a rule
+//! reading it is refused with [`Refusal::Behaviour`] (no word executes yet).
+//! Every other relation is data. A registered binary data relation nobody
+//! supplied rows for is empty, as in Datalog; that includes XLOG's
+//! `__xlog_meta_fail`, whose meaning is exactly a relation with no rows.
+//! Symbol values are already ids from XLOG's own symbol table, so no string
+//! reaches execution.
 //!
 //! One cube is built per [`CubeExecutor::execute_plan`] over every base
 //! relation: each id is looked up once. A rule body becomes cube views
@@ -52,7 +57,9 @@ use std::fmt;
 
 use lance_graph_contract::codebook::Codebook;
 use lance_graph_dt64::dr::{LocalMap, MapTable, Width};
+use lance_graph_dt64::AlgebraRef;
 use lance_graph_xlog::cube::{Cube, CubeRefusal, CubeStats, View};
+use lance_graph_xlog::lens::word_of;
 use xlog_core::RelId;
 use xlog_ir::{
     CompareOp, CompiledRule, ConstValue, ExecutionPlan, Expr, JoinType, ProjectExpr, RirNode,
@@ -103,6 +110,9 @@ pub enum Refusal {
     NotBinary(Label),
     /// A relation id with no name: never registered, and not a head.
     Unregistered(RelId),
+    /// The relation is an XLOG behaviour word (`0xFFFF :: 0xF100`), not
+    /// data; no word executes on the cube yet.
+    Behaviour(AlgebraRef),
     /// The cube refused.
     Cube(CubeRefusal),
 }
@@ -123,6 +133,7 @@ impl fmt::Display for Refusal {
             Refusal::JoinKey => write!(f, "join key outside its input"),
             Refusal::NotBinary(l) => write!(f, "label {l} is not a binary relation in the cube"),
             Refusal::Unregistered(r) => write!(f, "unregistered {r:?}"),
+            Refusal::Behaviour(w) => write!(f, "XLOG word {:#010x}/{}", w.lens, w.word),
             Refusal::Cube(e) => write!(f, "cube: {e:?}"),
         }
     }
@@ -150,6 +161,8 @@ pub struct CubeExecutor {
     vocab: Codebook,
     /// `RelId` -> codebook label, for the relations that are data.
     labels: HashMap<RelId, Label>,
+    /// `RelId` -> XLOG behaviour word, for the relations that are behaviour.
+    words: HashMap<RelId, AlgebraRef>,
     /// Registered binary relations nobody supplied: empty, at intake.
     empty: BTreeSet<String>,
     out: BTreeMap<Label, Rows>,
@@ -217,6 +230,13 @@ impl CubeExecutor {
     /// rows.
     pub fn put_relation(&mut self, name: &str, rows: &[(u32, u32)]) {
         self.base.insert(name.to_string(), rows.to_vec());
+    }
+
+    /// The codebook label of a data relation, after [`Self::execute_plan`]
+    /// interned it. `None` for a name that is not data, which includes the
+    /// behaviour words of the XLOG lens.
+    pub fn label_of(&self, name: &str) -> Option<u8> {
+        self.vocab.index_of(name)
     }
 
     /// A relation's rows: a derived relation the plan produced, or a base
@@ -326,9 +346,24 @@ impl CubeExecutor {
     /// binary relations nobody supplied are given no rows: they are empty.
     fn intern(&mut self, plan: &ExecutionPlan) -> Result<(), PlanRefusal> {
         let mut vocab = Codebook::new();
-        let mut registered: Vec<(&RelId, &String)> = self.registered.iter().collect();
+        // Names the XLOG lens lists are behaviour: addressed, not interned.
+        self.words = self
+            .registered
+            .iter()
+            .filter_map(|(rel, name)| word_of(name).map(|w| (*rel, w)))
+            .collect();
+        let mut registered: Vec<(&RelId, &String)> = self
+            .registered
+            .iter()
+            .filter(|(rel, _)| !self.words.contains_key(*rel))
+            .collect();
         registered.sort();
-        let heads = plan.rules_by_scc.iter().flatten().map(|r| &r.head);
+        let heads = plan
+            .rules_by_scc
+            .iter()
+            .flatten()
+            .map(|r| &r.head)
+            .filter(|h| word_of(h).is_none());
         let names = self
             .base
             .keys()
@@ -358,7 +393,10 @@ impl CubeExecutor {
         self.labels
             .get(&rel)
             .copied()
-            .ok_or(Refusal::Unregistered(rel))
+            .ok_or_else(|| match self.words.get(&rel) {
+                Some(w) => Refusal::Behaviour(*w),
+                None => Refusal::Unregistered(rel),
+            })
     }
 
     /// The plan's SCCs in stratum order, with heads and members as ids.
@@ -487,6 +525,15 @@ impl CubeExecutor {
         resolve: &Resolve<'_>,
         body: &RirNode,
     ) -> Result<Vec<Vec<u32>>, Refusal> {
+        // A body reading behaviour is refused as such, whatever its shape:
+        // the reason must not depend on which shape check runs first.
+        let mut word = None;
+        body.visit_referenced_relations(&mut |rel| {
+            word = word.or_else(|| self.words.get(&rel).copied());
+        });
+        if let Some(w) = word {
+            return Err(Refusal::Behaviour(w));
+        }
         match body {
             RirNode::Scan { .. } | RirNode::Filter { .. } => self.single(store, resolve, body),
             RirNode::Project { input, columns }
