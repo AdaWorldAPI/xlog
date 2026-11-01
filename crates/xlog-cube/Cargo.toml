@@ -14,6 +14,6 @@ license = "MIT OR Apache-2.0"
 xlog-core = { path = "../xlog-core" }
 xlog-ir = { path = "../xlog-ir" }
 xlog-logic = { path = "../xlog-logic" }
-lance-graph-xlog = { git = "https://github.com/AdaWorldAPI/lance-graph", branch = "main" }
-lance-graph-dt64 = { git = "https://github.com/AdaWorldAPI/lance-graph", branch = "main" }
-lance-graph-contract = { git = "https://github.com/AdaWorldAPI/lance-graph", branch = "main" }
+lance-graph-xlog = { git = "https://github.com/AdaWorldAPI/lance-graph", branch = "ccr-85acaff0-oszq40-xlog-lens" }
+lance-graph-dt64 = { git = "https://github.com/AdaWorldAPI/lance-graph", branch = "ccr-85acaff0-oszq40-xlog-lens" }
+lance-graph-contract = { git = "https://github.com/AdaWorldAPI/lance-graph", branch = "ccr-85acaff0-oszq40-xlog-lens" }
