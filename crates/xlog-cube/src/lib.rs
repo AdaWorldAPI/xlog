@@ -6,6 +6,11 @@
 //! `lance_graph_xlog::cube::Cube` instead of CUDA. No device, no kernels,
 //! no `xlog-cuda` dependency.
 //!
+//! Names are labels at the boundary only. `register_relation`,
+//! `put_relation`, `relation` and the [`Report`] speak names; everything in
+//! between is keyed by `RelId` and cube relation ids, and refusals are a
+//! typed [`Refusal`] until the report is written.
+//!
 //! One cube is built per [`CubeExecutor::execute_plan`] over every base
 //! relation: each id is looked up once. A rule body becomes cube views
 //! (`scan`, `bind`, `join`); rows are built where a rule's head relation is
@@ -34,6 +39,7 @@
 //! with only some of its rules applied.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt;
 
 use lance_graph_dt64::dr::{LocalMap, MapTable, Width};
 use lance_graph_xlog::cube::{Cube, CubeRefusal, CubeStats, View};
@@ -45,7 +51,7 @@ use xlog_ir::{
 /// The one tile the probe uses.
 const TILE: u32 = 0;
 
-/// What one `execute_plan` did.
+/// What one `execute_plan` did, by name: written once, after execution.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Report {
     /// Rules run on the cube, by head.
@@ -58,30 +64,87 @@ pub struct Report {
     pub stats: CubeStats,
 }
 
+/// Why a rule was not run on the cube.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// A body node kind the executor does not admit.
+    Body(&'static str),
+    /// `Project` over a node kind other than a scan, a filter or a join.
+    ProjectOver(&'static str),
+    /// A filter over something other than a scan.
+    FilterOver(&'static str),
+    /// A join side other than a scan or a filtered scan.
+    JoinSide(&'static str),
+    /// A multi-way fallback node other than `Project`, inner `Join`, `Scan`.
+    Fallback(&'static str),
+    /// A filter other than `col == const`.
+    Filter,
+    /// A filter column outside a binary relation.
+    FilterColumn,
+    /// A constant outside `u32`.
+    Constant,
+    /// A bound on the join column.
+    BoundOnJoinColumn,
+    /// A computed or out-of-range output column.
+    OutputColumn,
+    /// A join key outside its input or outside a binary relation.
+    JoinKey,
+    /// A relation the plan reads that is not a binary relation in the cube.
+    NotBinary(RelId),
+    /// A relation id never registered.
+    Unregistered(RelId),
+    /// The cube refused.
+    Cube(CubeRefusal),
+}
+
+impl fmt::Display for Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Refusal::Body(k) => write!(f, "{k} body"),
+            Refusal::ProjectOver(k) => write!(f, "Project over {k}"),
+            Refusal::FilterOver(k) => write!(f, "Filter over {k}"),
+            Refusal::JoinSide(k) => write!(f, "join side {k}"),
+            Refusal::Fallback(k) => write!(f, "multi-way fallback {k}"),
+            Refusal::Filter => write!(f, "filter other than `col == const`"),
+            Refusal::FilterColumn => write!(f, "filter column outside a binary relation"),
+            Refusal::Constant => write!(f, "constant outside u32"),
+            Refusal::BoundOnJoinColumn => write!(f, "bound on the join column"),
+            Refusal::OutputColumn => write!(f, "computed or out-of-range output column"),
+            Refusal::JoinKey => write!(f, "join key outside its input"),
+            Refusal::NotBinary(r) => write!(f, "{r:?} is not a binary relation in the cube"),
+            Refusal::Unregistered(r) => write!(f, "unregistered {r:?}"),
+            Refusal::Cube(e) => write!(f, "cube: {e:?}"),
+        }
+    }
+}
+
 /// Why the plan could not run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlanRefusal {
     /// The base relations hold more distinct ids than one tile (256).
     Domain,
-    /// The cube refused its intake.
+    /// The cube refused its intake or a completed head.
     Cube(CubeRefusal),
-    /// A completed SCC's head could not be added to the cube.
-    Store(String),
 }
 
 /// The executor. See the module docs.
 #[derive(Default)]
 pub struct CubeExecutor {
     names: HashMap<RelId, String>,
+    ids: HashMap<String, RelId>,
     base: BTreeMap<String, Vec<(u32, u32)>>,
-    out: BTreeMap<String, Rows>,
+    out: BTreeMap<RelId, Rows>,
 }
 
 type Rows = BTreeSet<Vec<u32>>;
 
-/// Which cube relation an atom reads, given the relation's name and the
-/// atom's position in the body.
-type Resolve<'a> = dyn Fn(&str, usize) -> Result<u32, String> + 'a;
+/// Which cube relation an atom reads, given the relation and the atom's
+/// position in the body.
+type Resolve<'a> = dyn Fn(RelId, usize) -> Result<u32, Refusal> + 'a;
+
+/// A flattened multi-way fallback: scan leaves, each leaf column's variable
+/// class, and the projected leaf columns.
+type Flat = (Vec<RelId>, Vec<usize>, Vec<usize>);
 
 /// One side of a join: a cube relation, and an optional bound
 /// `(column, value)`.
@@ -92,7 +155,7 @@ struct Side {
 }
 
 /// The cube, its map table, and the rows of every relation added to it. A
-/// copy rule (`p :- q`) reads those rows; every other body runs on the cube.
+/// single-relation body reads those rows; every other body runs on the cube.
 struct Store {
     cube: Cube,
     table: MapTable,
@@ -101,17 +164,21 @@ struct Store {
 
 impl Store {
     /// Add binary rows as a cube relation; `None` for rows of another arity.
-    fn add(&mut self, rows: &Rows) -> Result<Option<u32>, String> {
+    fn add(&mut self, rows: &Rows) -> Result<Option<u32>, CubeRefusal> {
         let Some(pairs) = binary(rows) else {
             return Ok(None);
         };
-        let id = self
-            .cube
-            .add_relation(&self.table, &pairs)
-            .map_err(|e| format!("{e:?}"))?;
+        let id = self.cube.add_relation(&self.table, &pairs)?;
         self.rows.insert(id, rows.clone());
         Ok(Some(id))
     }
+}
+
+/// One SCC, resolved to ids before it runs.
+struct Scc<'p> {
+    members: BTreeSet<RelId>,
+    rules: Vec<(RelId, &'p RirNode)>,
+    recursive: bool,
 }
 
 impl CubeExecutor {
@@ -122,6 +189,7 @@ impl CubeExecutor {
     /// As `Executor::register_relation`.
     pub fn register_relation(&mut self, rel: RelId, name: &str) {
         self.names.insert(rel, name.to_string());
+        self.ids.insert(name.to_string(), rel);
     }
 
     /// As `Executor::put_relation`, for a binary `u32` relation given as
@@ -133,7 +201,7 @@ impl CubeExecutor {
     /// A relation's rows: a derived relation the plan produced, or a base
     /// relation. The download boundary.
     pub fn relation(&self, name: &str) -> Option<Vec<Vec<u32>>> {
-        if let Some(rows) = self.out.get(name) {
+        if let Some(rows) = self.ids.get(name).and_then(|id| self.out.get(id)) {
             return Some(rows.iter().cloned().collect());
         }
         self.base
@@ -143,8 +211,13 @@ impl CubeExecutor {
 
     /// Run every SCC of every stratum, in order, on one cube.
     pub fn execute_plan(&mut self, plan: &ExecutionPlan) -> Result<Report, PlanRefusal> {
-        let order: Vec<&String> = self.base.keys().collect();
-        let rels: Vec<&[(u32, u32)]> = order.iter().map(|n| self.base[*n].as_slice()).collect();
+        // Boundary: names to ids, once.
+        let base: Vec<(RelId, &[(u32, u32)])> = self
+            .base
+            .iter()
+            .filter_map(|(n, r)| self.ids.get(n).map(|id| (*id, r.as_slice())))
+            .collect();
+        let rels: Vec<&[(u32, u32)]> = base.iter().map(|(_, r)| *r).collect();
         let mut ids: Vec<u64> = rels
             .iter()
             .flat_map(|r| r.iter().flat_map(|&(a, b)| [u64::from(a), u64::from(b)]))
@@ -158,71 +231,130 @@ impl CubeExecutor {
         let mut store = Store {
             cube,
             table,
-            rows: order
+            rows: base
                 .iter()
                 .enumerate()
-                .map(|(i, n)| (i as u32, pairs_to_rows(&self.base[*n])))
+                .map(|(i, (_, r))| (i as u32, pairs_to_rows(r)))
                 .collect(),
         };
-        // Relation name -> the cube relation holding its current contents.
-        let mut current: HashMap<String, u32> = order
+        let mut current: HashMap<RelId, u32> = base
             .iter()
             .enumerate()
-            .map(|(i, n)| ((*n).clone(), i as u32))
+            .map(|(i, (id, _))| (*id, i as u32))
             .collect();
+        self.label_heads(plan);
+        let sccs = self.resolve_sccs(plan);
 
-        let mut report = Report::default();
-        let mut produced: BTreeMap<String, Rows> = BTreeMap::new();
-        for stratum in &plan.strata {
-            for &scc in &stratum.sccs {
-                let Some(rules) = plan.rules_by_scc.get(scc as usize) else {
-                    continue;
-                };
-                if rules.is_empty() {
-                    continue;
-                }
-                let info = plan.sccs.get(scc as usize);
-                let members: BTreeSet<String> = info
-                    .map(|s| s.predicates.iter().cloned().collect())
-                    .unwrap_or_default();
-                let outcome = if info.is_some_and(|s| s.is_recursive) {
-                    self.recursive_scc(&mut store, &current, rules, &members, &mut report.rounds)
-                } else {
-                    self.plain_scc(&mut store, &current, rules)
-                };
-                match outcome {
-                    Ok(heads) => {
-                        report.ran.extend(rules.iter().map(|r| r.head.clone()));
-                        for (head, rows) in heads {
-                            if let Some(id) = store.add(&rows).map_err(PlanRefusal::Store)? {
-                                current.insert(head.clone(), id);
-                            }
-                            produced.insert(head, rows);
+        // Execution: ids only.
+        let mut ran: Vec<RelId> = Vec::new();
+        let mut refused: Vec<(RelId, Refusal)> = Vec::new();
+        let mut rounds = 0;
+        let mut produced: BTreeMap<RelId, Rows> = BTreeMap::new();
+        for scc in &sccs {
+            let outcome = if scc.recursive {
+                self.recursive_scc(&mut store, &current, scc, &mut rounds)
+            } else {
+                self.plain_scc(&mut store, &current, scc)
+            };
+            match outcome {
+                Ok(heads) => {
+                    ran.extend(scc.rules.iter().map(|(h, _)| *h));
+                    for (head, rows) in heads {
+                        if let Some(id) = store.add(&rows).map_err(PlanRefusal::Cube)? {
+                            current.insert(head, id);
                         }
+                        produced.insert(head, rows);
                     }
-                    Err(reason) => report
-                        .refused
-                        .extend(rules.iter().map(|r| (r.head.clone(), reason.clone()))),
+                }
+                Err(reason) => {
+                    refused.extend(scc.rules.iter().map(|(h, _)| (*h, reason.clone())));
                 }
             }
         }
         self.out = produced;
-        report.stats = store.cube.stats();
-        Ok(report)
+
+        // Boundary: ids to names, once.
+        let name = |id: &RelId| self.names.get(id).cloned().unwrap_or_default();
+        Ok(Report {
+            ran: ran.iter().map(name).collect(),
+            refused: refused
+                .iter()
+                .map(|(h, r)| (name(h), self.describe(r)))
+                .collect(),
+            rounds,
+            stats: store.cube.stats(),
+        })
+    }
+
+    /// A refusal's text, with relation ids written as names.
+    fn describe(&self, r: &Refusal) -> String {
+        match r {
+            Refusal::NotBinary(id) => match self.names.get(id) {
+                Some(n) => format!("`{n}` is not a binary relation in the cube"),
+                None => r.to_string(),
+            },
+            other => other.to_string(),
+        }
+    }
+
+    /// Give every head the plan derives a `RelId`. XLOG assigns ids only to
+    /// relations some rule reads, so a head nothing reads has a name and no
+    /// id; it gets one here, counted down from `u32::MAX` so it cannot meet a
+    /// compiler-assigned id.
+    fn label_heads(&mut self, plan: &ExecutionPlan) {
+        let heads: BTreeSet<&String> = plan
+            .rules_by_scc
+            .iter()
+            .flatten()
+            .map(|r| &r.head)
+            .chain(plan.sccs.iter().flat_map(|s| s.predicates.iter()))
+            .collect();
+        for head in heads {
+            if !self.ids.contains_key(head) {
+                let id = RelId(u32::MAX - self.ids.len() as u32);
+                self.register_relation(id, head);
+            }
+        }
+    }
+
+    /// The plan's SCCs in stratum order, with heads and members as ids.
+    fn resolve_sccs<'p>(&self, plan: &'p ExecutionPlan) -> Vec<Scc<'p>> {
+        let id = |n: &String| self.ids.get(n).copied();
+        plan.strata
+            .iter()
+            .flat_map(|s| s.sccs.iter())
+            .filter_map(|&scc| {
+                let rules = plan.rules_by_scc.get(scc as usize)?;
+                if rules.is_empty() {
+                    return None;
+                }
+                let info = plan.sccs.get(scc as usize);
+                Some(Scc {
+                    members: info
+                        .map(|s| s.predicates.iter().filter_map(id).collect())
+                        .unwrap_or_default(),
+                    rules: rules
+                        .iter()
+                        .filter_map(|r: &CompiledRule| id(&r.head).map(|h| (h, &r.body)))
+                        .collect(),
+                    recursive: info.is_some_and(|s| s.is_recursive),
+                })
+            })
+            .collect()
     }
 
     /// Every rule of a non-recursive SCC, once.
     fn plain_scc(
         &self,
         store: &mut Store,
-        current: &HashMap<String, u32>,
-        rules: &[CompiledRule],
-    ) -> Result<BTreeMap<String, Rows>, String> {
-        let resolve = |name: &str, _: usize| lookup(current, name);
-        let mut heads: BTreeMap<String, Rows> = BTreeMap::new();
-        for rule in rules {
-            let rows = self.rule(store, &resolve, &rule.body)?;
-            heads.entry(rule.head.clone()).or_default().extend(rows);
+        current: &HashMap<RelId, u32>,
+        scc: &Scc<'_>,
+    ) -> Result<BTreeMap<RelId, Rows>, Refusal> {
+        let resolve = |rel: RelId, _: usize| lookup(current, rel);
+        let mut heads: BTreeMap<RelId, Rows> = BTreeMap::new();
+        for (head, body) in &scc.rules {
+            let rows = self.rule(store, &resolve, body)?;
+            heads.entry(*head).or_default().extend(rows);
         }
         Ok(heads)
     }
@@ -233,37 +365,36 @@ impl CubeExecutor {
     fn recursive_scc(
         &self,
         store: &mut Store,
-        outer: &HashMap<String, u32>,
-        rules: &[CompiledRule],
-        members: &BTreeSet<String>,
+        outer: &HashMap<RelId, u32>,
+        scc: &Scc<'_>,
         rounds: &mut usize,
-    ) -> Result<BTreeMap<String, Rows>, String> {
+    ) -> Result<BTreeMap<RelId, Rows>, Refusal> {
         // Rules reading no SCC member seed the first delta; the others are
         // recursive, with the positions of their SCC atoms.
-        let mut delta: BTreeMap<String, Rows> = BTreeMap::new();
-        let mut recursive: Vec<(&CompiledRule, Vec<usize>)> = Vec::new();
-        for rule in rules {
-            let atoms = self.atoms(&rule.body)?;
+        let mut delta: BTreeMap<RelId, Rows> = BTreeMap::new();
+        let mut recursive: Vec<(RelId, &RirNode, Vec<usize>)> = Vec::new();
+        for (head, body) in &scc.rules {
+            let atoms = atoms(body)?;
             let inside: Vec<usize> = (0..atoms.len())
-                .filter(|&i| members.contains(&atoms[i]))
+                .filter(|&i| scc.members.contains(&atoms[i]))
                 .collect();
             if inside.is_empty() {
-                let resolve = |name: &str, _: usize| lookup(outer, name);
-                let rows = self.rule(store, &resolve, &rule.body)?;
-                delta.entry(rule.head.clone()).or_default().extend(rows);
+                let resolve = |rel: RelId, _: usize| lookup(outer, rel);
+                let rows = self.rule(store, &resolve, body)?;
+                delta.entry(*head).or_default().extend(rows);
             } else {
-                recursive.push((rule, inside));
+                recursive.push((*head, *body, inside));
             }
         }
 
-        let mut full: BTreeMap<String, Rows> =
-            members.iter().map(|m| (m.clone(), Rows::new())).collect();
+        let mut full: BTreeMap<RelId, Rows> =
+            scc.members.iter().map(|m| (*m, Rows::new())).collect();
         let mut current = outer.clone();
         loop {
             // Keep only rows the full relation lacks; fold them in.
-            let mut delta_ids: HashMap<String, u32> = HashMap::new();
+            let mut delta_ids: HashMap<RelId, u32> = HashMap::new();
             let mut grew = false;
-            for m in members {
+            for m in &scc.members {
                 let new: Rows = delta
                     .remove(m)
                     .unwrap_or_default()
@@ -274,59 +405,33 @@ impl CubeExecutor {
                 full.get_mut(m)
                     .expect("every member has a full relation")
                     .extend(new.iter().cloned());
-                let not_binary = || format!("`{m}` is recursive and not binary");
-                delta_ids.insert(m.clone(), store.add(&new)?.ok_or_else(not_binary)?);
-                current.insert(m.clone(), store.add(&full[m])?.ok_or_else(not_binary)?);
+                let add = |store: &mut Store, rows: &Rows| {
+                    store
+                        .add(rows)
+                        .map_err(Refusal::Cube)?
+                        .ok_or(Refusal::NotBinary(*m))
+                };
+                delta_ids.insert(*m, add(store, &new)?);
+                current.insert(*m, add(store, &full[m])?);
             }
             if !grew {
                 return Ok(full);
             }
             *rounds += 1;
-            for (rule, inside) in &recursive {
+            for (head, body, inside) in &recursive {
                 for &at in inside {
-                    let resolve = |name: &str, pos: usize| {
+                    let resolve = |rel: RelId, pos: usize| {
                         if pos == at {
-                            lookup(&delta_ids, name)
+                            lookup(&delta_ids, rel)
                         } else {
-                            lookup(&current, name)
+                            lookup(&current, rel)
                         }
                     };
-                    let rows = self.rule(store, &resolve, &rule.body)?;
-                    delta.entry(rule.head.clone()).or_default().extend(rows);
+                    let rows = self.rule(store, &resolve, body)?;
+                    delta.entry(*head).or_default().extend(rows);
                 }
             }
         }
-    }
-
-    /// The relation names a body reads, by atom position.
-    fn atoms(&self, body: &RirNode) -> Result<Vec<String>, String> {
-        fn atom(n: &RirNode) -> Option<RelId> {
-            match n {
-                RirNode::Scan { rel } => Some(*rel),
-                RirNode::Filter { input, .. } => atom(input),
-                _ => None,
-            }
-        }
-        let rels = match body {
-            RirNode::Scan { .. } | RirNode::Filter { .. } => vec![atom(body)],
-            RirNode::ChainJoin { left, right, .. } => vec![atom(left), atom(right)],
-            RirNode::MultiWayJoin { fallback, .. } => {
-                let (leaves, _, _) = flatten_fallback(fallback)?;
-                leaves.into_iter().map(Some).collect()
-            }
-            RirNode::Project { input, .. } => match input.as_ref() {
-                RirNode::Join { left, right, .. } => vec![atom(left), atom(right)],
-                RirNode::Scan { .. } | RirNode::Filter { .. } => vec![atom(input)],
-                other => return Err(format!("Project over {}", kind(other))),
-            },
-            other => return Err(format!("{} body", kind(other))),
-        };
-        rels.into_iter()
-            .map(|r| {
-                let r = r.ok_or_else(|| "join side other than a scan".to_string())?;
-                Ok(self.name(r)?.to_string())
-            })
-            .collect()
     }
 
     fn rule(
@@ -334,7 +439,7 @@ impl CubeExecutor {
         store: &mut Store,
         resolve: &Resolve<'_>,
         body: &RirNode,
-    ) -> Result<Vec<Vec<u32>>, String> {
+    ) -> Result<Vec<Vec<u32>>, Refusal> {
         match body {
             RirNode::Scan { .. } | RirNode::Filter { .. } => self.single(store, resolve, body),
             RirNode::Project { input, columns }
@@ -347,7 +452,7 @@ impl CubeExecutor {
                     .iter()
                     .map(|c| match c {
                         ProjectExpr::Column(i) if *i < 2 => Ok(*i),
-                        _ => Err("computed or out-of-range output column".to_string()),
+                        _ => Err(Refusal::OutputColumn),
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(self
@@ -385,9 +490,9 @@ impl CubeExecutor {
                     (right, right_keys[0]),
                     columns,
                 ),
-                other => Err(format!("Project over {}", kind(other))),
+                other => Err(Refusal::ProjectOver(kind(other))),
             },
-            other => Err(format!("{} body", kind(other))),
+            other => Err(Refusal::Body(kind(other))),
         }
     }
 
@@ -399,19 +504,19 @@ impl CubeExecutor {
         store: &Store,
         resolve: &Resolve<'_>,
         node: &RirNode,
-    ) -> Result<Vec<Vec<u32>>, String> {
+    ) -> Result<Vec<Vec<u32>>, Refusal> {
         let (rel, bound) = match node {
-            RirNode::Scan { rel } => (rel, None),
+            RirNode::Scan { rel } => (*rel, None),
             RirNode::Filter { input, predicate } => match input.as_ref() {
-                RirNode::Scan { rel } => (rel, Some(eq_const(predicate)?)),
-                other => return Err(format!("Filter over {}", kind(other))),
+                RirNode::Scan { rel } => (*rel, Some(eq_const(predicate)?)),
+                other => return Err(Refusal::FilterOver(kind(other))),
             },
-            other => return Err(format!("{} body", kind(other))),
+            other => return Err(Refusal::Body(kind(other))),
         };
-        let id = resolve(self.name(*rel)?, 0)?;
         if bound.is_some_and(|(col, _)| col > 1) {
-            return Err("filter column outside a binary relation".into());
+            return Err(Refusal::FilterColumn);
         }
+        let id = resolve(rel, 0)?;
         Ok(store.rows[&id]
             .iter()
             .filter(|row| bound.is_none_or(|(col, v)| row[col] == v))
@@ -430,26 +535,26 @@ impl CubeExecutor {
         store: &Store,
         resolve: &Resolve<'_>,
         fallback: &RirNode,
-    ) -> Result<Vec<Vec<u32>>, String> {
+    ) -> Result<Vec<Vec<u32>>, Refusal> {
         let (leaves, class, columns) = flatten_fallback(fallback)?;
         let map = store
             .table
             .map(&store.table.seal(), TILE)
-            .map_err(|e| format!("{e:?}"))?;
+            .map_err(|e| Refusal::Cube(CubeRefusal::Map(e)))?;
         let n = map.len();
         let words = n.div_ceil(64);
         // Per atom: its two variables and its adjacency masks in both
         // directions, over local positions.
         let mut atoms = Vec::with_capacity(leaves.len());
         for (i, rel) in leaves.iter().enumerate() {
-            let id = resolve(self.name(*rel)?, i)?;
-            let pairs = binary(&store.rows[&id]).ok_or("multi-way atom is not binary")?;
+            let id = resolve(*rel, i)?;
+            let pairs = binary(&store.rows[&id]).ok_or(Refusal::NotBinary(*rel))?;
             let mut adj = Adjacency::new(n, words);
             for (a, b) in pairs {
                 let local = |g: u32| {
                     map.local(u64::from(g))
                         .map(usize::from)
-                        .map_err(|e| format!("{e:?}"))
+                        .map_err(|e| Refusal::Cube(CubeRefusal::Domain(e)))
                 };
                 adj.insert(local(a)?, local(b)?);
             }
@@ -471,50 +576,43 @@ impl CubeExecutor {
         Ok(out.into_iter().collect())
     }
 
-    fn name(&self, rel: RelId) -> Result<&str, String> {
-        self.names
-            .get(&rel)
-            .map(String::as_str)
-            .ok_or_else(|| format!("unregistered {rel:?}"))
-    }
-
     fn side(
         &self,
         resolve: &Resolve<'_>,
         pos: usize,
         node: &RirNode,
         key: usize,
-    ) -> Result<Side, String> {
+    ) -> Result<Side, Refusal> {
         match node {
             RirNode::Scan { rel } => Ok(Side {
-                rel: resolve(self.name(*rel)?, pos)?,
+                rel: resolve(*rel, pos)?,
                 bound: None,
             }),
             RirNode::Filter { input, predicate } => {
                 let RirNode::Scan { rel } = input.as_ref() else {
-                    return Err(format!("Filter over {}", kind(input)));
+                    return Err(Refusal::FilterOver(kind(input)));
                 };
                 let (col, v) = eq_const(predicate)?;
                 if col == key || col > 1 {
-                    return Err("bound on the join column".into());
+                    return Err(Refusal::BoundOnJoinColumn);
                 }
                 Ok(Side {
-                    rel: resolve(self.name(*rel)?, pos)?,
+                    rel: resolve(*rel, pos)?,
                     bound: Some((col, v)),
                 })
             }
-            other => Err(format!("join side {}", kind(other))),
+            other => Err(Refusal::JoinSide(kind(other))),
         }
     }
 
-    fn view(store: &mut Store, side: Side) -> Result<View, String> {
-        let scan = store.cube.scan(side.rel).map_err(|e| format!("{e:?}"))?;
+    fn view(store: &mut Store, side: Side) -> Result<View, Refusal> {
+        let scan = store.cube.scan(side.rel).map_err(Refusal::Cube)?;
         match side.bound {
             None => Ok(scan),
             Some((col, v)) => store
                 .cube
                 .bind(&store.table, scan, col as u8, v)
-                .map_err(|e| format!("{e:?}")),
+                .map_err(Refusal::Cube),
         }
     }
 
@@ -525,15 +623,15 @@ impl CubeExecutor {
         (left, lk): (&RirNode, usize),
         (right, rk): (&RirNode, usize),
         columns: &[ProjectExpr],
-    ) -> Result<Vec<Vec<u32>>, String> {
+    ) -> Result<Vec<Vec<u32>>, Refusal> {
         if lk > 1 || rk > 1 {
-            return Err("join key outside a binary relation".into());
+            return Err(Refusal::JoinKey);
         }
         let cols = columns
             .iter()
             .map(|c| match c {
                 ProjectExpr::Column(i) if *i < 4 => Ok(*i),
-                _ => Err("computed or out-of-range output column".to_string()),
+                _ => Err(Refusal::OutputColumn),
             })
             .collect::<Result<Vec<_>, _>>()?;
         let l = self.side(resolve, 0, left, lk)?;
@@ -542,11 +640,11 @@ impl CubeExecutor {
         let j = store
             .cube
             .join(lv, lk as u8, rv, rk as u8)
-            .map_err(|e| format!("{e:?}"))?;
+            .map_err(Refusal::Cube)?;
         let rows = store
             .cube
             .materialize_rows(&store.table, j)
-            .map_err(|e| format!("{e:?}"))?;
+            .map_err(Refusal::Cube)?;
         // The join's columns are left ++ right; the cube hands back
         // (left free, key, right free).
         let at = |(lf, key, rf): (u64, u64, u64), i: usize| -> u32 {
@@ -562,6 +660,28 @@ impl CubeExecutor {
             .into_iter()
             .map(|t| cols.iter().map(|&i| at(t, i)).collect())
             .collect())
+    }
+}
+
+/// The relations a body reads, by atom position.
+fn atoms(body: &RirNode) -> Result<Vec<RelId>, Refusal> {
+    fn atom(n: &RirNode) -> Result<RelId, Refusal> {
+        match n {
+            RirNode::Scan { rel } => Ok(*rel),
+            RirNode::Filter { input, .. } => atom(input),
+            other => Err(Refusal::JoinSide(kind(other))),
+        }
+    }
+    match body {
+        RirNode::Scan { .. } | RirNode::Filter { .. } => Ok(vec![atom(body)?]),
+        RirNode::ChainJoin { left, right, .. } => Ok(vec![atom(left)?, atom(right)?]),
+        RirNode::MultiWayJoin { fallback, .. } => Ok(flatten_fallback(fallback)?.0),
+        RirNode::Project { input, .. } => match input.as_ref() {
+            RirNode::Join { left, right, .. } => Ok(vec![atom(left)?, atom(right)?]),
+            RirNode::Scan { .. } | RirNode::Filter { .. } => Ok(vec![atom(input)?]),
+            other => Err(Refusal::ProjectOver(kind(other))),
+        },
+        other => Err(Refusal::Body(kind(other))),
     }
 }
 
@@ -654,19 +774,15 @@ fn generic_join(
 /// inner `Join`s), the variable class of every leaf column (join keys
 /// unified, classes renumbered by first appearance), and the projected
 /// leaf columns. Leaves are binary: two columns each.
-/// A flattened fallback: scan leaves, each leaf column's variable class, and
-/// the projected leaf columns.
-type Flat = (Vec<RelId>, Vec<usize>, Vec<usize>);
-
-fn flatten_fallback(fallback: &RirNode) -> Result<Flat, String> {
+fn flatten_fallback(fallback: &RirNode) -> Result<Flat, Refusal> {
     let RirNode::Project { input, columns } = fallback else {
-        return Err(format!("multi-way fallback {}", kind(fallback)));
+        return Err(Refusal::Fallback(kind(fallback)));
     };
     fn walk(
         n: &RirNode,
         leaves: &mut Vec<RelId>,
         eqs: &mut Vec<(usize, usize)>,
-    ) -> Result<usize, String> {
+    ) -> Result<usize, Refusal> {
         match n {
             RirNode::Scan { rel } => {
                 leaves.push(*rel);
@@ -684,13 +800,13 @@ fn flatten_fallback(fallback: &RirNode) -> Result<Flat, String> {
                 let wr = walk(right, leaves, eqs)?;
                 for (&l, &r) in left_keys.iter().zip(right_keys) {
                     if l >= wl || r >= wr {
-                        return Err("join key outside its input".into());
+                        return Err(Refusal::JoinKey);
                     }
                     eqs.push((off + l, off + wl + r));
                 }
                 Ok(wl + wr)
             }
-            other => Err(format!("multi-way fallback leaf {}", kind(other))),
+            other => Err(Refusal::Fallback(kind(other))),
         }
     }
     let mut leaves = Vec::new();
@@ -720,37 +836,34 @@ fn flatten_fallback(fallback: &RirNode) -> Result<Flat, String> {
         .iter()
         .map(|c| match c {
             ProjectExpr::Column(i) if *i < width => Ok(*i),
-            _ => Err("computed or out-of-range output column".to_string()),
+            _ => Err(Refusal::OutputColumn),
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok((leaves, class, columns))
 }
 
 /// `col == const`, the only filter admitted.
-fn eq_const(predicate: &Expr) -> Result<(usize, u32), String> {
+fn eq_const(predicate: &Expr) -> Result<(usize, u32), Refusal> {
     let Expr::Compare {
         left,
         op: CompareOp::Eq,
         right,
     } = predicate
     else {
-        return Err("filter other than `col == const`".into());
+        return Err(Refusal::Filter);
     };
     // Without facts to type the column, XLOG types the constant `U64`.
     match (left.as_ref(), right.as_ref()) {
         (Expr::Column(c), Expr::Const(ConstValue::U32(v))) => Ok((*c, *v)),
-        (Expr::Column(c), Expr::Const(ConstValue::U64(v))) => Ok((
-            *c,
-            u32::try_from(*v).map_err(|_| "constant outside u32".to_string())?,
-        )),
-        _ => Err("filter other than `col == const`".into()),
+        (Expr::Column(c), Expr::Const(ConstValue::U64(v))) => {
+            Ok((*c, u32::try_from(*v).map_err(|_| Refusal::Constant)?))
+        }
+        _ => Err(Refusal::Filter),
     }
 }
 
-fn lookup(ids: &HashMap<String, u32>, name: &str) -> Result<u32, String> {
-    ids.get(name)
-        .copied()
-        .ok_or_else(|| format!("`{name}` is not a binary relation in the cube"))
+fn lookup(ids: &HashMap<RelId, u32>, rel: RelId) -> Result<u32, Refusal> {
+    ids.get(&rel).copied().ok_or(Refusal::NotBinary(rel))
 }
 
 /// Rows as pairs, when every row has two columns.
