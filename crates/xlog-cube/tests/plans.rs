@@ -270,12 +270,7 @@ fn a_head_with_one_refused_rule_is_not_handed_back_partially() {
 }
 
 /// Brute force over every assignment of `vars` variables to ids 0..10.
-fn brute(
-    vars: usize,
-    r: &Rel,
-    s: &Rel,
-    keep: &dyn Fn(&[u32], &Rel, &Rel) -> Option<Vec<u32>>,
-) -> BTreeSet<Vec<u32>> {
+fn brute(vars: usize, r: &Rel, s: &Rel, keep: &Keep) -> BTreeSet<Vec<u32>> {
     let mut out = BTreeSet::new();
     let mut b = vec![0u32; vars];
     loop {
