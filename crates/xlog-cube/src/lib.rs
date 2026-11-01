@@ -232,6 +232,13 @@ impl CubeExecutor {
         self.base.insert(name.to_string(), rows.to_vec());
     }
 
+    /// The codebook label of a data relation, after [`Self::execute_plan`]
+    /// interned it. `None` for a name that is not data, which includes the
+    /// behaviour words of the XLOG lens.
+    pub fn label_of(&self, name: &str) -> Option<u8> {
+        self.vocab.index_of(name)
+    }
+
     /// A relation's rows: a derived relation the plan produced, or a base
     /// relation. The download boundary.
     pub fn relation(&self, name: &str) -> Option<Vec<Vec<u32>>> {
