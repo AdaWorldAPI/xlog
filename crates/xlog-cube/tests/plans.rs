@@ -121,44 +121,150 @@ fn two_heads_share_one_cube() {
     assert_eq!(report.stats.programs, 4);
 }
 
+/// Naive fixpoint: apply every rule to the current relations until nothing
+/// changes. Independent of the executor's semi-naive rounds.
+fn naive_fixpoint(r: &Rel, s: &Rel, step: Step) -> BTreeSet<Vec<u32>> {
+    let mut tc = BTreeSet::new();
+    loop {
+        let next = step(&tc, r, s);
+        if next == tc {
+            return tc;
+        }
+        tc = next;
+    }
+}
+
+type Step = fn(&BTreeSet<Vec<u32>>, &Rel, &Rel) -> BTreeSet<Vec<u32>>;
+
+const RECURSIVE: [(&str, Step); 4] = [
+    // Linear transitive closure.
+    ("tc(X,Y) :- r(X,Y). tc(X,Z) :- tc(X,Y), r(Y,Z).", |tc, r, _| {
+        let mut n: BTreeSet<Vec<u32>> = r.iter().map(|&(a, b)| vec![a, b]).collect();
+        for t in tc {
+            n.insert(t.clone());
+            for &(y, z) in r {
+                if t[1] == y {
+                    n.insert(vec![t[0], z]);
+                }
+            }
+        }
+        n
+    }),
+    // Non-linear (doubling) transitive closure: two SCC atoms per body.
+    ("tc(X,Y) :- r(X,Y). tc(X,Z) :- tc(X,Y), tc(Y,Z).", |tc, r, _| {
+        let mut n: BTreeSet<Vec<u32>> = r.iter().map(|&(a, b)| vec![a, b]).collect();
+        for a in tc {
+            n.insert(a.clone());
+            for b in tc {
+                if a[1] == b[0] {
+                    n.insert(vec![a[0], b[1]]);
+                }
+            }
+        }
+        n
+    }),
+    // Reachability over the union of two edge relations.
+    ("tc(X,Y) :- r(X,Y). tc(X,Y) :- s(X,Y). tc(X,Z) :- tc(X,Y), r(Y,Z). tc(X,Z) :- tc(X,Y), s(Y,Z).", |tc, r, s| {
+        let edges: Vec<(u32, u32)> = r.iter().chain(s.iter()).copied().collect();
+        let mut n: BTreeSet<Vec<u32>> = edges.iter().map(|&(a, b)| vec![a, b]).collect();
+        for t in tc {
+            n.insert(t.clone());
+            for &(y, z) in &edges {
+                if t[1] == y {
+                    n.insert(vec![t[0], z]);
+                }
+            }
+        }
+        n
+    }),
+    // Reachable from node 1 only, through a bound start.
+    ("tc(X,Y) :- r(X,Y), X = 1. tc(X,Z) :- tc(X,Y), r(Y,Z).", |tc, r, _| {
+        let mut n: BTreeSet<Vec<u32>> =
+            r.iter().filter(|t| t.0 == 1).map(|&(a, b)| vec![a, b]).collect();
+        for t in tc {
+            n.insert(t.clone());
+            for &(y, z) in r {
+                if t[1] == y {
+                    n.insert(vec![t[0], z]);
+                }
+            }
+        }
+        n
+    }),
+];
+
 #[test]
-fn recursion_and_derived_inputs_are_refused_not_answered() {
-    let r: Rel = vec![(1, 2), (2, 3)];
+fn recursive_programs_match_a_naive_fixpoint() {
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    for (src, step) in RECURSIVE {
+        let (mut nonempty, mut deep) = (0, 0);
+        for _ in 0..100 {
+            let (r, s) = (random(&mut seed, 15), random(&mut seed, 15));
+            let (ex, report) = run(src, &r, &s);
+            assert!(
+                report.refused.is_empty(),
+                "{src}: refused {:?}",
+                report.refused
+            );
+            let want = naive_fixpoint(&r, &s, step);
+            nonempty += usize::from(!want.is_empty());
+            deep += usize::from(report.rounds >= 3);
+            assert_eq!(rows(&ex, "tc"), want, "{src}\nr={r:?}\ns={s:?}");
+        }
+        assert!(nonempty > 15, "{src}: only {nonempty} non-empty cases");
+        assert!(deep > 10, "{src}: only {deep} cases needed 3+ rounds");
+    }
+}
+
+#[test]
+fn a_derived_relation_feeds_a_later_rule() {
+    let r: Rel = vec![(1, 2), (2, 3), (3, 3)];
+    let s: Rel = vec![(2, 1), (3, 3)];
+    // `p` reads `q`, which the plan derives first.
     let (ex, report) = run(
-        "tc(X,Y) :- r(X,Y). tc(X,Z) :- tc(X,Y), r(Y,Z).",
+        "q(X,Z) :- r(X,Y), s(Y,Z). p(X,Z) :- q(X,Y), r(Y,Z).",
+        &r,
+        &s,
+    );
+    assert!(report.refused.is_empty(), "{report:?}");
+    let q = PROGRAMS[0].2(&r, &s);
+    let mut p = BTreeSet::new();
+    for t in &q {
+        for &(y, z) in &r {
+            if t[1] == y {
+                p.insert(vec![t[0], z]);
+            }
+        }
+    }
+    assert_eq!(rows(&ex, "q"), q);
+    assert_eq!(rows(&ex, "p"), p);
+}
+
+#[test]
+fn an_unsupported_rule_refuses_its_whole_recursive_scc() {
+    let r: Rel = vec![(1, 2), (2, 3)];
+    // The second recursive rule compares two columns: not admitted.
+    let (ex, report) = run(
+        "tc(X,Y) :- r(X,Y). tc(X,Z) :- tc(X,Y), r(Y,Z). tc(X,X) :- tc(X,X).",
         &r,
         &vec![],
     );
-    assert!(
-        report
-            .refused
-            .iter()
-            .any(|(h, why)| h == "tc" && why.contains("recursive")),
-        "{report:?}"
-    );
+    assert!(report.refused.iter().any(|(h, _)| h == "tc"), "{report:?}");
     assert_eq!(
         ex.relation("tc"),
         None,
         "a refused head is never handed back"
     );
-
-    let s: Rel = vec![(2, 1), (3, 3)];
-    let (ex, report) = run("q(X,Z) :- r(X,Y), s(Y,Z). p(X) :- q(X,X).", &r, &s);
-    assert!(report.ran.contains(&"q".to_string()));
-    assert!(report.refused.iter().any(|(h, _)| h == "p"), "{report:?}");
-    assert_eq!(rows(&ex, "q"), PROGRAMS[0].2(&r, &s));
-    assert_eq!(ex.relation("p"), None);
 }
 
 #[test]
 fn a_head_with_one_refused_rule_is_not_handed_back_partially() {
-    // The first rule runs on the cube; the second (`s(X, X)`, a filter
+    // The first rule is admitted on its own; the second (`s(X, X)`, a filter
     // comparing two columns) is refused. Handing back only the first rule's
-    // rows would be a wrong, smaller `q`.
+    // rows would be a wrong, smaller `q`, so the whole SCC is refused.
     let r: Rel = vec![(1, 2), (3, 4)];
     let s: Rel = vec![(5, 5), (6, 7)];
     let (ex, report) = run("q(X,Y) :- r(X,Y). q(X,X) :- s(X,X).", &r, &s);
-    assert!(report.ran.contains(&"q".to_string()), "{report:?}");
     assert!(report.refused.iter().any(|(h, _)| h == "q"), "{report:?}");
     assert_eq!(ex.relation("q"), None);
 }

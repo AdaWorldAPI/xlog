@@ -36,8 +36,8 @@ fn main() {
             rules += report.ran.len() + report.refused.len();
             ran += report.ran.len();
             for (_, w) in report.refused {
-                let key = if w.contains("is not a binary base") {
-                    "input is derived or not binary".into()
+                let key = if w.contains("is not a binary relation in the cube") {
+                    "reads a relation that is not binary".into()
                 } else {
                     w
                 };
