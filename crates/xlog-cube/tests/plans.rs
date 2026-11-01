@@ -401,9 +401,10 @@ fn a_term_built_in_is_refused_as_behaviour_not_read_as_data() {
     assert_eq!(q.len(), 1, "{report:?}");
     assert!(q[0].1.contains("XLOG word 0xfffff100/0"), "{report:?}");
     assert_eq!(
-        ex.relation("__xlog_meta_functor"),
+        ex.label_of("__xlog_meta_functor"),
         None,
         "a word was interned"
     );
+    assert!(ex.label_of("p").is_some() && ex.label_of("r").is_some());
     assert_eq!(rows(&ex, "p"), r.iter().map(|&(a, b)| vec![a, b]).collect());
 }
