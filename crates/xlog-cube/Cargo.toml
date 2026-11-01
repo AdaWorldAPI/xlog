@@ -16,3 +16,4 @@ xlog-ir = { path = "../xlog-ir" }
 xlog-logic = { path = "../xlog-logic" }
 lance-graph-xlog = { git = "https://github.com/AdaWorldAPI/lance-graph", branch = "main" }
 lance-graph-dt64 = { git = "https://github.com/AdaWorldAPI/lance-graph", branch = "main" }
+lance-graph-contract = { git = "https://github.com/AdaWorldAPI/lance-graph", branch = "main" }
