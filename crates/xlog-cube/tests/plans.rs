@@ -149,3 +149,16 @@ fn recursion_and_derived_inputs_are_refused_not_answered() {
     assert_eq!(rows(&ex, "q"), PROGRAMS[0].2(&r, &s));
     assert_eq!(ex.relation("p"), None);
 }
+
+#[test]
+fn a_head_with_one_refused_rule_is_not_handed_back_partially() {
+    // The first rule runs on the cube; the second (`s(X, X)`, a filter
+    // comparing two columns) is refused. Handing back only the first rule's
+    // rows would be a wrong, smaller `q`.
+    let r: Rel = vec![(1, 2), (3, 4)];
+    let s: Rel = vec![(5, 5), (6, 7)];
+    let (ex, report) = run("q(X,Y) :- r(X,Y). q(X,X) :- s(X,X).", &r, &s);
+    assert!(report.ran.contains(&"q".to_string()), "{report:?}");
+    assert!(report.refused.iter().any(|(h, _)| h == "q"), "{report:?}");
+    assert_eq!(ex.relation("q"), None);
+}

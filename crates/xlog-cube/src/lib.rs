@@ -217,7 +217,7 @@ impl CubeExecutor {
         index
             .get_key_value(name.as_str())
             .map(|(k, _)| *k)
-            .ok_or_else(|| format!("derived input `{name}`"))
+            .ok_or_else(|| format!("`{name}` is not a binary base relation"))
     }
 
     fn side(&self, index: &HashMap<&str, u32>, node: &RirNode, key: usize) -> Result<Side, String> {
