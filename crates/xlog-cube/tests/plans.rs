@@ -268,3 +268,100 @@ fn a_head_with_one_refused_rule_is_not_handed_back_partially() {
     assert!(report.refused.iter().any(|(h, _)| h == "q"), "{report:?}");
     assert_eq!(ex.relation("q"), None);
 }
+
+/// Brute force over every assignment of `vars` variables to ids 0..10.
+fn brute(
+    vars: usize,
+    r: &Rel,
+    s: &Rel,
+    keep: &dyn Fn(&[u32], &Rel, &Rel) -> Option<Vec<u32>>,
+) -> BTreeSet<Vec<u32>> {
+    let mut out = BTreeSet::new();
+    let mut b = vec![0u32; vars];
+    loop {
+        if let Some(row) = keep(&b, r, s) {
+            out.insert(row);
+        }
+        let mut i = 0;
+        loop {
+            if i == vars {
+                return out;
+            }
+            b[i] += 1;
+            if b[i] < 10 {
+                break;
+            }
+            b[i] = 0;
+            i += 1;
+        }
+    }
+}
+
+fn has(rel: &Rel, a: u32, b: u32) -> bool {
+    rel.contains(&(a, b))
+}
+
+type Keep = fn(&[u32], &Rel, &Rel) -> Option<Vec<u32>>;
+
+const MULTIWAY: [(&str, &str, usize, Keep); 4] = [
+    (
+        "tri(X,Y,Z) :- r(X,Y), r(Y,Z), r(X,Z).",
+        "tri",
+        3,
+        |b, r, _| {
+            (has(r, b[0], b[1]) && has(r, b[1], b[2]) && has(r, b[0], b[2]))
+                .then(|| vec![b[0], b[1], b[2]])
+        },
+    ),
+    (
+        "c4(X,Y,Z,W) :- r(X,Y), r(Y,Z), r(Z,W), r(W,X).",
+        "c4",
+        4,
+        |b, r, _| {
+            (has(r, b[0], b[1]) && has(r, b[1], b[2]) && has(r, b[2], b[3]) && has(r, b[3], b[0]))
+                .then(|| vec![b[0], b[1], b[2], b[3]])
+        },
+    ),
+    (
+        "k4(A,B,C,D) :- r(A,B), r(A,C), r(A,D), r(B,C), r(B,D), r(C,D).",
+        "k4",
+        4,
+        |b, r, _| {
+            let e = |i: usize, j: usize| has(r, b[i], b[j]);
+            (e(0, 1) && e(0, 2) && e(0, 3) && e(1, 2) && e(1, 3) && e(2, 3)).then(|| b.to_vec())
+        },
+    ),
+    // Two relations, projected: endpoints of an r-s-r path.
+    ("q(X,W) :- r(X,Y), s(Y,Z), r(Z,W).", "q", 4, |b, r, s| {
+        (has(r, b[0], b[1]) && has(s, b[1], b[2]) && has(r, b[2], b[3])).then(|| vec![b[0], b[3]])
+    }),
+];
+
+#[test]
+fn multi_way_joins_match_brute_force() {
+    let mut seed = 0xD1B5_4A32_D192_ED03u64;
+    for (src, head, vars, keep) in MULTIWAY {
+        let plan = Compiler::new().compile(src).expect("compile");
+        let multiway = plan
+            .rules_by_scc
+            .iter()
+            .flatten()
+            .any(|r| r.head == head && matches!(r.body, xlog_ir::RirNode::MultiWayJoin { .. }));
+        assert!(multiway, "{src}: XLOG did not compile it to a MultiWayJoin");
+        let mut nonempty = 0;
+        for _ in 0..60 {
+            // Dense relations, so cycles and cliques occur.
+            let (r, s) = (random(&mut seed, 40), random(&mut seed, 40));
+            let (ex, report) = run(src, &r, &s);
+            assert!(
+                report.refused.is_empty(),
+                "{src}: refused {:?}",
+                report.refused
+            );
+            let want = brute(vars, &r, &s, &keep);
+            nonempty += usize::from(!want.is_empty());
+            assert_eq!(rows(&ex, head), want, "{src}\nr={r:?}\ns={s:?}");
+        }
+        assert!(nonempty > 10, "{src}: only {nonempty} non-empty cases");
+    }
+}

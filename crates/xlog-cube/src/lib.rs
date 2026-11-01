@@ -22,6 +22,8 @@
 //! - `Scan(r)`, `Filter { Scan(r), col == const }`, and `Project` over
 //!   either (single-relation bodies: read from the rows recorded for that
 //!   relation, no cube program);
+//! - `MultiWayJoin`, read through its `fallback` (scan leaves joined by
+//!   inner joins): generic join over adjacency masks on the cube's domain;
 //! - `ChainJoin { l, r, left_key, right_key, output_columns }` and
 //!   `Project { Join { l, r, [k], [k], Inner }, columns }`, where each side is
 //!   `Scan(rel)` or `Filter { Scan(rel), col == const }` on the side's free
@@ -308,6 +310,10 @@ impl CubeExecutor {
         let rels = match body {
             RirNode::Scan { .. } | RirNode::Filter { .. } => vec![atom(body)],
             RirNode::ChainJoin { left, right, .. } => vec![atom(left), atom(right)],
+            RirNode::MultiWayJoin { fallback, .. } => {
+                let (leaves, _, _) = flatten_fallback(fallback)?;
+                leaves.into_iter().map(Some).collect()
+            }
             RirNode::Project { input, .. } => match input.as_ref() {
                 RirNode::Join { left, right, .. } => vec![atom(left), atom(right)],
                 RirNode::Scan { .. } | RirNode::Filter { .. } => vec![atom(input)],
@@ -350,6 +356,7 @@ impl CubeExecutor {
                     .map(|row| cols.iter().map(|&i| row[i]).collect())
                     .collect())
             }
+            RirNode::MultiWayJoin { fallback, .. } => self.multiway(store, resolve, fallback),
             RirNode::ChainJoin {
                 left,
                 right,
@@ -410,6 +417,58 @@ impl CubeExecutor {
             .filter(|row| bound.is_none_or(|(col, v)| row[col] == v))
             .cloned()
             .collect())
+    }
+
+    /// A multi-way conjunctive join, evaluated as generic join over the
+    /// cube's coordinates. The atoms, the variables and the output come from
+    /// `fallback`, the IR-equivalent binary-join plan: its scan leaves are the
+    /// atoms, its join keys (unified) the variables, its projection the head.
+    /// One variable is bound at a time; its candidates are the AND of one
+    /// adjacency mask per atom it occurs in (`lance_graph_xlog::and`).
+    fn multiway(
+        &self,
+        store: &Store,
+        resolve: &Resolve<'_>,
+        fallback: &RirNode,
+    ) -> Result<Vec<Vec<u32>>, String> {
+        let (leaves, class, columns) = flatten_fallback(fallback)?;
+        let map = store
+            .table
+            .map(&store.table.seal(), TILE)
+            .map_err(|e| format!("{e:?}"))?;
+        let n = map.len();
+        let words = n.div_ceil(64);
+        // Per atom: its two variables and its adjacency masks in both
+        // directions, over local positions.
+        let mut atoms = Vec::with_capacity(leaves.len());
+        for (i, rel) in leaves.iter().enumerate() {
+            let id = resolve(self.name(*rel)?, i)?;
+            let pairs = binary(&store.rows[&id]).ok_or("multi-way atom is not binary")?;
+            let mut adj = Adjacency::new(n, words);
+            for (a, b) in pairs {
+                let local = |g: u32| {
+                    map.local(u64::from(g))
+                        .map(usize::from)
+                        .map_err(|e| format!("{e:?}"))
+                };
+                adj.insert(local(a)?, local(b)?);
+            }
+            atoms.push(((class[2 * i], class[2 * i + 1]), adj));
+        }
+        let vars = class.iter().copied().max().map_or(0, |m| m + 1);
+        let mut binding = vec![usize::MAX; vars];
+        let mut out = BTreeSet::new();
+        generic_join(&atoms, words, 0, &mut binding, &mut |b: &[usize]| {
+            let row: Vec<u32> = columns
+                .iter()
+                .map(|&c| {
+                    map.global(b[class[c]] as u8)
+                        .expect("local position in the map") as u32
+                })
+                .collect();
+            out.insert(row);
+        });
+        Ok(out.into_iter().collect())
     }
 
     fn name(&self, rel: RelId) -> Result<&str, String> {
@@ -504,6 +563,167 @@ impl CubeExecutor {
             .map(|t| cols.iter().map(|&i| at(t, i)).collect())
             .collect())
     }
+}
+
+/// One atom's relation as bit masks over local positions: `fwd[x]` holds
+/// the `y` with `(x, y)`, `bwd[y]` the `x`, and `col0`/`col1` the values each
+/// column takes.
+struct Adjacency {
+    fwd: Vec<Vec<u64>>,
+    bwd: Vec<Vec<u64>>,
+    col0: Vec<u64>,
+    col1: Vec<u64>,
+}
+
+impl Adjacency {
+    fn new(n: usize, words: usize) -> Self {
+        Self {
+            fwd: vec![vec![0; words]; n],
+            bwd: vec![vec![0; words]; n],
+            col0: vec![0; words],
+            col1: vec![0; words],
+        }
+    }
+
+    fn insert(&mut self, a: usize, b: usize) {
+        self.fwd[a][b / 64] |= 1 << (b % 64);
+        self.bwd[b][a / 64] |= 1 << (a % 64);
+        self.col0[a / 64] |= 1 << (a % 64);
+        self.col1[b / 64] |= 1 << (b % 64);
+    }
+}
+
+/// Bind variable `v`, then the rest. A variable's candidates are the AND,
+/// over every atom it occurs in, of: the partner's row or column when the
+/// partner is bound (or is `v` itself), else the column's value set.
+fn generic_join(
+    atoms: &[((usize, usize), Adjacency)],
+    words: usize,
+    v: usize,
+    binding: &mut Vec<usize>,
+    emit: &mut dyn FnMut(&[usize]),
+) {
+    if v == binding.len() {
+        emit(binding);
+        return;
+    }
+    let mut cand = vec![u64::MAX; words];
+    let mut scratch = vec![0u64; words];
+    let mut constrained = false;
+    for ((a, b), adj) in atoms {
+        let mask: Option<Vec<u64>> = match (*a == v, *b == v) {
+            // `r(V, V)`: the diagonal.
+            (true, true) => Some(
+                (0..words)
+                    .map(|w| {
+                        (0..64)
+                            .filter(|i| {
+                                let x = w * 64 + i;
+                                x < adj.fwd.len() && adj.fwd[x][w] >> i & 1 == 1
+                            })
+                            .fold(0u64, |m, i| m | 1 << i)
+                    })
+                    .collect(),
+            ),
+            (true, false) if binding[*b] != usize::MAX => Some(adj.bwd[binding[*b]].clone()),
+            (true, false) => Some(adj.col0.clone()),
+            (false, true) if binding[*a] != usize::MAX => Some(adj.fwd[binding[*a]].clone()),
+            (false, true) => Some(adj.col1.clone()),
+            _ => None,
+        };
+        if let Some(m) = mask {
+            lance_graph_xlog::and(&cand, &m, &mut scratch);
+            std::mem::swap(&mut cand, &mut scratch);
+            constrained = true;
+        }
+    }
+    if !constrained {
+        return;
+    }
+    let n = atoms.first().map_or(0, |(_, adj)| adj.fwd.len());
+    for x in 0..n {
+        if cand[x / 64] >> (x % 64) & 1 == 1 {
+            binding[v] = x;
+            generic_join(atoms, words, v + 1, binding, emit);
+        }
+    }
+    binding[v] = usize::MAX;
+}
+
+/// The scan leaves of a `MultiWayJoin` fallback (`Project` over a tree of
+/// inner `Join`s), the variable class of every leaf column (join keys
+/// unified, classes renumbered by first appearance), and the projected
+/// leaf columns. Leaves are binary: two columns each.
+/// A flattened fallback: scan leaves, each leaf column's variable class, and
+/// the projected leaf columns.
+type Flat = (Vec<RelId>, Vec<usize>, Vec<usize>);
+
+fn flatten_fallback(fallback: &RirNode) -> Result<Flat, String> {
+    let RirNode::Project { input, columns } = fallback else {
+        return Err(format!("multi-way fallback {}", kind(fallback)));
+    };
+    fn walk(
+        n: &RirNode,
+        leaves: &mut Vec<RelId>,
+        eqs: &mut Vec<(usize, usize)>,
+    ) -> Result<usize, String> {
+        match n {
+            RirNode::Scan { rel } => {
+                leaves.push(*rel);
+                Ok(2)
+            }
+            RirNode::Join {
+                left,
+                right,
+                left_keys,
+                right_keys,
+                join_type: JoinType::Inner,
+            } => {
+                let off = 2 * leaves.len();
+                let wl = walk(left, leaves, eqs)?;
+                let wr = walk(right, leaves, eqs)?;
+                for (&l, &r) in left_keys.iter().zip(right_keys) {
+                    if l >= wl || r >= wr {
+                        return Err("join key outside its input".into());
+                    }
+                    eqs.push((off + l, off + wl + r));
+                }
+                Ok(wl + wr)
+            }
+            other => Err(format!("multi-way fallback leaf {}", kind(other))),
+        }
+    }
+    let mut leaves = Vec::new();
+    let mut eqs = Vec::new();
+    let width = walk(input, &mut leaves, &mut eqs)?;
+    let mut parent: Vec<usize> = (0..width).collect();
+    fn root(p: &mut [usize], mut x: usize) -> usize {
+        while p[x] != x {
+            p[x] = p[p[x]];
+            x = p[x];
+        }
+        x
+    }
+    for (a, b) in eqs {
+        let (ra, rb) = (root(&mut parent, a), root(&mut parent, b));
+        parent[ra] = rb;
+    }
+    let mut ids: HashMap<usize, usize> = HashMap::new();
+    let class: Vec<usize> = (0..width)
+        .map(|c| {
+            let r = root(&mut parent, c);
+            let next = ids.len();
+            *ids.entry(r).or_insert(next)
+        })
+        .collect();
+    let columns = columns
+        .iter()
+        .map(|c| match c {
+            ProjectExpr::Column(i) if *i < width => Ok(*i),
+            _ => Err("computed or out-of-range output column".to_string()),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((leaves, class, columns))
 }
 
 /// `col == const`, the only filter admitted.
