@@ -1,0 +1,4 @@
+[toolchain]
+# Same channel as lance-graph (ndarray needs 1.99). This crate is standalone,
+# so the XLOG workspace keeps its own toolchain.
+channel = "1.99.0"

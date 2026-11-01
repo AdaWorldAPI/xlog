@@ -1,5 +1,7 @@
 [workspace]
 resolver = "2"
+# Standalone (own [workspace]): pulls lance-graph by git only when built.
+exclude = ["crates/xlog-cube"]
 members = [
     "crates/xlog-core",
     "crates/xlog-ir",

@@ -1,0 +1,19 @@
+[package]
+name = "xlog-cube"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Runs XLOG's compiled plans on lance-graph's resident hypercube (lance_graph_xlog::cube) instead of CUDA. A probe: admitted RIR shapes run on the cube, every other shape is refused and counted."
+license = "MIT OR Apache-2.0"
+
+# Standalone, so the XLOG workspace never resolves the lance-graph git
+# dependency unless this crate is built.
+[workspace]
+
+[dependencies]
+xlog-core = { path = "../xlog-core" }
+xlog-ir = { path = "../xlog-ir" }
+xlog-logic = { path = "../xlog-logic" }
+lance-graph-xlog = { git = "https://github.com/AdaWorldAPI/lance-graph", branch = "main" }
+lance-graph-dt64 = { git = "https://github.com/AdaWorldAPI/lance-graph", branch = "main" }
+lance-graph-contract = { git = "https://github.com/AdaWorldAPI/lance-graph", branch = "main" }
