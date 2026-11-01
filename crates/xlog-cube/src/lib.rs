@@ -599,21 +599,28 @@ impl CubeExecutor {
         resolve: &Resolve<'_>,
         node: &RirNode,
     ) -> Result<Vec<Vec<u32>>, Refusal> {
-        let (rel, bound) = match node {
-            RirNode::Scan { rel } => (*rel, None),
+        let (rel, keep) = match node {
+            RirNode::Scan { rel } => (*rel, Keep::All),
             RirNode::Filter { input, predicate } => match input.as_ref() {
-                RirNode::Scan { rel } => (*rel, Some(eq_const(predicate)?)),
+                // `r(V,V)`: a repeated variable compiles to `col0 == col1`.
+                RirNode::Scan { rel } => match eq_cols(predicate) {
+                    Some((a, b)) => (*rel, Keep::Diagonal(a, b)),
+                    None => {
+                        let (col, v) = eq_const(predicate)?;
+                        (*rel, Keep::Const(col, v))
+                    }
+                },
                 other => return Err(Refusal::FilterOver(kind(other))),
             },
             other => return Err(Refusal::Body(kind(other))),
         };
-        if bound.is_some_and(|(col, _)| col > 1) {
+        if !keep.in_binary() {
             return Err(Refusal::FilterColumn);
         }
         let id = resolve(self.label(rel)?, 0)?;
         Ok(store.rows[&id]
             .iter()
-            .filter(|row| bound.is_none_or(|(col, v)| row[col] == v))
+            .filter(|row| keep.holds(row))
             .cloned()
             .collect())
     }
@@ -937,6 +944,50 @@ fn flatten_fallback(fallback: &RirNode) -> Result<Flat, Refusal> {
 }
 
 /// `col == const`, the only filter admitted.
+/// What a single-relation body keeps.
+#[derive(Clone, Copy)]
+enum Keep {
+    All,
+    /// `col == const`.
+    Const(usize, u32),
+    /// `col == col`.
+    Diagonal(usize, usize),
+}
+
+impl Keep {
+    fn in_binary(self) -> bool {
+        match self {
+            Keep::All => true,
+            Keep::Const(c, _) => c < 2,
+            Keep::Diagonal(a, b) => a < 2 && b < 2,
+        }
+    }
+
+    fn holds(self, row: &[u32]) -> bool {
+        match self {
+            Keep::All => true,
+            Keep::Const(c, v) => row[c] == v,
+            Keep::Diagonal(a, b) => row[a] == row[b],
+        }
+    }
+}
+
+/// `Column(a) == Column(b)`, the filter a repeated variable compiles to.
+/// Both columns hold ids of the same relation, so equality needs no typing.
+fn eq_cols(predicate: &Expr) -> Option<(usize, usize)> {
+    match predicate {
+        Expr::Compare {
+            left,
+            op: CompareOp::Eq,
+            right,
+        } => match (left.as_ref(), right.as_ref()) {
+            (Expr::Column(a), Expr::Column(b)) => Some((*a, *b)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn eq_const(predicate: &Expr) -> Result<(usize, u32), Refusal> {
     let Expr::Compare {
         left,

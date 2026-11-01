@@ -243,9 +243,10 @@ fn a_derived_relation_feeds_a_later_rule() {
 #[test]
 fn an_unsupported_rule_refuses_its_whole_recursive_scc() {
     let r: Rel = vec![(1, 2), (2, 3)];
-    // The second recursive rule compares two columns: not admitted.
+    // The third rule orders two columns (`<`): not admitted. (It used
+    // `tc(X,X)`, column equality, which is admitted now.)
     let (ex, report) = run(
-        "tc(X,Y) :- r(X,Y). tc(X,Z) :- tc(X,Y), r(Y,Z). tc(X,X) :- tc(X,X).",
+        "tc(X,Y) :- r(X,Y). tc(X,Z) :- tc(X,Y), r(Y,Z). tc(X,Y) :- tc(X,Y), X < Y.",
         &r,
         &vec![],
     );
@@ -259,12 +260,12 @@ fn an_unsupported_rule_refuses_its_whole_recursive_scc() {
 
 #[test]
 fn a_head_with_one_refused_rule_is_not_handed_back_partially() {
-    // The first rule is admitted on its own; the second (`s(X, X)`, a filter
-    // comparing two columns) is refused. Handing back only the first rule's
+    // The first rule is admitted on its own; the second (`X < Y`, a filter
+    // ordering two columns) is refused. Handing back only the first rule's
     // rows would be a wrong, smaller `q`, so the whole SCC is refused.
     let r: Rel = vec![(1, 2), (3, 4)];
-    let s: Rel = vec![(5, 5), (6, 7)];
-    let (ex, report) = run("q(X,Y) :- r(X,Y). q(X,X) :- s(X,X).", &r, &s);
+    let s: Rel = vec![(5, 6), (7, 7)];
+    let (ex, report) = run("q(X,Y) :- r(X,Y). q(X,Y) :- s(X,Y), X < Y.", &r, &s);
     assert!(report.refused.iter().any(|(h, _)| h == "q"), "{report:?}");
     assert_eq!(ex.relation("q"), None);
 }
@@ -407,4 +408,63 @@ fn a_term_built_in_is_refused_as_behaviour_not_read_as_data() {
     );
     assert!(ex.label_of("p").is_some() && ex.label_of("r").is_some());
     assert_eq!(rows(&ex, "p"), r.iter().map(|&(a, b)| vec![a, b]).collect());
+}
+
+/// `r(V,V)`: a repeated variable compiles to `Filter(col0 == col1)`. Over
+/// random relations with loops, the diagonal is exactly the looped ids, and
+/// the head may repeat the column.
+#[test]
+fn a_repeated_variable_selects_the_diagonal() {
+    let mut seed = 0x5EED_D1A6u64;
+    let mut nonempty = 0;
+    for _ in 0..100 {
+        let mut r = random(&mut seed, 20);
+        let loop_at = r.len() as u32 % 10;
+        r.push((loop_at, loop_at));
+        let want: BTreeSet<Vec<u32>> = r
+            .iter()
+            .filter(|(a, b)| a == b)
+            .map(|&(a, _)| vec![a])
+            .collect();
+        let (ex, report) = run("d(X) :- r(X,X). e(X,X) :- r(X,X).", &r, &vec![]);
+        assert!(report.refused.is_empty(), "{report:?}");
+        assert_eq!(rows(&ex, "d"), want);
+        let twice: BTreeSet<Vec<u32>> = want.iter().map(|v| vec![v[0], v[0]]).collect();
+        assert_eq!(rows(&ex, "e"), twice);
+        nonempty += usize::from(want.len() > 1);
+    }
+    assert!(
+        nonempty > 30,
+        "only {nonempty} cases with more than the planted loop"
+    );
+}
+
+/// The diagonal of a recursive relation: on the cycle-with-exit fixture,
+/// `reach` has exactly 12 pairs and the ids on a cycle are 0, 1 and 2.
+#[test]
+fn the_diagonal_of_a_closure_is_the_ids_on_a_cycle() {
+    let r: Rel = vec![(0, 1), (1, 2), (2, 0), (2, 3)];
+    let (ex, report) = run(
+        "reach(X,Y) :- r(X,Y). reach(X,Z) :- reach(X,Y), r(Y,Z). cyc(X) :- reach(X,X).",
+        &r,
+        &vec![],
+    );
+    assert!(report.refused.is_empty(), "{report:?}");
+    let reach = rows(&ex, "reach");
+    assert_eq!(reach.len(), 12);
+    assert!(!reach.contains(&vec![3, 3]));
+    assert_eq!(
+        rows(&ex, "cyc"),
+        [0, 1, 2].iter().map(|&x| vec![x]).collect()
+    );
+}
+
+/// A diagonal on one side of a join needs `Cube::bind` to bind a column to
+/// another column; it is not admitted, and stays refused rather than wrong.
+#[test]
+fn a_diagonal_join_side_is_refused() {
+    let r: Rel = vec![(1, 1), (2, 3)];
+    let s: Rel = vec![(1, 5)];
+    let (_, report) = run("t(X,Z) :- r(X,X), s(X,Z).", &r, &s);
+    assert_eq!(report.refused.len(), 1, "{report:?}");
 }
