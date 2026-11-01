@@ -380,3 +380,30 @@ fn an_unsupplied_relation_is_empty_not_refused() {
     assert_eq!(rows(&ex, "q"), BTreeSet::new());
     assert_eq!(rows(&ex, "p"), r.iter().map(|&(a, b)| vec![a, b]).collect());
 }
+
+/// XLOG's term built-ins are behaviour, addressed in the XLOG lens: a rule
+/// reading one is refused as behaviour, never interned as a data relation,
+/// and a rule beside it that reads only data still runs.
+#[test]
+fn a_term_built_in_is_refused_as_behaviour_not_read_as_data() {
+    let r: Rel = vec![(1, 2), (2, 3)];
+    let mut c = Compiler::new();
+    let plan = c
+        .compile("q(F,A) :- functor(point(1, 2), F, A). p(X,Y) :- r(X,Y).")
+        .expect("compile");
+    let mut ex = CubeExecutor::new();
+    for (name, id) in c.rel_ids() {
+        ex.register_relation(*id, name);
+    }
+    ex.put_relation("r", &r);
+    let report = ex.execute_plan(&plan).expect("plan");
+    let q: Vec<_> = report.refused.iter().filter(|(h, _)| h == "q").collect();
+    assert_eq!(q.len(), 1, "{report:?}");
+    assert!(q[0].1.contains("XLOG word 0xfffff100/0"), "{report:?}");
+    assert_eq!(
+        ex.relation("__xlog_meta_functor"),
+        None,
+        "a word was interned"
+    );
+    assert_eq!(rows(&ex, "p"), r.iter().map(|&(a, b)| vec![a, b]).collect());
+}
