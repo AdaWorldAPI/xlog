@@ -294,6 +294,16 @@ struct Seed {
     terms: Vec<Term>,
 }
 
+/// Demand seeds plus the queries they answer.
+///
+/// `demanded[i]` is true when query `i` produced a seed, including a seed that
+/// was deduplicated against an earlier identical query. Only those queries
+/// read a target predicate through a fully demanded relation.
+struct QuerySeeds {
+    seeds: Vec<Seed>,
+    demanded: Vec<bool>,
+}
+
 struct AdornmentText<'a>(&'a [bool]);
 impl std::fmt::Display for AdornmentText<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -403,7 +413,8 @@ fn rewrite_enabled_with_owner(
     let mode = mode.expect("checked above");
 
     let recursive = recursive_predicates(&program.value, allocations)?;
-    let seeds = collect_query_seeds(&program.value, &recursive, allocations)?;
+    let QuerySeeds { seeds, demanded } =
+        collect_query_seeds(&program.value, &recursive, allocations)?;
     if seeds.is_empty() {
         let reason = "no bound recursive query eligible for magic_sets";
         allocations.vector::<String>(1)?;
@@ -424,8 +435,12 @@ fn rewrite_enabled_with_owner(
         allocations.tree::<String, ()>(target_preds.len())?;
         target_preds.insert(seed.pred.clone());
     }
-    let unsafe_reasons =
+    let mut unsafe_reasons =
         unsupported_target_reasons(&program.value, &target_preds, &recursive, allocations)?;
+    let consumer_reasons =
+        undemanded_consumer_reasons(&program.value, &target_preds, &demanded, allocations)?;
+    allocations.reserve_vector(&mut unsafe_reasons, consumer_reasons.len())?;
+    unsafe_reasons.extend(consumer_reasons);
     if !unsafe_reasons.is_empty() {
         return decline_or_error(program, mode, unsafe_reasons, allocations);
     }
@@ -566,10 +581,12 @@ fn collect_query_seeds(
     program: &Program,
     recursive: &HashSet<String>,
     allocations: &mut MagicAllocations<'_, '_>,
-) -> Result<Vec<Seed>> {
+) -> Result<QuerySeeds> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-    for query in &program.queries {
+    allocations.vector::<bool>(program.queries.len())?;
+    let mut demanded = vec![false; program.queries.len()];
+    for (index, query) in program.queries.iter().enumerate() {
         if !recursive.contains(&query.atom.predicate) {
             continue;
         }
@@ -587,6 +604,7 @@ fn collect_query_seeds(
         {
             continue;
         }
+        demanded[index] = true;
         allocations.atom(&query.atom)?;
         let terms = bound_terms(&query.atom, &pattern);
         allocations.vector::<u8>(pattern.len())?;
@@ -613,7 +631,113 @@ fn collect_query_seeds(
             });
         }
     }
-    Ok(out)
+    Ok(QuerySeeds {
+        seeds: out,
+        demanded,
+    })
+}
+
+/// Reasons why restricting the target predicates to the seeded demand would
+/// change an answer outside those queries.
+///
+/// The rewrite replaces every target rule with a magic-guarded rule, so after
+/// it a target relation holds only the tuples the seeds demand. Three kinds of
+/// reader exist:
+///
+/// * target rules themselves: the recursion being rewritten, guarded and
+///   checked by `unsupported_target_reasons`;
+/// * the generated query rule `__xlog_query_{i}(...) :- <query i atom>` of a
+///   query that produced a seed: its bound columns are exactly the seed, so
+///   the restricted relation answers it completely;
+/// * every other reader, positive, negated or epistemic, in an ordinary rule,
+///   a desugared constraint rule, a learnable rule, or the generated rule of a
+///   query that produced no seed. Such a reader is independent of the demand
+///   and would silently see a truncated relation.
+///
+/// The last kind makes the specialization demand-unsafe; each one yields a
+/// reason so `auto` keeps the unrestricted program and `on` reports it.
+fn undemanded_consumer_reasons(
+    program: &Program,
+    target_preds: &BTreeSet<String>,
+    demanded: &[bool],
+    allocations: &mut MagicAllocations<'_, '_>,
+) -> Result<Vec<String>> {
+    let mut reasons = BTreeSet::new();
+    let rule_readers = program
+        .rules
+        .iter()
+        .filter(|rule| !target_preds.contains(&rule.head.predicate))
+        .map(|rule| (false, &rule.head, rule.body.as_slice()));
+    let learnable_readers = program
+        .learnable_rules
+        .iter()
+        .map(|rule| (true, &rule.head, rule.body.as_slice()));
+    for (learnable, head, body) in rule_readers.chain(learnable_readers) {
+        let query_index = if learnable {
+            None
+        } else {
+            generated_query_index(&head.predicate).filter(|index| *index < program.queries.len())
+        };
+        if let Some(index) = query_index {
+            if demanded[index]
+                && matches!(body, [BodyLiteral::Positive(atom)] if *atom == program.queries[index].atom)
+            {
+                continue;
+            }
+        }
+        for literal in body {
+            let Some(atom) = literal.atom() else {
+                continue;
+            };
+            if !target_preds.contains(&atom.predicate) {
+                continue;
+            }
+            let reason = match query_index {
+                Some(index) => {
+                    allocations.format(format_args!(
+                        "query {} reads magic_sets target {} without a bound demand seed",
+                        index, atom.predicate
+                    ))?;
+                    format!(
+                        "query {} reads magic_sets target {} without a bound demand seed",
+                        index, atom.predicate
+                    )
+                }
+                None => {
+                    let kind = if learnable { "learnable rule" } else { "rule" };
+                    allocations.format(format_args!(
+                        "{} for {} reads magic_sets target {} outside the demanded queries",
+                        kind, head.predicate, atom.predicate
+                    ))?;
+                    format!(
+                        "{} for {} reads magic_sets target {} outside the demanded queries",
+                        kind, head.predicate, atom.predicate
+                    )
+                }
+            };
+            allocations.tree::<String, ()>(reasons.len())?;
+            reasons.insert(reason);
+        }
+    }
+    allocations.vector::<String>(reasons.len())?;
+    Ok(reasons.into_iter().collect())
+}
+
+/// The query index of a generated query head `__xlog_query_{index}`.
+///
+/// Only the canonical decimal spelling the desugaring pass emits is accepted,
+/// so an authored head such as `__xlog_query_01` is never mistaken for one.
+/// Authored relations with an exact generated name are refused before this
+/// pass runs.
+fn generated_query_index(predicate: &str) -> Option<usize> {
+    let digits = predicate.strip_prefix("__xlog_query_")?;
+    let canonical = !digits.is_empty()
+        && digits.bytes().all(|byte| byte.is_ascii_digit())
+        && (digits == "0" || !digits.starts_with('0'));
+    if !canonical {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 fn initial_adornments(
