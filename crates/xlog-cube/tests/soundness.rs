@@ -34,8 +34,14 @@ fn a_rule_reading_a_refused_relation_is_refused() {
     let pair: &[(u32, u32)] = &[(1, 10), (1, 20), (2, 10)];
     let blocked: &[(u32, u32)] = &[(1, 10)];
     let (ex, report) = run(src, &[("pair", pair), ("blocked", blocked)]);
-    assert!(report.refused.iter().any(|(h, _)| h == "keep"), "{report:?}");
-    assert!(!report.ran.iter().any(|h| h == "__xlog_query_0"), "{report:?}");
+    assert!(
+        report.refused.iter().any(|(h, _)| h == "keep"),
+        "{report:?}"
+    );
+    assert!(
+        !report.ran.iter().any(|h| h == "__xlog_query_0"),
+        "{report:?}"
+    );
     let why = report
         .refused
         .iter()
