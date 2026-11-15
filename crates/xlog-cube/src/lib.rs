@@ -115,6 +115,9 @@ pub enum Refusal {
     Behaviour(AlgebraRef),
     /// The cube refused.
     Cube(CubeRefusal),
+    /// The rule reads a relation whose own rules were refused: it would read
+    /// an empty stand-in, not that relation.
+    ReadsRefused(Label),
 }
 
 impl fmt::Display for Refusal {
@@ -135,6 +138,7 @@ impl fmt::Display for Refusal {
             Refusal::Unregistered(r) => write!(f, "unregistered {r:?}"),
             Refusal::Behaviour(w) => write!(f, "XLOG word {:#010x}/{}", w.lens, w.word),
             Refusal::Cube(e) => write!(f, "cube: {e:?}"),
+            Refusal::ReadsRefused(l) => write!(f, "reads refused relation (label {l})"),
         }
     }
 }
@@ -294,11 +298,32 @@ impl CubeExecutor {
         let mut refused: Vec<(Label, Refusal)> = Vec::new();
         let mut rounds = 0;
         let mut produced: BTreeMap<Label, Rows> = BTreeMap::new();
+        // Heads whose SCC was refused. Every arity-2 relation has an empty
+        // stand-in in the cube, so a reader of a refused head would run over
+        // that stand-in and report a wrong answer as ran: refuse it instead.
+        let mut refused_heads: BTreeSet<Label> = BTreeSet::new();
         for scc in &sccs {
-            let outcome = if scc.recursive {
-                self.recursive_scc(&mut store, &current, scc, &mut rounds)
+            // Rows a host put for a member of this SCC (facts of a derived
+            // predicate) are part of its answer.
+            let put: BTreeMap<Label, Rows> = scc
+                .members
+                .iter()
+                .filter_map(|m| {
+                    let rows = self.base.get(self.vocab.label(*m)?)?;
+                    Some((*m, pairs_to_rows(rows)))
+                })
+                .collect();
+            let outcome = if let Some(l) = self.reads_any(scc, &refused_heads) {
+                Err(Refusal::ReadsRefused(l))
+            } else if scc.recursive {
+                self.recursive_scc(&mut store, &current, scc, &put, &mut rounds)
             } else {
-                self.plain_scc(&mut store, &current, scc)
+                self.plain_scc(&mut store, &current, scc).map(|mut heads| {
+                    for (m, rows) in &put {
+                        heads.entry(*m).or_default().extend(rows.iter().cloned());
+                    }
+                    heads
+                })
             };
             match outcome {
                 Ok(heads) => {
@@ -311,6 +336,7 @@ impl CubeExecutor {
                     }
                 }
                 Err(reason) => {
+                    refused_heads.extend(scc.rules.iter().map(|(h, _)| *h));
                     refused.extend(scc.rules.iter().map(|(h, _)| (*h, reason.clone())));
                 }
             }
@@ -335,6 +361,10 @@ impl CubeExecutor {
         match r {
             Refusal::NotBinary(l) => match self.vocab.label(*l) {
                 Some(n) => format!("`{n}` is not a binary relation in the cube"),
+                None => r.to_string(),
+            },
+            Refusal::ReadsRefused(l) => match self.vocab.label(*l) {
+                Some(n) => format!("reads refused relation `{n}`"),
                 None => r.to_string(),
             },
             other => other.to_string(),
@@ -425,6 +455,23 @@ impl CubeExecutor {
             .collect()
     }
 
+    /// The first relation in `labels` that a rule of `scc` reads.
+    fn reads_any(&self, scc: &Scc<'_>, labels: &BTreeSet<Label>) -> Option<Label> {
+        let mut hit = None;
+        for (_, body) in &scc.rules {
+            body.visit_referenced_relations(&mut |rel| {
+                if hit.is_none() {
+                    hit = self
+                        .labels
+                        .get(&rel)
+                        .copied()
+                        .filter(|l| labels.contains(l));
+                }
+            });
+        }
+        hit
+    }
+
     /// Every rule of a non-recursive SCC, once.
     fn plain_scc(
         &self,
@@ -449,11 +496,13 @@ impl CubeExecutor {
         store: &mut Store,
         outer: &HashMap<Label, u32>,
         scc: &Scc<'_>,
+        put: &BTreeMap<Label, Rows>,
         rounds: &mut usize,
     ) -> Result<BTreeMap<Label, Rows>, Refusal> {
-        // Rules reading no SCC member seed the first delta; the others are
-        // recursive, with the positions of their SCC atoms.
-        let mut delta: BTreeMap<Label, Rows> = BTreeMap::new();
+        // Rows put for a member, and rules reading no SCC member, seed the
+        // first delta; the others are recursive, with the positions of their
+        // SCC atoms.
+        let mut delta: BTreeMap<Label, Rows> = put.clone();
         let mut recursive: Vec<(Label, &RirNode, Vec<usize>)> = Vec::new();
         for (head, body) in &scc.rules {
             let atoms = atoms(body)?
