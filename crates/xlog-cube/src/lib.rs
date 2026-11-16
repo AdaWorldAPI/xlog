@@ -48,6 +48,12 @@
 //!   `Scan(rel)` or `Filter { Scan(rel), col == const }` on the side's free
 //!   column.
 //!
+//! One-column relations given with [`CubeExecutor::put_set`] are cube sets.
+//! Two SCC shapes over them are routed to cube set expressions before the
+//! paths above (the `sets` module; [`Report::routed`] names the path): a
+//! non-recursive SCC of one-column set bodies, and a recursive SCC with one
+//! one-column member whose single step is `h(Y) :- h(X), e(X, Y), f(Y)`.
+//!
 //! Every other body is refused and recorded in [`Report::refused`] with its
 //! reason. A refused rule refuses its whole SCC: a head is never handed back
 //! with only some of its rules applied.
@@ -58,12 +64,14 @@ use std::fmt;
 use lance_graph_contract::codebook::Codebook;
 use lance_graph_dt64::dr::{LocalMap, MapTable, Width};
 use lance_graph_dt64::AlgebraRef;
-use lance_graph_xlog::cube::{Cube, CubeRefusal, CubeStats, View};
+use lance_graph_xlog::cube::{Cube, CubeRefusal, CubeStats, SetExpr, View};
 use lance_graph_xlog::lens::word_of;
 use xlog_core::RelId;
 use xlog_ir::{
     CompareOp, CompiledRule, ConstValue, ExecutionPlan, Expr, JoinType, ProjectExpr, RirNode,
 };
+
+mod sets;
 
 /// The one tile the probe uses.
 const TILE: u32 = 0;
@@ -79,6 +87,10 @@ pub struct Report {
     pub rounds: usize,
     /// The cube's counters after the plan.
     pub stats: CubeStats,
+    /// Heads evaluated as set expressions on the cube instead of rows:
+    /// `(head, "set" | "reach")` (D-XLOG-W5-C). Every routed head is also in
+    /// `ran`.
+    pub routed: Vec<(String, String)>,
 }
 
 /// Why a rule was not run on the cube.
@@ -161,6 +173,10 @@ pub struct CubeExecutor {
     /// XLOG's `RelId` -> name pairing, as registered. Read only at intake.
     registered: HashMap<RelId, String>,
     base: BTreeMap<String, Vec<(u32, u32)>>,
+    /// One-column relations given ids ([`Self::put_set`]).
+    sets: BTreeMap<String, Vec<u32>>,
+    /// Registered one-column relations nobody supplied: empty, at intake.
+    empty_sets: BTreeSet<String>,
     /// The program's data relations, interned at intake.
     vocab: Codebook,
     /// `RelId` -> codebook label, for the relations that are data.
@@ -236,6 +252,13 @@ impl CubeExecutor {
         self.base.insert(name.to_string(), rows.to_vec());
     }
 
+    /// A one-column `u32` relation, given as its ids. It is stored in the
+    /// cube as a set, and the rules reading it are routed as set expressions
+    /// when their shape allows (see the `sets` module).
+    pub fn put_set(&mut self, name: &str, ids: &[u32]) {
+        self.sets.insert(name.to_string(), ids.to_vec());
+    }
+
     /// The codebook label of a data relation, after [`Self::execute_plan`]
     /// interned it. `None` for a name that is not data, which includes the
     /// behaviour words of the XLOG lens.
@@ -248,6 +271,10 @@ impl CubeExecutor {
     pub fn relation(&self, name: &str) -> Option<Vec<Vec<u32>>> {
         if let Some(rows) = self.vocab.index_of(name).and_then(|l| self.out.get(&l)) {
             return Some(rows.iter().cloned().collect());
+        }
+        if let Some(ids) = self.sets.get(name) {
+            let rows: BTreeSet<Vec<u32>> = ids.iter().map(|&i| vec![i]).collect();
+            return Some(rows.into_iter().collect());
         }
         self.base
             .get(name)
@@ -270,6 +297,7 @@ impl CubeExecutor {
         let mut ids: Vec<u64> = rels
             .iter()
             .flat_map(|r| r.iter().flat_map(|&(a, b)| [u64::from(a), u64::from(b)]))
+            .chain(self.sets.values().flatten().map(|&i| u64::from(i)))
             .collect();
         ids.sort_unstable();
         ids.dedup();
@@ -286,6 +314,25 @@ impl CubeExecutor {
                 .map(|(i, (_, r))| (i as u32, pairs_to_rows(r)))
                 .collect(),
         };
+        // One-column relations: stored sets, and the expressions of the
+        // heads routed so far.
+        let mut exprs: HashMap<Label, SetExpr> = HashMap::new();
+        let no_ids: Vec<u32> = Vec::new();
+        for (name, ids) in self
+            .sets
+            .iter()
+            .chain(self.empty_sets.iter().map(|n| (n, &no_ids)))
+        {
+            if let Some(l) = self.vocab.index_of(name) {
+                let id = store
+                    .cube
+                    .add_set(&store.table, ids)
+                    .map_err(PlanRefusal::Cube)?;
+                exprs.insert(l, SetExpr::Set(id));
+            }
+        }
+        let arity = |rel: RelId| plan.rel_arities.get(&rel).copied();
+        let mut routed: Vec<(Label, sets::Route)> = Vec::new();
         let mut current: HashMap<Label, u32> = base
             .iter()
             .enumerate()
@@ -315,9 +362,36 @@ impl CubeExecutor {
                 .collect();
             let outcome = if let Some(l) = self.reads_any(scc, &refused_heads) {
                 Err(Refusal::ReadsRefused(l))
+            } else if let Some((route, heads)) = self.route(scc, &exprs, &current, &arity) {
+                // Download each head's answer; keep its expression, not the
+                // mask, for later readers.
+                let mut out = BTreeMap::new();
+                let mut failed = None;
+                for (h, e) in heads {
+                    match store.cube.set_mask(&store.table, &e) {
+                        Ok(mask) => {
+                            out.insert(h, mask_rows(&store, &mask));
+                            exprs.insert(h, e);
+                            routed.push((h, route));
+                        }
+                        Err(e) => failed = Some(Refusal::Cube(e)),
+                    }
+                }
+                match failed {
+                    Some(r) => Err(r),
+                    None => Ok(out),
+                }
             } else if scc.recursive {
+                // Not routed: a member's stored facts are not its whole
+                // answer, so no later rule may read them as the head.
+                for m in &scc.members {
+                    exprs.remove(m);
+                }
                 self.recursive_scc(&mut store, &current, scc, &put, &mut rounds)
             } else {
+                for m in &scc.members {
+                    exprs.remove(m);
+                }
                 self.plain_scc(&mut store, &current, scc).map(|mut heads| {
                     for (m, rows) in &put {
                         heads.entry(*m).or_default().extend(rows.iter().cloned());
@@ -353,6 +427,10 @@ impl CubeExecutor {
                 .collect(),
             rounds,
             stats: store.cube.stats(),
+            routed: routed
+                .iter()
+                .map(|(h, r)| (name(h), r.name().to_string()))
+                .collect(),
         })
     }
 
@@ -397,11 +475,30 @@ impl CubeExecutor {
         let names = self
             .base
             .keys()
+            .chain(self.sets.keys())
             .chain(registered.iter().map(|(_, n)| *n))
             .chain(heads);
         for name in names {
             vocab.intern(name).ok_or(PlanRefusal::Vocabulary)?;
         }
+        // A derived head never gets an empty stand-in: a reader would read
+        // it instead of the head's rows.
+        let derived: BTreeSet<&String> = plan
+            .rules_by_scc
+            .iter()
+            .flatten()
+            .map(|r| &r.head)
+            .collect();
+        self.empty_sets = registered
+            .iter()
+            .filter(|(rel, name)| {
+                plan.rel_arities.get(*rel) == Some(&1)
+                    && !derived.contains(name)
+                    && !self.sets.contains_key(*name)
+                    && !self.base.contains_key(*name)
+            })
+            .map(|(_, name)| (*name).clone())
+            .collect();
         self.empty = registered
             .iter()
             .filter(|(rel, name)| {
@@ -1054,6 +1151,19 @@ fn eq_const(predicate: &Expr) -> Result<(usize, u32), Refusal> {
         }
         _ => Err(Refusal::Filter),
     }
+}
+
+/// A set head's rows: one `[id]` per position of `mask`.
+fn mask_rows(store: &Store, mask: &[u64]) -> Rows {
+    let Ok(map) = store.table.map(&store.table.seal(), TILE) else {
+        return Rows::new();
+    };
+    map.globals()
+        .iter()
+        .enumerate()
+        .filter(|(p, _)| mask.get(p / 64).is_some_and(|w| w >> (p % 64) & 1 == 1))
+        .map(|(_, &g)| vec![g as u32])
+        .collect()
 }
 
 fn lookup(ids: &HashMap<Label, u32>, l: Label) -> Result<u32, Refusal> {
