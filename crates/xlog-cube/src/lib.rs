@@ -48,6 +48,12 @@
 //!   `Scan(rel)` or `Filter { Scan(rel), col == const }` on the side's free
 //!   column.
 //!
+//! One-column relations given with [`CubeExecutor::put_set`] are cube sets.
+//! Two SCC shapes over them are routed to cube set expressions before the
+//! paths above (the `sets` module; [`Report::routed`] names the path): a
+//! non-recursive SCC of one-column set bodies, and a recursive SCC with one
+//! one-column member whose single step is `h(Y) :- h(X), e(X, Y), f(Y)`.
+//!
 //! Every other body is refused and recorded in [`Report::refused`] with its
 //! reason. A refused rule refuses its whole SCC: a head is never handed back
 //! with only some of its rules applied.
