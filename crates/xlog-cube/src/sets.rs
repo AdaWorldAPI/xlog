@@ -14,6 +14,16 @@
 //!   cube and at least one `f` is a set: `Reach { e, seed: or(base),
 //!   target: and(f) }`.
 //!
+//! A non-recursive SCC whose rules do not have the Set shape is also routed
+//! when every rule body is a **one-column set term** (EXO-394): a one-column
+//! scan, a column of a binary relation in the cube (`h(X) :- r(_, X).` is
+//! `Project(Scan r, [1])`, a `SetExpr::Column`), a `Diff` of two terms (XLOG's
+//! lowering of `not`), or a semi-join of two terms on column 0. So
+//! `no_in(X) :- node(X), not has_in(X).` is `node ∧ ¬col(edge, 1)` in one
+//! terminal. Binary differences (`keep(X, Y) :- pair(X, Y), not
+//! blocked(X, Y).`) and nullary heads are not one-column terms and keep the
+//! existing paths.
+//!
 //! A head read later is composed from its expression, so `rollback(X) :-
 //! replay(X), blocked(X).` evaluates `Reach(..) ∧ blocked` inside one
 //! terminal. The rows a head reports are downloaded from
@@ -133,6 +143,55 @@ fn conj(body: &RirNode, arity: &dyn Fn(RelId) -> Option<usize>) -> Option<Conj> 
     })
 }
 
+/// The set expression of a body whose result has exactly one column, or
+/// `None`. Leaves: a one-column relation with an expression (a stored set or
+/// a routed head), or column `c` of a binary relation the cube holds.
+/// Members of the SCC are never read: their expressions are not built yet.
+fn set_term(
+    node: &RirNode,
+    labels: &HashMap<RelId, Label>,
+    exprs: &HashMap<Label, SetExpr>,
+    current: &HashMap<Label, u32>,
+    members: &[Label],
+    arity: &dyn Fn(RelId) -> Option<usize>,
+) -> Option<SetExpr> {
+    let leaf = |rel: &RelId| -> Option<Label> {
+        let l = *labels.get(rel)?;
+        (!members.contains(&l)).then_some(l)
+    };
+    let go = |n: &RirNode| set_term(n, labels, exprs, current, members, arity);
+    match node {
+        RirNode::ChainJoin { fallback, .. } | RirNode::MultiWayJoin { fallback, .. } => {
+            go(fallback.as_ref())
+        }
+        RirNode::Scan { rel } if arity(*rel)? == 1 => exprs.get(&leaf(rel)?).cloned(),
+        RirNode::Project { input, columns } => {
+            let [ProjectExpr::Column(c)] = columns.as_slice() else {
+                return None;
+            };
+            match input.as_ref() {
+                RirNode::Scan { rel } if arity(*rel)? == 2 && *c < 2 => {
+                    let id = *current.get(&leaf(rel)?)?;
+                    Some(SetExpr::column(id, *c as u8))
+                }
+                other if *c == 0 => go(other),
+                _ => None,
+            }
+        }
+        RirNode::Diff { left, right } => Some(SetExpr::and_not(go(left)?, go(right)?)),
+        RirNode::Join {
+            left,
+            right,
+            left_keys,
+            right_keys,
+            join_type: JoinType::Semi,
+        } if left_keys.as_slice() == [0] && right_keys.as_slice() == [0] => {
+            Some(SetExpr::and(go(left)?, go(right)?))
+        }
+        _ => None,
+    }
+}
+
 fn or_all(mut es: Vec<SetExpr>) -> Option<SetExpr> {
     let first = es.pop()?;
     Some(es.into_iter().fold(first, |acc, e| SetExpr::or(e, acc)))
@@ -182,11 +241,10 @@ impl CubeExecutor {
         if !scc.recursive {
             let mut per_head: BTreeMap<Label, Vec<SetExpr>> = BTreeMap::new();
             for (head, body) in &scc.rules {
-                let c = conj(body, arity)?;
-                per_head
-                    .entry(*head)
-                    .or_default()
-                    .push(self.set_body(&c, exprs, &members, arity)?);
+                let e = conj(body, arity)
+                    .and_then(|c| self.set_body(&c, exprs, &members, arity))
+                    .or_else(|| set_term(body, &self.labels, exprs, current, &members, arity))?;
+                per_head.entry(*head).or_default().push(e);
             }
             let out = per_head
                 .into_iter()
