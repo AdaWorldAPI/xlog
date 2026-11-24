@@ -215,6 +215,10 @@ struct Store {
     cube: Cube,
     table: MapTable,
     rows: HashMap<u32, Rows>,
+    /// Derived heads whose arity is not 2, by label. The cube holds binary
+    /// relations only, so these are never cube relations: a single-relation
+    /// projection may read them, and every other body still refuses them.
+    wide: HashMap<Label, Rows>,
 }
 
 impl Store {
@@ -313,6 +317,7 @@ impl CubeExecutor {
                 .enumerate()
                 .map(|(i, (_, r))| (i as u32, pairs_to_rows(r)))
                 .collect(),
+            wide: HashMap::new(),
         };
         // One-column relations: stored sets, and the expressions of the
         // heads routed so far.
@@ -405,6 +410,8 @@ impl CubeExecutor {
                     for (head, rows) in heads {
                         if let Some(id) = store.add(&rows).map_err(PlanRefusal::Cube)? {
                             current.insert(head, id);
+                        } else {
+                            store.wide.insert(head, rows.clone());
                         }
                         produced.insert(head, rows);
                     }
@@ -682,16 +689,55 @@ impl CubeExecutor {
         }
         match body {
             RirNode::Scan { .. } | RirNode::Filter { .. } => self.single(store, resolve, body),
+            // `X != Z` (or `X = Z`) over a join: filter the join's rows, then
+            // project. Only a column-against-column equality or inequality;
+            // an ordering comparison is refused below.
+            RirNode::Project { input, columns } if join_compare(input).is_some() => {
+                let Some((join, (a, eq, b))) = join_compare(input) else {
+                    unreachable!("guard checked join_compare");
+                };
+                let RirNode::Join {
+                    left,
+                    right,
+                    left_keys,
+                    right_keys,
+                    ..
+                } = join
+                else {
+                    unreachable!("join_compare returns a join");
+                };
+                let all: Vec<ProjectExpr> = (0..4).map(ProjectExpr::Column).collect();
+                let joined = self.join(
+                    store,
+                    resolve,
+                    (left, left_keys[0]),
+                    (right, right_keys[0]),
+                    &all,
+                )?;
+                let cols = columns
+                    .iter()
+                    .map(|c| match c {
+                        ProjectExpr::Column(i) if *i < 4 => Ok(*i),
+                        _ => Err(Refusal::OutputColumn),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(joined
+                    .into_iter()
+                    .filter(|row| (row[a] == row[b]) == eq)
+                    .map(|row| cols.iter().map(|&i| row[i]).collect())
+                    .collect())
+            }
             RirNode::Project { input, columns }
                 if matches!(
                     input.as_ref(),
                     RirNode::Scan { .. } | RirNode::Filter { .. }
                 ) =>
             {
+                let width = self.width(store, input)?;
                 let cols = columns
                     .iter()
                     .map(|c| match c {
-                        ProjectExpr::Column(i) if *i < 2 => Ok(*i),
+                        ProjectExpr::Column(i) if *i < width => Ok(*i),
                         _ => Err(Refusal::OutputColumn),
                     })
                     .collect::<Result<Vec<_>, _>>()?;
@@ -763,12 +809,33 @@ impl CubeExecutor {
         if !keep.in_binary() {
             return Err(Refusal::FilterColumn);
         }
-        let id = resolve(self.label(rel)?, 0)?;
-        Ok(store.rows[&id]
-            .iter()
-            .filter(|row| keep.holds(row))
-            .cloned()
-            .collect())
+        let l = self.label(rel)?;
+        let rows = match resolve(l, 0) {
+            Ok(id) => &store.rows[&id],
+            // A wide derived head is not a cube relation; its rows are.
+            Err(Refusal::NotBinary(_)) if store.wide.contains_key(&l) => &store.wide[&l],
+            Err(e) => return Err(e),
+        };
+        Ok(rows.iter().filter(|row| keep.holds(row)).cloned().collect())
+    }
+
+    /// The column count of a single-relation body: the arity of a wide
+    /// derived head, else 2.
+    fn width(&self, store: &Store, node: &RirNode) -> Result<usize, Refusal> {
+        let rel = match node {
+            RirNode::Scan { rel } => *rel,
+            RirNode::Filter { input, .. } => match input.as_ref() {
+                RirNode::Scan { rel } => *rel,
+                other => return Err(Refusal::FilterOver(kind(other))),
+            },
+            other => return Err(Refusal::Body(kind(other))),
+        };
+        let l = self.label(rel)?;
+        Ok(store
+            .wide
+            .get(&l)
+            .and_then(|rows| rows.iter().next())
+            .map_or(2, Vec::len))
     }
 
     /// A multi-way conjunctive join, evaluated as generic join over the
@@ -1120,6 +1187,39 @@ impl Keep {
 
 /// `Column(a) == Column(b)`, the filter a repeated variable compiles to.
 /// Both columns hold ids of the same relation, so equality needs no typing.
+/// `Filter{Join, column op column}` with one inner join key per side and
+/// `op` equality or inequality: the join and `(a, eq, b)`, where `eq` is true
+/// for `=` and false for `!=`.
+fn join_compare(node: &RirNode) -> Option<(&RirNode, (usize, bool, usize))> {
+    let RirNode::Filter { input, predicate } = node else {
+        return None;
+    };
+    let RirNode::Join {
+        left_keys,
+        right_keys,
+        join_type: JoinType::Inner,
+        ..
+    } = input.as_ref()
+    else {
+        return None;
+    };
+    if left_keys.len() != 1 || right_keys.len() != 1 {
+        return None;
+    }
+    let Expr::Compare { left, op, right } = predicate else {
+        return None;
+    };
+    let eq = match op {
+        CompareOp::Eq => true,
+        CompareOp::Ne => false,
+        _ => return None,
+    };
+    match (left.as_ref(), right.as_ref()) {
+        (Expr::Column(a), Expr::Column(b)) if *a < 4 && *b < 4 => Some((input, (*a, eq, *b))),
+        _ => None,
+    }
+}
+
 fn eq_cols(predicate: &Expr) -> Option<(usize, usize)> {
     match predicate {
         Expr::Compare {
