@@ -168,3 +168,30 @@ fn a_recursive_reader_reads_the_derived_head_as_a_relation() {
         .map(|(_, w)| w.as_str());
     assert_eq!(why, Some("read by a recursive SCC"), "{:?}", rep.reingested);
 }
+
+/// What the demand fixture builds, measured from the cube's own counters.
+/// `r` reads `q` through its recipe, so no derived relation is added to the
+/// cube. `q`'s own three rows are built, by the join path, because every head
+/// is downloaded; `r` adds none: the program without `r` builds the same.
+#[test]
+fn the_composed_reader_adds_no_relation_and_builds_no_rows() {
+    let src = r#"
+        pred e(u32, u32).
+        pred q(u32, u32).
+        pred r(u32, u32).
+        q(X, Z) :- e(X, Y), e(Y, Z).
+        r(X, W) :- q(X, Z), e(Z, W).
+    "#;
+    let e: &[(u32, u32)] = &[(1, 2), (2, 3), (3, 4), (4, 5)];
+    let (_, rep) = run(src, &[("e", e)]);
+    assert_eq!(rep.stats.relations_added, 0, "{:?}", rep.stats);
+    assert_eq!(rep.stats.rows_materialized, 3, "q's rows: {:?}", rep.stats);
+    assert_eq!(rep.recipes, vec!["q".to_string(), "r".to_string()]);
+    let without_r = r#"
+        pred e(u32, u32).
+        pred q(u32, u32).
+        q(X, Z) :- e(X, Y), e(Y, Z).
+    "#;
+    let (_, base) = run(without_r, &[("e", e)]);
+    assert_eq!(base.stats.rows_materialized, rep.stats.rows_materialized);
+}
