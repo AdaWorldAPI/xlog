@@ -196,14 +196,16 @@ fn stored_facts_join_a_routed_head() {
     assert_eq!(routed(&report), [("p", "set")]);
 }
 
-/// A one-column head the old path produces (here from a binary relation) is
-/// not a set, so a reader of it is not routed: it is refused, never answered
-/// from facts stored for that head alone.
+/// A one-column head the old path produces (here a projection of a binary
+/// join) is not a set, so a reader of it is not routed: it is refused, never
+/// answered from facts stored for that head alone. (Before EXO-394 this test
+/// used `h(X) :- r(X, Y).`, which is now a column leaf and routed; see
+/// `a_column_head_keeps_its_stored_facts`.)
 #[test]
 fn a_reader_of_an_unrouted_head_is_not_routed() {
     let src = r#"
         pred r(u32, u32). pred s(u32). pred h(u32). pred g(u32).
-        h(X) :- r(X, Y).
+        h(X) :- r(X, Y), r(Y, Z).
         g(X) :- h(X), s(X).
     "#;
     let (ex, report) = run(
@@ -254,4 +256,25 @@ fn other_recursive_shapes_are_not_routed() {
             report.routed
         );
     }
+}
+
+/// EXO-394: `h(X) :- r(X, Y).` is a column leaf, so `h` is routed, and the
+/// facts a host stored for `h` stay part of its answer: h = col(r, 0) ∪ {9}.
+#[test]
+fn a_column_head_keeps_its_stored_facts() {
+    let src = r#"
+        pred r(u32, u32). pred s(u32). pred h(u32). pred g(u32).
+        h(X) :- r(X, Y).
+        g(X) :- h(X), s(X).
+    "#;
+    let (ex, report) = run(
+        src,
+        Input {
+            sets: &[("s", &[1, 9]), ("h", &[9])],
+            pairs: &[("r", &[(1, 2)])],
+        },
+    );
+    assert_eq!(rows(&ex, "h"), ones(&[1, 9]));
+    assert_eq!(rows(&ex, "g"), ones(&[1, 9]));
+    assert!(report.refused.is_empty(), "{:?}", report.refused);
 }
