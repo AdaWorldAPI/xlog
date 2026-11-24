@@ -313,3 +313,26 @@ fn an_empty_domain_projects_to_nothing() {
     assert!(rows(&ex, "fof").is_empty());
     assert!(!refused(&r, "fof"), "{:?}", r.refused);
 }
+
+/// A wide head with two rules has two recipes; reading two of its columns
+/// ORs both projections.
+#[test]
+fn two_recipes_of_one_wide_head_are_ored() {
+    let src = r#"
+        pred a(u32, u32).
+        pred b(u32, u32).
+        pred w(u32, u32, u32).
+        pred h(u32, u32).
+        w(A, B, C) :- a(A, B), b(B, C).
+        w(A, B, C) :- b(A, B), a(B, C).
+        h(A, C) :- w(A, B, C).
+    "#;
+    let a: &[(u32, u32)] = &[(1, 2), (3, 4)];
+    let b: &[(u32, u32)] = &[(2, 5), (4, 1)];
+    let (ex, r) = run(src, &[], &[("a", a), ("b", b)]);
+    // Rule 1, a(A,B) b(B,C): (1,2,5) (3,4,1).
+    // Rule 2, b(A,B) a(B,C): b(4,1) a(1,2) -> (4,1,2); b(2,5) has no a(5,_).
+    // h = (A,C): (1,5) (3,1) from rule 1, (4,2) from rule 2.
+    assert_eq!(rows(&ex, "h"), set(&[[1, 5], [3, 1], [4, 2]]));
+    assert!(!refused(&r, "h"), "{:?}", r.refused);
+}

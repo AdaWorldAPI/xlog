@@ -77,7 +77,9 @@ use std::fmt;
 use lance_graph_contract::codebook::Codebook;
 use lance_graph_dt64::dr::{LocalMap, MapTable, Width};
 use lance_graph_dt64::AlgebraRef;
-use lance_graph_xlog::cube::{Atom, BodyRefusal, Cube, CubeRefusal, CubeStats, SetExpr, View};
+use lance_graph_xlog::cube::{
+    Atom, BodyRefusal, Cube, CubeRefusal, CubeStats, PairAnswer, SetExpr, View,
+};
 use lance_graph_xlog::lens::word_of;
 use xlog_core::RelId;
 use xlog_ir::{
@@ -1016,7 +1018,7 @@ impl CubeExecutor {
     /// project witnesses, and is refused.
     fn run_recipe(store: &Store, r: &Recipe) -> Result<Vec<Vec<u32>>, Refusal> {
         if let [u, v] = r.head[..] {
-            return Self::pairs(store, r, [u, v]);
+            return Self::decode(store, &Self::answer(store, r, [u, v])?);
         }
         let mut seen = vec![false; r.k];
         for &x in &r.head {
@@ -1038,14 +1040,19 @@ impl CubeExecutor {
         Ok(rows.into_iter().collect())
     }
 
-    /// The demanded projection `(u, v)` of a recipe, decoded at the edge.
-    fn pairs(store: &Store, r: &Recipe, demand: [u8; 2]) -> Result<Vec<Vec<u32>>, Refusal> {
-        let ans = store
+    /// The demanded projection `(u, v)` of a recipe, as presence over the
+    /// cube's positions.
+    fn answer(store: &Store, r: &Recipe, demand: [u8; 2]) -> Result<PairAnswer, Refusal> {
+        store
             .cube
             .body_pair(&store.table, &r.atoms, r.k, &r.distinct, demand)
-            .map_err(Refusal::CubeBody)?;
+            .map_err(Refusal::CubeBody)
+    }
+
+    /// A projection's pairs as rows: the head's download, decoded once.
+    fn decode(store: &Store, ans: &PairAnswer) -> Result<Vec<Vec<u32>>, Refusal> {
         // An empty domain has no positions and zero words per row.
-        if ans.words == 0 {
+        if ans.words() == 0 {
             return Ok(Vec::new());
         }
         let map = store
@@ -1053,8 +1060,8 @@ impl CubeExecutor {
             .map(&store.table.seal(), TILE)
             .map_err(|e| Refusal::Cube(CubeRefusal::Map(e)))?;
         let g = map.globals();
-        let mut out = Vec::with_capacity(ans.pairs as usize);
-        for (x, row) in ans.rows.chunks(ans.words).enumerate() {
+        let mut out = Vec::with_capacity(ans.pairs() as usize);
+        for (x, row) in ans.rows().chunks(ans.words()).enumerate() {
             for (wi, &word) in row.iter().enumerate() {
                 let mut bits = word;
                 while bits != 0 {
@@ -1068,7 +1075,8 @@ impl CubeExecutor {
     }
 
     /// Two columns of a wide relation: the OR of the demanded projection of
-    /// each of its recipes. The wide relation's rows are never read.
+    /// each of its recipes, taken on the planes (`PairAnswer::or_assign`) and
+    /// decoded once. The wide relation's rows are never read.
     fn unfold(
         &self,
         store: &Store,
@@ -1081,14 +1089,21 @@ impl CubeExecutor {
         let [ProjectExpr::Column(a), ProjectExpr::Column(b)] = columns else {
             return Err(Refusal::OutputColumn);
         };
-        let mut out = Rows::new();
+        let mut acc: Option<PairAnswer> = None;
         for r in recipes {
             let (Some(&u), Some(&v)) = (r.head.get(*a), r.head.get(*b)) else {
                 return Err(Refusal::OutputColumn);
             };
-            out.extend(Self::pairs(store, r, [u, v])?);
+            let ans = Self::answer(store, r, [u, v])?;
+            match acc.as_mut() {
+                None => acc = Some(ans),
+                Some(acc) => acc.or_assign(&ans).map_err(Refusal::CubeBody)?,
+            }
         }
-        Ok(out.into_iter().collect())
+        match acc {
+            Some(ans) => Self::decode(store, &ans),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// The head arity a body projects, when the body says it.
