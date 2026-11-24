@@ -64,7 +64,7 @@ use std::fmt;
 use lance_graph_contract::codebook::Codebook;
 use lance_graph_dt64::dr::{LocalMap, MapTable, Width};
 use lance_graph_dt64::AlgebraRef;
-use lance_graph_xlog::cube::{Cube, CubeRefusal, CubeStats, SetExpr, View};
+use lance_graph_xlog::cube::{Atom, BodyRefusal, Cube, CubeRefusal, CubeStats, SetExpr, View};
 use lance_graph_xlog::lens::word_of;
 use xlog_core::RelId;
 use xlog_ir::{
@@ -130,6 +130,16 @@ pub enum Refusal {
     /// The rule reads a relation whose own rules were refused: it would read
     /// an empty stand-in, not that relation.
     ReadsRefused(Label),
+    /// A filter other than `col != col` over a join.
+    JoinFilter,
+    /// A wide head keeping only some of its body's variables: its answer
+    /// would be a projection of witnesses, which is not built.
+    Existential,
+    /// A wide relation read without a recipe: one of its rules did not
+    /// flatten to a conjunctive body.
+    NoRecipe(Label),
+    /// The cube refused the body.
+    CubeBody(BodyRefusal),
 }
 
 impl fmt::Display for Refusal {
@@ -151,6 +161,10 @@ impl fmt::Display for Refusal {
             Refusal::Behaviour(w) => write!(f, "XLOG word {:#010x}/{}", w.lens, w.word),
             Refusal::Cube(e) => write!(f, "cube: {e:?}"),
             Refusal::ReadsRefused(l) => write!(f, "reads refused relation (label {l})"),
+            Refusal::JoinFilter => write!(f, "filter over a join other than `col != col`"),
+            Refusal::Existential => write!(f, "wide head keeping only some body variables"),
+            Refusal::NoRecipe(l) => write!(f, "wide relation (label {l}) has no recipe"),
+            Refusal::CubeBody(e) => write!(f, "cube body: {e:?}"),
         }
     }
 }
@@ -215,6 +229,20 @@ struct Store {
     cube: Cube,
     table: MapTable,
     rows: HashMap<u32, Rows>,
+    /// Wide heads kept as recipes: one per rule. A reader projecting two
+    /// columns of a wide head runs the recipes, never its rows. A head with
+    /// a rule that did not flatten maps to `None`.
+    recipes: HashMap<Label, Option<Vec<Recipe>>>,
+}
+
+/// A conjunctive body over cube relations: atoms, the variable count, the
+/// distinctness pairs, and the variable each head column reads.
+#[derive(Clone)]
+struct Recipe {
+    atoms: Vec<Atom>,
+    k: usize,
+    distinct: Vec<[u8; 2]>,
+    head: Vec<u8>,
 }
 
 impl Store {
@@ -313,6 +341,7 @@ impl CubeExecutor {
                 .enumerate()
                 .map(|(i, (_, r))| (i as u32, pairs_to_rows(r)))
                 .collect(),
+            recipes: HashMap::new(),
         };
         // One-column relations: stored sets, and the expressions of the
         // heads routed so far.
@@ -578,10 +607,22 @@ impl CubeExecutor {
     ) -> Result<BTreeMap<Label, Rows>, Refusal> {
         let resolve = |l: Label, _: usize| lookup(current, l);
         let mut heads: BTreeMap<Label, Rows> = BTreeMap::new();
+        let mut recipes: HashMap<Label, Option<Vec<Recipe>>> = HashMap::new();
         for (head, body) in &scc.rules {
             let rows = self.rule(store, &resolve, body)?;
+            let wide = rows.first().is_some_and(|r| r.len() > 2)
+                || self.body_width(body).is_some_and(|w| w > 2);
+            if wide {
+                let recipe = self.recipe(&resolve, body).ok();
+                let slot = recipes.entry(*head).or_insert_with(|| Some(Vec::new()));
+                match (slot.as_mut(), recipe) {
+                    (Some(list), Some(r)) => list.push(r),
+                    _ => *slot = None,
+                }
+            }
             heads.entry(*head).or_default().extend(rows);
         }
+        store.recipes.extend(recipes);
         Ok(heads)
     }
 
@@ -682,6 +723,24 @@ impl CubeExecutor {
         }
         match body {
             RirNode::Scan { .. } | RirNode::Filter { .. } => self.single(store, resolve, body),
+            // Two columns of a wide relation: run its recipes (EXO-396).
+            RirNode::Project { input, columns }
+                if matches!(input.as_ref(), RirNode::Scan { rel }
+                    if self.label(*rel).is_ok_and(|l| store.recipes.contains_key(&l))) =>
+            {
+                let RirNode::Scan { rel } = input.as_ref() else {
+                    unreachable!("matched above")
+                };
+                self.unfold(store, self.label(*rel)?, columns)
+            }
+            // A join under `col != col`: one recipe, run where it stands.
+            RirNode::Project { input, .. }
+                if matches!(input.as_ref(), RirNode::Filter { input, .. }
+                    if matches!(input.as_ref(), RirNode::Join { .. })) =>
+            {
+                let recipe = self.recipe(resolve, body)?;
+                Self::run_recipe(store, &recipe)
+            }
             RirNode::Project { input, columns }
                 if matches!(
                     input.as_ref(),
@@ -910,6 +969,193 @@ impl CubeExecutor {
     }
 }
 
+impl CubeExecutor {
+    /// A conjunctive body as a recipe over cube relations: atoms in leaf
+    /// order (so `resolve` sees the same positions as [`atoms`]), the
+    /// variables, the distinctness pairs, and the head's variables.
+    fn recipe(&self, resolve: &Resolve<'_>, body: &RirNode) -> Result<Recipe, Refusal> {
+        let (leaves, class, distinct, columns) = flatten_body(body)?;
+        let var = |c: usize| u8::try_from(class[c]).map_err(|_| Refusal::OutputColumn);
+        let atoms = leaves
+            .iter()
+            .enumerate()
+            .map(|(i, rel)| {
+                Ok(Atom {
+                    rel: resolve(self.label(*rel)?, i)?,
+                    vars: [var(2 * i)?, var(2 * i + 1)?],
+                })
+            })
+            .collect::<Result<Vec<_>, Refusal>>()?;
+        Ok(Recipe {
+            atoms,
+            k: class.iter().copied().max().map_or(0, |m| m + 1),
+            distinct: distinct
+                .iter()
+                .map(|&(a, b)| Ok([var(a)?, var(b)?]))
+                .collect::<Result<_, Refusal>>()?,
+            head: columns.iter().map(|&c| var(c)).collect::<Result<_, _>>()?,
+        })
+    }
+
+    /// A recipe's head rows, built here because the head is downloaded: a
+    /// two-column head is the demanded projection ([`Cube::body_pair`]); a
+    /// head keeping every variable is the witnesses. Anything else would
+    /// project witnesses, and is refused.
+    fn run_recipe(store: &Store, r: &Recipe) -> Result<Vec<Vec<u32>>, Refusal> {
+        if let [u, v] = r.head[..] {
+            return Self::pairs(store, r, [u, v]);
+        }
+        let mut seen = vec![false; r.k];
+        for &x in &r.head {
+            if std::mem::replace(&mut seen[usize::from(x)], true) {
+                return Err(Refusal::Existential);
+            }
+        }
+        if seen.contains(&false) {
+            return Err(Refusal::Existential);
+        }
+        let flat = store
+            .cube
+            .materialize_distinct_witnesses(&store.table, &r.atoms, r.k, &r.distinct)
+            .map_err(Refusal::CubeBody)?;
+        let rows: Rows = flat
+            .chunks(r.k)
+            .map(|w| r.head.iter().map(|&x| w[usize::from(x)] as u32).collect())
+            .collect();
+        Ok(rows.into_iter().collect())
+    }
+
+    /// The demanded projection `(u, v)` of a recipe, decoded at the edge.
+    fn pairs(store: &Store, r: &Recipe, demand: [u8; 2]) -> Result<Vec<Vec<u32>>, Refusal> {
+        let ans = store
+            .cube
+            .body_pair(&store.table, &r.atoms, r.k, &r.distinct, demand)
+            .map_err(Refusal::CubeBody)?;
+        let map = store
+            .table
+            .map(&store.table.seal(), TILE)
+            .map_err(|e| Refusal::Cube(CubeRefusal::Map(e)))?;
+        let g = map.globals();
+        let mut out = Vec::with_capacity(ans.pairs as usize);
+        for (x, row) in ans.rows.chunks(ans.words).enumerate() {
+            for (wi, &word) in row.iter().enumerate() {
+                let mut bits = word;
+                while bits != 0 {
+                    let y = wi * 64 + bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    out.push(vec![g[x] as u32, g[y] as u32]);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Two columns of a wide relation: the OR of the demanded projection of
+    /// each of its recipes. The wide relation's rows are never read.
+    fn unfold(
+        &self,
+        store: &Store,
+        wide: Label,
+        columns: &[ProjectExpr],
+    ) -> Result<Vec<Vec<u32>>, Refusal> {
+        let Some(recipes) = store.recipes.get(&wide).and_then(Option::as_ref) else {
+            return Err(Refusal::NoRecipe(wide));
+        };
+        let [ProjectExpr::Column(a), ProjectExpr::Column(b)] = columns else {
+            return Err(Refusal::OutputColumn);
+        };
+        let mut out = Rows::new();
+        for r in recipes {
+            let (Some(&u), Some(&v)) = (r.head.get(*a), r.head.get(*b)) else {
+                return Err(Refusal::OutputColumn);
+            };
+            out.extend(Self::pairs(store, r, [u, v])?);
+        }
+        Ok(out.into_iter().collect())
+    }
+
+    /// The head arity a body projects, when the body says it.
+    fn body_width(&self, body: &RirNode) -> Option<usize> {
+        match body {
+            RirNode::Project { columns, .. } => Some(columns.len()),
+            RirNode::MultiWayJoin { output_columns, .. }
+            | RirNode::ChainJoin { output_columns, .. } => Some(output_columns.len()),
+            _ => None,
+        }
+    }
+}
+
+/// A conjunctive body flattened: scan leaves, each leaf column's variable,
+/// the distinctness pairs (as leaf columns), and the projected leaf columns.
+type Body = (Vec<RelId>, Vec<usize>, Vec<(usize, usize)>, Vec<usize>);
+
+/// A body that is a conjunction of binary atoms: a multi-way join's
+/// fallback, or `Project { Filter { join tree, col != col ∧ … } }`.
+fn flatten_body(body: &RirNode) -> Result<Body, Refusal> {
+    match body {
+        RirNode::MultiWayJoin { fallback, .. } => {
+            let (leaves, class, columns) = flatten_fallback(fallback)?;
+            Ok((leaves, class, Vec::new(), columns))
+        }
+        // Two scans joined on one key; a side bound to a constant has no
+        // atom form (an atom is two variables), so it does not flatten.
+        RirNode::ChainJoin {
+            left,
+            right,
+            left_key,
+            right_key,
+            output_columns,
+            ..
+        } => {
+            let join = RirNode::Join {
+                left: left.clone(),
+                right: right.clone(),
+                left_keys: vec![*left_key],
+                right_keys: vec![*right_key],
+                join_type: JoinType::Inner,
+            };
+            let (leaves, class, columns) = flatten(&join, output_columns)?;
+            Ok((leaves, class, Vec::new(), columns))
+        }
+        RirNode::Project { input, columns } if matches!(input.as_ref(), RirNode::Join { .. }) => {
+            let (leaves, class, columns) = flatten(input, columns)?;
+            Ok((leaves, class, Vec::new(), columns))
+        }
+        RirNode::Project { input, columns } => {
+            let RirNode::Filter { input, predicate } = input.as_ref() else {
+                return Err(Refusal::ProjectOver(kind(input)));
+            };
+            let mut distinct = Vec::new();
+            ne_cols(predicate, &mut distinct)?;
+            let (leaves, class, columns) = flatten(input, columns)?;
+            if distinct.iter().any(|&(a, b)| a.max(b) >= class.len()) {
+                return Err(Refusal::JoinFilter);
+            }
+            Ok((leaves, class, distinct, columns))
+        }
+        other => Err(Refusal::Body(kind(other))),
+    }
+}
+
+/// `col != col`, or a conjunction of them.
+fn ne_cols(predicate: &Expr, out: &mut Vec<(usize, usize)>) -> Result<(), Refusal> {
+    match predicate {
+        Expr::Compare {
+            left,
+            op: CompareOp::Ne,
+            right,
+        } => match (left.as_ref(), right.as_ref()) {
+            (Expr::Column(a), Expr::Column(b)) => {
+                out.push((*a, *b));
+                Ok(())
+            }
+            _ => Err(Refusal::JoinFilter),
+        },
+        Expr::And(items) => items.iter().try_for_each(|e| ne_cols(e, out)),
+        _ => Err(Refusal::JoinFilter),
+    }
+}
+
 /// The relations a body reads, by atom position.
 fn atoms(body: &RirNode) -> Result<Vec<RelId>, Refusal> {
     fn atom(n: &RirNode) -> Result<RelId, Refusal> {
@@ -925,6 +1171,9 @@ fn atoms(body: &RirNode) -> Result<Vec<RelId>, Refusal> {
         RirNode::MultiWayJoin { fallback, .. } => Ok(flatten_fallback(fallback)?.0),
         RirNode::Project { input, .. } => match input.as_ref() {
             RirNode::Join { left, right, .. } => Ok(vec![atom(left)?, atom(right)?]),
+            RirNode::Filter { input: j, .. } if matches!(j.as_ref(), RirNode::Join { .. }) => {
+                Ok(flatten_body(body)?.0)
+            }
             RirNode::Scan { .. } | RirNode::Filter { .. } => Ok(vec![atom(input)?]),
             other => Err(Refusal::ProjectOver(kind(other))),
         },
@@ -1025,6 +1274,11 @@ fn flatten_fallback(fallback: &RirNode) -> Result<Flat, Refusal> {
     let RirNode::Project { input, columns } = fallback else {
         return Err(Refusal::Fallback(kind(fallback)));
     };
+    flatten(input, columns)
+}
+
+/// A tree of inner joins over scans, and a projection of its columns.
+fn flatten(input: &RirNode, columns: &[ProjectExpr]) -> Result<Flat, Refusal> {
     fn walk(
         n: &RirNode,
         leaves: &mut Vec<RelId>,
