@@ -48,6 +48,19 @@
 //!   `Scan(rel)` or `Filter { Scan(rel), col == const }` on the side's free
 //!   column.
 //!
+//! - `Project { Filter { join tree, col != col ∧ … }, columns }`: one
+//!   conjunctive body, each `!=` a distinctness pair the cube clears inside
+//!   its walk (EXO-396). A two-column head is the demanded projection
+//!   (`Cube::body_pair`); a head keeping every body variable is the
+//!   witnesses (`Cube::materialize_distinct_witnesses`). A wide head that
+//!   drops a variable is refused.
+//!
+//! A wide head (arity > 2) is kept as recipes, one per rule, when every rule
+//! flattens to a conjunctive body over cube relations. A rule reading two
+//! columns of it (`Project { Scan(wide), [a, b] }`) runs those recipes and
+//! ORs their demanded projections; the wide head's rows are its download
+//! and are never read back.
+//!
 //! One-column relations given with [`CubeExecutor::put_set`] are cube sets.
 //! Two SCC shapes over them are routed to cube set expressions before the
 //! paths above (the `sets` module; [`Report::routed`] names the path): a
