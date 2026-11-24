@@ -299,3 +299,17 @@ fn two_distinctness_pairs_in_one_body() {
     assert_eq!(rows(&ex, "p"), set(&[[1, 3], [2, 1]]));
     assert!(!refused(&r, "p"), "{:?}", r.refused);
 }
+
+/// An empty domain has no positions, so the projection has zero words per
+/// row: the answer is empty, not a panic.
+#[test]
+fn an_empty_domain_projects_to_nothing() {
+    let src = r#"
+        pred friend(u32, u32).
+        pred fof(u32, u32).
+        fof(X, Z) :- friend(X, Y), friend(Y, Z), X != Z.
+    "#;
+    let (ex, r) = run(src, &[], &[("friend", &[])]);
+    assert!(rows(&ex, "fof").is_empty());
+    assert!(!refused(&r, "fof"), "{:?}", r.refused);
+}

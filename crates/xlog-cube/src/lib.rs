@@ -1044,6 +1044,10 @@ impl CubeExecutor {
             .cube
             .body_pair(&store.table, &r.atoms, r.k, &r.distinct, demand)
             .map_err(Refusal::CubeBody)?;
+        // An empty domain has no positions and zero words per row.
+        if ans.words == 0 {
+            return Ok(Vec::new());
+        }
         let map = store
             .table
             .map(&store.table.seal(), TILE)
