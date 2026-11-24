@@ -219,6 +219,10 @@ struct Store {
     /// relations only, so these are never cube relations: a single-relation
     /// projection may read them, and every other body still refuses them.
     wide: HashMap<Label, Rows>,
+    /// Every data relation's declared arity, by label (from the plan). A
+    /// head is wide by its declaration, not by its rows: an empty 4-ary head
+    /// has no rows to measure.
+    arity: HashMap<Label, usize>,
 }
 
 impl Store {
@@ -318,6 +322,11 @@ impl CubeExecutor {
                 .map(|(i, (_, r))| (i as u32, pairs_to_rows(r)))
                 .collect(),
             wide: HashMap::new(),
+            arity: self
+                .labels
+                .iter()
+                .filter_map(|(rel, l)| plan.rel_arities.get(rel).map(|a| (*l, *a)))
+                .collect(),
         };
         // One-column relations: stored sets, and the expressions of the
         // heads routed so far.
@@ -408,7 +417,10 @@ impl CubeExecutor {
                 Ok(heads) => {
                     ran.extend(scc.rules.iter().map(|(h, _)| *h));
                     for (head, rows) in heads {
-                        if let Some(id) = store.add(&rows).map_err(PlanRefusal::Cube)? {
+                        let declared_wide = store.arity.get(&head).is_some_and(|&a| a != 2);
+                        if declared_wide {
+                            store.wide.insert(head, rows.clone());
+                        } else if let Some(id) = store.add(&rows).map_err(PlanRefusal::Cube)? {
                             current.insert(head, id);
                         } else {
                             store.wide.insert(head, rows.clone());
@@ -831,11 +843,14 @@ impl CubeExecutor {
             other => return Err(Refusal::Body(kind(other))),
         };
         let l = self.label(rel)?;
+        if !store.wide.contains_key(&l) {
+            return Ok(2);
+        }
         Ok(store
-            .wide
+            .arity
             .get(&l)
-            .and_then(|rows| rows.iter().next())
-            .map_or(2, Vec::len))
+            .copied()
+            .unwrap_or_else(|| store.wide[&l].iter().next().map_or(2, Vec::len)))
     }
 
     /// A multi-way conjunctive join, evaluated as generic join over the

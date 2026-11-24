@@ -198,3 +198,39 @@ fn join_over_a_wide_relation_stays_refused() {
     let (_, rep) = run(src, &[], &[("a", a), ("b", b)]);
     assert!(refused(&rep, "h"), "ran: {:?}", rep.ran);
 }
+
+/// An empty wide head is still wide: `sg_witness` has no rows when
+/// `all_child_pairs` matches no chain, and `sg_result(W, Z) :- sg_witness(..)`
+/// must read it as an empty 4-ary relation, not as an empty pair relation
+/// whose column 3 is out of range.
+#[test]
+fn an_empty_wide_head_is_still_projected() {
+    let parent: &[(u32, u32)] = &[(1, 3), (6, 3), (7, 4), (3, 5), (4, 5)];
+    let parent_rev: &[(u32, u32)] = &[(3, 1), (3, 6), (4, 7), (5, 3), (5, 4)];
+    // (9, 9) matches no chain, so sg_witness is empty.
+    let all_child_pairs: &[(u32, u32)] = &[(9, 9)];
+    let (ex, r) = run(
+        SG_SRC,
+        &[],
+        &[
+            ("parent", parent),
+            ("parent_rev", parent_rev),
+            ("all_child_pairs", all_child_pairs),
+        ],
+    );
+    assert!(!refused(&r, "sg_result"), "refused: {:?}", r.refused);
+    assert!(rows(&ex, "sg_witness").is_empty());
+    // Rule 1 only: siblings under parents 3 ({1, 6}), 4 ({7}) and 5 ({3, 4}).
+    let expected = set(&[
+        [1, 1],
+        [1, 6],
+        [6, 1],
+        [6, 6],
+        [7, 7],
+        [3, 3],
+        [3, 4],
+        [4, 3],
+        [4, 4],
+    ]);
+    assert_eq!(rows(&ex, "sg_result"), expected);
+}
