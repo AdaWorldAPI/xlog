@@ -195,3 +195,82 @@ fn the_composed_reader_adds_no_relation_and_builds_no_rows() {
     let (_, base) = run(without_r, &[("e", e)]);
     assert_eq!(base.stats.rows_materialized, rep.stats.rows_materialized);
 }
+
+fn run_demanded(
+    src: &str,
+    pairs: &[(&str, &[(u32, u32)])],
+    demand: &[&str],
+) -> (CubeExecutor, Report) {
+    let mut c = Compiler::new();
+    let plan = c.compile(src).expect("compile");
+    let mut ex = CubeExecutor::new();
+    for (name, id) in c.rel_ids() {
+        ex.register_relation(*id, name);
+    }
+    for (n, rows) in pairs {
+        ex.put_relation(n, rows);
+    }
+    ex.demand(demand);
+    let report = ex.execute_plan(&plan).expect("plan");
+    (ex, report)
+}
+
+const TWO_HOP: &str = r#"
+    pred e(u32, u32).
+    pred q(u32, u32).
+    pred r(u32, u32).
+    q(X, Z) :- e(X, Y), e(Y, Z).
+    r(X, W) :- q(X, Z), e(Z, W).
+"#;
+
+/// FAILS IF: demanding only `r` changes `r`'s answer, or still builds `q`'s
+/// rows. `q` is read by `r` as its recipe, so nothing needs its rows.
+#[test]
+fn an_undemanded_recipe_head_is_never_built() {
+    let e: &[(u32, u32)] = &[(1, 2), (2, 3), (3, 4), (4, 5)];
+    let (all_ex, all) = run(TWO_HOP, &[("e", e)]);
+    let (ex, rep) = run_demanded(TWO_HOP, &[("e", e)], &["r"]);
+    assert_eq!(rows(&ex, "r"), set(&[[1, 4], [2, 5]]));
+    assert_eq!(rows(&ex, "r"), rows(&all_ex, "r"));
+    assert_eq!(ex.relation("q"), None, "q is not decoded");
+    assert_eq!(rep.undecoded, vec!["q".to_string()]);
+    assert!(all.undecoded.is_empty(), "no demand decodes everything");
+    // The three rows `q`'s join built are gone; nothing replaced them.
+    assert_eq!(all.stats.rows_materialized, 3);
+    assert_eq!(rep.stats.rows_materialized, 0, "{:?}", rep.stats);
+    assert_eq!(rep.ran, all.ran);
+    assert!(rep.refused.is_empty() && rep.reingested.is_empty());
+}
+
+/// FAILS IF: a demanded head is skipped. Demanding both keeps both decoded.
+#[test]
+fn a_demanded_recipe_head_is_built() {
+    let e: &[(u32, u32)] = &[(1, 2), (2, 3), (3, 4), (4, 5)];
+    let (ex, rep) = run_demanded(TWO_HOP, &[("e", e)], &["q", "r"]);
+    assert_eq!(rows(&ex, "q"), set(&[[1, 3], [2, 4], [3, 5]]));
+    assert!(rep.undecoded.is_empty());
+    assert_eq!(rep.stats.rows_materialized, 3);
+}
+
+/// FAILS IF: an undemanded head that a recursive reader must add to the cube
+/// is added without its rows. It is decoded then, from its recipes.
+#[test]
+fn an_undemanded_head_read_by_recursion_is_decoded_when_added() {
+    let src = r#"
+        pred e(u32, u32).
+        pred q(u32, u32).
+        pred t(u32, u32).
+        q(X, Z) :- e(X, Y), e(Y, Z).
+        t(X, Y) :- q(X, Y).
+        t(X, Z) :- t(X, Y), q(Y, Z).
+    "#;
+    let e: &[(u32, u32)] = &[(1, 2), (2, 3), (3, 4), (4, 5)];
+    let (ex, rep) = run_demanded(src, &[("e", e)], &["t"]);
+    assert_eq!(rows(&ex, "t"), set(&[[1, 3], [2, 4], [3, 5], [1, 5]]));
+    assert!(reingested(&rep, "q"), "{:?}", rep.reingested);
+    assert!(
+        rep.undecoded.is_empty(),
+        "q was decoded to be added: {:?}",
+        rep.undecoded
+    );
+}

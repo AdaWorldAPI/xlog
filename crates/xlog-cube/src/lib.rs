@@ -124,8 +124,13 @@ pub struct Report {
     /// recipes (EXO-396). It is added only when a reader cannot.
     pub reingested: Vec<(String, String)>,
     /// Derived binary heads that stayed recipes for the whole plan: never
-    /// added to the cube as relations. Their rows are still downloaded.
+    /// added to the cube as relations. Their rows are downloaded unless the
+    /// caller set a demand that excludes them; see `undecoded`.
     pub recipes: Vec<String>,
+    /// Recipe heads outside the caller's demand ([`CubeExecutor::demand`])
+    /// whose rows were never built: their rules ran only as recipes inside
+    /// their readers. [`CubeExecutor::relation`] answers `None` for them.
+    pub undecoded: Vec<String>,
 }
 
 /// Why a rule was not run on the cube.
@@ -242,6 +247,9 @@ pub struct CubeExecutor {
     /// Registered binary relations nobody supplied: empty, at intake.
     empty: BTreeSet<String>,
     out: BTreeMap<Label, Rows>,
+    /// Heads the caller asked for ([`Self::demand`]); `None` decodes every
+    /// head.
+    demand: Option<BTreeSet<String>>,
 }
 
 /// A data relation's identity: its 1-byte index in the program's codebook.
@@ -343,6 +351,16 @@ impl CubeExecutor {
 
     /// A relation's rows: a derived relation the plan produced, or a base
     /// relation. The download boundary.
+    /// Decode only these heads at the end of [`Self::execute_plan`]. A
+    /// non-recursive derived binary head outside the demand, with no facts
+    /// put for it, whose every rule is a recipe, is never built as rows: its
+    /// readers substitute the recipes, and it is decoded only if a reader has
+    /// to add it to the cube. Without a demand every head is decoded, as
+    /// before. The demand changes which rows are built, never an answer.
+    pub fn demand(&mut self, heads: &[&str]) {
+        self.demand = Some(heads.iter().map(|h| h.to_string()).collect());
+    }
+
     pub fn relation(&self, name: &str) -> Option<Vec<Vec<u32>>> {
         if let Some(rows) = self.vocab.index_of(name).and_then(|l| self.out.get(&l)) {
             return Some(rows.iter().cloned().collect());
@@ -418,6 +436,20 @@ impl CubeExecutor {
             .map(|(i, (id, _))| (*id, i as u32))
             .collect();
         let sccs = self.resolve_sccs(plan);
+        // Heads outside the caller's demand, minus heads a host put facts for.
+        let undemanded: BTreeSet<Label> = match &self.demand {
+            None => BTreeSet::new(),
+            Some(d) => sccs
+                .iter()
+                .filter(|scc| !scc.recursive)
+                .flat_map(|scc| scc.rules.iter().map(|(h, _)| *h))
+                .filter(|h| {
+                    let name = self.vocab.label(*h).unwrap_or_default();
+                    !d.contains(name) && !self.base.contains_key(name)
+                })
+                .collect(),
+        };
+        let mut undecoded: BTreeSet<Label> = BTreeSet::new();
 
         // Execution: codebook labels and cube ids only.
         let mut ran: Vec<Label> = Vec::new();
@@ -439,7 +471,7 @@ impl CubeExecutor {
                     .filter(|l| self.reads_any(scc, &BTreeSet::from([*l])).is_some())
                     .collect();
                 for l in reads {
-                    let id = Self::reingest(&mut store, &produced, l)?;
+                    let id = Self::reingest(&mut store, &mut produced, &mut undecoded, l)?;
                     current.insert(l, id);
                     reingested.push((l, "read by a recursive SCC".to_string()));
                 }
@@ -487,12 +519,13 @@ impl CubeExecutor {
                     for m in &scc.members {
                         exprs.remove(m);
                     }
-                    self.plain_scc(&mut store, &current, scc).map(|mut heads| {
-                        for (m, rows) in &put {
-                            heads.entry(*m).or_default().extend(rows.iter().cloned());
-                        }
-                        heads
-                    })
+                    self.plain_scc(&mut store, &current, scc, &undemanded, &mut undecoded)
+                        .map(|mut heads| {
+                            for (m, rows) in &put {
+                                heads.entry(*m).or_default().extend(rows.iter().cloned());
+                            }
+                            heads
+                        })
                 };
                 // A rule that cannot substitute a deferred head reads it as a
                 // relation: add it, and run the SCC again.
@@ -504,7 +537,7 @@ impl CubeExecutor {
                     ),
                     _ => break outcome,
                 };
-                let id = Self::reingest(&mut store, &produced, l)?;
+                let id = Self::reingest(&mut store, &mut produced, &mut undecoded, l)?;
                 current.insert(l, id);
                 reingested.push((l, why));
             };
@@ -524,7 +557,9 @@ impl CubeExecutor {
                         } else if let Some(id) = store.add(&rows).map_err(PlanRefusal::Cube)? {
                             current.insert(head, id);
                         }
-                        produced.insert(head, rows);
+                        if !undecoded.contains(&head) {
+                            produced.insert(head, rows);
+                        }
                     }
                 }
                 Err(reason) => {
@@ -557,6 +592,11 @@ impl CubeExecutor {
                 let mut kept: Vec<String> = store.deferred.keys().map(name).collect();
                 kept.sort();
                 kept
+            },
+            undecoded: {
+                let mut v: Vec<String> = undecoded.iter().map(name).collect();
+                v.sort();
+                v
             },
         })
     }
@@ -702,11 +742,49 @@ impl CubeExecutor {
         store: &mut Store,
         current: &HashMap<Label, u32>,
         scc: &Scc<'_>,
+        undemanded: &BTreeSet<Label>,
+        undecoded: &mut BTreeSet<Label>,
     ) -> Result<BTreeMap<Label, Rows>, Refusal> {
         let resolve = |l: Label, _: usize| lookup(current, l);
         let mut heads: BTreeMap<Label, Rows> = BTreeMap::new();
         let mut recipes: HashMap<Label, Option<Vec<Recipe>>> = HashMap::new();
+        // An undemanded head whose every rule is a binary recipe is never
+        // built as rows: it is kept as its recipes.
+        let mut lazy: BTreeMap<Label, Vec<Recipe>> = BTreeMap::new();
+        for head in scc
+            .rules
+            .iter()
+            .map(|(h, _)| *h)
+            .filter(|h| undemanded.contains(h))
+        {
+            if lazy.contains_key(&head) {
+                continue;
+            }
+            let mut list = Vec::new();
+            let all = scc
+                .rules
+                .iter()
+                .filter(|(h, _)| *h == head)
+                .all(|(_, body)| match self.recipes(store, &resolve, body) {
+                    Ok(rs) if !rs.is_empty() && rs.iter().all(|r| r.head.len() == 2) => {
+                        list.extend(rs);
+                        true
+                    }
+                    _ => false,
+                });
+            if all {
+                lazy.insert(head, list);
+            }
+        }
+        for (head, list) in lazy {
+            heads.entry(head).or_default();
+            store.binary.insert(head, Some(list));
+            undecoded.insert(head);
+        }
         for (head, body) in &scc.rules {
+            if undecoded.contains(head) {
+                continue;
+            }
             let rows = self.rule(store, &resolve, body)?;
             let width = rows.first().map(Vec::len).or_else(|| self.body_width(body));
             if width.is_some_and(|w| w >= 2) {
@@ -1190,10 +1268,17 @@ impl CubeExecutor {
     /// Add a deferred head to the cube as a relation, from its rows.
     fn reingest(
         store: &mut Store,
-        produced: &BTreeMap<Label, Rows>,
+        produced: &mut BTreeMap<Label, Rows>,
+        undecoded: &mut BTreeSet<Label>,
         l: Label,
     ) -> Result<u32, PlanRefusal> {
-        store.deferred.remove(&l);
+        let list = store.deferred.remove(&l);
+        if undecoded.remove(&l) {
+            // Never built: decode it now, from the recipes it was kept as.
+            let rows = Self::run_recipes(store, list.as_deref().unwrap_or_default())
+                .map_err(|_| PlanRefusal::Cube(CubeRefusal::UnknownRel(u32::from(l))))?;
+            produced.insert(l, rows.into_iter().collect());
+        }
         let rows = produced.get(&l).cloned().unwrap_or_default();
         store
             .add(&rows)
