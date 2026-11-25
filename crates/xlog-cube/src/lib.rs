@@ -87,14 +87,15 @@ use lance_graph_contract::codebook::Codebook;
 use lance_graph_dt64::dr::{LocalMap, MapTable, Width};
 use lance_graph_dt64::AlgebraRef;
 use lance_graph_xlog::cube::{
-    Atom, BodyRefusal, Cube, CubeRefusal, CubeStats, PairAnswer, SetExpr, View, MAX_BODY_VARS,
+    Atom, BodyRefusal, Cube, CubeRefusal, CubeStats, PairAnswer, Restrict, SetExpr, View,
+    MAX_BODY_VARS,
 };
 use lance_graph_xlog::lens::word_of;
 use xlog_core::RelId;
 use xlog_ir::{
     CompareOp, CompiledRule, ConstValue, ExecutionPlan, Expr, JoinType, ProjectExpr, RirNode,
 };
-use xlog_logic::{MagicSetReport, MagicSetStatus};
+use xlog_logic::{MagicSetReport, MagicSetRewrite, MagicSetStatus};
 
 mod sets;
 
@@ -161,6 +162,9 @@ pub enum Refusal {
     JoinKey,
     /// A relation the plan reads that is not a binary relation in the cube.
     NotBinary(Label),
+    /// A one-column atom joined into a body whose relation is no cube set:
+    /// a recursive member, or a head that was not routed.
+    NotASet(Label),
     /// A relation id with no name: never registered, and not a head.
     Unregistered(RelId),
     /// The relation is an XLOG behaviour word (`0xFFFF :: 0xF100`), not
@@ -203,6 +207,7 @@ impl fmt::Display for Refusal {
             Refusal::OutputColumn => write!(f, "computed or out-of-range output column"),
             Refusal::JoinKey => write!(f, "join key outside its input"),
             Refusal::NotBinary(l) => write!(f, "label {l} is not a binary relation in the cube"),
+            Refusal::NotASet(l) => write!(f, "label {l} is a one-column atom with no cube set"),
             Refusal::Unregistered(r) => write!(f, "unregistered {r:?}"),
             Refusal::Behaviour(w) => write!(f, "XLOG word {:#010x}/{}", w.lens, w.word),
             Refusal::Cube(e) => write!(f, "cube: {e:?}"),
@@ -230,6 +235,12 @@ pub enum PlanRefusal {
     /// [`CubeExecutor::demand_magic`] named a predicate that is not a head of
     /// the plan: the magic-set report describes another program.
     DemandMismatch(String),
+    /// The plan reads a magic-set seed (`__xlog_magic_*`) nobody supplied.
+    /// The seed is a fact of the rewritten program, which the execution plan
+    /// does not carry; running without it would answer from an empty seed.
+    /// Supply it with [`CubeExecutor::demand_magic_rewrite`] or
+    /// [`CubeExecutor::put_set`].
+    MagicSeedMissing(String),
 }
 
 /// The executor. See the module docs.
@@ -284,8 +295,12 @@ type Rows = BTreeSet<Vec<u32>>;
 type Resolve<'a> = dyn Fn(Label, usize) -> Result<u32, Refusal> + 'a;
 
 /// A flattened multi-way fallback: scan leaves, each leaf column's variable
-/// class, and the projected leaf columns.
-type Flat = (Vec<RelId>, Vec<usize>, Vec<usize>);
+/// class, the projected leaf columns, and each leaf's width (1 or 2).
+type Flat = (Vec<RelId>, Vec<usize>, Vec<usize>, Vec<usize>);
+
+/// A relation's width in a flattened body. Unknown relations are binary,
+/// which is what every caller that only reads the leaves assumed before.
+type Arity<'a> = dyn Fn(RelId) -> usize + 'a;
 
 /// One side of a join: a cube relation, and an optional bound
 /// `(column, value)`.
@@ -310,6 +325,12 @@ struct Store {
     binary: HashMap<Label, Option<Vec<Recipe>>>,
     /// Derived binary heads kept as recipes and not added to the cube.
     deferred: HashMap<Label, Vec<Recipe>>,
+    /// One-column relations: stored sets, and the expressions of the heads
+    /// routed so far. A one-column atom in a join body is a semijoin with
+    /// its expression ([`Restrict`]).
+    exprs: HashMap<Label, SetExpr>,
+    /// Every relation's arity, as the plan's lowering assigned it.
+    arity: HashMap<RelId, usize>,
 }
 
 /// A conjunctive body over cube relations: atoms, the variable count, the
@@ -317,6 +338,8 @@ struct Store {
 #[derive(Clone)]
 struct Recipe {
     atoms: Vec<Atom>,
+    /// The body's one-column atoms, as semijoins on their variable.
+    restrict: Vec<Restrict>,
     k: usize,
     distinct: Vec<[u8; 2]>,
     head: Vec<u8>,
@@ -417,6 +440,41 @@ impl CubeExecutor {
         };
     }
 
+    /// [`Self::demand_magic`] with the rewrite's report, and its seeds put as
+    /// sets: every body-less rule of the rewritten program whose head is a
+    /// generated magic predicate (`__xlog_magic_reach_bf(1).`). The
+    /// execution plan does not carry these facts, so without them the
+    /// magic-guarded rules would read an empty seed. A seed term that is not
+    /// a `u32` id is not put; the plan then refuses with
+    /// [`PlanRefusal::MagicSeedMissing`].
+    pub fn demand_magic_rewrite(&mut self, rewrite: &MagicSetRewrite) {
+        self.demand_magic(&rewrite.report);
+        if rewrite.report.status != MagicSetStatus::Applied {
+            return;
+        }
+        let generated: BTreeSet<&str> = rewrite
+            .report
+            .generated_predicates
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let mut seeds: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+        for rule in &rewrite.program.rules {
+            let head = &rule.head;
+            if !rule.body.is_empty() || !generated.contains(head.predicate.as_str()) {
+                continue;
+            }
+            if let [xlog_logic::Term::Integer(i)] = head.terms[..] {
+                if let Ok(id) = u32::try_from(i) {
+                    seeds.entry(head.predicate.clone()).or_default().push(id);
+                }
+            }
+        }
+        for (name, ids) in seeds {
+            self.put_set(&name, &ids);
+        }
+    }
+
     /// The head names the demand names for `plan`, or `None` for every head.
     fn demanded(&self, plan: &ExecutionPlan) -> Result<Option<BTreeSet<String>>, PlanRefusal> {
         let queries = || -> BTreeSet<String> {
@@ -472,6 +530,15 @@ impl CubeExecutor {
     pub fn execute_plan(&mut self, plan: &ExecutionPlan) -> Result<Report, PlanRefusal> {
         // Boundary: intern the data relations, once.
         self.intern(plan)?;
+        // A report from another program is named as such before its seed.
+        self.demanded(plan)?;
+        if let Some(seed) = self
+            .empty_sets
+            .iter()
+            .find(|n| n.starts_with("__xlog_magic_"))
+        {
+            return Err(PlanRefusal::MagicSeedMissing(seed.clone()));
+        }
         let none: &[(u32, u32)] = &[];
         let base: Vec<(Label, &[(u32, u32)])> = self
             .base
@@ -503,11 +570,12 @@ impl CubeExecutor {
             recipes: HashMap::new(),
             binary: HashMap::new(),
             deferred: HashMap::new(),
+            exprs: HashMap::new(),
+            arity: plan.rel_arities.clone(),
         };
         let mut reingested: Vec<(Label, String)> = Vec::new();
         // One-column relations: stored sets, and the expressions of the
-        // heads routed so far.
-        let mut exprs: HashMap<Label, SetExpr> = HashMap::new();
+        // heads routed so far (`store.exprs`).
         let no_ids: Vec<u32> = Vec::new();
         for (name, ids) in self
             .sets
@@ -519,7 +587,7 @@ impl CubeExecutor {
                     .cube
                     .add_set(&store.table, ids)
                     .map_err(PlanRefusal::Cube)?;
-                exprs.insert(l, SetExpr::Set(id));
+                store.exprs.insert(l, SetExpr::Set(id));
             }
         }
         let arity = |rel: RelId| plan.rel_arities.get(&rel).copied();
@@ -583,7 +651,8 @@ impl CubeExecutor {
             let outcome = loop {
                 let outcome = if let Some(l) = self.reads_any(scc, &refused_heads) {
                     Err(Refusal::ReadsRefused(l))
-                } else if let Some((route, heads)) = self.route(scc, &exprs, &current, &arity) {
+                } else if let Some((route, heads)) = self.route(scc, &store.exprs, &current, &arity)
+                {
                     // Download each head's answer; keep its expression, not the
                     // mask, for later readers.
                     let mut out = BTreeMap::new();
@@ -592,7 +661,7 @@ impl CubeExecutor {
                         match store.cube.set_mask(&store.table, &e) {
                             Ok(mask) => {
                                 out.insert(h, mask_rows(&store, &mask));
-                                exprs.insert(h, e);
+                                store.exprs.insert(h, e);
                                 routed.push((h, route));
                             }
                             Err(e) => failed = Some(Refusal::Cube(e)),
@@ -606,12 +675,12 @@ impl CubeExecutor {
                     // Not routed: a member's stored facts are not its whole
                     // answer, so no later rule may read them as the head.
                     for m in &scc.members {
-                        exprs.remove(m);
+                        store.exprs.remove(m);
                     }
                     self.recursive_scc(&mut store, &current, scc, &put, &mut rounds)
                 } else {
                     for m in &scc.members {
-                        exprs.remove(m);
+                        store.exprs.remove(m);
                     }
                     self.plain_scc(&mut store, &current, scc, &undemanded, &mut undecoded)
                         .map(|mut heads| {
@@ -700,6 +769,10 @@ impl CubeExecutor {
         match r {
             Refusal::NotBinary(l) => match self.vocab.label(*l) {
                 Some(n) => format!("`{n}` is not a binary relation in the cube"),
+                None => r.to_string(),
+            },
+            Refusal::NotASet(l) => match self.vocab.label(*l) {
+                Some(n) => format!("`{n}` is a one-column atom with no cube set"),
                 None => r.to_string(),
             },
             Refusal::ReadsRefused(l) => match self.vocab.label(*l) {
@@ -1017,6 +1090,19 @@ impl CubeExecutor {
                 .and_then(|rs| Self::run_recipes(store, &rs))
                 .map_err(|e| Refusal::Deferred(first, self.describe(&e)));
         }
+        // A join with a one-column atom is a semijoin: the body runs as a
+        // recipe, the atom restricting its variable (EXO-457, magic sets).
+        let unary = |r: &RelId| store.arity.get(r) == Some(&1);
+        if leaves.iter().any(unary)
+            && !leaves.iter().all(unary)
+            && matches!(
+                body,
+                RirNode::ChainJoin { .. } | RirNode::MultiWayJoin { .. } | RirNode::Project { .. }
+            )
+        {
+            let rs = self.recipes(store, resolve, body)?;
+            return Self::run_recipes(store, &rs);
+        }
         match body {
             RirNode::Scan { .. } | RirNode::Filter { .. } => self.single(store, resolve, body),
             // Two columns of a wide relation: run its recipes (EXO-396).
@@ -1235,7 +1321,17 @@ impl CubeExecutor {
         resolve: &Resolve<'_>,
         body: &RirNode,
     ) -> Result<Vec<Recipe>, Refusal> {
-        let (leaves, class, distinct, columns) = flatten_body(body)?;
+        let arity = |rel: RelId| store.arity.get(&rel).copied().unwrap_or(2);
+        let (leaves, class, distinct, columns, widths) = flatten_body(body, &arity)?;
+        // Each leaf's first column in the flattened row.
+        let offsets: Vec<usize> = widths
+            .iter()
+            .scan(0, |at, &w| {
+                let o = *at;
+                *at += w;
+                Some(o)
+            })
+            .collect();
         let var = |c: usize| u8::try_from(c).map_err(|_| Refusal::Unfold("variable limit"));
         let labels = leaves
             .iter()
@@ -1267,12 +1363,27 @@ impl CubeExecutor {
         'combos: loop {
             let mut k = k0;
             let mut atoms = Vec::new();
+            let mut restrict = Vec::new();
             let mut pairs = distinct
                 .iter()
                 .map(|&(a, b)| Ok([var(class[a])?, var(class[b])?]))
                 .collect::<Result<Vec<_>, Refusal>>()?;
             for (i, label) in labels.iter().enumerate() {
-                let (a, b) = (class[2 * i], class[2 * i + 1]);
+                if widths[i] == 1 {
+                    // A one-column atom: the semijoin of its variable with
+                    // the relation's set, evaluated inside the terminal.
+                    let set = store
+                        .exprs
+                        .get(label)
+                        .cloned()
+                        .ok_or(Refusal::NotASet(*label))?;
+                    restrict.push(Restrict {
+                        var: var(class[offsets[i]])?,
+                        set,
+                    });
+                    continue;
+                }
+                let (a, b) = (class[offsets[i]], class[offsets[i] + 1]);
                 match choices[i] {
                     None => atoms.push(Atom {
                         rel: resolve(*label, i)?,
@@ -1305,11 +1416,18 @@ impl CubeExecutor {
                         for &[x, y] in &r.distinct {
                             pairs.push([var(map[usize::from(x)])?, var(map[usize::from(y)])?]);
                         }
+                        for rs in &r.restrict {
+                            restrict.push(Restrict {
+                                var: var(map[usize::from(rs.var)])?,
+                                set: rs.set.clone(),
+                            });
+                        }
                     }
                 }
             }
             out.push(Recipe {
                 atoms,
+                restrict,
                 k,
                 distinct: pairs,
                 head: columns
@@ -1399,7 +1517,7 @@ impl CubeExecutor {
         }
         let flat = store
             .cube
-            .materialize_distinct_witnesses(&store.table, &r.atoms, r.k, &r.distinct)
+            .materialize_restricted_witnesses(&store.table, &r.atoms, r.k, &r.distinct, &r.restrict)
             .map_err(Refusal::CubeBody)?;
         let rows: Rows = flat
             .chunks(r.k)
@@ -1413,7 +1531,14 @@ impl CubeExecutor {
     fn answer(store: &Store, r: &Recipe, demand: [u8; 2]) -> Result<PairAnswer, Refusal> {
         store
             .cube
-            .body_pair(&store.table, &r.atoms, r.k, &r.distinct, demand)
+            .body_pair_restricted(
+                &store.table,
+                &r.atoms,
+                r.k,
+                &r.distinct,
+                &r.restrict,
+                demand,
+            )
             .map_err(Refusal::CubeBody)
     }
 
@@ -1487,21 +1612,27 @@ impl CubeExecutor {
 
 /// A conjunctive body flattened: scan leaves, each leaf column's variable,
 /// the distinctness pairs (as leaf columns), and the projected leaf columns.
-type Body = (Vec<RelId>, Vec<usize>, Vec<(usize, usize)>, Vec<usize>);
+type Body = (
+    Vec<RelId>,
+    Vec<usize>,
+    Vec<(usize, usize)>,
+    Vec<usize>,
+    Vec<usize>,
+);
 
 /// A body that is a conjunction of binary atoms: a multi-way join's
 /// fallback, or `Project { Filter { join tree, col != col ∧ … } }`.
-fn flatten_body(body: &RirNode) -> Result<Body, Refusal> {
+fn flatten_body(body: &RirNode, arity: &Arity<'_>) -> Result<Body, Refusal> {
     match body {
         // One atom: its two columns are two variables.
-        RirNode::Scan { rel } => Ok((vec![*rel], vec![0, 1], Vec::new(), vec![0, 1])),
+        RirNode::Scan { rel } => Ok((vec![*rel], vec![0, 1], Vec::new(), vec![0, 1], vec![2])),
         RirNode::Project { input, columns } if matches!(input.as_ref(), RirNode::Scan { .. }) => {
-            let (leaves, class, columns) = flatten(input, columns)?;
-            Ok((leaves, class, Vec::new(), columns))
+            let (leaves, class, columns, widths) = flatten(input, columns, arity)?;
+            Ok((leaves, class, Vec::new(), columns, widths))
         }
         RirNode::MultiWayJoin { fallback, .. } => {
-            let (leaves, class, columns) = flatten_fallback(fallback)?;
-            Ok((leaves, class, Vec::new(), columns))
+            let (leaves, class, columns, widths) = flatten_fallback(fallback, arity)?;
+            Ok((leaves, class, Vec::new(), columns, widths))
         }
         // Two scans joined on one key; a side bound to a constant has no
         // atom form (an atom is two variables), so it does not flatten.
@@ -1520,12 +1651,12 @@ fn flatten_body(body: &RirNode) -> Result<Body, Refusal> {
                 right_keys: vec![*right_key],
                 join_type: JoinType::Inner,
             };
-            let (leaves, class, columns) = flatten(&join, output_columns)?;
-            Ok((leaves, class, Vec::new(), columns))
+            let (leaves, class, columns, widths) = flatten(&join, output_columns, arity)?;
+            Ok((leaves, class, Vec::new(), columns, widths))
         }
         RirNode::Project { input, columns } if matches!(input.as_ref(), RirNode::Join { .. }) => {
-            let (leaves, class, columns) = flatten(input, columns)?;
-            Ok((leaves, class, Vec::new(), columns))
+            let (leaves, class, columns, widths) = flatten(input, columns, arity)?;
+            Ok((leaves, class, Vec::new(), columns, widths))
         }
         RirNode::Project { input, columns } => {
             let RirNode::Filter { input, predicate } = input.as_ref() else {
@@ -1533,11 +1664,11 @@ fn flatten_body(body: &RirNode) -> Result<Body, Refusal> {
             };
             let mut distinct = Vec::new();
             ne_cols(predicate, &mut distinct)?;
-            let (leaves, class, columns) = flatten(input, columns)?;
+            let (leaves, class, columns, widths) = flatten(input, columns, arity)?;
             if distinct.iter().any(|&(a, b)| a.max(b) >= class.len()) {
                 return Err(Refusal::JoinFilter);
             }
-            Ok((leaves, class, distinct, columns))
+            Ok((leaves, class, distinct, columns, widths))
         }
         other => Err(Refusal::Body(kind(other))),
     }
@@ -1574,11 +1705,11 @@ fn atoms(body: &RirNode) -> Result<Vec<RelId>, Refusal> {
     match body {
         RirNode::Scan { .. } | RirNode::Filter { .. } => Ok(vec![atom(body)?]),
         RirNode::ChainJoin { left, right, .. } => Ok(vec![atom(left)?, atom(right)?]),
-        RirNode::MultiWayJoin { fallback, .. } => Ok(flatten_fallback(fallback)?.0),
+        RirNode::MultiWayJoin { fallback, .. } => Ok(flatten_fallback(fallback, &|_| 2)?.0),
         RirNode::Project { input, .. } => match input.as_ref() {
             RirNode::Join { left, right, .. } => Ok(vec![atom(left)?, atom(right)?]),
             RirNode::Filter { input: j, .. } if matches!(j.as_ref(), RirNode::Join { .. }) => {
-                Ok(flatten_body(body)?.0)
+                Ok(flatten_body(body, &|_| 2)?.0)
             }
             RirNode::Scan { .. } | RirNode::Filter { .. } => Ok(vec![atom(input)?]),
             other => Err(Refusal::ProjectOver(kind(other))),
@@ -1591,24 +1722,30 @@ fn atoms(body: &RirNode) -> Result<Vec<RelId>, Refusal> {
 /// inner `Join`s), the variable class of every leaf column (join keys
 /// unified, classes renumbered by first appearance), and the projected
 /// leaf columns. Leaves are binary: two columns each.
-fn flatten_fallback(fallback: &RirNode) -> Result<Flat, Refusal> {
+fn flatten_fallback(fallback: &RirNode, arity: &Arity<'_>) -> Result<Flat, Refusal> {
     let RirNode::Project { input, columns } = fallback else {
         return Err(Refusal::Fallback(kind(fallback)));
     };
-    flatten(input, columns)
+    flatten(input, columns, arity)
 }
 
 /// A tree of inner joins over scans, and a projection of its columns.
-fn flatten(input: &RirNode, columns: &[ProjectExpr]) -> Result<Flat, Refusal> {
+fn flatten(input: &RirNode, columns: &[ProjectExpr], arity: &Arity<'_>) -> Result<Flat, Refusal> {
     fn walk(
         n: &RirNode,
+        arity: &Arity<'_>,
         leaves: &mut Vec<RelId>,
+        widths: &mut Vec<usize>,
         eqs: &mut Vec<(usize, usize)>,
     ) -> Result<usize, Refusal> {
         match n {
             RirNode::Scan { rel } => {
+                // Only a one-column leaf is narrower; every other leaf keeps
+                // the two columns it was always flattened with.
+                let w = if arity(*rel) == 1 { 1 } else { 2 };
                 leaves.push(*rel);
-                Ok(2)
+                widths.push(w);
+                Ok(w)
             }
             RirNode::Join {
                 left,
@@ -1617,9 +1754,9 @@ fn flatten(input: &RirNode, columns: &[ProjectExpr]) -> Result<Flat, Refusal> {
                 right_keys,
                 join_type: JoinType::Inner,
             } => {
-                let off = 2 * leaves.len();
-                let wl = walk(left, leaves, eqs)?;
-                let wr = walk(right, leaves, eqs)?;
+                let off: usize = widths.iter().sum();
+                let wl = walk(left, arity, leaves, widths, eqs)?;
+                let wr = walk(right, arity, leaves, widths, eqs)?;
                 for (&l, &r) in left_keys.iter().zip(right_keys) {
                     if l >= wl || r >= wr {
                         return Err(Refusal::JoinKey);
@@ -1632,8 +1769,9 @@ fn flatten(input: &RirNode, columns: &[ProjectExpr]) -> Result<Flat, Refusal> {
         }
     }
     let mut leaves = Vec::new();
+    let mut widths = Vec::new();
     let mut eqs = Vec::new();
-    let width = walk(input, &mut leaves, &mut eqs)?;
+    let width = walk(input, arity, &mut leaves, &mut widths, &mut eqs)?;
     let mut parent: Vec<usize> = (0..width).collect();
     fn root(p: &mut [usize], mut x: usize) -> usize {
         while p[x] != x {
@@ -1661,7 +1799,7 @@ fn flatten(input: &RirNode, columns: &[ProjectExpr]) -> Result<Flat, Refusal> {
             _ => Err(Refusal::OutputColumn),
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok((leaves, class, columns))
+    Ok((leaves, class, columns, widths))
 }
 
 /// `col == const`, the only filter admitted.

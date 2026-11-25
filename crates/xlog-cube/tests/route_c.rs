@@ -336,9 +336,7 @@ fn run_magic(
     let mut c = Compiler::new();
     let plan = c.compile(src).expect("compile");
     let program = xlog_logic::parse_program(report_src).expect("parse");
-    let report = xlog_logic::rewrite_magic_sets(&program)
-        .expect("rewrite")
-        .report;
+    let rewrite = xlog_logic::rewrite_magic_sets(&program).expect("rewrite");
     let mut ex = CubeExecutor::new();
     for (name, id) in c.rel_ids() {
         ex.register_relation(*id, name);
@@ -346,40 +344,75 @@ fn run_magic(
     for (n, rows) in pairs {
         ex.put_relation(n, rows);
     }
-    ex.demand_magic(&report);
+    ex.demand_magic_rewrite(&rewrite);
     let rep = ex.execute_plan(&plan)?;
     Ok((ex, rep))
 }
 
-/// FAILS IF: the magic demand drops the query or the adorned predicate, or
-/// keeps the unread recipe head `two`. `reach/bf` demands `reach`.
+/// The program without the pragma: the answer magic sets must preserve.
+const PLAIN_REACH: &str = r#"
+    pred edge(u32, u32). pred reach(u32, u32). pred two(u32, u32).
+    reach(X, Y) :- edge(X, Y).
+    reach(X, Z) :- reach(X, Y), edge(Y, Z).
+    two(X, Z) :- edge(X, Y), edge(Y, Z).
+    ?- reach(1, Y).
+"#;
+
+/// FAILS IF: the semijoin with the magic seed is dropped (`reach` grows to
+/// every source), the query's answer differs from the program without
+/// magic sets, or the demand keeps the unread recipe head `two`.
 ///
-/// Pinned as it stands: the cube cannot run the rewritten recursion yet. Its
-/// rules read the one-column seed `__xlog_magic_reach_bf`, and a recursive
-/// SCC reads its inputs only as binary relations, so `reach` and the query
-/// are refused, with or without a demand. The demand is still validated and
-/// still keeps `two` undecoded. When the cube runs magic-guarded recursion
-/// this test fails, and the query's answer `{(1,2), (1,3)}` replaces the
-/// refusal assertions.
+/// `?- reach(1, Y)` over `1->2->3, 10->11->12`. Without magic sets `reach`
+/// has all six pairs; with them, only the seed's two, and the query answer
+/// is unchanged.
 #[test]
 fn the_adorned_predicates_join_the_demand() {
     let e: &[(u32, u32)] = &[(1, 2), (2, 3), (10, 11), (11, 12)];
-    let (_, all) = run(MAGIC_REACH, &[("edge", e)]);
+    let (plain, prep) = run(PLAIN_REACH, &[("edge", e)]);
     let (ex, rep) =
         run_magic(MAGIC_REACH, MAGIC_REACH, &[("edge", e)]).expect("the report matches the plan");
-    let not_binary = "`__xlog_magic_reach_bf` is not a binary relation in the cube";
-    assert!(
-        rep.refused
-            .iter()
-            .any(|(h, why)| h == "reach" && why == not_binary),
-        "{:?}",
-        rep.refused
+    assert!(rep.refused.is_empty(), "{:?}", rep.refused);
+    assert!(prep.refused.is_empty(), "{:?}", prep.refused);
+    assert_eq!(
+        rows(&plain, "reach"),
+        set(&[[1, 2], [1, 3], [2, 3], [10, 11], [10, 12], [11, 12]])
     );
-    assert!(refused(&rep, "__xlog_query_0"));
-    assert_eq!(rep.refused, all.refused, "the demand changes no refusal");
+    assert_eq!(rows(&ex, "reach"), set(&[[1, 2], [1, 3]]));
+    assert_eq!(
+        rows(&ex, "__xlog_query_0"),
+        rows(&plain, "__xlog_query_0"),
+        "magic sets change no query answer"
+    );
+    assert!(!rows(&ex, "__xlog_query_0").is_empty());
     assert_eq!(rep.undecoded, vec!["two".to_string()]);
     assert_eq!(ex.relation("two"), None);
-    assert!(all.undecoded.is_empty());
+}
+
+/// FAILS IF: a magic-rewritten plan runs with no seed. The seed is a fact of
+/// the rewritten program that the execution plan does not carry; without it
+/// every magic-guarded rule reads an empty set and the query answers
+/// nothing, silently.
+#[test]
+fn a_magic_plan_without_its_seed_is_refused() {
+    let e: &[(u32, u32)] = &[(1, 2), (2, 3)];
+    let mut c = Compiler::new();
+    let plan = c.compile(MAGIC_REACH).expect("compile");
+    let mut ex = CubeExecutor::new();
+    for (name, id) in c.rel_ids() {
+        ex.register_relation(*id, name);
+    }
+    ex.put_relation("edge", e);
+    assert_eq!(
+        ex.execute_plan(&plan).err(),
+        Some(xlog_cube::PlanRefusal::MagicSeedMissing(
+            "__xlog_magic_reach_bf".to_string()
+        ))
+    );
+    // Silence twin: the seed supplied by hand runs.
+    ex.put_set("__xlog_magic_reach_bf", &[1]);
+    let rep = ex.execute_plan(&plan).expect("seeded plan runs");
+    assert!(rep.refused.is_empty(), "{:?}", rep.refused);
+    assert_eq!(rows(&ex, "reach"), set(&[[1, 2], [1, 3]]));
 }
 
 /// FAILS IF: a report from another program is accepted: its adorned
