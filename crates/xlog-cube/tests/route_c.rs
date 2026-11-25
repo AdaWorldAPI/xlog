@@ -274,3 +274,45 @@ fn an_undemanded_head_read_by_recursion_is_decoded_when_added() {
         rep.undecoded
     );
 }
+
+fn run_queries(src: &str, pairs: &[(&str, &[(u32, u32)])]) -> (CubeExecutor, Report) {
+    let mut c = Compiler::new();
+    let plan = c.compile(src).expect("compile");
+    assert!(!plan.generated_query_rules.is_empty() || !src.contains("?-"));
+    let mut ex = CubeExecutor::new();
+    for (name, id) in c.rel_ids() {
+        ex.register_relation(*id, name);
+    }
+    for (n, rows) in pairs {
+        ex.put_relation(n, rows);
+    }
+    ex.demand_queries();
+    let report = ex.execute_plan(&plan).expect("plan");
+    (ex, report)
+}
+
+/// FAILS IF: the demand is not the plan's query heads. With one `?-` over `r`,
+/// only `__xlog_query_0` is demanded, so neither `q` nor `r` is built, and the
+/// query's answer is unchanged.
+#[test]
+fn the_query_rules_are_the_demand() {
+    let src = format!("{TWO_HOP}\n?- r(X, W).\n");
+    let e: &[(u32, u32)] = &[(1, 2), (2, 3), (3, 4), (4, 5)];
+    let (all_ex, _) = run(&src, &[("e", e)]);
+    let (ex, rep) = run_queries(&src, &[("e", e)]);
+    let want = rows(&all_ex, "__xlog_query_0");
+    assert_eq!(want, set(&[[1, 4], [2, 5]]), "the query's answer");
+    assert_eq!(rows(&ex, "__xlog_query_0"), want);
+    assert_eq!(rep.undecoded, vec!["q".to_string(), "r".to_string()]);
+    assert_eq!(ex.relation("r"), None);
+}
+
+/// FAILS IF: a plan without queries loses heads under `demand_queries`: it
+/// asks nothing, so every head is decoded.
+#[test]
+fn a_plan_without_queries_decodes_every_head() {
+    let e: &[(u32, u32)] = &[(1, 2), (2, 3), (3, 4), (4, 5)];
+    let (ex, rep) = run_queries(TWO_HOP, &[("e", e)]);
+    assert!(rep.undecoded.is_empty());
+    assert_eq!(rows(&ex, "q"), set(&[[1, 3], [2, 4], [3, 5]]));
+}

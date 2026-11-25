@@ -247,9 +247,21 @@ pub struct CubeExecutor {
     /// Registered binary relations nobody supplied: empty, at intake.
     empty: BTreeSet<String>,
     out: BTreeMap<Label, Rows>,
-    /// Heads the caller asked for ([`Self::demand`]); `None` decodes every
-    /// head.
-    demand: Option<BTreeSet<String>>,
+    /// Which heads to decode ([`Self::demand`], [`Self::demand_queries`]).
+    demand: Demand,
+}
+
+/// Which heads [`CubeExecutor::execute_plan`] decodes.
+#[derive(Clone, Debug, Default)]
+enum Demand {
+    /// Every head.
+    #[default]
+    All,
+    /// The heads the caller named.
+    Named(BTreeSet<String>),
+    /// The heads of the plan's generated query rules
+    /// (`ExecutionPlan::generated_query_rules`).
+    Queries,
 }
 
 /// A data relation's identity: its 1-byte index in the program's codebook.
@@ -358,7 +370,33 @@ impl CubeExecutor {
     /// to add it to the cube. Without a demand every head is decoded, as
     /// before. The demand changes which rows are built, never an answer.
     pub fn demand(&mut self, heads: &[&str]) {
-        self.demand = Some(heads.iter().map(|h| h.to_string()).collect());
+        self.demand = Demand::Named(heads.iter().map(|h| h.to_string()).collect());
+    }
+
+    /// [`Self::demand`] with the heads of the plan's generated query rules
+    /// (one `__xlog_query_<i>` per authored `?-` query), read from
+    /// `ExecutionPlan::generated_query_rules` at [`Self::execute_plan`]. A
+    /// plan with no query rules demands every head: a program that asks
+    /// nothing is read by its caller through [`Self::relation`].
+    pub fn demand_queries(&mut self) {
+        self.demand = Demand::Queries;
+    }
+
+    /// The head names the demand names for `plan`, or `None` for every head.
+    fn demanded(&self, plan: &ExecutionPlan) -> Option<BTreeSet<String>> {
+        match &self.demand {
+            Demand::All => None,
+            Demand::Named(d) => Some(d.clone()),
+            Demand::Queries => {
+                let heads: BTreeSet<String> = plan
+                    .generated_query_rules
+                    .iter()
+                    .filter_map(|q| plan.rules_by_scc.get(q.scc_index)?.get(q.rule_index))
+                    .map(|r| r.head.clone())
+                    .collect();
+                (!heads.is_empty()).then_some(heads)
+            }
+        }
     }
 
     pub fn relation(&self, name: &str) -> Option<Vec<Vec<u32>>> {
@@ -437,7 +475,7 @@ impl CubeExecutor {
             .collect();
         let sccs = self.resolve_sccs(plan);
         // Heads outside the caller's demand, minus heads a host put facts for.
-        let undemanded: BTreeSet<Label> = match &self.demand {
+        let undemanded: BTreeSet<Label> = match &self.demanded(plan) {
             None => BTreeSet::new(),
             Some(d) => sccs
                 .iter()
