@@ -94,6 +94,7 @@ use xlog_core::RelId;
 use xlog_ir::{
     CompareOp, CompiledRule, ConstValue, ExecutionPlan, Expr, JoinType, ProjectExpr, RirNode,
 };
+use xlog_logic::{MagicSetReport, MagicSetStatus};
 
 mod sets;
 
@@ -226,6 +227,9 @@ pub enum PlanRefusal {
     /// More than 255 data relations: the program's codebook is full and the
     /// vocabulary would have to split.
     Vocabulary,
+    /// [`CubeExecutor::demand_magic`] named a predicate that is not a head of
+    /// the plan: the magic-set report describes another program.
+    DemandMismatch(String),
 }
 
 /// The executor. See the module docs.
@@ -262,6 +266,12 @@ enum Demand {
     /// The heads of the plan's generated query rules
     /// (`ExecutionPlan::generated_query_rules`).
     Queries,
+    /// [`Demand::Queries`] plus the predicates a magic-set rewrite adorned,
+    /// checked against the plan with the magic predicates it generated.
+    Magic {
+        adorned: BTreeSet<String>,
+        generated: BTreeSet<String>,
+    },
 }
 
 /// A data relation's identity: its 1-byte index in the program's codebook.
@@ -382,21 +392,67 @@ impl CubeExecutor {
         self.demand = Demand::Queries;
     }
 
+    /// [`Self::demand_queries`] plus the predicates `report`'s magic-set
+    /// rewrite adorned (`reach/bf` demands `reach`): the predicates the
+    /// queries reach through a binding. The generated magic predicates
+    /// (`__xlog_magic_*`) are not demanded; they are the rewrite's seeds.
+    ///
+    /// The report must describe the program the plan was compiled from:
+    /// [`Self::execute_plan`] refuses with [`PlanRefusal::DemandMismatch`]
+    /// when an adorned or generated predicate is not a head of the plan. A
+    /// report that did not apply (disabled or declined) is
+    /// [`Self::demand_queries`].
+    pub fn demand_magic(&mut self, report: &MagicSetReport) {
+        self.demand = if report.status == MagicSetStatus::Applied {
+            Demand::Magic {
+                adorned: report
+                    .adorned_predicates
+                    .iter()
+                    .map(|a| a.split_once('/').map_or(a.as_str(), |(p, _)| p).to_string())
+                    .collect(),
+                generated: report.generated_predicates.iter().cloned().collect(),
+            }
+        } else {
+            Demand::Queries
+        };
+    }
+
     /// The head names the demand names for `plan`, or `None` for every head.
-    fn demanded(&self, plan: &ExecutionPlan) -> Option<BTreeSet<String>> {
-        match &self.demand {
+    fn demanded(&self, plan: &ExecutionPlan) -> Result<Option<BTreeSet<String>>, PlanRefusal> {
+        let queries = || -> BTreeSet<String> {
+            plan.generated_query_rules
+                .iter()
+                .filter_map(|q| plan.rules_by_scc.get(q.scc_index)?.get(q.rule_index))
+                .map(|r| r.head.clone())
+                .collect()
+        };
+        Ok(match &self.demand {
             Demand::All => None,
             Demand::Named(d) => Some(d.clone()),
-            Demand::Queries => {
-                let heads: BTreeSet<String> = plan
-                    .generated_query_rules
+            Demand::Queries => Some(queries()).filter(|h| !h.is_empty()),
+            Demand::Magic { adorned, generated } => {
+                let heads: BTreeSet<&str> = plan
+                    .rules_by_scc
                     .iter()
-                    .filter_map(|q| plan.rules_by_scc.get(q.scc_index)?.get(q.rule_index))
-                    .map(|r| r.head.clone())
+                    .flatten()
+                    .map(|r| r.head.as_str())
                     .collect();
-                (!heads.is_empty()).then_some(heads)
+                // An adorned predicate keeps its rules; a generated magic
+                // predicate may be only a seed fact, so it is checked against
+                // the relations the compiler registered.
+                let known = |p: &String| self.registered.values().any(|n| n == p);
+                if let Some(p) = adorned
+                    .iter()
+                    .find(|p| !heads.contains(p.as_str()))
+                    .or_else(|| generated.iter().find(|p| !known(p)))
+                {
+                    return Err(PlanRefusal::DemandMismatch(p.clone()));
+                }
+                let mut d = queries();
+                d.extend(adorned.iter().cloned());
+                Some(d).filter(|h| !h.is_empty())
             }
-        }
+        })
     }
 
     pub fn relation(&self, name: &str) -> Option<Vec<Vec<u32>>> {
@@ -475,7 +531,7 @@ impl CubeExecutor {
             .collect();
         let sccs = self.resolve_sccs(plan);
         // Heads outside the caller's demand, minus heads a host put facts for.
-        let undemanded: BTreeSet<Label> = match &self.demanded(plan) {
+        let undemanded: BTreeSet<Label> = match &self.demanded(plan)? {
             None => BTreeSet::new(),
             Some(d) => sccs
                 .iter()

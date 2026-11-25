@@ -316,3 +316,88 @@ fn a_plan_without_queries_decodes_every_head() {
     assert!(rep.undecoded.is_empty());
     assert_eq!(rows(&ex, "q"), set(&[[1, 3], [2, 4], [3, 5]]));
 }
+
+const MAGIC_REACH: &str = r#"
+    #pragma magic_sets = on
+    pred edge(u32, u32).
+    pred reach(u32, u32).
+    pred two(u32, u32).
+    reach(X, Y) :- edge(X, Y).
+    reach(X, Z) :- reach(X, Y), edge(Y, Z).
+    two(X, Z) :- edge(X, Y), edge(Y, Z).
+    ?- reach(1, Y).
+"#;
+
+fn run_magic(
+    src: &str,
+    report_src: &str,
+    pairs: &[(&str, &[(u32, u32)])],
+) -> Result<(CubeExecutor, Report), xlog_cube::PlanRefusal> {
+    let mut c = Compiler::new();
+    let plan = c.compile(src).expect("compile");
+    let program = xlog_logic::parse_program(report_src).expect("parse");
+    let report = xlog_logic::rewrite_magic_sets(&program)
+        .expect("rewrite")
+        .report;
+    let mut ex = CubeExecutor::new();
+    for (name, id) in c.rel_ids() {
+        ex.register_relation(*id, name);
+    }
+    for (n, rows) in pairs {
+        ex.put_relation(n, rows);
+    }
+    ex.demand_magic(&report);
+    let rep = ex.execute_plan(&plan)?;
+    Ok((ex, rep))
+}
+
+/// FAILS IF: the magic demand drops the query or the adorned predicate, or
+/// keeps the unread recipe head `two`. `reach/bf` demands `reach`.
+///
+/// Pinned as it stands: the cube cannot run the rewritten recursion yet. Its
+/// rules read the one-column seed `__xlog_magic_reach_bf`, and a recursive
+/// SCC reads its inputs only as binary relations, so `reach` and the query
+/// are refused, with or without a demand. The demand is still validated and
+/// still keeps `two` undecoded. When the cube runs magic-guarded recursion
+/// this test fails, and the query's answer `{(1,2), (1,3)}` replaces the
+/// refusal assertions.
+#[test]
+fn the_adorned_predicates_join_the_demand() {
+    let e: &[(u32, u32)] = &[(1, 2), (2, 3), (10, 11), (11, 12)];
+    let (_, all) = run(MAGIC_REACH, &[("edge", e)]);
+    let (ex, rep) =
+        run_magic(MAGIC_REACH, MAGIC_REACH, &[("edge", e)]).expect("the report matches the plan");
+    let not_binary = "`__xlog_magic_reach_bf` is not a binary relation in the cube";
+    assert!(
+        rep.refused
+            .iter()
+            .any(|(h, why)| h == "reach" && why == not_binary),
+        "{:?}",
+        rep.refused
+    );
+    assert!(refused(&rep, "__xlog_query_0"));
+    assert_eq!(rep.refused, all.refused, "the demand changes no refusal");
+    assert_eq!(rep.undecoded, vec!["two".to_string()]);
+    assert_eq!(ex.relation("two"), None);
+    assert!(all.undecoded.is_empty());
+}
+
+/// FAILS IF: a report from another program is accepted: its adorned
+/// predicate is not a head of this plan.
+#[test]
+fn a_report_from_another_program_is_refused() {
+    let other = r#"
+        #pragma magic_sets = on
+        pred edge(u32, u32).
+        pred path(u32, u32).
+        path(X, Y) :- edge(X, Y).
+        path(X, Z) :- path(X, Y), edge(Y, Z).
+        ?- path(1, Y).
+    "#;
+    let e: &[(u32, u32)] = &[(1, 2), (2, 3)];
+    let got = run_magic(MAGIC_REACH, other, &[("edge", e)]).err();
+    assert!(
+        matches!(got, Some(xlog_cube::PlanRefusal::DemandMismatch(ref p)) if p == "path"),
+        "{got:?}"
+    );
+}
