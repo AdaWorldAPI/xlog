@@ -48,6 +48,28 @@
 //!   `Scan(rel)` or `Filter { Scan(rel), col == const }` on the side's free
 //!   column.
 //!
+//! - `Project { Filter { join tree, col != col ∧ … }, columns }`: one
+//!   conjunctive body, each `!=` a distinctness pair the cube clears inside
+//!   its walk (EXO-396). A two-column head is the demanded projection
+//!   (`Cube::body_pair`); a head keeping every body variable is the
+//!   witnesses (`Cube::materialize_distinct_witnesses`). A wide head that
+//!   drops a variable is refused.
+//!
+//! A wide head (arity > 2) is kept as recipes, one per rule, when every rule
+//! flattens to a conjunctive body over cube relations. A rule reading two
+//! columns of it (`Project { Scan(wide), [a, b] }`) runs those recipes and
+//! ORs their demanded projections on the planes, decoding once; the wide
+//! head's rows are never read back.
+//!
+//! What is still built as rows, and why. [`CubeExecutor::execute_plan`] has
+//! no demand set: every head is produced into the executor and any of them
+//! can be read afterwards with [`CubeExecutor::relation`]. So a wide head's
+//! own rows are built even when only a reader of it is wanted (its body runs
+//! through `multiway`, which builds its own adjacency masks rather than
+//! reading the cube's pair planes). A derived binary head is decoded to rows
+//! and re-added to the cube with `add_relation` for later rules. Both are
+//! this API's boundary, not demand-sensitive execution.
+//!
 //! One-column relations given with [`CubeExecutor::put_set`] are cube sets.
 //! Two SCC shapes over them are routed to cube set expressions before the
 //! paths above (the `sets` module; [`Report::routed`] names the path): a
@@ -64,7 +86,9 @@ use std::fmt;
 use lance_graph_contract::codebook::Codebook;
 use lance_graph_dt64::dr::{LocalMap, MapTable, Width};
 use lance_graph_dt64::AlgebraRef;
-use lance_graph_xlog::cube::{Cube, CubeRefusal, CubeStats, SetExpr, View};
+use lance_graph_xlog::cube::{
+    Atom, BodyRefusal, Cube, CubeRefusal, CubeStats, PairAnswer, SetExpr, View, MAX_BODY_VARS,
+};
 use lance_graph_xlog::lens::word_of;
 use xlog_core::RelId;
 use xlog_ir::{
@@ -72,6 +96,9 @@ use xlog_ir::{
 };
 
 mod sets;
+
+/// The most recipes one substitution may expand a body into.
+const MAX_EXPANSION: usize = 16;
 
 /// The one tile the probe uses.
 const TILE: u32 = 0;
@@ -91,6 +118,14 @@ pub struct Report {
     /// `(head, "set" | "reach")` (D-XLOG-W5-C). Every routed head is also in
     /// `ran`.
     pub routed: Vec<(String, String)>,
+    /// Derived binary heads that were added to the cube as relations, with
+    /// why: `(head, reason)`. A non-recursive derived binary head whose rules
+    /// all flatten to recipes is not added; its readers substitute the
+    /// recipes (EXO-396). It is added only when a reader cannot.
+    pub reingested: Vec<(String, String)>,
+    /// Derived binary heads that stayed recipes for the whole plan: never
+    /// added to the cube as relations. Their rows are still downloaded.
+    pub recipes: Vec<String>,
 }
 
 /// Why a rule was not run on the cube.
@@ -130,6 +165,21 @@ pub enum Refusal {
     /// The rule reads a relation whose own rules were refused: it would read
     /// an empty stand-in, not that relation.
     ReadsRefused(Label),
+    /// A rule reads a deferred derived head it cannot substitute: the head
+    /// must be added to the cube first. Never reported; the rule reruns.
+    Deferred(Label, String),
+    /// A substitution was refused before any body was built.
+    Unfold(&'static str),
+    /// A filter other than `col != col` over a join.
+    JoinFilter,
+    /// A wide head keeping only some of its body's variables: its answer
+    /// would be a projection of witnesses, which is not built.
+    Existential,
+    /// A wide relation read without a recipe: one of its rules did not
+    /// flatten to a conjunctive body.
+    NoRecipe(Label),
+    /// The cube refused the body.
+    CubeBody(BodyRefusal),
 }
 
 impl fmt::Display for Refusal {
@@ -151,6 +201,12 @@ impl fmt::Display for Refusal {
             Refusal::Behaviour(w) => write!(f, "XLOG word {:#010x}/{}", w.lens, w.word),
             Refusal::Cube(e) => write!(f, "cube: {e:?}"),
             Refusal::ReadsRefused(l) => write!(f, "reads refused relation (label {l})"),
+            Refusal::Deferred(l, why) => write!(f, "label {l} must be a relation: {why}"),
+            Refusal::Unfold(why) => write!(f, "substitution refused: {why}"),
+            Refusal::JoinFilter => write!(f, "filter over a join other than `col != col`"),
+            Refusal::Existential => write!(f, "wide head keeping only some body variables"),
+            Refusal::NoRecipe(l) => write!(f, "wide relation (label {l}) has no recipe"),
+            Refusal::CubeBody(e) => write!(f, "cube body: {e:?}"),
         }
     }
 }
@@ -215,6 +271,25 @@ struct Store {
     cube: Cube,
     table: MapTable,
     rows: HashMap<u32, Rows>,
+    /// Wide heads kept as recipes: one per rule. A reader projecting two
+    /// columns of a wide head runs the recipes, never its rows. A head with
+    /// a rule that did not flatten maps to `None`.
+    recipes: HashMap<Label, Option<Vec<Recipe>>>,
+    /// The recipes of every binary head a non-recursive SCC produced, one
+    /// per rule; `None` when a rule did not flatten.
+    binary: HashMap<Label, Option<Vec<Recipe>>>,
+    /// Derived binary heads kept as recipes and not added to the cube.
+    deferred: HashMap<Label, Vec<Recipe>>,
+}
+
+/// A conjunctive body over cube relations: atoms, the variable count, the
+/// distinctness pairs, and the variable each head column reads.
+#[derive(Clone)]
+struct Recipe {
+    atoms: Vec<Atom>,
+    k: usize,
+    distinct: Vec<[u8; 2]>,
+    head: Vec<u8>,
 }
 
 impl Store {
@@ -313,7 +388,11 @@ impl CubeExecutor {
                 .enumerate()
                 .map(|(i, (_, r))| (i as u32, pairs_to_rows(r)))
                 .collect(),
+            recipes: HashMap::new(),
+            binary: HashMap::new(),
+            deferred: HashMap::new(),
         };
+        let mut reingested: Vec<(Label, String)> = Vec::new();
         // One-column relations: stored sets, and the expressions of the
         // heads routed so far.
         let mut exprs: HashMap<Label, SetExpr> = HashMap::new();
@@ -350,6 +429,21 @@ impl CubeExecutor {
         // that stand-in and report a wrong answer as ran: refuse it instead.
         let mut refused_heads: BTreeSet<Label> = BTreeSet::new();
         for scc in &sccs {
+            // A recursive SCC reads its inputs as relations: recursion is not
+            // composed with recipes.
+            if scc.recursive {
+                let reads: Vec<Label> = store
+                    .deferred
+                    .keys()
+                    .copied()
+                    .filter(|l| self.reads_any(scc, &BTreeSet::from([*l])).is_some())
+                    .collect();
+                for l in reads {
+                    let id = Self::reingest(&mut store, &produced, l)?;
+                    current.insert(l, id);
+                    reingested.push((l, "read by a recursive SCC".to_string()));
+                }
+            }
             // Rows a host put for a member of this SCC (facts of a derived
             // predicate) are part of its answer.
             let put: BTreeMap<Label, Rows> = scc
@@ -360,50 +454,74 @@ impl CubeExecutor {
                     Some((*m, pairs_to_rows(rows)))
                 })
                 .collect();
-            let outcome = if let Some(l) = self.reads_any(scc, &refused_heads) {
-                Err(Refusal::ReadsRefused(l))
-            } else if let Some((route, heads)) = self.route(scc, &exprs, &current, &arity) {
-                // Download each head's answer; keep its expression, not the
-                // mask, for later readers.
-                let mut out = BTreeMap::new();
-                let mut failed = None;
-                for (h, e) in heads {
-                    match store.cube.set_mask(&store.table, &e) {
-                        Ok(mask) => {
-                            out.insert(h, mask_rows(&store, &mask));
-                            exprs.insert(h, e);
-                            routed.push((h, route));
+            let outcome = loop {
+                let outcome = if let Some(l) = self.reads_any(scc, &refused_heads) {
+                    Err(Refusal::ReadsRefused(l))
+                } else if let Some((route, heads)) = self.route(scc, &exprs, &current, &arity) {
+                    // Download each head's answer; keep its expression, not the
+                    // mask, for later readers.
+                    let mut out = BTreeMap::new();
+                    let mut failed = None;
+                    for (h, e) in heads {
+                        match store.cube.set_mask(&store.table, &e) {
+                            Ok(mask) => {
+                                out.insert(h, mask_rows(&store, &mask));
+                                exprs.insert(h, e);
+                                routed.push((h, route));
+                            }
+                            Err(e) => failed = Some(Refusal::Cube(e)),
                         }
-                        Err(e) => failed = Some(Refusal::Cube(e)),
                     }
-                }
-                match failed {
-                    Some(r) => Err(r),
-                    None => Ok(out),
-                }
-            } else if scc.recursive {
-                // Not routed: a member's stored facts are not its whole
-                // answer, so no later rule may read them as the head.
-                for m in &scc.members {
-                    exprs.remove(m);
-                }
-                self.recursive_scc(&mut store, &current, scc, &put, &mut rounds)
-            } else {
-                for m in &scc.members {
-                    exprs.remove(m);
-                }
-                self.plain_scc(&mut store, &current, scc).map(|mut heads| {
-                    for (m, rows) in &put {
-                        heads.entry(*m).or_default().extend(rows.iter().cloned());
+                    match failed {
+                        Some(r) => Err(r),
+                        None => Ok(out),
                     }
-                    heads
-                })
+                } else if scc.recursive {
+                    // Not routed: a member's stored facts are not its whole
+                    // answer, so no later rule may read them as the head.
+                    for m in &scc.members {
+                        exprs.remove(m);
+                    }
+                    self.recursive_scc(&mut store, &current, scc, &put, &mut rounds)
+                } else {
+                    for m in &scc.members {
+                        exprs.remove(m);
+                    }
+                    self.plain_scc(&mut store, &current, scc).map(|mut heads| {
+                        for (m, rows) in &put {
+                            heads.entry(*m).or_default().extend(rows.iter().cloned());
+                        }
+                        heads
+                    })
+                };
+                // A rule that cannot substitute a deferred head reads it as a
+                // relation: add it, and run the SCC again.
+                let (l, why) = match &outcome {
+                    Err(Refusal::Deferred(l, why)) => (*l, why.clone()),
+                    Err(Refusal::NotBinary(l)) if store.deferred.contains_key(l) => (
+                        *l,
+                        "read by a rule the cube's walk does not take".to_string(),
+                    ),
+                    _ => break outcome,
+                };
+                let id = Self::reingest(&mut store, &produced, l)?;
+                current.insert(l, id);
+                reingested.push((l, why));
             };
             match outcome {
                 Ok(heads) => {
                     ran.extend(scc.rules.iter().map(|(h, _)| *h));
                     for (head, rows) in heads {
-                        if let Some(id) = store.add(&rows).map_err(PlanRefusal::Cube)? {
+                        // A non-recursive derived binary head whose every rule
+                        // is a recipe, with no facts put for it, stays a recipe.
+                        let recipes = if scc.recursive || put.contains_key(&head) {
+                            None
+                        } else {
+                            store.binary.get(&head).cloned().flatten()
+                        };
+                        if let Some(list) = recipes {
+                            store.deferred.insert(head, list);
+                        } else if let Some(id) = store.add(&rows).map_err(PlanRefusal::Cube)? {
                             current.insert(head, id);
                         }
                         produced.insert(head, rows);
@@ -431,6 +549,15 @@ impl CubeExecutor {
                 .iter()
                 .map(|(h, r)| (name(h), r.name().to_string()))
                 .collect(),
+            reingested: reingested
+                .iter()
+                .map(|(h, why)| (name(h), why.clone()))
+                .collect(),
+            recipes: {
+                let mut kept: Vec<String> = store.deferred.keys().map(name).collect();
+                kept.sort();
+                kept
+            },
         })
     }
 
@@ -578,9 +705,34 @@ impl CubeExecutor {
     ) -> Result<BTreeMap<Label, Rows>, Refusal> {
         let resolve = |l: Label, _: usize| lookup(current, l);
         let mut heads: BTreeMap<Label, Rows> = BTreeMap::new();
+        let mut recipes: HashMap<Label, Option<Vec<Recipe>>> = HashMap::new();
         for (head, body) in &scc.rules {
             let rows = self.rule(store, &resolve, body)?;
+            let width = rows.first().map(Vec::len).or_else(|| self.body_width(body));
+            if width.is_some_and(|w| w >= 2) {
+                let found = self.recipes(store, &resolve, body).ok();
+                let slot = recipes.entry(*head).or_insert_with(|| Some(Vec::new()));
+                match (slot.as_mut(), found) {
+                    (Some(list), Some(rs)) => list.extend(rs),
+                    _ => *slot = None,
+                }
+            }
             heads.entry(*head).or_default().extend(rows);
+        }
+        for (head, list) in recipes {
+            let wide = list
+                .as_ref()
+                .and_then(|l| l.first())
+                .map_or_else(
+                    || heads.get(&head).and_then(|r| r.first()).map(Vec::len),
+                    |r| Some(r.head.len()),
+                )
+                .is_some_and(|w| w > 2);
+            if wide {
+                store.recipes.insert(head, list);
+            } else {
+                store.binary.insert(head, list);
+            }
         }
         Ok(heads)
     }
@@ -680,8 +832,39 @@ impl CubeExecutor {
         if let Some(w) = word {
             return Err(Refusal::Behaviour(w));
         }
+        // A body naming a deferred head runs as recipes, substituting it.
+        let leaves = atoms(body).unwrap_or_default();
+        if let Some(&first) = leaves
+            .iter()
+            .filter_map(|r| self.label(*r).ok())
+            .find(|l| store.deferred.contains_key(l))
+            .as_ref()
+        {
+            return self
+                .recipes(store, resolve, body)
+                .and_then(|rs| Self::run_recipes(store, &rs))
+                .map_err(|e| Refusal::Deferred(first, self.describe(&e)));
+        }
         match body {
             RirNode::Scan { .. } | RirNode::Filter { .. } => self.single(store, resolve, body),
+            // Two columns of a wide relation: run its recipes (EXO-396).
+            RirNode::Project { input, columns }
+                if matches!(input.as_ref(), RirNode::Scan { rel }
+                    if self.label(*rel).is_ok_and(|l| store.recipes.contains_key(&l))) =>
+            {
+                let RirNode::Scan { rel } = input.as_ref() else {
+                    unreachable!("matched above")
+                };
+                self.unfold(store, self.label(*rel)?, columns)
+            }
+            // A join under `col != col`: one recipe, run where it stands.
+            RirNode::Project { input, .. }
+                if matches!(input.as_ref(), RirNode::Filter { input, .. }
+                    if matches!(input.as_ref(), RirNode::Join { .. })) =>
+            {
+                let rs = self.recipes(store, resolve, body)?;
+                Self::run_recipes(store, &rs)
+            }
             RirNode::Project { input, columns }
                 if matches!(
                     input.as_ref(),
@@ -701,7 +884,12 @@ impl CubeExecutor {
                     .map(|row| cols.iter().map(|&i| row[i]).collect())
                     .collect())
             }
-            RirNode::MultiWayJoin { fallback, .. } => self.multiway(store, resolve, fallback),
+            // A multi-way join is one conjunctive body: its recipe runs on the
+            // cube's own walk over the lent pair planes.
+            RirNode::MultiWayJoin { .. } => {
+                let rs = self.recipes(store, resolve, body)?;
+                Self::run_recipes(store, &rs)
+            }
             RirNode::ChainJoin {
                 left,
                 right,
@@ -769,58 +957,6 @@ impl CubeExecutor {
             .filter(|row| keep.holds(row))
             .cloned()
             .collect())
-    }
-
-    /// A multi-way conjunctive join, evaluated as generic join over the
-    /// cube's coordinates. The atoms, the variables and the output come from
-    /// `fallback`, the IR-equivalent binary-join plan: its scan leaves are the
-    /// atoms, its join keys (unified) the variables, its projection the head.
-    /// One variable is bound at a time; its candidates are the AND of one
-    /// adjacency mask per atom it occurs in (`lance_graph_xlog::and`).
-    fn multiway(
-        &self,
-        store: &Store,
-        resolve: &Resolve<'_>,
-        fallback: &RirNode,
-    ) -> Result<Vec<Vec<u32>>, Refusal> {
-        let (leaves, class, columns) = flatten_fallback(fallback)?;
-        let map = store
-            .table
-            .map(&store.table.seal(), TILE)
-            .map_err(|e| Refusal::Cube(CubeRefusal::Map(e)))?;
-        let n = map.len();
-        let words = n.div_ceil(64);
-        // Per atom: its two variables and its adjacency masks in both
-        // directions, over local positions.
-        let mut atoms = Vec::with_capacity(leaves.len());
-        for (i, rel) in leaves.iter().enumerate() {
-            let id = resolve(self.label(*rel)?, i)?;
-            let pairs = binary(&store.rows[&id]).ok_or(Refusal::NotBinary(self.label(*rel)?))?;
-            let mut adj = Adjacency::new(n, words);
-            for (a, b) in pairs {
-                let local = |g: u32| {
-                    map.local(u64::from(g))
-                        .map(usize::from)
-                        .map_err(|e| Refusal::Cube(CubeRefusal::Domain(e)))
-                };
-                adj.insert(local(a)?, local(b)?);
-            }
-            atoms.push(((class[2 * i], class[2 * i + 1]), adj));
-        }
-        let vars = class.iter().copied().max().map_or(0, |m| m + 1);
-        let mut binding = vec![usize::MAX; vars];
-        let mut out = BTreeSet::new();
-        generic_join(&atoms, words, 0, &mut binding, &mut |b: &[usize]| {
-            let row: Vec<u32> = columns
-                .iter()
-                .map(|&c| {
-                    map.global(b[class[c]] as u8)
-                        .expect("local position in the map") as u32
-                })
-                .collect();
-            out.insert(row);
-        });
-        Ok(out.into_iter().collect())
     }
 
     fn side(
@@ -910,6 +1046,343 @@ impl CubeExecutor {
     }
 }
 
+impl CubeExecutor {
+    /// A conjunctive body as recipes over cube relations: atoms in leaf
+    /// order (so `resolve` sees the same positions as [`atoms`]), the
+    /// variables, the distinctness pairs, and the head's variables.
+    ///
+    /// An atom over a deferred head is replaced by that head's recipes: the
+    /// head's two variables become the atom's, its other variables fresh
+    /// ones, its pairs renamed. A head with several rules is a disjunction, so
+    /// the result is one recipe per choice of rule; the caller ORs them. The
+    /// number of recipes and each one's variable count are checked before
+    /// any is built.
+    fn recipes(
+        &self,
+        store: &Store,
+        resolve: &Resolve<'_>,
+        body: &RirNode,
+    ) -> Result<Vec<Recipe>, Refusal> {
+        let (leaves, class, distinct, columns) = flatten_body(body)?;
+        let var = |c: usize| u8::try_from(c).map_err(|_| Refusal::Unfold("variable limit"));
+        let labels = leaves
+            .iter()
+            .map(|r| self.label(*r))
+            .collect::<Result<Vec<_>, _>>()?;
+        let choices: Vec<Option<&Vec<Recipe>>> =
+            labels.iter().map(|l| store.deferred.get(l)).collect();
+        // Preflight: the expansion and the widest substituted body.
+        let mut count = 1usize;
+        let mut widest = class.iter().copied().max().map_or(0, |m| m + 1);
+        for list in choices.iter().flatten() {
+            count = count.saturating_mul(list.len());
+            widest += list
+                .iter()
+                .map(|r| r.k.saturating_sub(2))
+                .max()
+                .unwrap_or(0);
+        }
+        if count > MAX_EXPANSION {
+            return Err(Refusal::Unfold("expansion budget"));
+        }
+        if widest > MAX_BODY_VARS {
+            return Err(Refusal::Unfold("variable limit"));
+        }
+        let k0 = class.iter().copied().max().map_or(0, |m| m + 1);
+        let mut out = Vec::with_capacity(count);
+        // One index per leaf into its recipes; an odometer over the choices.
+        let mut pick = vec![0usize; leaves.len()];
+        'combos: loop {
+            let mut k = k0;
+            let mut atoms = Vec::new();
+            let mut pairs = distinct
+                .iter()
+                .map(|&(a, b)| Ok([var(class[a])?, var(class[b])?]))
+                .collect::<Result<Vec<_>, Refusal>>()?;
+            for (i, label) in labels.iter().enumerate() {
+                let (a, b) = (class[2 * i], class[2 * i + 1]);
+                match choices[i] {
+                    None => atoms.push(Atom {
+                        rel: resolve(*label, i)?,
+                        vars: [var(a)?, var(b)?],
+                    }),
+                    Some(list) => {
+                        let r = &list[pick[i]];
+                        let [h0, h1] = r.head[..] else {
+                            return Err(Refusal::Unfold("a deferred head is not binary"));
+                        };
+                        if h0 == h1 {
+                            return Err(Refusal::Unfold("repeated head variable"));
+                        }
+                        let mut map = vec![usize::MAX; r.k];
+                        map[usize::from(h0)] = a;
+                        map[usize::from(h1)] = b;
+                        for m in map.iter_mut().filter(|m| **m == usize::MAX) {
+                            *m = k;
+                            k += 1;
+                        }
+                        for at in &r.atoms {
+                            atoms.push(Atom {
+                                rel: at.rel,
+                                vars: [
+                                    var(map[usize::from(at.vars[0])])?,
+                                    var(map[usize::from(at.vars[1])])?,
+                                ],
+                            });
+                        }
+                        for &[x, y] in &r.distinct {
+                            pairs.push([var(map[usize::from(x)])?, var(map[usize::from(y)])?]);
+                        }
+                    }
+                }
+            }
+            out.push(Recipe {
+                atoms,
+                k,
+                distinct: pairs,
+                head: columns
+                    .iter()
+                    .map(|&c| var(class[c]))
+                    .collect::<Result<_, _>>()?,
+            });
+            // Next choice; an empty list means the atom has no rule, so the
+            // body has no answer and no recipe.
+            for (i, list) in choices.iter().enumerate() {
+                let Some(list) = list else { continue };
+                if list.is_empty() {
+                    return Ok(Vec::new());
+                }
+                pick[i] += 1;
+                if pick[i] < list.len() {
+                    continue 'combos;
+                }
+                pick[i] = 0;
+            }
+            return Ok(out);
+        }
+    }
+
+    /// The rows of a disjunction of recipes: two-column heads ORed on the
+    /// planes and decoded once; heads keeping every variable, the union of
+    /// their witnesses.
+    fn run_recipes(store: &Store, rs: &[Recipe]) -> Result<Vec<Vec<u32>>, Refusal> {
+        if rs.iter().all(|r| r.head.len() == 2) {
+            let mut acc: Option<PairAnswer> = None;
+            for r in rs {
+                let ans = Self::answer(store, r, [r.head[0], r.head[1]])?;
+                match acc.as_mut() {
+                    None => acc = Some(ans),
+                    Some(acc) => acc.or_assign(&ans).map_err(Refusal::CubeBody)?,
+                }
+            }
+            return match acc {
+                Some(ans) => Self::decode(store, &ans),
+                None => Ok(Vec::new()),
+            };
+        }
+        let mut rows = Rows::new();
+        for r in rs {
+            rows.extend(Self::run_recipe(store, r)?);
+        }
+        Ok(rows.into_iter().collect())
+    }
+
+    /// Add a deferred head to the cube as a relation, from its rows.
+    fn reingest(
+        store: &mut Store,
+        produced: &BTreeMap<Label, Rows>,
+        l: Label,
+    ) -> Result<u32, PlanRefusal> {
+        store.deferred.remove(&l);
+        let rows = produced.get(&l).cloned().unwrap_or_default();
+        store
+            .add(&rows)
+            .map_err(PlanRefusal::Cube)?
+            .ok_or(PlanRefusal::Cube(CubeRefusal::UnknownRel(u32::from(l))))
+    }
+
+    /// A recipe's head rows, built here because the head is downloaded: a
+    /// two-column head is the demanded projection ([`Cube::body_pair`]); a
+    /// head keeping every variable is the witnesses. Anything else would
+    /// project witnesses, and is refused.
+    fn run_recipe(store: &Store, r: &Recipe) -> Result<Vec<Vec<u32>>, Refusal> {
+        if let [u, v] = r.head[..] {
+            return Self::decode(store, &Self::answer(store, r, [u, v])?);
+        }
+        let mut seen = vec![false; r.k];
+        for &x in &r.head {
+            if std::mem::replace(&mut seen[usize::from(x)], true) {
+                return Err(Refusal::Existential);
+            }
+        }
+        if seen.contains(&false) {
+            return Err(Refusal::Existential);
+        }
+        let flat = store
+            .cube
+            .materialize_distinct_witnesses(&store.table, &r.atoms, r.k, &r.distinct)
+            .map_err(Refusal::CubeBody)?;
+        let rows: Rows = flat
+            .chunks(r.k)
+            .map(|w| r.head.iter().map(|&x| w[usize::from(x)] as u32).collect())
+            .collect();
+        Ok(rows.into_iter().collect())
+    }
+
+    /// The demanded projection `(u, v)` of a recipe, as presence over the
+    /// cube's positions.
+    fn answer(store: &Store, r: &Recipe, demand: [u8; 2]) -> Result<PairAnswer, Refusal> {
+        store
+            .cube
+            .body_pair(&store.table, &r.atoms, r.k, &r.distinct, demand)
+            .map_err(Refusal::CubeBody)
+    }
+
+    /// A projection's pairs as rows: the head's download, decoded once.
+    fn decode(store: &Store, ans: &PairAnswer) -> Result<Vec<Vec<u32>>, Refusal> {
+        // An empty domain has no positions and zero words per row.
+        if ans.words() == 0 {
+            return Ok(Vec::new());
+        }
+        let map = store
+            .table
+            .map(&store.table.seal(), TILE)
+            .map_err(|e| Refusal::Cube(CubeRefusal::Map(e)))?;
+        let g = map.globals();
+        let mut out = Vec::with_capacity(ans.pairs() as usize);
+        for (x, row) in ans.rows().chunks(ans.words()).enumerate() {
+            for (wi, &word) in row.iter().enumerate() {
+                let mut bits = word;
+                while bits != 0 {
+                    let y = wi * 64 + bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    out.push(vec![g[x] as u32, g[y] as u32]);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Two columns of a wide relation: the OR of the demanded projection of
+    /// each of its recipes, taken on the planes (`PairAnswer::or_assign`) and
+    /// decoded once. The wide relation's rows are never read.
+    fn unfold(
+        &self,
+        store: &Store,
+        wide: Label,
+        columns: &[ProjectExpr],
+    ) -> Result<Vec<Vec<u32>>, Refusal> {
+        let Some(recipes) = store.recipes.get(&wide).and_then(Option::as_ref) else {
+            return Err(Refusal::NoRecipe(wide));
+        };
+        let [ProjectExpr::Column(a), ProjectExpr::Column(b)] = columns else {
+            return Err(Refusal::OutputColumn);
+        };
+        let mut acc: Option<PairAnswer> = None;
+        for r in recipes {
+            let (Some(&u), Some(&v)) = (r.head.get(*a), r.head.get(*b)) else {
+                return Err(Refusal::OutputColumn);
+            };
+            let ans = Self::answer(store, r, [u, v])?;
+            match acc.as_mut() {
+                None => acc = Some(ans),
+                Some(acc) => acc.or_assign(&ans).map_err(Refusal::CubeBody)?,
+            }
+        }
+        match acc {
+            Some(ans) => Self::decode(store, &ans),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// The head arity a body projects, when the body says it.
+    fn body_width(&self, body: &RirNode) -> Option<usize> {
+        match body {
+            RirNode::Project { columns, .. } => Some(columns.len()),
+            RirNode::MultiWayJoin { output_columns, .. }
+            | RirNode::ChainJoin { output_columns, .. } => Some(output_columns.len()),
+            _ => None,
+        }
+    }
+}
+
+/// A conjunctive body flattened: scan leaves, each leaf column's variable,
+/// the distinctness pairs (as leaf columns), and the projected leaf columns.
+type Body = (Vec<RelId>, Vec<usize>, Vec<(usize, usize)>, Vec<usize>);
+
+/// A body that is a conjunction of binary atoms: a multi-way join's
+/// fallback, or `Project { Filter { join tree, col != col ∧ … } }`.
+fn flatten_body(body: &RirNode) -> Result<Body, Refusal> {
+    match body {
+        // One atom: its two columns are two variables.
+        RirNode::Scan { rel } => Ok((vec![*rel], vec![0, 1], Vec::new(), vec![0, 1])),
+        RirNode::Project { input, columns } if matches!(input.as_ref(), RirNode::Scan { .. }) => {
+            let (leaves, class, columns) = flatten(input, columns)?;
+            Ok((leaves, class, Vec::new(), columns))
+        }
+        RirNode::MultiWayJoin { fallback, .. } => {
+            let (leaves, class, columns) = flatten_fallback(fallback)?;
+            Ok((leaves, class, Vec::new(), columns))
+        }
+        // Two scans joined on one key; a side bound to a constant has no
+        // atom form (an atom is two variables), so it does not flatten.
+        RirNode::ChainJoin {
+            left,
+            right,
+            left_key,
+            right_key,
+            output_columns,
+            ..
+        } => {
+            let join = RirNode::Join {
+                left: left.clone(),
+                right: right.clone(),
+                left_keys: vec![*left_key],
+                right_keys: vec![*right_key],
+                join_type: JoinType::Inner,
+            };
+            let (leaves, class, columns) = flatten(&join, output_columns)?;
+            Ok((leaves, class, Vec::new(), columns))
+        }
+        RirNode::Project { input, columns } if matches!(input.as_ref(), RirNode::Join { .. }) => {
+            let (leaves, class, columns) = flatten(input, columns)?;
+            Ok((leaves, class, Vec::new(), columns))
+        }
+        RirNode::Project { input, columns } => {
+            let RirNode::Filter { input, predicate } = input.as_ref() else {
+                return Err(Refusal::ProjectOver(kind(input)));
+            };
+            let mut distinct = Vec::new();
+            ne_cols(predicate, &mut distinct)?;
+            let (leaves, class, columns) = flatten(input, columns)?;
+            if distinct.iter().any(|&(a, b)| a.max(b) >= class.len()) {
+                return Err(Refusal::JoinFilter);
+            }
+            Ok((leaves, class, distinct, columns))
+        }
+        other => Err(Refusal::Body(kind(other))),
+    }
+}
+
+/// `col != col`, or a conjunction of them.
+fn ne_cols(predicate: &Expr, out: &mut Vec<(usize, usize)>) -> Result<(), Refusal> {
+    match predicate {
+        Expr::Compare {
+            left,
+            op: CompareOp::Ne,
+            right,
+        } => match (left.as_ref(), right.as_ref()) {
+            (Expr::Column(a), Expr::Column(b)) => {
+                out.push((*a, *b));
+                Ok(())
+            }
+            _ => Err(Refusal::JoinFilter),
+        },
+        Expr::And(items) => items.iter().try_for_each(|e| ne_cols(e, out)),
+        _ => Err(Refusal::JoinFilter),
+    }
+}
+
 /// The relations a body reads, by atom position.
 fn atoms(body: &RirNode) -> Result<Vec<RelId>, Refusal> {
     fn atom(n: &RirNode) -> Result<RelId, Refusal> {
@@ -925,96 +1398,14 @@ fn atoms(body: &RirNode) -> Result<Vec<RelId>, Refusal> {
         RirNode::MultiWayJoin { fallback, .. } => Ok(flatten_fallback(fallback)?.0),
         RirNode::Project { input, .. } => match input.as_ref() {
             RirNode::Join { left, right, .. } => Ok(vec![atom(left)?, atom(right)?]),
+            RirNode::Filter { input: j, .. } if matches!(j.as_ref(), RirNode::Join { .. }) => {
+                Ok(flatten_body(body)?.0)
+            }
             RirNode::Scan { .. } | RirNode::Filter { .. } => Ok(vec![atom(input)?]),
             other => Err(Refusal::ProjectOver(kind(other))),
         },
         other => Err(Refusal::Body(kind(other))),
     }
-}
-
-/// One atom's relation as bit masks over local positions: `fwd[x]` holds
-/// the `y` with `(x, y)`, `bwd[y]` the `x`, and `col0`/`col1` the values each
-/// column takes.
-struct Adjacency {
-    fwd: Vec<Vec<u64>>,
-    bwd: Vec<Vec<u64>>,
-    col0: Vec<u64>,
-    col1: Vec<u64>,
-}
-
-impl Adjacency {
-    fn new(n: usize, words: usize) -> Self {
-        Self {
-            fwd: vec![vec![0; words]; n],
-            bwd: vec![vec![0; words]; n],
-            col0: vec![0; words],
-            col1: vec![0; words],
-        }
-    }
-
-    fn insert(&mut self, a: usize, b: usize) {
-        self.fwd[a][b / 64] |= 1 << (b % 64);
-        self.bwd[b][a / 64] |= 1 << (a % 64);
-        self.col0[a / 64] |= 1 << (a % 64);
-        self.col1[b / 64] |= 1 << (b % 64);
-    }
-}
-
-/// Bind variable `v`, then the rest. A variable's candidates are the AND,
-/// over every atom it occurs in, of: the partner's row or column when the
-/// partner is bound (or is `v` itself), else the column's value set.
-fn generic_join(
-    atoms: &[((usize, usize), Adjacency)],
-    words: usize,
-    v: usize,
-    binding: &mut Vec<usize>,
-    emit: &mut dyn FnMut(&[usize]),
-) {
-    if v == binding.len() {
-        emit(binding);
-        return;
-    }
-    let mut cand = vec![u64::MAX; words];
-    let mut scratch = vec![0u64; words];
-    let mut constrained = false;
-    for ((a, b), adj) in atoms {
-        let mask: Option<Vec<u64>> = match (*a == v, *b == v) {
-            // `r(V, V)`: the diagonal.
-            (true, true) => Some(
-                (0..words)
-                    .map(|w| {
-                        (0..64)
-                            .filter(|i| {
-                                let x = w * 64 + i;
-                                x < adj.fwd.len() && adj.fwd[x][w] >> i & 1 == 1
-                            })
-                            .fold(0u64, |m, i| m | 1 << i)
-                    })
-                    .collect(),
-            ),
-            (true, false) if binding[*b] != usize::MAX => Some(adj.bwd[binding[*b]].clone()),
-            (true, false) => Some(adj.col0.clone()),
-            (false, true) if binding[*a] != usize::MAX => Some(adj.fwd[binding[*a]].clone()),
-            (false, true) => Some(adj.col1.clone()),
-            _ => None,
-        };
-        if let Some(m) = mask {
-            lance_graph_xlog::and(&cand, &m, &mut scratch);
-            std::mem::swap(&mut cand, &mut scratch);
-            constrained = true;
-        }
-    }
-    if !constrained {
-        return;
-    }
-    let n = atoms.first().map_or(0, |(_, adj)| adj.fwd.len());
-    for x in 0..n {
-        if cand[x / 64] >> (x % 64) & 1 == 1 {
-            binding[v] = x;
-            generic_join(atoms, words, v + 1, binding, emit);
-        }
-    }
-    binding[v] = usize::MAX;
 }
 
 /// The scan leaves of a `MultiWayJoin` fallback (`Project` over a tree of
@@ -1025,6 +1416,11 @@ fn flatten_fallback(fallback: &RirNode) -> Result<Flat, Refusal> {
     let RirNode::Project { input, columns } = fallback else {
         return Err(Refusal::Fallback(kind(fallback)));
     };
+    flatten(input, columns)
+}
+
+/// A tree of inner joins over scans, and a projection of its columns.
+fn flatten(input: &RirNode, columns: &[ProjectExpr]) -> Result<Flat, Refusal> {
     fn walk(
         n: &RirNode,
         leaves: &mut Vec<RelId>,
