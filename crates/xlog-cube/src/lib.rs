@@ -440,8 +440,8 @@ impl CubeExecutor {
         };
     }
 
-    /// [`Self::demand_magic`] with the rewrite's report, and its seeds put as
-    /// sets: every body-less rule of the rewritten program whose head is a
+    /// [`Self::demand_magic`] with the rewrite's report, and its seeds put
+    /// as sets (one bound argument) or relations (two): every body-less rule of the rewritten program whose head is a
     /// generated magic predicate (`__xlog_magic_reach_bf(1).`). The
     /// execution plan does not carry these facts, so without them the
     /// magic-guarded rules would read an empty seed. A seed term that is not
@@ -458,20 +458,41 @@ impl CubeExecutor {
             .iter()
             .map(String::as_str)
             .collect();
-        let mut seeds: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+        // One bound argument is a set; two are a relation, so the bound pair
+        // stays correlated (`magic(1, 3)`, `magic(4, 5)` never admits (1, 5)).
+        let mut sets: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+        let mut pairs: BTreeMap<String, Vec<(u32, u32)>> = BTreeMap::new();
+        let id = |t: &xlog_logic::Term| match t {
+            xlog_logic::Term::Integer(i) => u32::try_from(*i).ok(),
+            _ => None,
+        };
         for rule in &rewrite.program.rules {
             let head = &rule.head;
             if !rule.body.is_empty() || !generated.contains(head.predicate.as_str()) {
                 continue;
             }
-            if let [xlog_logic::Term::Integer(i)] = head.terms[..] {
-                if let Ok(id) = u32::try_from(i) {
-                    seeds.entry(head.predicate.clone()).or_default().push(id);
+            match &head.terms[..] {
+                [a] => {
+                    if let Some(a) = id(a) {
+                        sets.entry(head.predicate.clone()).or_default().push(a);
+                    }
                 }
+                [a, b] => {
+                    if let (Some(a), Some(b)) = (id(a), id(b)) {
+                        pairs
+                            .entry(head.predicate.clone())
+                            .or_default()
+                            .push((a, b));
+                    }
+                }
+                _ => {}
             }
         }
-        for (name, ids) in seeds {
+        for (name, ids) in sets {
             self.put_set(&name, &ids);
+        }
+        for (name, rows) in pairs {
+            self.put_relation(&name, &rows);
         }
     }
 
@@ -532,10 +553,17 @@ impl CubeExecutor {
         self.intern(plan)?;
         // A report from another program is named as such before its seed.
         self.demanded(plan)?;
+        let derived: BTreeSet<&str> = plan
+            .rules_by_scc
+            .iter()
+            .flatten()
+            .map(|r| r.head.as_str())
+            .collect();
         if let Some(seed) = self
             .empty_sets
             .iter()
-            .find(|n| n.starts_with("__xlog_magic_"))
+            .chain(self.empty.iter())
+            .find(|n| n.starts_with("__xlog_magic_") && !derived.contains(n.as_str()))
         {
             return Err(PlanRefusal::MagicSeedMissing(seed.clone()));
         }
@@ -1176,6 +1204,13 @@ impl CubeExecutor {
                     (right, right_keys[0]),
                     columns,
                 ),
+                // A join on several keys (a correlated demand, `edge(X, Y),
+                // magic(X, Y)`) or a join tree: one conjunctive body, run by
+                // the same flattening as a multi-way fallback.
+                RirNode::Join { .. } => {
+                    let rs = self.recipes(store, resolve, body)?;
+                    Self::run_recipes(store, &rs)
+                }
                 other => Err(Refusal::ProjectOver(kind(other))),
             },
             other => Err(Refusal::Body(kind(other))),

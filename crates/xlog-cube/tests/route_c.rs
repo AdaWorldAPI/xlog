@@ -434,3 +434,85 @@ fn a_report_from_another_program_is_refused() {
         "{got:?}"
     );
 }
+
+/// Two bound arguments: XLOG generates a binary magic relation
+/// (`__xlog_magic_reach_bb`), whose seeds are pairs.
+const MAGIC_BB: &str = r#"
+    #pragma magic_sets = on
+    pred edge(u32, u32). pred reach(u32, u32).
+    reach(X, Y) :- edge(X, Y).
+    reach(X, Z) :- reach(X, Y), edge(Y, Z).
+    ?- reach(1, 3).
+    ?- reach(4, 5).
+    ?- reach(1, 7).
+"#;
+
+const PLAIN_BB: &str = r#"
+    pred edge(u32, u32). pred reach(u32, u32).
+    reach(X, Y) :- edge(X, Y).
+    reach(X, Z) :- reach(X, Y), edge(Y, Z).
+    ?- reach(1, 3).
+    ?- reach(4, 5).
+    ?- reach(1, 7).
+"#;
+
+/// FAILS IF: a two-bound-argument demand loses its pairing or its seeds:
+/// a demanded pair is derived differently from the program without magic
+/// sets, or the undemanded component is still derived. The seeds `(1,3)`,
+/// `(4,5)`, `(1,7)` are one binary relation: the body walk reads
+/// `edge(X, Y), magic(X, Y)` as two atoms over the same two variables, never
+/// as two independent masks. `1 -> 7` is unreachable (`6 -> 7` is another
+/// component).
+///
+/// A ground query's head is a computed constant column, which the cube
+/// refuses with and without magic sets; the refusals are asserted equal, so
+/// the witness is `reach` on the demanded pairs.
+#[test]
+fn a_correlated_demand_is_a_binary_seed_relation() {
+    let e: &[(u32, u32)] = &[(1, 2), (2, 3), (4, 5), (2, 5), (6, 7)];
+    let (plain, prep) = run(PLAIN_BB, &[("edge", e)]);
+    let (ex, rep) = run_magic(MAGIC_BB, MAGIC_BB, &[("edge", e)]).expect("plan");
+    assert!(!refused(&rep, "reach"), "{:?}", rep.refused);
+    assert_eq!(rep.refused, prep.refused, "magic sets change no refusal");
+    assert_eq!(
+        rows(&ex, "__xlog_magic_reach_bb"),
+        set(&[[1, 3], [4, 5], [1, 7]]),
+        "the seeds are one relation of pairs"
+    );
+    let (got, all) = (rows(&ex, "reach"), rows(&plain, "reach"));
+    for pair in [[1u32, 3], [4, 5], [1, 7]] {
+        assert_eq!(
+            got.contains(&pair.to_vec()),
+            all.contains(&pair.to_vec()),
+            "{pair:?}"
+        );
+    }
+    assert!(got.contains(&vec![1, 3]) && got.contains(&vec![4, 5]));
+    assert!(!all.contains(&vec![1, 7]));
+    // Every derived row is a real one, and the demand prunes: the component
+    // 6 -> 7 is not derived.
+    assert!(got.is_subset(&all), "{got:?} not within {all:?}");
+    assert!(all.contains(&vec![6, 7]));
+    assert!(!got.contains(&vec![6, 7]));
+}
+
+/// FAILS IF: a missing binary seed runs instead of being refused.
+#[test]
+fn a_missing_binary_seed_is_refused() {
+    let mut c = Compiler::new();
+    let plan = c.compile(MAGIC_BB).expect("compile");
+    let mut ex = CubeExecutor::new();
+    for (name, id) in c.rel_ids() {
+        ex.register_relation(*id, name);
+    }
+    ex.put_relation("edge", &[(1, 2), (2, 3)]);
+    assert_eq!(
+        ex.execute_plan(&plan).err(),
+        Some(xlog_cube::PlanRefusal::MagicSeedMissing(
+            "__xlog_magic_reach_bb".to_string()
+        ))
+    );
+    // Silence twin: supplied by hand, it runs.
+    ex.put_relation("__xlog_magic_reach_bb", &[(1, 3)]);
+    assert!(ex.execute_plan(&plan).is_ok());
+}
