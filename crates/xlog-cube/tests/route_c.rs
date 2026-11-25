@@ -516,3 +516,54 @@ fn a_missing_binary_seed_is_refused() {
     ex.put_relation("__xlog_magic_reach_bb", &[(1, 3)]);
     assert!(ex.execute_plan(&plan).is_ok());
 }
+
+/// A one-column recursive head with a bound query: `r(X)` holds when `X`
+/// reaches a goal. The rewrite guards both rules with the unary seed and
+/// derives the seed itself recursively (`magic(Y) :- magic(X), e(X, Y)`);
+/// the cube's existing set algebra (Set and Reach routes) is expected to run
+/// it, with no new path.
+const MAGIC_UNARY: &str = r#"
+    #pragma magic_sets = on
+    pred e(u32, u32). pred start(u32). pred r(u32).
+    r(X) :- start(X).
+    r(X) :- e(X, Y), r(Y).
+    ?- r(1).
+"#;
+
+const PLAIN_UNARY: &str = r#"
+    pred e(u32, u32). pred start(u32). pred r(u32).
+    r(X) :- start(X).
+    r(X) :- e(X, Y), r(Y).
+    ?- r(1).
+"#;
+
+/// FAILS IF: magic sets change what the cube admits for a one-column
+/// recursion, or when the cube admits it, change its answer.
+///
+/// Pinned as it stands: `r(X) :- e(X, Y), r(Y)` steps along `e` backwards
+/// (column 1 to column 0), and the Reach route steps forwards only, so the
+/// program is refused with and without magic sets, for the same reason.
+/// When a backward Reach lands, the refusal assertions flip to answers.
+#[test]
+fn a_unary_magic_recursion_is_refused_exactly_as_without_magic() {
+    let e: &[(u32, u32)] = &[(1, 2), (2, 3), (7, 8)];
+    let run_sets = |src: &str, magic: bool| {
+        let mut c = Compiler::new();
+        let plan = c.compile(src).expect("compile");
+        let mut ex = CubeExecutor::new();
+        for (name, id) in c.rel_ids() {
+            ex.register_relation(*id, name);
+        }
+        ex.put_relation("e", e);
+        ex.put_set("start", &[3, 8]);
+        if magic {
+            let p = xlog_logic::parse_program(src).expect("parse");
+            ex.demand_magic_rewrite(&xlog_logic::rewrite_magic_sets(&p).expect("rewrite"));
+        }
+        ex.execute_plan(&plan).expect("plan")
+    };
+    let plain = run_sets(PLAIN_UNARY, false);
+    let magic = run_sets(MAGIC_UNARY, true);
+    assert_eq!(magic.refused, plain.refused, "magic sets change no refusal");
+    assert!(refused(&plain, "r"), "{:?}", plain.refused);
+}
